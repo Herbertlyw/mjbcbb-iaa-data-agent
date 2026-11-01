@@ -9,6 +9,7 @@ export interface ColumnSpec {
   chType: string;
   description: string;
   nullable?: boolean;
+  unit?: string;
   null_means?: string;
   zero_means?: string;
   sensitive?: boolean;
@@ -44,16 +45,16 @@ export const WAREHOUSE_TABLES: TableSpec[] = [
     { name: "channel_kind", chType: "LowCardinality(String)", description: "渠道类别" },
   ], "小型集只有 mist_ads 与 pebble_net。"),
   fact("fact_fox_daily_install", "每日新增", "按日、产品、平台、地区、渠道的新增用户。", "event_date", ["new_users"], null, ["device_token"], [
-    metric("new_users", "Nullable(Int32)", "新增用户。NULL 是缺失，0 是真实零。", true),
+    metric("new_users", "Nullable(Int32)", "新增用户。NULL 是缺失，0 是真实零。", true, "人"),
     { name: "device_token", chType: "Nullable(String)", description: "虚构设备桶，敏感，不能出现在查询里。", nullable: true, sensitive: true },
   ], "2026-09-29 至 2026-10-12。雾帆美国 iOS 纸灯在 10-09 为 NULL，10-07 为 0。卵石渠道多数日期无行。"),
   fact("fact_fox_daily_active", "每日活跃", "同一粒度的活跃用户，不从新增填补。", "event_date", ["active_users"], null, [], [
-    metric("active_users", "Nullable(Int32)", "活跃用户。NULL 是缺失，0 是真实零。", true),
+    metric("active_users", "Nullable(Int32)", "活跃用户。NULL 是缺失，0 是真实零。", true, "人"),
   ], "与新增同一批日期。10-12 日本 iOS 纸灯雾帆是合成异常波动。"),
   {
     ...fact("fact_fox_retention_cohort", "留存 cohort", "按 cohort 日和留存日龄的留存人数。", "cohort_date", ["retained_users"], null, [], [
       { name: "day_n", chType: "UInt16", description: "留存日龄" },
-      metric("retained_users", "Nullable(Int32)", "留存人数。NULL 不是 0。", true),
+      metric("retained_users", "Nullable(Int32)", "留存人数。NULL 不是 0。", true, "人"),
     ], "小型集只覆盖纸灯美国 iOS 的 2026-10-06 cohort，日龄 1 和 7。日龄 7 为 NULL。"),
     date_column: "cohort_date",
     series: { date_column: "cohort_date", dimensions: ["title_id", "platform", "country_code"], metrics: ["retained_users"], predicted_column: null },
@@ -61,20 +62,20 @@ export const WAREHOUSE_TABLES: TableSpec[] = [
   {
     ...fact("fact_fox_ad_receipt", "广告变现", "按日和广告位的变现。预测行不进入实际。", "event_date", ["revenue_usd"], "is_predicted", [], [
       { name: "placement", chType: "LowCardinality(String)", description: "虚构广告位" },
-      metric("revenue_usd", "Nullable(Float64)", "变现金额。NULL 是缺失，0 是真实零。", true),
+      metric("revenue_usd", "Nullable(Float64)", "变现金额。NULL 是缺失，0 是真实零。", true, "USD"),
       { name: "is_predicted", chType: "UInt8", description: "1 表示预测，不能并入实际。" },
     ], "纸灯美国 iOS rewarded：10-08 为 NULL，10-07 为 0，10-10 与 10-11 为预测。没有渠道字段，不能假装按渠道缺失。"),
     columns: undefined as unknown as ColumnSpec[],
   },
   fact("fact_fox_daily_spend", "每日投放成本", "按日的成本与当日实际或预测回收。", "event_date", ["spend_usd", "payback_usd"], "is_predicted", [], [
-    metric("spend_usd", "Nullable(Float64)", "投放成本。NULL 不是 0。", true),
-    metric("payback_usd", "Nullable(Float64)", "当日回收。预测行不进入实际 ROI。", true),
+    metric("spend_usd", "Nullable(Float64)", "投放成本。NULL 不是 0。", true, "USD"),
+    metric("payback_usd", "Nullable(Float64)", "当日回收。预测行不进入实际 ROI。", true, "USD"),
     { name: "is_predicted", chType: "UInt8", description: "1 表示预测。" },
   ], "纸灯美国 iOS 雾帆：10-08 成本 NULL，10-07 成本真实零，10-10 整行是预测。"),
   {
     ...fact("fact_fox_cohort_payback", "cohort 回收", "按 cohort 和回收周期的实际或预测回收。", "cohort_date", ["payback_usd"], "is_predicted", [], [
       { name: "horizon_day", chType: "UInt16", description: "回收观察日" },
-      metric("payback_usd", "Nullable(Float64)", "该周期回收。", true),
+      metric("payback_usd", "Nullable(Float64)", "该周期回收。", true, "USD"),
       { name: "is_predicted", chType: "UInt8", description: "1 表示预测。" },
     ], "纸灯美国 iOS 雾帆 cohort 2026-10-06：7 日实际，30 日预测，1 日为 NULL。"),
     date_column: "cohort_date",
@@ -124,8 +125,8 @@ function fact(table: string, title: string, purpose: string, dateColumn: string,
   };
 }
 
-function metric(name: string, chType: string, description: string, nullable: boolean): ColumnSpec {
-  return { name, chType, description, nullable, null_means: "缺失，不能当成零", zero_means: "观测到的真实零" };
+function metric(name: string, chType: string, description: string, nullable: boolean, unit?: string): ColumnSpec {
+  return { name, chType, description, nullable, ...(unit ? { unit } : {}), null_means: "缺失，不能当成零", zero_means: "观测到的真实零" };
 }
 
 // Repair ad receipt columns: fact() already includes placement via extra, but I passed extra after the spread bug.
@@ -141,7 +142,7 @@ function normalizeTables(): void {
     { name: "platform", chType: "LowCardinality(String)", description: "平台" },
     { name: "country_code", chType: "LowCardinality(String)", description: "地区" },
     { name: "placement", chType: "LowCardinality(String)", description: "虚构广告位" },
-    metric("revenue_usd", "Nullable(Float64)", "变现金额。NULL 是缺失，0 是真实零。", true),
+    metric("revenue_usd", "Nullable(Float64)", "变现金额。NULL 是缺失，0 是真实零。", true, "USD"),
     { name: "is_predicted", chType: "UInt8", description: "1 表示预测，不能并入实际。" },
   ];
   ad.series = { date_column: "event_date", dimensions: ["title_id", "platform", "country_code"], metrics: ["revenue_usd"], predicted_column: "is_predicted" };
@@ -296,7 +297,7 @@ export function emitHarborlightKnowledge(root: string): void {
   for (const table of WAREHOUSE_TABLES) {
     const body = {
       asset_id: table.asset_id,
-      revision: `${table.asset_id}-r1`,
+      revision: `${table.asset_id}-r${table.series ? 2 : 1}`,
       table: table.table,
       engine: "clickhouse-local",
       simulated: true,
@@ -305,11 +306,13 @@ export function emitHarborlightKnowledge(root: string): void {
       timezone: "America/Los_Angeles",
       freshness: { as_of: null, status: "unknown", note: "查询只认已发布探测，不认这里的占位。" },
       must_filter: table.date_column ? [table.date_column] : [],
-      ...(table.series ? { series: table.series } : {}),
+      ...(table.series ? { series: { ...table.series, ...(table.series.predicted_column ? { prediction_values: { actual: 0, predicted: 1 } } : { prediction_mode: "observed_only" }) } } : {}),
+      ...(table.table === "fact_fox_daily_spend" ? { derived_metrics: [{ id: "roi", label: "实际 ROI", operation: "divide", numerator: "payback_usd", denominator: "spend_usd", prediction: "actual_only", unit: "比值" }] } : {}),
       columns: table.columns.map((column) => ({
         name: column.name,
         type: column.chType,
         description: column.description,
+        ...(column.unit ? { unit: column.unit } : {}),
         ...(column.nullable ? { nullable: true, null_means: column.null_means, zero_means: column.zero_means } : {}),
       })),
       sensitive_columns: table.sensitive_columns,
@@ -321,7 +324,7 @@ export function emitHarborlightKnowledge(root: string): void {
       kind: "data_contract",
       title: table.title,
       summary: table.purpose,
-      revision: `${table.asset_id}-r1`,
+      revision: `${table.asset_id}-r${table.series ? 2 : 1}`,
       status: "published",
       discoverable: true,
       table: table.table,
@@ -329,7 +332,7 @@ export function emitHarborlightKnowledge(root: string): void {
     });
   }
   writeFileSync(path.join(root, "registry.json"), JSON.stringify({
-    registry_revision: "harborlight-registry-2026-10-29",
+    registry_revision: "harborlight-registry-2026-11-01",
     simulated: true,
     scenario: "虚构工作室 Harborlight 的合成 ClickHouse。不是任何真实业务库。",
     timezone: "America/Los_Angeles",

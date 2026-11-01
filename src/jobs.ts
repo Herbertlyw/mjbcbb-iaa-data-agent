@@ -498,6 +498,9 @@ export class JobService {
         if (event.type === "message_end" && event.message.role === "assistant") {
           modelCalls += 1;
           input.onModelCall();
+          if (event.message.stopReason === "error") {
+            fail(safeProviderError(new Error(event.message.errorMessage ?? "provider_error")));
+          }
         }
         if (event.type === "tool_execution_start") {
           toolCalls += 1;

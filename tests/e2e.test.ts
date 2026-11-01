@@ -17,7 +17,7 @@ test("提问、检索、契约、查询、引用和追问", async () => {
     assert.match(first.analysis?.answer ?? "", /27\.5/);
     assert.match(first.analysis?.answer ?? "", /缺失|NULL/);
     assert.match(first.analysis?.answer ?? "", /无记录|值为 NULL/);
-    assert.match(first.analysis?.answer ?? "", /真实为零/);
+    assert.match(first.analysis?.answer ?? "", /数值为零/);
     assert.match(first.analysis?.answer ?? "", /预测/);
     assert.equal(first.analysis?.model_suggested_status, "completed");
     assert.equal(first.analysis?.simulated, true);
@@ -43,10 +43,11 @@ test("证据完整时可以完成，敏感请求和澄清不会假装查到了",
   await withRuntime({}, async (runtime) => {
     const japan = analyst(runtime);
     const done = await ask(runtime, japan.session_id, DEMO_QUESTIONS[2].text);
-    assert.equal(done.status, "completed");
+    assert.equal(done.status, "partial"); // 预测筛选没有行，不能把空集伪装成观测零。
     assert.match(done.analysis?.answer ?? "", /70/);
     assert.match(done.analysis?.answer ?? "", /21/);
-    assert.equal(done.analysis?.calculations.some((item) => item.cells.revenue_predicted === 0), true);
+    assert.equal(done.analysis?.calculations.flatMap((item) => item.verified_cells ?? []).some((cell) => cell.column === "revenue_usd" && cell.prediction.startsWith("预测") && cell.value === 0), false);
+    assert.ok(done.analysis?.server_reasons.includes("calculation_lineage_unsupported"));
 
     const sensitive = analyst(runtime);
     const denied = await ask(runtime, sensitive.session_id, DEMO_QUESTIONS[4].text);

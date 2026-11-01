@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -21,7 +21,7 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const knowledgeDir = path.join(root, "knowledge", "harborlight");
 const adminPassword = randomBytes(18).toString("hex");
 const readerPassword = randomBytes(18).toString("hex");
-const container = `lumenfox-ch-${process.pid}`;
+const container = `lumenfox-ch-${randomUUID()}`;
 
 test("Harborlight 表卡驱动槽位，不把 SQLite 表名写进这条链", () => {
   const turn = resolveTurn(null, "纸灯 在 2026-10-06 到 2026-10-12（美国、iOS、雾帆）的新增用户是多少？", knowledgeDir);
@@ -38,9 +38,10 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
   const dir = mkdtempSync(path.join(tmpdir(), "lumenfox-ch-"));
   const freshnessPath = path.join(dir, "freshness.json");
   const url = `http://127.0.0.1:${port}`;
+  let containerCreated = false;
   try {
     await runQuiet("docker", [
-      "run", "-d", "--name", container,
+      "run", "--pull=never", "-d", "--name", container,
       "--ulimit", "nofile=262144:262144",
       "-p", `127.0.0.1:${port}:8123`,
       "-e", `CLICKHOUSE_PASSWORD=${adminPassword}`,
@@ -48,6 +49,7 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
       "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1",
       "clickhouse/clickhouse-server:24.8.14.39",
     ], adminPassword);
+    containerCreated = true;
     await waitForHttp(url);
     const bootstrap = createClickHouseClient({
       url, username: "default", password: adminPassword, database: "default", maxRowsToRead: 5_000_000, timeoutSeconds: 30,
@@ -214,6 +216,7 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
         WHERE i.event_date >= '2026-10-06' AND i.event_date <= '2026-10-12'
           AND i.title_id = 'paper_lantern' AND i.platform = 'ios' AND i.country_code = 'US' AND r.is_predicted = 0`);
       assert.notEqual(Number(duplicated[0]?.n), 43.5);
+      await verifyEvidenceLineage(runtime, reader, freshnessPath);
     } finally {
       await runtime.close();
       await reader.close();
@@ -221,21 +224,123 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
     }
     await runSplitProcess(url, freshnessPath, dir, port);
   } finally {
-    await runQuiet("docker", ["rm", "-f", container], adminPassword).catch(() => undefined);
+    if (containerCreated) await runQuiet("docker", ["rm", "-f", container], adminPassword).catch(() => undefined);
+    rmSync(dir, { recursive: true, force: true });
   }
 });
+
+async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, reader: ReturnType<typeof createClickHouseClient>, freshnessPath: string) {
+  const session = runtime.sessions.create("analyst");
+  await bindTables(runtime, session.session_id, ["contract.fact_fox_daily_install", "contract.fact_fox_daily_active", "contract.fact_fox_ad_receipt", "contract.fact_fox_daily_spend"]);
+  runtime.sessions.setActiveJob(session.session_id, "job_evidence_lineage");
+  const time = "event_date >= '2026-10-06' AND event_date <= '2026-10-12'";
+  const common = "title_id = 'paper_lantern' AND platform = 'ios'";
+  async function calculate(sql: string, column: string, predicted: "any" | "actual_only" | "predicted_only" = "any") {
+    const query = await runtime.tools.query(session.session_id, { sql });
+    assert.equal(query.ok, true, JSON.stringify(query));
+    if (!query.ok) throw new Error("query rejected");
+    const calculation = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(query.resource_id), operations: [{ op: "sum", column, predicted, as: "MODEL_CHOSEN_ALIAS" }] });
+    assert.equal(calculation.ok, true, JSON.stringify(calculation));
+    if (!calculation.ok) throw new Error("calculation rejected");
+    return { query, calculation };
+  }
+  const installs = await calculate(`SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE ${time} AND ${common} AND country_code = 'JP' AND channel_id = 'mist_ads'`, "new_users");
+  const active = await calculate(`SELECT event_date, title_id, platform, country_code, channel_id, active_users FROM fact_fox_daily_active WHERE ${time} AND ${common} AND country_code = 'JP' AND channel_id = 'mist_ads'`, "active_users");
+  const revenue = await calculate(`SELECT event_date, title_id, platform, country_code, placement, revenue_usd, is_predicted FROM fact_fox_ad_receipt WHERE ${time} AND ${common} AND country_code = 'US'`, "revenue_usd", "actual_only");
+  const values = [installs, active, revenue];
+  const resources = values.flatMap((item) => [String(item.query.resource_id), String(item.calculation.resource_id)]);
+  const wrongLabels = ["WRONG_COUNTRY_US", "WRONG_DATE_1999", "WRONG_METRIC_ROI", "WRONG_UNIT_USD", "WRONG_GROUP_ANDROID"];
+  const analysis = await runtime.tools.updateAnalysis(session.session_id, {
+    suggested_status: "completed", draft_answer: "", resource_ids: resources,
+    findings: wrongLabels.map((label, index) => ({ label, metric: "spend_usd", unit: "USD", value: 70, kind: "predicted" as const, resource_id: String(installs.calculation.resource_id), cell: "MODEL_CHOSEN_ALIAS", group: (index % 2 ? { platform: "android" } : { country_code: "US" }) as Record<string, string>, time_range: { start: "1999-01-01", end: "1999-01-02" } })),
+  });
+  assert.equal(analysis.ok, true);
+  if (!analysis.ok) return;
+  const answer = String(analysis.answer);
+  for (const wrong of wrongLabels) assert.equal(answer.includes(wrong), false);
+  assert.match(answer, /fact_fox_daily_install\.new_users/);
+  const installLine = answer.split("\n").find((line) => line.includes("fact_fox_daily_install.new_users")) ?? "";
+  assert.match(installLine, /合计 70；单位 人/);
+  assert.match(installLine, /country_code=JP/);
+  assert.doesNotMatch(installLine, /USD|country_code=US|platform=android|1999/);
+  assert.match(answer, /合计 70；单位 人/);
+  assert.match(answer, /country_code=JP/);
+  assert.match(answer, /2026-10-06 到 2026-10-12/);
+  assert.match(answer, /fact_fox_daily_active\.active_users[^\n]*5090/);
+  assert.match(answer, /fact_fox_ad_receipt\.revenue_usd[^\n]*43\.5；单位 USD；实际/);
+  assert.equal(answer.includes("MODEL_CHOSEN_ALIAS"), false);
+  const flags = await calculate(`SELECT event_date, title_id, platform, country_code, placement, revenue_usd, is_predicted FROM fact_fox_ad_receipt WHERE ${time} AND ${common} AND country_code = 'US'`, "revenue_usd", "predicted_only");
+  const predicted = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(flags.query.resource_id), String(flags.calculation.resource_id)], findings: [{ label: "WRONG_ACTUAL", value: 27.5, kind: "actual", resource_id: String(flags.calculation.resource_id), cell: "MODEL_CHOSEN_ALIAS" }] });
+  assert.equal(predicted.ok, true);
+  if (predicted.ok) { assert.match(String(predicted.answer), /27\.5；单位 USD；预测/); assert.doesNotMatch(String(predicted.answer), /WRONG_ACTUAL/); }
+  const grouped = await calculate(`SELECT event_date, title_id, platform, country_code, channel_id, spend_usd, is_predicted FROM fact_fox_daily_spend WHERE ${time} AND ${common} AND country_code = 'US'`, "spend_usd", "actual_only");
+  const groupedAnalysis = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(grouped.query.resource_id), String(grouped.calculation.resource_id)] });
+  assert.equal(groupedAnalysis.ok, true);
+  if (groupedAnalysis.ok) assert.match(String(groupedAnalysis.answer), /mist_ads=40.*pebble_net=5|pebble_net=5.*mist_ads=40/);
+  for (const expression of ["new_users AS revenue_usd", "SUM(new_users) AS revenue_usd"]) {
+    const unsupported = await runtime.tools.query(session.session_id, { sql: `SELECT ${expression} FROM fact_fox_daily_install WHERE ${time} AND ${common} AND country_code = 'JP' AND channel_id = 'mist_ads'` });
+    if (!unsupported.ok) continue; // SQL admission may conservatively reject it earlier.
+    const calc = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(unsupported.resource_id), operations: [{ op: "sum", column: "revenue_usd", as: "fake" }] });
+    assert.equal(calc.ok, true);
+    if (!calc.ok) continue;
+    const result = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(unsupported.resource_id), String(calc.resource_id)] });
+    assert.equal(result.ok, true);
+    if (result.ok) { assert.notEqual(result.status, "completed"); assert.doesNotMatch(String(result.answer), /合计 70/); }
+  }
+  const zeroNullQuery = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE ${time} AND ${common} AND country_code = 'US' AND channel_id = 'mist_ads'` });
+  assert.equal(zeroNullQuery.ok, true);
+  if (zeroNullQuery.ok) {
+    const counts = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(zeroNullQuery.resource_id), operations: [{ op: "count_null", column: "new_users", as: "pretend_zero" }, { op: "count_zero", column: "new_users", as: "pretend_missing" }] });
+    assert.equal(counts.ok, true);
+    if (counts.ok) {
+      const result = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(zeroNullQuery.resource_id), String(counts.resource_id)] });
+      assert.equal(result.ok, true);
+      if (result.ok) { assert.match(String(result.answer), /值为 NULL 的行数 1/); assert.match(String(result.answer), /数值为零的行数 1/); assert.doesNotMatch(String(result.answer), /pretend_zero|pretend_missing/); }
+    }
+  }
+  const nullOnly = await calculate(`SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-09' AND event_date <= '2026-10-09' AND ${common} AND country_code = 'US' AND channel_id = 'mist_ads'`, "new_users");
+  const nullResult = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(nullOnly.query.resource_id), String(nullOnly.calculation.resource_id)] });
+  assert.equal(nullResult.ok, true);
+  if (nullResult.ok) assert.doesNotMatch(String(nullResult.answer), /合计 0/);
+  const mixed = await calculate(`SELECT event_date, title_id, platform, country_code, placement, revenue_usd, is_predicted FROM fact_fox_ad_receipt WHERE ${time} AND ${common} AND country_code = 'US'`, "revenue_usd", "any");
+  const mixedResult = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(mixed.query.resource_id), String(mixed.calculation.resource_id)] });
+  assert.equal(mixedResult.ok, true);
+  if (mixedResult.ok) assert.doesNotMatch(String(mixedResult.answer), /合计 71/);
+  const oldLimit = runtime.config.maxResultRows;
+  runtime.config.maxResultRows = 2;
+  try {
+    const cut = await calculate(`SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE ${time} AND ${common} AND country_code = 'JP' AND channel_id = 'mist_ads'`, "new_users");
+    const result = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(cut.query.resource_id), String(cut.calculation.resource_id)] });
+    assert.equal(result.ok, true);
+    if (result.ok) { assert.notEqual(result.status, "completed"); assert.doesNotMatch(String(result.answer), /合计 20/); assert.deepEqual((result.sources as Array<{ rows: unknown[] }>)[0]?.rows, []); }
+  } finally { runtime.config.maxResultRows = oldLimit; }
+  runtime.sessions.setActiveJob(session.session_id, "job_next");
+  const crossed = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(installs.query.resource_id), operations: [{ op: "sum", column: "new_users", as: "fake" }] });
+  assert.equal(crossed.ok, false);
+  if (!crossed.ok) assert.equal(crossed.code, "resource_from_other_execution");
+  runtime.sessions.setActiveJob(session.session_id, "job_evidence_lineage");
+  await probeClickHouseAndPublish({ targetsPath: path.join(knowledgeDir, "freshness-targets.json"), destinationPath: freshnessPath, query: (sql) => clickHouseQuery(reader, sql) as Promise<Array<{ event_date: string }>> });
+  const stale = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(installs.query.resource_id), String(installs.calculation.resource_id)] });
+  assert.equal(stale.ok, true);
+  if (stale.ok) { assert.notEqual(stale.status, "completed"); assert.doesNotMatch(String(stale.answer), /合计 70/); assert.deepEqual((stale.sources as Array<{ rows: unknown[] }>)[0]?.rows, []); }
+}
 
 async function runSplitProcess(clickhouseUrl: string, freshnessPath: string, dir: string, clickhousePort: number) {
   const mysqlPort = await freePort();
   const redisPort = await freePort();
   const apiPort = await freePort();
-  const mysqlName = `lumenfox-ch-mysql-${process.pid}`;
-  const redisName = `lumenfox-ch-redis-${process.pid}`;
+  const suffix = randomUUID();
+  const mysqlName = `lumenfox-ch-mysql-${suffix}`;
+  const redisName = `lumenfox-ch-redis-${suffix}`;
+  let mysqlCreated = false;
+  let redisCreated = false;
   const statePassword = randomBytes(12).toString("hex");
   const children: ChildProcess[] = [];
   try {
-    await runQuiet("docker", ["run", "-d", "--name", mysqlName, "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${statePassword}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${statePassword}`, "mysql:8.0.32"], statePassword);
-    await runQuiet("docker", ["run", "-d", "--name", redisName, "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", statePassword], statePassword);
+    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", mysqlName, "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${statePassword}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${statePassword}`, "mysql:8.0.32"], statePassword);
+    mysqlCreated = true;
+    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", redisName, "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", statePassword], statePassword);
+    redisCreated = true;
     const env = {
       PATH: process.env.PATH ?? "",
       HOST: "127.0.0.1",
@@ -446,8 +551,8 @@ async function runSplitProcess(clickhouseUrl: string, freshnessPath: string, dir
     for (const child of children) {
       if (child.exitCode === null) child.kill("SIGKILL");
     }
-    await runQuiet("docker", ["rm", "-f", mysqlName], statePassword).catch(() => undefined);
-    await runQuiet("docker", ["rm", "-f", redisName], statePassword).catch(() => undefined);
+    if (mysqlCreated) await runQuiet("docker", ["rm", "-f", mysqlName], statePassword).catch(() => undefined);
+    if (redisCreated) await runQuiet("docker", ["rm", "-f", redisName], statePassword).catch(() => undefined);
   }
 }
 

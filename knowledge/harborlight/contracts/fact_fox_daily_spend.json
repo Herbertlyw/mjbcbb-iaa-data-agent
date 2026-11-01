@@ -1,6 +1,6 @@
 {
   "asset_id": "contract.fact_fox_daily_spend",
-  "revision": "contract.fact_fox_daily_spend-r1",
+  "revision": "contract.fact_fox_daily_spend-r2",
   "table": "fact_fox_daily_spend",
   "engine": "clickhouse-local",
   "simulated": true,
@@ -27,8 +27,12 @@
       "spend_usd",
       "payback_usd"
     ],
-    "predicted_column": "is_predicted"
+    "predicted_column": "is_predicted",
+    "prediction_values": { "actual": 0, "predicted": 1 }
   },
+  "derived_metrics": [
+    { "id": "roi", "label": "实际 ROI", "operation": "divide", "numerator": "payback_usd", "denominator": "spend_usd", "prediction": "actual_only", "unit": "比值" }
+  ],
   "columns": [
     {
       "name": "event_date",
@@ -56,7 +60,7 @@
       "description": "channel_id 维度"
     },
     {
-      "name": "spend_usd",
+      "name": "spend_usd", "unit": "USD",
       "type": "Nullable(Float64)",
       "description": "投放成本。NULL 不是 0。",
       "nullable": true,
@@ -64,7 +68,7 @@
       "zero_means": "观测到的真实零"
     },
     {
-      "name": "payback_usd",
+      "name": "payback_usd", "unit": "USD",
       "type": "Nullable(Float64)",
       "description": "当日回收。预测行不进入实际 ROI。",
       "nullable": true,

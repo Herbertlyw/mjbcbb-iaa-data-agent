@@ -109,7 +109,7 @@ test("独立进程通过 HTTP/SSE 恢复任务，并拒绝错配的幂等键", a
       if (job && ["completed", "partial", "failed", "cancelled", "timed_out", "needs_clarification"].includes(job.status)) break;
       await new Promise((resolve) => setTimeout(resolve, 40));
     }
-    assert.equal(job?.status, "completed");
+    assert.equal(job?.status, "partial");
     assert.equal(job?.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
     const replay = await fetch(`${base}/api/jobs/${queued.job_id}/events?after=2`);
     const body = await replay.text();

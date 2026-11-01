@@ -90,6 +90,23 @@ test("本地假 HTTP 服务经 Pi SDK 适配器处理错误、缺用量和非法
   }
 });
 
+test("窗口预留拒绝应显示真实错误且不派发请求", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piBaseUrl: fake.url, piContextWindow: 1500 }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成超长上下文".repeat(1500));
+      assert.equal(job.status, "failed");
+      assert.equal(job.error?.code, "context_window_exceeded");
+      assert.equal(job.analysis, null);
+      assert.equal(fake.observations.length, 0);
+      assert.equal(runtime.state.listProviderSteps(job.job_id).length, 0);
+    });
+  } finally {
+    await fake.close();
+  }
+});
+
 test("本机假服务请求体带有系统提示、原话、工具定义，off 与 low 分别写入 reasoning_effort", async () => {
   const question = "纸灯 在 2026-10-06 到 2026-10-12（美国、iOS、雾帆）的新增用户是多少？";
   const fake = await startFakeOpenAI(token);

@@ -15,6 +15,7 @@ export function assessCoverage(
     zero_dates: [],
     predicted_dates: [],
     actual_dates: [],
+    unknown_prediction_dates: [],
     groups: [],
   });
   const series = contract?.series;
@@ -22,7 +23,7 @@ export function assessCoverage(
   const dates = enumerateDates(timeRange.start, timeRange.end);
   if (!dates) return empty("unknown", "日期范围无法展开，覆盖情况未知");
   const pinned = series.dimensions.every((dimension) => equalities[dimension]);
-  const overall = classify(rows, series.date_column, series.metrics, series.predicted_column ?? null, dates);
+  const overall = classify(rows, series.date_column, series.metrics, series.predicted_column ?? null, series.prediction_values, series.prediction_mode, dates);
   const groups: CoverageGroup[] = [];
   if (!pinned) {
     for (const dimension of series.dimensions) {
@@ -30,7 +31,7 @@ export function assessCoverage(
       const values = [...new Set(rows.map((row) => row[dimension]).filter((value) => value !== undefined && value !== null).map(String))];
       if (values.length < 2) continue;
       for (const value of values) {
-        const subset = classify(rows.filter((row) => String(row[dimension]) === value), series.date_column, series.metrics, series.predicted_column ?? null, dates);
+        const subset = classify(rows.filter((row) => String(row[dimension]) === value), series.date_column, series.metrics, series.predicted_column ?? null, series.prediction_values, series.prediction_mode, dates);
         groups.push({ dimension, value, ...subset });
       }
     }
@@ -38,8 +39,8 @@ export function assessCoverage(
   return {
     status: "known",
     reason: pinned
-      ? "过滤条件钉住了契约声明的序列维度，并按自然日核对。"
-      : "未过滤的维度只评估结果里出现的取值；没有出现的组合不算缺失。",
+      ? "过滤条件钉住了契约声明的序列维度，并按自然日核对。同一天可同时包含 NULL、零和不同预测标记；实际与预测日期表示标记，不保证值非空。"
+      : "未过滤的维度只评估结果里出现的取值；没有出现的组合不算缺失。同一天的状态可以重叠，实际与预测日期表示标记，不保证值非空。",
     expected_days: dates.length,
     ...overall,
     groups,
@@ -56,6 +57,7 @@ export function unknownCoverage(reason: string): CoverageReport {
     zero_dates: [],
     predicted_dates: [],
     actual_dates: [],
+    unknown_prediction_dates: [],
     groups: [],
   };
 }
@@ -76,6 +78,7 @@ export function combineCoverage(parts: Array<{ table: string; report: CoverageRe
     zero_dates: [],
     predicted_dates: [],
     actual_dates: [],
+    unknown_prediction_dates: [],
     groups: [],
     per_table,
   };
@@ -93,6 +96,8 @@ function classify(
   dateColumn: string,
   metrics: string[],
   predictedColumn: string | null,
+  mapping: { actual: number; predicted: number } | undefined,
+  predictionMode: "observed_only" | undefined,
   dates: string[],
 ): Omit<CoverageGroup, "dimension" | "value"> {
   const absent: string[] = [];
@@ -100,28 +105,32 @@ function classify(
   const zeros: string[] = [];
   const predicted: string[] = [];
   const actual: string[] = [];
+  const unknown: string[] = [];
   for (const date of dates) {
     const matched = rows.filter((row) => String(row[dateColumn]) === date);
-    if (matched.length === 0) {
-      absent.push(date);
-      continue;
+    if (!matched.length) { absent.push(date); continue; }
+    let hasNull = false; let hasZero = false; let hasActual = false; let hasPredicted = false; let hasUnknown = false;
+    for (const row of matched) {
+      for (const metric of metrics) {
+        const value = row[metric];
+        if (value === null || value === undefined) hasNull = true;
+        else if (Number(value) === 0) hasZero = true;
+        const flag = predictedColumn ? row[predictedColumn] : undefined;
+        const validFlag = (typeof flag === "number" || typeof flag === "string" && /^-?\d+(?:\.\d+)?$/u.test(flag)) && mapping && mapping.actual !== mapping.predicted;
+        if (!predictedColumn && predictionMode === "observed_only") hasActual = true;
+        else if (!validFlag) hasUnknown = true;
+        else if (Number(flag) === mapping!.actual) hasActual = true;
+        else if (Number(flag) === mapping!.predicted) hasPredicted = true;
+        else hasUnknown = true;
+      }
     }
-    const kinds = matched.flatMap((row) => metrics.map((metric) => kindOf(row, metric, predictedColumn)));
-    if (kinds.includes("null")) nulls.push(date);
-    else if (kinds.includes("predicted") && !kinds.includes("actual") && !kinds.includes("zero")) predicted.push(date);
-    else if (kinds.every((kind) => kind === "zero")) zeros.push(date);
-    else if (kinds.includes("predicted") || kinds.includes("null")) nulls.push(date);
-    else actual.push(date);
+    if (hasNull) nulls.push(date);
+    if (hasZero) zeros.push(date);
+    if (hasPredicted) predicted.push(date);
+    if (hasActual) actual.push(date);
+    if (hasUnknown) unknown.push(date);
   }
-  return { absent_dates: absent, null_dates: nulls, zero_dates: zeros, predicted_dates: predicted, actual_dates: actual };
-}
-
-function kindOf(row: Record<string, unknown>, metric: string, predictedColumn: string | null): "null" | "zero" | "predicted" | "actual" {
-  if (predictedColumn && Number(row[predictedColumn]) === 1) return "predicted";
-  const value = row[metric];
-  if (value === null || value === undefined) return "null";
-  if (Number(value) === 0) return "zero";
-  return "actual";
+  return { absent_dates: absent, null_dates: nulls, zero_dates: zeros, predicted_dates: predicted, actual_dates: actual, unknown_prediction_dates: unknown };
 }
 
 function enumerateDates(start: string, end: string): string[] | null {

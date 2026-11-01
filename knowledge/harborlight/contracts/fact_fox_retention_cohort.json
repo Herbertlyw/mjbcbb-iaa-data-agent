@@ -1,6 +1,6 @@
 {
   "asset_id": "contract.fact_fox_retention_cohort",
-  "revision": "contract.fact_fox_retention_cohort-r1",
+  "revision": "contract.fact_fox_retention_cohort-r2",
   "table": "fact_fox_retention_cohort",
   "engine": "clickhouse-local",
   "simulated": true,
@@ -25,7 +25,8 @@
     "metrics": [
       "retained_users"
     ],
-    "predicted_column": null
+    "predicted_column": null,
+    "prediction_mode": "observed_only"
   },
   "columns": [
     {
@@ -54,7 +55,7 @@
       "description": "留存日龄"
     },
     {
-      "name": "retained_users",
+      "name": "retained_users", "unit": "人",
       "type": "Nullable(Int32)",
       "description": "留存人数。NULL 不是 0。",
       "nullable": true,

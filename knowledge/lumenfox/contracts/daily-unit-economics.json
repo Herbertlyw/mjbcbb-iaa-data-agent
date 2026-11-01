@@ -1,6 +1,6 @@
 {
   "asset_id": "contract.daily_unit_economics",
-  "revision": "contract-daily-unit-economics-r1",
+  "revision": "contract-daily-unit-economics-r2",
   "table": "daily_unit_economics",
   "engine": "sqlite-local",
   "simulated": true,
@@ -17,16 +17,20 @@
     "date_column": "event_date",
     "dimensions": ["product_id", "platform", "country_code", "channel"],
     "metrics": ["spend_usd", "payback_usd"],
-    "predicted_column": "is_predicted"
+    "predicted_column": "is_predicted",
+    "prediction_values": { "actual": 0, "predicted": 1 }
   },
+  "derived_metrics": [
+    { "id": "roi", "label": "实际 ROI", "operation": "divide", "numerator": "payback_usd", "denominator": "spend_usd", "prediction": "actual_only", "unit": "比值" }
+  ],
   "columns": [
     { "name": "event_date", "type": "date", "description": "当地日历日，America/Los_Angeles" },
     { "name": "product_id", "type": "string", "description": "虚构产品" },
     { "name": "platform", "type": "string", "description": "ios 或 android" },
     { "name": "country_code", "type": "string", "description": "地区，用国家代码表示" },
     { "name": "channel", "type": "string", "description": "虚构渠道 nebula_ads 或 comet_network" },
-    { "name": "spend_usd", "type": "real", "description": "投放成本", "nullable": true, "null_means": "missing", "zero_means": "observed_zero" },
-    { "name": "payback_usd", "type": "real", "description": "回收。是否实际看 is_predicted", "nullable": true, "null_means": "missing", "zero_means": "observed_zero" },
+    { "name": "spend_usd", "unit": "USD", "type": "real", "description": "投放成本", "nullable": true, "null_means": "missing", "zero_means": "observed_zero" },
+    { "name": "payback_usd", "unit": "USD", "type": "real", "description": "回收。是否实际看 is_predicted", "nullable": true, "null_means": "missing", "zero_means": "observed_zero" },
     { "name": "is_predicted", "type": "integer", "description": "1 表示预测回收，0 表示实际观察" }
   ],
   "sensitive_columns": [],

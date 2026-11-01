@@ -3,16 +3,50 @@ import { readFileSync, writeFileSync } from "node:fs";
 import test from "node:test";
 import type { AddressInfo } from "node:net";
 import { modelPrompt } from "../src/agent.js";
+import { assessCoverage } from "../src/coverage.js";
+import { verifyCell } from "../src/evidence.js";
 import { loadConfig } from "../src/config.js";
 import { DEMO_QUESTIONS } from "../src/demo.js";
 import { publishFreshness, readPublication } from "../src/freshness.js";
 import { planFromTranscript } from "../src/planner.js";
 import { startServer } from "../src/server.js";
 import { resolveTurn } from "../src/turn.js";
-import type { CoverageReport } from "../src/types.js";
+import type { CoverageReport, DataContract, QueryResource } from "../src/types.js";
 import { analyst, ask, bindTables, withRuntime } from "./helpers.js";
 
 const WEEK = "event_date >= '2026-10-06' AND event_date <= '2026-10-12'";
+
+test("同一天的 NULL、零、实际和预测分别记录；无映射不推断实际", () => {
+  const contract = JSON.parse(readFileSync(new URL("../knowledge/harborlight/contracts/fact_fox_ad_receipt.json", import.meta.url), "utf8")) as DataContract;
+  const range = { start: "2026-10-06", end: "2026-10-06" };
+  const mixed = assessCoverage(contract, { title_id: "paper_lantern", platform: "ios", country_code: "US" }, range, [
+    { event_date: "2026-10-06", revenue_usd: 0, is_predicted: 0 },
+    { event_date: "2026-10-06", revenue_usd: null, is_predicted: 1 },
+  ]);
+  assert.deepEqual(mixed.zero_dates, ["2026-10-06"]);
+  assert.deepEqual(mixed.null_dates, ["2026-10-06"]);
+  assert.deepEqual(mixed.actual_dates, ["2026-10-06"]);
+  assert.deepEqual(mixed.predicted_dates, ["2026-10-06"]);
+  const unknown = assessCoverage({ ...contract, series: { ...contract.series!, predicted_column: null, prediction_values: undefined, prediction_mode: undefined } }, {}, range, [{ event_date: "2026-10-06", revenue_usd: 0 }]);
+  assert.deepEqual(unknown.zero_dates, ["2026-10-06"]);
+  assert.deepEqual(unknown.actual_dates, []);
+  assert.deepEqual(unknown.predicted_dates, []);
+  assert.deepEqual(unknown.unknown_prediction_dates, ["2026-10-06"]);
+});
+
+test("未声明预测语义时不能把全部记录当成实际或预测", () => {
+  const original = JSON.parse(readFileSync(new URL("../knowledge/harborlight/contracts/fact_fox_daily_install.json", import.meta.url), "utf8")) as DataContract;
+  const contract: DataContract = { ...original, series: { ...original.series!, prediction_mode: undefined } };
+  const source = {
+    resource_id: "res_synthetic", tables: [contract.table], sql: "SELECT event_date, country_code, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND country_code = 'JP'",
+    time_range: { start: "2026-10-06", end: "2026-10-06", timezone: contract.timezone }, rows: [{ event_date: "2026-10-06", country_code: "JP", new_users: 70 }], truncated: false, complete_population: true,
+  } as unknown as QueryResource;
+  const operation = { op: "sum" as const, column: "new_users", as: "model_alias" };
+  assert.equal(verifyCell(source, contract, { ...operation, predicted: "actual_only" }, 70), null);
+  assert.equal(verifyCell(source, contract, { ...operation, predicted: "predicted_only" }, 70), null);
+  assert.match(verifyCell(source, contract, operation, 70)?.prediction ?? "", /未验证/);
+  assert.match(verifyCell(source, original, { ...operation, predicted: "actual_only" }, 70)?.prediction ?? "", /契约声明仅观察值/);
+});
 
 test("无记录、NULL、真实零、预测和未知覆盖分开", async () => {
   await withRuntime({}, async (runtime) => {
@@ -29,6 +63,7 @@ test("无记录、NULL、真实零、预测和未知覆盖分开", async () => {
     assert.equal(absentCoverage.zero_dates.length, 0);
     assert.equal(absentCoverage.actual_dates.length, 1);
 
+    runtime.sessions.setActiveJob(session.session_id, "job_empty");
     const empty = await runtime.tools.query(session.session_id, {
       sql: "SELECT event_date, product_id, platform, country_code, channel, new_users FROM daily_installs WHERE event_date >= '2026-01-01' AND event_date <= '2026-01-03' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'",
     });
@@ -36,7 +71,6 @@ test("无记录、NULL、真实零、预测和未知覆盖分开", async () => {
     if (!empty.ok) return;
     const emptyCoverage = empty.coverage as CoverageReport;
     assert.deepEqual(emptyCoverage.absent_dates, ["2026-01-01", "2026-01-02", "2026-01-03"]);
-    runtime.sessions.setActiveJob(session.session_id, "job_empty");
     const emptyAnalysis = await runtime.tools.updateAnalysis(session.session_id, {
       suggested_status: "completed",
       draft_answer: "模型把空窗口说成 0。",
@@ -178,7 +212,8 @@ test("新鲜度只读已发布快照，版本变化后不能当成已验证事�
     if (!analysis.ok) return;
     assert.equal(analysis.status, "partial");
     assert.ok((analysis.server_reasons as string[]).includes("freshness_version_changed"));
-    assert.match(String(analysis.answer), /10/);
+    assert.doesNotMatch(String(analysis.answer), /合计 10/);
+    assert.deepEqual((analysis.sources as Array<{ rows: unknown[] }>)[0]?.rows, []);
   });
 });
 

@@ -33,6 +33,7 @@ export interface ContractColumn {
   type: string;
   description: string;
   nullable?: boolean;
+  unit?: string;
   null_means?: string;
   zero_means?: string;
 }
@@ -53,7 +54,10 @@ export interface DataContract {
     dimensions: string[];
     metrics: string[];
     predicted_column?: string | null;
+    prediction_mode?: "observed_only";
+    prediction_values?: { actual: number; predicted: number };
   };
+  derived_metrics?: Array<{ id: string; label: string; operation: "divide"; numerator: string; denominator: string; prediction: "actual_only"; unit: string }>;
   columns: ContractColumn[];
   sensitive_columns: string[];
   grain?: string[];
@@ -173,6 +177,7 @@ export interface CoverageGroup {
   zero_dates: string[];
   predicted_dates: string[];
   actual_dates: string[];
+  unknown_prediction_dates: string[];
 }
 
 export interface CoverageReport {
@@ -185,6 +190,7 @@ export interface CoverageReport {
   zero_dates: string[];
   predicted_dates: string[];
   actual_dates: string[];
+  unknown_prediction_dates: string[];
   groups: CoverageGroup[];
   per_table?: CoverageReport[];
 }
@@ -237,6 +243,7 @@ export interface CalculationResource {
   job_id?: string;
   source_resource_id: string;
   cells: Record<string, number>;
+  operations?: Record<string, import("./evidence.js").CellOperation>;
   input_truncated: boolean;
   complete_population: boolean;
   null_means: "missing";
@@ -264,6 +271,7 @@ export interface AnalysisSource {
   rows: Array<Record<string, unknown>>;
   coverage: CoverageReport;
   freshness_receipts: FreshnessReceipt[];
+  evidence_eligible?: boolean;
 }
 
 export interface AnalysisRecord {
@@ -280,6 +288,7 @@ export interface AnalysisRecord {
     resource_id: string;
     source_resource_id: string;
     cells: Record<string, number>;
+    verified_cells?: import("./evidence.js").VerifiedCell[];
     input_truncated: boolean;
     complete_population: boolean;
   }>;

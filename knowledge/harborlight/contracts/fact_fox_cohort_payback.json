@@ -1,6 +1,6 @@
 {
   "asset_id": "contract.fact_fox_cohort_payback",
-  "revision": "contract.fact_fox_cohort_payback-r1",
+  "revision": "contract.fact_fox_cohort_payback-r2",
   "table": "fact_fox_cohort_payback",
   "engine": "clickhouse-local",
   "simulated": true,
@@ -26,7 +26,8 @@
     "metrics": [
       "payback_usd"
     ],
-    "predicted_column": "is_predicted"
+    "predicted_column": "is_predicted",
+    "prediction_values": { "actual": 0, "predicted": 1 }
   },
   "columns": [
     {
@@ -60,7 +61,7 @@
       "description": "回收观察日"
     },
     {
-      "name": "payback_usd",
+      "name": "payback_usd", "unit": "USD",
       "type": "Nullable(Float64)",
       "description": "该周期回收。",
       "nullable": true,

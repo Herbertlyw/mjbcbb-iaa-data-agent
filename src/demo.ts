@@ -40,3 +40,16 @@ export const DEMO_QUESTIONS = [
     text: "换成看留存",
   },
 ] as const;
+
+const HARBORLIGHT_QUESTIONS = [
+  { id: "weekly", label: "纸灯美国新增", text: "纸灯 在 2026-10-06 到 2026-10-12（美国、iOS、雾帆）的新增用户是多少？" },
+  { id: "japan", label: "追问日本", text: "那日本呢？" },
+  { id: "shorter", label: "更改日期", text: "日期改成 2026-10-06 到 2026-10-08。" },
+  { id: "vague", label: "含糊问题", text: "只说看看收入" },
+] as const;
+
+export function demoForScenario(harborlight: boolean) {
+  return harborlight
+    ? { scenario: "Harborlight", placeholder: "问一个关于纸灯或玻璃鲦的问题", questions: HARBORLIGHT_QUESTIONS }
+    : { scenario: "Lumenfox", placeholder: "问一个关于 Starlane Drift 的问题", questions: DEMO_QUESTIONS };
+}

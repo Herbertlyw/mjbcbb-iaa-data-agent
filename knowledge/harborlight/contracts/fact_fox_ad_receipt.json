@@ -1,6 +1,6 @@
 {
   "asset_id": "contract.fact_fox_ad_receipt",
-  "revision": "contract.fact_fox_ad_receipt-r1",
+  "revision": "contract.fact_fox_ad_receipt-r2",
   "table": "fact_fox_ad_receipt",
   "engine": "clickhouse-local",
   "simulated": true,
@@ -25,7 +25,8 @@
     "metrics": [
       "revenue_usd"
     ],
-    "predicted_column": "is_predicted"
+    "predicted_column": "is_predicted",
+    "prediction_values": { "actual": 0, "predicted": 1 }
   },
   "grain": ["event_date", "title_id", "platform", "country_code", "placement"],
   "columns": [
@@ -55,7 +56,7 @@
       "description": "虚构广告位"
     },
     {
-      "name": "revenue_usd",
+      "name": "revenue_usd", "unit": "USD",
       "type": "Nullable(Float64)",
       "description": "变现金额。NULL 是缺失，0 是真实零。",
       "nullable": true,

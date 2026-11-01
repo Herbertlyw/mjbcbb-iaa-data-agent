@@ -73,11 +73,41 @@ test("不同指标、分组和无依据草稿不会被当成已验证数字", as
     });
     assert.equal(cited.ok, true, JSON.stringify(cited));
     if (!cited.ok) return;
-    assert.match(String(cited.answer), /星云新增/);
-    assert.match(String(cited.answer), /余烬德国新增/);
+    assert.match(String(cited.answer), /daily_installs\.new_users/);
+    assert.match(String(cited.answer), /channel=nebula_ads/);
+    assert.doesNotMatch(String(cited.answer), /星云新增|余烬德国新增/);
     assert.match(String(cited.answer), /predicted|广告预测/);
     assert.equal(String(cited.answer).includes("99999"), false);
     assert.match((cited.limitations as string[]).join(" "), /没有逐一验证/);
     assert.notEqual(cited.status, "completed");
+  });
+});
+
+
+test("当前任务不能用旧任务查询重新计算并冒充本轮证据", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_old");
+    const old = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, new_users FROM daily_installs WHERE ${WEEK} AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US'` });
+    assert.equal(old.ok, true);
+    if (!old.ok) return;
+    runtime.sessions.setActiveJob(session.session_id, "job_new");
+    const calculation = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(old.resource_id), operations: [{ op: "sum", column: "new_users", as: "new_users_sum" }] });
+    assert.equal(calculation.ok, false);
+    if (!calculation.ok) assert.equal(calculation.code, "resource_from_other_execution");
+    runtime.sessions.saveResource({ resource_id: "res_forged_calculation", session_id: session.session_id, job_id: "job_new", kind: "calculation", created_at: new Date().toISOString(), source_resource_id: String(old.resource_id), cells: { new_users_sum: 123456 }, input_truncated: false, complete_population: true, null_means: "missing", zero_means: "observed_zero", predicted_means: "forecast_not_actual", notes: [] });
+    const current = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, new_users FROM daily_installs WHERE ${WEEK} AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US'` });
+    assert.equal(current.ok, true);
+    if (!current.ok) return;
+    const forged = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(current.resource_id), "res_forged_calculation"] });
+    assert.equal(forged.ok, true);
+    if (forged.ok) {
+      assert.equal(String(forged.answer).includes("123456"), false);
+      assert.ok((forged.server_reasons as string[]).includes("resource_from_other_execution"));
+    }
+    const attempt = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "旧数字", resource_ids: [String(old.resource_id)] });
+    assert.equal(attempt.ok, false);
+    if (!attempt.ok) assert.equal(attempt.code, "evidence_feedback");
   });
 });

@@ -40,6 +40,16 @@ export function diagnoseKnowledge(root = path.join(repoRoot(), "knowledge", "lum
     if (!clickhouseKnowledge) database.exec(knowledge.seed_sql);
     for (const asset of knowledge.assets) {
       if (!asset.contract || !/^[a-z_][a-z0-9_]*$/u.test(asset.contract.table)) continue;
+      const series = asset.contract.series;
+      if (series && (series.predicted_column && series.prediction_mode || !series.predicted_column && series.prediction_values)) {
+        issues.push({ code: "prediction_mapping_conflict", message: `${asset.contract.table} 的预测状态声明互相冲突` });
+      }
+      if (series?.predicted_column) {
+        const mapping = series.prediction_values;
+        if (!mapping || !Number.isFinite(mapping.actual) || !Number.isFinite(mapping.predicted) || mapping.actual === mapping.predicted) {
+          issues.push({ code: "prediction_mapping_missing", message: `${asset.contract.table} 的预测标记缺少明确且不同的实际/预测取值` });
+        }
+      }
       if (asset.contract.engine === "clickhouse-local") {
         if (asset.contract.columns.length === 0) issues.push({ code: "empty_contract", message: `${asset.contract.table} 没有字段` });
         const schemaPath = path.join(root, "schema.sql");
@@ -64,7 +74,6 @@ export function diagnoseKnowledge(root = path.join(repoRoot(), "knowledge", "lum
       for (const column of asset.contract.columns) {
         if (!columns.has(column.name)) issues.push({ code: "schema_contract_mismatch", message: `${asset.contract.table}.${column.name} 没有对应字段` });
       }
-      const series = asset.contract.series;
       if (series) {
         for (const name of [series.date_column, ...series.dimensions, ...series.metrics, ...(series.predicted_column ? [series.predicted_column] : [])]) {
           if (!columns.has(name)) issues.push({ code: "series_column_missing", message: `${asset.contract.table} 的覆盖声明引用了不存在的字段 ${name}` });

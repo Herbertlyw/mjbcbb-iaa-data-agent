@@ -12,14 +12,18 @@ const TERMINALS = new Set(["job_finished", "job_failed", "job_cancelled", "job_t
 
 test("重启后仍能读取会话、消息、任务和证据", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "lumenfox-restart-"));
+  let first: ReturnType<typeof openRuntime> | undefined;
+  let second: ReturnType<typeof openRuntime> | undefined;
   try {
-    const first = openRuntime(dir);
+    first = openRuntime(dir);
     const session = first.sessions.create("analyst", "重启演示");
     const done = await ask(first, session.session_id, DEMO_QUESTIONS[2].text, "restart-key");
-    assert.equal(done.status, "completed");
+    assert.equal(done.status, "partial");
+    assert.ok(done.analysis?.server_reasons.includes("calculation_lineage_unsupported"));
     await first.close();
+    first = undefined;
 
-    const second = openRuntime(dir, { startWorker: false });
+    second = openRuntime(dir, { startWorker: false });
     const restored = second.sessions.require(session.session_id);
     assert.equal(restored.title, "重启演示");
     assert.equal(restored.slots?.platform, "ios");
@@ -28,7 +32,7 @@ test("重启后仍能读取会话、消息、任务和证据", async () => {
     assert.equal(messages.length, 1);
     assert.equal(messages[0]?.text, DEMO_QUESTIONS[2].text);
     const job = second.jobs.require(done.job_id);
-    assert.equal(job.status, "completed");
+    assert.equal(job.status, "partial");
     assert.match(job.analysis?.answer ?? "", /70/);
     assert.equal(job.events[0]?.type, "job_queued");
     assert.deepEqual(
@@ -43,7 +47,8 @@ test("重启后仍能读取会话、消息、任务和证据", async () => {
     );
     const again = second.jobs.submit(session.session_id, DEMO_QUESTIONS[2].text, "restart-key");
     assert.equal(again.job_id, done.job_id);
-    assert.throws(() => second.jobs.submit(session.session_id, "另一句不同的问题", "restart-key"), (error: unknown) => {
+    const reopened = second;
+    assert.throws(() => reopened.jobs.submit(session.session_id, "另一句不同的问题", "restart-key"), (error: unknown) => {
       return error instanceof Error && "code" in error && error.code === "idempotency_conflict";
     });
     const other = second.sessions.create("analyst");
@@ -52,7 +57,10 @@ test("重启后仍能读取会话、消息、任务和证据", async () => {
     assert.equal(foreign.ok, false);
     if (!foreign.ok) assert.equal(foreign.code, "cross_session_resource");
     await second.close();
+    second = undefined;
   } finally {
+    if (first) await first.close({ abandon: true });
+    if (second) await second.close({ abandon: true });
     rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -18,8 +18,9 @@ const password = randomBytes(18).toString("hex");
 const database = `lumenfox_it_${process.pid}`;
 const user = "lumenfox_it";
 const queueKey = `lumenfox:it:${process.pid}:jobs`;
-const mysqlName = `lumenfox-it-${process.pid}-mysql`;
-const redisName = `lumenfox-it-${process.pid}-redis`;
+const suffix = randomUUID();
+const mysqlName = `lumenfox-it-${suffix}-mysql`;
+const redisName = `lumenfox-it-${suffix}-redis`;
 
 test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢复", async () => {
   await assertLocalImages();
@@ -40,9 +41,13 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
   await seeded.close();
   const children: ChildProcess[] = [];
   const store = () => new MysqlStateStore({ host: "127.0.0.1", port: mysqlPort, user, password, database });
+  let mysqlCreated = false;
+  let redisCreated = false;
   try {
-    await runQuiet("docker", ["run", "-d", "--name", mysqlName, "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${password}`, "-e", `MYSQL_DATABASE=${database}`, "-e", `MYSQL_USER=${user}`, "-e", `MYSQL_PASSWORD=${password}`, "mysql:8.0.32", "--bind-address=0.0.0.0"], password);
-    await runQuiet("docker", ["run", "-d", "--name", redisName, "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", password], password);
+    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", mysqlName, "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${password}`, "-e", `MYSQL_DATABASE=${database}`, "-e", `MYSQL_USER=${user}`, "-e", `MYSQL_PASSWORD=${password}`, "mysql:8.0.32", "--bind-address=0.0.0.0"], password);
+    mysqlCreated = true;
+    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", redisName, "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", password], password);
+    redisCreated = true;
     await waitForMysql(mysqlPort);
     await waitForRedis(redisPort);
     const authority = store();
@@ -61,7 +66,7 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
     const conflict = await postJob(apiPort, created.session_id, "完全不同的问题", "same-key", true);
     assert.equal(conflict.status, 409);
     const done = await waitJob(authority, first.job_id);
-    assert.equal(done.status, "completed", JSON.stringify(done.error));
+    assert.equal(done.status, "partial", JSON.stringify(done.error));
     assert.equal(done.events.filter((event) => event.type === "job_finished").length, 1);
     assert.deepEqual(done.events.map((event) => event.seq), done.events.map((_, index) => index + 1));
     const httpJob = await getJob(apiPort, first.job_id);
@@ -94,7 +99,7 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
     const dispatcherAgain = startRole("src/dispatcher.ts", baseEnv);
     children.push(dispatcherAgain);
     const recoveredDispatch = await waitJob(authority, queuedOnly.job_id);
-    assert.equal(recoveredDispatch.status, "completed");
+    assert.equal(recoveredDispatch.status, "partial");
     assert.equal(recoveredDispatch.events.filter((event) => ["job_finished", "job_failed", "job_cancelled"].includes(event.type)).length, 1);
 
     await stopProcess(worker);
@@ -109,7 +114,7 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
     const duplicateWorker = startRole("src/worker.ts", baseEnv);
     children.push(duplicateWorker);
     const duplicated = await waitJob(authority, duplicate.job_id);
-    assert.equal(duplicated.status, "completed");
+    assert.equal(duplicated.status, "partial");
     assert.equal(duplicated.events.filter((event) => event.type === "job_finished").length, 1);
     await queue.close();
     await stopProcess(duplicateWorker);
@@ -123,7 +128,7 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
     const recoveryWorker = startRole("src/worker.ts", recoveryEnv);
     children.push(recoveryWorker);
     const recoveredWithoutRedis = await waitJob(authority, lost.job_id);
-    assert.equal(recoveredWithoutRedis.status, "completed");
+    assert.equal(recoveredWithoutRedis.status, "partial");
     assert.equal(recoveredWithoutRedis.events.filter((event) => event.type === "job_finished").length, 1);
     assert.equal(authority.listPendingOutbox(20).some((item) => item.job_id === lost.job_id), true);
     await stopProcess(recoveryWorker);
@@ -189,8 +194,9 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
     other.close();
   } finally {
     for (const child of children) await stopProcess(child);
-    await runQuiet("docker", ["rm", "-f", mysqlName], password).catch(() => undefined);
-    await runQuiet("docker", ["rm", "-f", redisName], password).catch(() => undefined);
+    if (mysqlCreated) await runQuiet("docker", ["rm", "-f", mysqlName], password).catch(() => undefined);
+    if (redisCreated) await runQuiet("docker", ["rm", "-f", redisName], password).catch(() => undefined);
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

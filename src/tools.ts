@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { assessCoverage, combineCoverage, coverageHasGap, unknownCoverage } from "./coverage.js";
 import { plainRows } from "./database.js";
+import { verifyCell, type CellOperation, type VerifiedCell } from "./evidence.js";
 import { readPublication } from "./freshness.js";
 import { canQueryTable, canRead, contractExpired, tableGrain } from "./knowledge.js";
 import { newId, type SessionStore } from "./session.js";
@@ -199,9 +200,11 @@ export class ToolService {
       ...(denyReason ? { reason: denyReason } : {}),
       timezone: contract.timezone,
       must_filter: contract.must_filter,
+      series: contract.series ?? null,
       columns: contract.columns.map((column) => ({
         name: column.name,
         type: column.type,
+        unit: column.unit ?? null,
         description: column.description,
         sensitive: contract.sensitive_columns.includes(column.name),
         nullable: column.nullable === true,
@@ -375,10 +378,15 @@ export class ToolService {
     if (!found.ok) return fail(found.code, found.message);
     if (found.resource.kind !== "query_result") return fail("resource_not_calculable", "只能计算查询结果资源");
     const source = found.resource;
+    const activeJob = this.ctx.sessions.require(sessionId).active_job_id;
+    if (activeJob && source.job_id !== activeJob) return fail("resource_from_other_execution", "只能计算当前任务的查询结果；请重新查询并复核契约与新鲜度。");
     const cells: Record<string, number> = {};
     const notes: string[] = [];
+    const operations: Record<string, CellOperation> = Object.create(null) as Record<string, CellOperation>;
     for (const operation of input.operations ?? []) {
-      cells[operation.as] = computeCell(source, operation, notes);
+      if (!operation.as || Object.hasOwn(operations, operation.as)) return fail("duplicate_cell", "计算单元格名称必须非空且不重复。");
+      operations[operation.as] = { ...operation };
+      Object.defineProperty(cells, operation.as, { value: computeCell(source, operation, notes), enumerable: true, configurable: true, writable: true });
     }
     const resource: CalculationResource = {
       resource_id: newId("res"),
@@ -388,6 +396,7 @@ export class ToolService {
       ...(sessionId && this.ctx.sessions.require(sessionId).active_job_id ? { job_id: this.ctx.sessions.require(sessionId).active_job_id } : {}),
       source_resource_id: source.resource_id,
       cells,
+      operations,
       input_truncated: source.truncated,
       complete_population: source.complete_population && !source.truncated,
       null_means: "missing",
@@ -435,9 +444,16 @@ export class ToolService {
         reasons.push(found.code);
         continue;
       }
-      if (found.resource.job_id && jobId && found.resource.job_id !== jobId) {
+      if (jobId && found.resource.job_id !== jobId) {
         reasons.push("resource_from_other_execution");
         continue;
+      }
+      if (found.resource.kind === "calculation" && jobId) {
+        const source = this.ctx.sessions.lookupResource(sessionId, found.resource.source_resource_id);
+        if (!source.ok || source.resource.kind !== "query_result" || source.resource.job_id !== jobId || !(input.resource_ids ?? []).includes(source.resource.resource_id)) {
+          reasons.push("resource_from_other_execution");
+          continue;
+        }
       }
       resources.push(found.resource);
       citations.push({ resource_id: resourceId, note: found.resource.kind });
@@ -459,14 +475,6 @@ export class ToolService {
           rows: found.resource.rows,
           coverage: found.resource.coverage ?? unknownCoverage("资源没有覆盖回执，覆盖情况未知。"),
           freshness_receipts: found.resource.freshness_receipts ?? [],
-        });
-      } else {
-        calculations.push({
-          resource_id: found.resource.resource_id,
-          source_resource_id: found.resource.source_resource_id,
-          cells: found.resource.cells,
-          input_truncated: found.resource.input_truncated,
-          complete_population: found.resource.complete_population,
         });
       }
     }
@@ -500,7 +508,6 @@ export class ToolService {
       sessionAnalyses(session).push(exhausted);
       return { ok: true, ...exhausted, notice: "修订次数用完后，只交付有证据的部分。" };
     }
-    const cells = Object.assign({}, ...calculations.map((item) => item.cells)) as Record<string, number>;
     let status: AnalysisStatus = input.suggested_status;
     if (input.clarification_question) {
       status = "needs_clarification";
@@ -510,16 +517,30 @@ export class ToolService {
       status = input.clarification_question ? "needs_clarification" : "failed";
       reasons.push("insufficient_evidence");
     }
-    const missing = (cells.new_users_missing ?? 0) + (cells.revenue_missing ?? 0) + (cells.spend_missing ?? 0);
-    if (missing > 0) reasons.push("missing_values_disclosed");
-    if ((cells.revenue_predicted ?? 0) > 0 || (cells.predicted_payback ?? 0) > 0) reasons.push("predicted_values_disclosed");
-    if ((cells.new_users_zero ?? 0) + (cells.revenue_zero ?? 0) + (cells.spend_zero ?? 0) > 0) reasons.push("true_zeros_disclosed");
-    if (status === "completed" && (sources.some((source) => source.truncated) || calculations.some((item) => item.input_truncated))) {
-      status = "partial";
-      reasons.push("truncated_result_is_not_population");
+    if (input.suggested_status === "failed" && sources.length === 0 && !input.clarification_question) {
+      status = "failed";
+      reasons.push("no_authorized_result");
     }
     const liveFreshness = readPublication(this.ctx.config.freshnessPath);
+    const eligible = new Set<string>();
     for (const source of sources) {
+      const original = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === source.resource_id);
+      const asset = original && original.tables.length === 1 ? this.ctx.knowledge.contract_by_table.get(original.tables[0] ?? "") : undefined;
+      const contract = asset?.contract;
+      const currentContract = Boolean(original && asset && contract && original.registry_revision === this.ctx.knowledge.registry_revision && original.contract_revisions[contract.table] === contract.revision && original.asset_hashes[asset.asset_id] === asset.content_hash && canQueryTable(this.ctx.knowledge, session.role, contract.table) && !contractExpired(contract, this.ctx.config.simulatedToday));
+      const currentFresh = Boolean(liveFreshness && liveFreshness.valid_until >= this.ctx.config.simulatedToday && source.freshness_receipts.length === source.tables.length && source.tables.every((table) => source.freshness_receipts.some((receipt) => receipt.table === table)) && source.freshness_receipts.every((receipt) => receipt.publication_id === liveFreshness.publication_id && receipt.version === liveFreshness.version && liveFreshness.tables[receipt.table]?.status === "fresh"));
+      const shape = original && contract && verifyCell(original, contract, { op: "count_rows", as: "internal" }, original.rows.length);
+      source.evidence_eligible = Boolean(currentContract && currentFresh && shape && !source.truncated && source.complete_population);
+      if (source.evidence_eligible) eligible.add(source.resource_id);
+      else {
+        if (!currentFresh) reasons.push("freshness_version_changed");
+        if (!currentContract) reasons.push("contract_or_authorization_changed");
+        if (source.truncated || !source.complete_population) reasons.push("truncated_result_is_not_population");
+        if (!shape && currentContract) reasons.push("query_lineage_unsupported");
+        source.rows = [];
+        source.coverage = unknownCoverage("该查询结果不满足当前证据条件，覆盖回执不作为事实展示。");
+        if (status === "completed") status = "partial";
+      }
       if (!source.coverage || source.coverage.status === "unknown") {
         if (status === "completed") status = "partial";
         reasons.push("coverage_unknown");
@@ -527,61 +548,47 @@ export class ToolService {
         if (status === "completed") status = "partial";
         reasons.push("completeness_gap");
       }
-      for (const receipt of source.freshness_receipts) {
-        if (!liveFreshness || liveFreshness.publication_id !== receipt.publication_id || liveFreshness.version !== receipt.version) {
-          if (status === "completed") status = "partial";
-          reasons.push("freshness_version_changed");
+    }
+    const verified: VerifiedCell[] = [];
+    for (const resource of resources) {
+      if (resource.kind !== "calculation") continue;
+      const original = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === resource.source_resource_id);
+      const asset = original && original.tables.length === 1 ? this.ctx.knowledge.contract_by_table.get(original.tables[0] ?? "") : undefined;
+      const contract = asset?.contract;
+      const accepted: VerifiedCell[] = [];
+      if (original && contract && eligible.has(original.resource_id) && resource.operations) {
+        for (const [name, operation] of Object.entries(resource.operations)) {
+          const cell = verifyCell(original, contract, operation, resource.cells[name] ?? Number.NaN);
+          if (cell) { accepted.push(cell); verified.push(cell); }
+          else reasons.push("calculation_lineage_unsupported");
         }
-      }
+      } else reasons.push("calculation_lineage_unsupported");
+      const cells = Object.fromEntries(accepted.map((cell, index) => [`cell_${index + 1}`, cell.value]));
+      calculations.push({ resource_id: resource.resource_id, source_resource_id: resource.source_resource_id, cells, verified_cells: accepted, input_truncated: resource.input_truncated, complete_population: resource.complete_population });
     }
+    if (verified.some((cell) => cell.operation === "count_null" && cell.value > 0 || cell.operation === "sum" && cell.excludedNulls > 0)) reasons.push("missing_values_disclosed");
+    if (verified.some((cell) => cell.operation === "count_zero" && cell.value > 0)) reasons.push("true_zeros_disclosed");
+    if (verified.some((cell) => cell.prediction.startsWith("预测"))) reasons.push("predicted_values_disclosed");
+    if (reasons.includes("calculation_lineage_unsupported") && status === "completed") status = "partial";
     if (input.suggested_status === "completed" && status !== "completed") reasons.push("model_completion_was_not_authoritative");
-    if (input.suggested_status === "failed" && sources.length === 0 && !input.clarification_question) {
-      status = "failed";
-      reasons.push("no_authorized_result");
-    }
-    const verifiedFindingLines: string[] = [];
-    for (const finding of input.findings ?? []) {
-      const matched = resources.find((item) => item.resource_id === finding.resource_id);
-      const cells = matched && matched.kind === "calculation" ? matched.cells : null;
-      const cited = Boolean(finding.cell && cells && Object.prototype.hasOwnProperty.call(cells, finding.cell) && finding.value !== null && Number(cells[finding.cell]) === finding.value);
-      const source = matched && matched.kind === "calculation" ? this.ctx.sessions.lookupResource(sessionId, matched.source_resource_id) : { ok: false as const, code: "resource_not_found", message: "" };
-      const aligned = cited && source.ok && source.resource.kind === "query_result"
-        && (!source.resource.job_id || !jobId || source.resource.job_id === jobId)
-        && (!finding.time_range || (finding.time_range.start === source.resource.time_range.start && finding.time_range.end === source.resource.time_range.end))
-        && (!finding.group || Object.entries(finding.group).every(([key, value]) => source.resource.kind === "query_result" && source.resource.rows.some((row) => String(row[key]) === value)));
-      if (!aligned) {
-        reasons.push("unverified_finding");
-        continue;
-      }
-      if (source.ok && source.resource.kind === "query_result" && source.resource.truncated && status === "completed") {
-        status = "partial";
-        reasons.push("truncated_result_is_not_population");
-      }
-      const group = finding.group ? Object.entries(finding.group).map(([key, value]) => `${key}=${value}`).join("，") : "";
-      const range = finding.time_range ? `${finding.time_range.start} 到 ${finding.time_range.end}` : "";
-      verifiedFindingLines.push(`${finding.label}${group ? `（${group}）` : ""}${range ? ` ${range}` : ""}：${finding.kind} ${finding.value}。引用计算单元格 ${finding.cell}。`);
-    }
-    if (reasons.includes("unverified_finding") && status === "completed") {
-      status = "partial";
-      reasons.push("model_completion_was_not_authoritative");
-    }
-    const limitations = [...(input.limitations ?? [])];
-    if (missing > 0) limitations.push("值为 NULL 的记录没有当作零。");
-    if (sources.some((source) => source.coverage?.absent_dates.length || source.coverage?.groups.some((group) => group.absent_dates.length))) {
-      limitations.push("没有落成行的日期按无记录处理，没有补成零。");
-    }
+    const limitations: string[] = [];
+    if (input.findings?.length || input.limitations?.length) limitations.push("模型提供的标签、分组、单位、状态和自由文字未作为事实采用；数值与范围由服务端元数据生成。");
+    if (reasons.includes("calculation_lineage_unsupported") || reasons.includes("query_lineage_unsupported")) limitations.push("部分表达式或计算缺少可证明的血缘，没有作为已验证数值展示。");
     if (reasons.includes("coverage_unknown")) limitations.push("预期覆盖范围无法确定，覆盖情况未知。");
-    if (reasons.includes("freshness_version_changed")) limitations.push("查询使用的新鲜度发布版本已经变化，这些数字不能当成已验证事实。");
-    if ((cells.new_users_zero ?? 0) + (cells.revenue_zero ?? 0) > 0) limitations.push("结果中的 0 是观测到的真实零。");
-    if ((cells.revenue_predicted ?? 0) > 0 || (cells.predicted_payback ?? 0) > 0) limitations.push("预测值单独列出，没有计入实际收入或实际 ROI。");
-    if (sources.some((source) => source.truncated)) limitations.push("结果已截断，不能代表完整总体。");
+    if (reasons.includes("freshness_version_changed")) limitations.push("新鲜度发布版本已变化或失效，受影响的数值没有作为已验证事实展示。");
+    if (reasons.includes("truncated_result_is_not_population")) limitations.push("结果已截断，不能代表完整总体，受影响的数值没有作为已验证事实展示。");
+    if (reasons.includes("missing_values_disclosed")) limitations.push("NULL 是缺失，没有当作零。");
+    if (reasons.includes("true_zeros_disclosed")) limitations.push("结果包含数值为零的行；预测状态按契约单独标示。");
+    if (reasons.includes("predicted_values_disclosed")) limitations.push("预测值和实际值分开列出。");
     limitations.push("数据来自本地合成库，不是生产数据。");
-    const answer = [renderAnswer(status, cells, sources, input.clarification_question), ...verifiedFindingLines].filter((line) => line.length > 0).join("\n");
+    const derivedLines = renderDerivedAndGroups(verified, resources, this.ctx.knowledge);
+    let answer = renderAnswer(status, verified, sources, input.clarification_question, derivedLines);
     const draftNumbers = input.draft_answer.match(/\d+(?:\.\d+)?/g) ?? [];
     if (draftNumbers.some((item) => !answer.includes(item))) {
       limitations.push("模型草稿里有正式答案没有引用到的数字，那些数字没有逐一验证。");
       if (status === "completed") status = "partial";
     }
+    answer = renderAnswer(status, verified, sources, input.clarification_question, derivedLines);
     const analysis: AnalysisRecord = {
       analysis_id: newId("an"),
       job_id: jobId,
@@ -734,12 +741,7 @@ export function sessionAnalyses(session: { session_id: string }): AnalysisRecord
   return list;
 }
 
-export interface CellOperation {
-  op: "sum" | "count_null" | "count_zero" | "count_rows";
-  column?: string;
-  predicted?: "actual_only" | "predicted_only" | "any";
-  as: string;
-}
+export type { CellOperation } from "./evidence.js";
 
 export interface AnalysisFinding {
   label: string;
@@ -791,75 +793,76 @@ function matchesPredicted(row: Record<string, unknown>, predicted: "actual_only"
 
 function renderAnswer(
   status: AnalysisStatus,
-  cells: Record<string, number>,
+  cells: VerifiedCell[],
   sources: AnalysisRecord["sources"],
   clarification: string | undefined,
+  derivedLines: string[],
 ): string {
   const lines: string[] = [];
   if (status === "partial") lines.push("这个回答不完整。");
-  if (status === "completed") lines.push("问题已按本会话证据回答。缺失、真实零和预测值分开列出，没有互相填补。");
+  if (status === "completed") lines.push("以下数字由当前任务的已授权查询和计算生成。");
   if (status === "needs_clarification") lines.push(clarification || "还需要补充问题范围。");
   if (status === "failed") lines.push(clarification || "这次没有取得可引用的查询结果。");
-  if (cells.new_users_sum !== undefined) {
-    lines.push(
-      `新增用户合计 ${formatNumber(cells.new_users_sum)}。值为 NULL ${cells.new_users_missing ?? 0} 天，真实为零 ${cells.new_users_zero ?? 0} 天。NULL 和无记录都没有计入合计。`,
-    );
+  const operations: Record<VerifiedCell["operation"], string> = { sum: "非 NULL 值合计", count_null: "值为 NULL 的行数", count_zero: "数值为零的行数", count_rows: "查询结果行数" };
+  for (const cell of cells) {
+    const filters = Object.entries(cell.filters).map(([key, value]) => `${key}=${value}`).join("，") || "未限定维度";
+    const metric = cell.column ? `${cell.table}.${cell.column}（${cell.description}）` : `${cell.table} 查询行`;
+    lines.push(`${metric}：${operations[cell.operation]} ${formatNumber(cell.value)}；单位 ${cell.unit}；${cell.prediction}；筛选 ${filters}；${cell.range.start} 到 ${cell.range.end}（${cell.range.timezone}）；来源 ${cell.sourceResourceId}。${cell.operation === "sum" && cell.excludedNulls ? `排除了 ${cell.excludedNulls} 行 NULL；无记录没有补成零。` : ""}`);
   }
-  if (cells.revenue_actual !== undefined) {
-    lines.push(
-      `广告实际收入合计 ${formatNumber(cells.revenue_actual)}。预测值合计 ${formatNumber(cells.revenue_predicted ?? 0)}，没有并入实际。值为 NULL ${cells.revenue_missing ?? 0} 天，真实为零 ${cells.revenue_zero ?? 0} 天。`,
-    );
-  }
-  if (cells.new_users_sum_previous !== undefined && cells.new_users_sum !== undefined) {
-    const current = cells.new_users_sum;
-    const previous = cells.new_users_sum_previous;
-    const delta = current - previous;
-    const ratio = previous === 0 ? "上期合计为 0，不能计算环比比率" : `环比差额除以上期等于 ${formatNumber(delta / previous)}`;
-    const incomplete = sources.some((source) => source.coverage && (source.coverage.status === "unknown" || coverageHasGap(source.coverage)));
-    lines.push(
-      `新增环比：本期 ${formatNumber(current)}，上一等长窗口 ${formatNumber(previous)}，差额 ${formatNumber(delta)}。${ratio}。${incomplete ? "窗口里存在无记录、NULL 或预测，差额没有用 0 填补这些天。" : ""}这是相邻窗口的观察，不是原因，也不会触发投放操作。`,
-    );
-  }
-  if (cells.actual_spend !== undefined && cells.actual_payback === undefined) {
-    lines.push(
-      `实际投放成本合计 ${formatNumber(cells.actual_spend)}。值为 NULL 的成本 ${cells.spend_missing ?? 0} 天，真实零成本 ${cells.spend_zero ?? 0} 天。无记录和 NULL 都没有补成 0。`,
-    );
-  }
-  if (cells.actual_spend !== undefined && cells.actual_payback !== undefined) {
-    const spend = cells.actual_spend;
-    const payback = cells.actual_payback;
-    if (spend === 0) lines.push("实际投放成本合计为 0，ROI 分母为零，不能计算比率。预测回收没有拿来填充分母。");
-    else lines.push(`实际 ROI = 实际回收 ${formatNumber(payback)} / 实际成本 ${formatNumber(spend)} = ${formatNumber(payback / spend)}。预测回收 ${formatNumber(cells.predicted_payback ?? 0)} 没有进入分子。成本为 NULL ${cells.spend_missing ?? 0} 天，真实零成本 ${cells.spend_zero ?? 0} 天。`);
-  }
+  lines.push(...derivedLines);
   for (const source of sources) {
-    for (const group of ["channel", "channel_id", "platform", "country_code", "product_id", "title_id"]) {
-      const values = new Set(source.rows.map((row) => row[group]).filter((value) => value !== undefined));
-      if (values.size < 2) continue;
-      const names = new Set(source.rows[0] ? Object.keys(source.rows[0]) : []);
-      const metric = names.has("new_users") ? "new_users" : names.has("spend_usd") ? "spend_usd" : "";
-      if (!metric) continue;
-      const parts = [...values].map((value) => {
-        const sum = source.rows.reduce((total, row) => {
-          if (row[group] !== value) return total;
-          if (metric === "spend_usd" && Number(row.is_predicted) === 1) return total;
-          const amount = row[metric];
-          return amount === null || amount === undefined ? total : total + Number(amount);
-        }, 0);
-        return `${String(value)}=${formatNumber(sum)}`;
-      });
-      lines.push(`${source.tables.join(",")} 按 ${group} 的观察合计：${parts.join("，")}。无记录和 NULL 没有加进去。`);
-    }
-    appendCoverage(lines, source);
+    if (source.evidence_eligible) appendCoverage(lines, source);
+    else lines.push(`${source.tables.join(",")} 的证据当前不可验证，未展示其数值。`);
   }
-  if (sources.some((source) => source.truncated)) lines.push("查询结果已截断，上面的数字不是完整总体。");
-  if (sources.length) {
-    const source = sources[0];
-    lines.push(
-      `来源是本地合成库 ${source?.tables.join(", ")}，时间范围 ${source?.time_range.start} 到 ${source?.time_range.end}（${source?.time_range.timezone}）。`,
-    );
-  }
-  lines.push("结论只使用本会话里可追溯的已授权资源。");
+  if (!cells.length && sources.length) lines.push("没有可证明血缘的计算数值。");
   return lines.join("\n");
+}
+
+function renderDerivedAndGroups(cells: VerifiedCell[], resources: SessionResource[], knowledge: KnowledgeBase): string[] {
+  const lines: string[] = [];
+  const sourceIds = [...new Set(cells.map((cell) => cell.sourceResourceId))];
+  for (const id of sourceIds) {
+    const source = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === id);
+    const asset = source && knowledge.contract_by_table.get(source.tables[0] ?? "");
+    const contract = asset?.contract;
+    if (!source || !contract?.series) continue;
+    const related = cells.filter((cell) => cell.sourceResourceId === id && cell.operation === "sum");
+    for (const definition of contract.derived_metrics ?? []) {
+      if (definition.operation !== "divide" || definition.prediction !== "actual_only") continue;
+      const numerator = related.find((cell) => cell.column === definition.numerator && cell.predictionFilter === "actual_only" && cell.prediction.startsWith("实际（"));
+      const denominator = related.find((cell) => cell.column === definition.denominator && cell.predictionFilter === "actual_only" && cell.prediction.startsWith("实际（"));
+      if (!numerator || !denominator || numerator.unit !== denominator.unit || numerator.unit === "契约未声明") continue;
+      const scope = `${Object.entries(numerator.filters).map(([key, value]) => `${key}=${value}`).join("，") || "未限定维度"}；${numerator.range.start} 到 ${numerator.range.end}（${numerator.range.timezone}）`;
+      if (denominator.value === 0) lines.push(`${definition.label}：分母为零，不能计算。${scope}；来源 ${id}。`);
+      else lines.push(`${definition.label}：${formatNumber(numerator.value)} / ${formatNumber(denominator.value)} = ${formatNumber(numerator.value / denominator.value)}（${definition.unit}）。${scope}；来源 ${id}；只使用契约声明的实际值，预测行不进入结果。`);
+    }
+    // Group only already-authorized raw rows on a declared and selected dimension.
+    for (const cell of related) {
+      const calc = resources.find((item): item is CalculationResource => item.kind === "calculation" && item.source_resource_id === id && Object.values(item.operations ?? {}).some((op) => op.op === "sum" && op.column === cell.column && (op.predicted ?? "any") === cell.predictionFilter));
+      const op = calc && Object.values(calc.operations ?? {}).find((item) => item.op === "sum" && item.column === cell.column && (item.predicted ?? "any") === cell.predictionFilter);
+      if (!op || !cell.column) continue;
+      for (const dimension of contract.series.dimensions) {
+        if (Object.hasOwn(cell.filters, dimension) || !source.columns.includes(dimension)) continue;
+        if (source.rows.some((row) => typeof row[dimension] !== "string")) continue;
+        const values = [...new Set(source.rows.map((row) => row[dimension] as string))];
+        if (values.length < 2) continue;
+        const parts: string[] = [];
+        for (const value of values) {
+          const subset = source.rows.filter((row) => row[dimension] === value);
+          const mapping = contract.series.prediction_values;
+          const flag = contract.series.predicted_column;
+          const selected = flag && mapping && op.predicted === "actual_only" ? subset.filter((row) => Number(row[flag]) === mapping.actual) : flag && mapping && op.predicted === "predicted_only" ? subset.filter((row) => Number(row[flag]) === mapping.predicted) : subset;
+          const numbers = selected.map((row) => row[cell.column!]).filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+          if (!numbers.length) continue;
+          const total = numbers.reduce((a, b) => a + b, 0);
+          if (!verifyCell({ ...source, rows: subset }, contract, op, total)) continue;
+          parts.push(`${value}=${formatNumber(total)}`);
+        }
+        if (parts.length) lines.push(`${cell.table}.${cell.column} 按 ${dimension} 分组：${parts.join("，")}；单位 ${cell.unit}；${cell.prediction}；其他筛选 ${Object.entries(cell.filters).map(([key, value]) => `${key}=${value}`).join("，") || "无"}；${cell.range.start} 到 ${cell.range.end}（${cell.range.timezone}）；来源 ${id}。NULL 与无记录没有补零。`);
+      }
+    }
+  }
+  return lines;
 }
 
 function appendCoverage(lines: string[], source: AnalysisRecord["sources"][number]): void {
@@ -881,18 +884,19 @@ function appendOneCoverage(lines: string[], label: string, report: NonNullable<A
   }
   if (report.absent_dates.length) lines.push(`${label} 无记录 ${report.absent_dates.length} 天：${report.absent_dates.join("、")}。这些天没有补成 0。`);
   if (report.null_dates.length) lines.push(`${label} 有记录但值为 NULL 的日期：${report.null_dates.join("、")}。`);
-  if (report.zero_dates.length) lines.push(`${label} 观测值为零的日期：${report.zero_dates.join("、")}。`);
-  if (report.predicted_dates.length) lines.push(`${label} 预测值日期：${report.predicted_dates.join("、")}，没有当成实际值。`);
+  if (report.zero_dates.length) lines.push(`${label} 数值为零的日期：${report.zero_dates.join("、")}。`);
+  if (report.predicted_dates.length) lines.push(`${label} 含预测标记的日期：${report.predicted_dates.join("、")}，没有当成实际值。`);
+  if (report.unknown_prediction_dates?.length) lines.push(`${label} 的部分日期未声明实际/预测状态。`);
   for (const group of report.groups) {
     if (!group.absent_dates.length && !group.null_dates.length && !group.predicted_dates.length && !group.zero_dates.length) continue;
     lines.push(
-      `${group.dimension}=${group.value}：无记录 ${group.absent_dates.length} 天，NULL ${group.null_dates.length} 天，真实零 ${group.zero_dates.length} 天，预测 ${group.predicted_dates.length} 天。未出现的维度组合不算缺失。`,
+      `${group.dimension}=${group.value}：无记录 ${group.absent_dates.length} 天，NULL ${group.null_dates.length} 天，数值为零 ${group.zero_dates.length} 天，含预测标记 ${group.predicted_dates.length} 天。未出现的维度组合不算缺失。`,
     );
   }
 }
 
 function formatNumber(value: number): string {
-  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(4)));
+  return String(value);
 }
 
 function unique(values: string[]): string[] {

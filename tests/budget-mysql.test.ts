@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -13,9 +13,9 @@ import type { ProviderStepBegin } from "../src/state-store.js";
 test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围栏不会放宽额度", async () => {
   const port = await freePort();
   const password = randomBytes(12).toString("hex");
-  const name = `lumenfox-budget-${process.pid}`;
+  const name = `lumenfox-budget-${randomUUID()}`;
   const dir = mkdtempSync(path.join(tmpdir(), "lumenfox-budget-"));
-  await docker(["run", "-d", "--name", name, "-p", `127.0.0.1:${port}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${password}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${password}`, "mysql:8.0.32"]);
+  await docker(["run", "--pull=never", "-d", "--name", name, "-p", `127.0.0.1:${port}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${password}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${password}`, "mysql:8.0.32"]);
   try {
     await waitMysql(port, password);
     const runtime = openRuntime(dir, {
@@ -150,6 +150,7 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
     await runtime.close({ abandon: true });
   } finally {
     await docker(["rm", "-f", name]);
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

@@ -9,6 +9,8 @@ export interface ProtocolObservation {
   reasoningEffort: string | null;
   authorizationPresent: boolean;
   authorizationMatched: boolean;
+  userMessages: string[];
+  currentTurnRoles: string[];
 }
 
 export async function startFakeOpenAI(token: string): Promise<{ url: string; observations: ProtocolObservation[]; close: () => Promise<void> }> {
@@ -22,8 +24,10 @@ export async function startFakeOpenAI(token: string): Promise<{ url: string; obs
       const matched = header === `Bearer ${token}`;
       const script = typeof request.headers["x-script"] === "string" ? request.headers["x-script"] : "happy";
       let reasoningEffort: string | null = null;
+      let messages: ProtocolMessage[] = [];
       try {
-        const parsed = JSON.parse(body) as { reasoning_effort?: unknown };
+        const parsed = JSON.parse(body) as { reasoning_effort?: unknown; messages?: ProtocolMessage[] };
+        messages = Array.isArray(parsed.messages) ? parsed.messages : [];
         reasoningEffort = typeof parsed.reasoning_effort === "string" ? parsed.reasoning_effort : null;
       } catch {
         reasoningEffort = null;
@@ -37,6 +41,8 @@ export async function startFakeOpenAI(token: string): Promise<{ url: string; obs
         reasoningEffort,
         authorizationPresent: header.length > 0,
         authorizationMatched: matched,
+        userMessages: messages.filter((message) => message.role === "user").map(messageText),
+        currentTurnRoles: currentTurn(messages).map((message) => message.role),
       });
       if (!matched) {
         response.writeHead(401, { "content-type": "application/json" });
@@ -73,12 +79,13 @@ export async function startFakeOpenAI(token: string): Promise<{ url: string; obs
         writeTextStream(response, true);
         return;
       }
-      const call = script === "bad-args" ? badCall(body) : happyCall(body);
+      const call = script === "bad-args" ? badCall(body) : happyCall(messages);
       if (!call) {
         writeTextStream(response, true);
         return;
       }
-      writeToolStream(response, call, true);
+      const turnNumber = messages.filter((message) => message.role === "user").length;
+      writeToolStream(response, { ...call, id: `${call.id}_turn${turnNumber}` }, true);
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -91,19 +98,45 @@ export async function startFakeOpenAI(token: string): Promise<{ url: string; obs
   };
 }
 
-function happyCall(body: string): { id: string; name: string; arguments: string } | null {
-  const plain = body.replaceAll("\\", "");
-  if (plain.includes("玻璃鲦") && plain.includes("德国")) return scripted(plain, "玻璃鲦", glassSteps);
-  if (plain.includes("日本") && plain.includes("雾帆")) return scripted(plain, "日本", japanSteps);
-  if (plain.includes("连表")) return scripted(plain, "连表", unsafeJoinSteps);
-  if (plain.includes("只说看看收入")) return scripted(plain, "只说看看收入", clarifySteps);
-  if ((plain.match(/"name":"update_analysis","arguments"/g) ?? []).length >= 1) return null;
-  if (plain.includes('"ok":false')) {
-    return { id: "call_stop", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "failed", draft_answer: "查询没有成功。", resource_ids: [] }) };
+interface ProtocolMessage { role: string; content?: unknown; tool_calls?: Array<{ function?: { name?: string } }> }
+
+function messageText(message: ProtocolMessage): string {
+  if (typeof message.content === "string") return message.content;
+  if (Array.isArray(message.content)) return message.content.map((part) => typeof part?.text === "string" ? part.text : "").join("");
+  return "";
+}
+
+function currentTurn(messages: ProtocolMessage[]): ProtocolMessage[] {
+  const lastUser = messages.findLastIndex((message) => message.role === "user");
+  return lastUser < 0 ? [] : messages.slice(lastUser);
+}
+
+function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arguments: string } | null {
+  const turn = currentTurn(messages);
+  const latest = turn[0] ? messageText(turn[0]) : "";
+  const earlierUsers = messages.slice(0, messages.length - turn.length).filter((message) => message.role === "user").map(messageText);
+  const hasBase = earlierUsers.some((text) => text.includes("纸灯") && text.includes("美国") && text.includes("iOS") && text.includes("雾帆") && text.includes("2026-10-06") && text.includes("2026-10-12"));
+  if (latest.includes("玻璃鲦") && latest.includes("德国")) return scripted(turn, glassSteps);
+  if (latest.includes("只说看看收入") || (latest.includes("日本") && !hasBase && !latest.includes("纸灯"))) return scripted(turn, clarifySteps);
+  if (latest.includes("日期改成") && hasBase && earlierUsers.some((text) => text.includes("日本"))) return scripted(turn, shortJapanSteps);
+  if (latest.includes("日本") && (hasBase || latest.includes("雾帆"))) return scripted(turn, japanSteps);
+  if (latest.includes("连表")) return scripted(turn, unsafeJoinSteps);
+  return scripted(turn, defaultSteps);
+}
+
+function scripted(turn: ProtocolMessage[], steps: (ids: string[]) => Array<{ id: string; name: string; arguments: string }>): { id: string; name: string; arguments: string } | null {
+  if (turn.some((message) => message.role === "assistant" && message.tool_calls?.some((call) => call.function?.name === "update_analysis"))) return null;
+  const results = turn.filter((message) => message.role === "tool");
+  const resultText = results.map(messageText).join("\n");
+  if (resultText.includes('"ok":false')) {
+    return { id: "call_stop", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "failed", draft_answer: "查询没有成功，草稿里的 99999 不能采用。", resource_ids: [] }) };
   }
-  const results = (plain.match(/tool_call_id/g) ?? []).length;
-  if (results >= 6) return null;
-  const ids = [...plain.matchAll(/resource_id[=:]"?(res_[0-9a-f-]{36})/g)].map((match) => match[1] ?? "");
+  const ids = [...resultText.matchAll(/resource_id[=:]"?(res_[0-9a-f-]{36})/g)].map((match) => match[1] ?? "");
+  const planned = steps(ids);
+  return planned[results.length] ?? null;
+}
+
+function defaultSteps(ids: string[]) {
   const steps = [
     { id: "call_search", name: "search_assets", arguments: JSON.stringify({ query: "新增用户" }) },
     { id: "call_read", name: "read_assets", arguments: JSON.stringify({ asset_ids: ["metric.new_users"] }) },
@@ -134,19 +167,7 @@ function happyCall(body: string): { id: string; name: string; arguments: string 
       arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "模型草稿不是答案。", resource_ids: ids }),
     },
   ];
-  return steps[Math.min(results, steps.length - 1)] ?? steps[0]!;
-}
-
-function scripted(plain: string, marker: string, steps: (ids: string[]) => Array<{ id: string; name: string; arguments: string }>): { id: string; name: string; arguments: string } | null {
-  const turn = plain.slice(Math.max(0, plain.lastIndexOf(marker)));
-  if ((turn.match(/"name":"update_analysis","arguments"/g) ?? []).length >= 1) return null;
-  if (turn.includes('"ok":false')) {
-    return { id: "call_stop", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "failed", draft_answer: "查询没有成功，草稿里的 99999 不能采用。", resource_ids: [] }) };
-  }
-  const results = (turn.match(/tool_call_id/g) ?? []).length;
-  const ids = [...turn.matchAll(/resource_id[=:]"?(res_[0-9a-f-]{36})/g)].map((match) => match[1] ?? "");
-  const planned = steps(ids);
-  return planned[Math.min(results, planned.length - 1)] ?? null;
+  return steps;
 }
 
 function glassSteps(ids: string[]) {
@@ -165,6 +186,15 @@ function japanSteps(ids: string[]) {
     { id: "call_query", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'JP' AND channel_id = 'mist_ads'", purpose: "japan" }) },
     { id: "call_calc", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "new_users", as: "jp_new_users" }] }) },
     { id: "call_update", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "日本雾帆。", resource_ids: ids, findings: [{ label: "日本雾帆新增", value: 70, kind: "actual", resource_id: ids[1] ?? "", cell: "jp_new_users", group: { country_code: "JP" }, time_range: { start: "2026-10-06", end: "2026-10-12" } }] }) },
+  ];
+}
+
+function shortJapanSteps(ids: string[]) {
+  return [
+    { id: "call_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "call_query", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'JP' AND channel_id = 'mist_ads'", purpose: "japan-short" }) },
+    { id: "call_calc", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "new_users", as: "jp_short_new_users" }] }) },
+    { id: "call_update", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "日本雾帆短日期。", resource_ids: ids, findings: [{ label: "日本雾帆新增", value: 30, kind: "actual", resource_id: ids[1] ?? "", cell: "jp_short_new_users", group: { country_code: "JP" }, time_range: { start: "2026-10-06", end: "2026-10-08" } }] }) },
   ];
 }
 

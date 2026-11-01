@@ -1,6 +1,6 @@
 {
   "asset_id": "contract.fact_fox_daily_install",
-  "revision": "contract.fact_fox_daily_install-r1",
+  "revision": "contract.fact_fox_daily_install-r2",
   "table": "fact_fox_daily_install",
   "engine": "clickhouse-local",
   "simulated": true,
@@ -26,7 +26,8 @@
     "metrics": [
       "new_users"
     ],
-    "predicted_column": null
+    "predicted_column": null,
+    "prediction_mode": "observed_only"
   },
   "columns": [
     {
@@ -55,7 +56,7 @@
       "description": "channel_id 维度"
     },
     {
-      "name": "new_users",
+      "name": "new_users", "unit": "人",
       "type": "Nullable(Int32)",
       "description": "新增用户。NULL 是缺失，0 是真实零。",
       "nullable": true,

@@ -252,7 +252,7 @@ test("缺失、真实零和预测值不会被混成一个完成结论", async ()
     assert.ok((analysis.server_reasons as string[]).includes("true_zeros_disclosed"));
     const limitations = analysis.limitations as string[];
     assert.ok(limitations.some((item) => item.includes("NULL")));
-    assert.ok(limitations.some((item) => item.includes("真实零")));
+    assert.ok(limitations.some((item) => item.includes("数值为零")));
     assert.ok(limitations.some((item) => item.includes("预测")));
   });
 });

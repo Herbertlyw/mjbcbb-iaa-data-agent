@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
-import { DEMO_QUESTIONS } from "./demo.js";
+import { demoForScenario } from "./demo.js";
 import { RequestError } from "./jobs.js";
 import { modelCatalog } from "./model-catalog.js";
 import type { Runtime } from "./runtime.js";
@@ -67,7 +67,7 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
       return;
     }
     if (method === "GET" && url.pathname === "/api/demo") {
-      send(res, 200, { simulated: true, questions: DEMO_QUESTIONS });
+      send(res, 200, { simulated: true, ...demoForScenario(runtime.knowledge.contract_by_table.has("fact_fox_daily_install")) });
       return;
     }
     if (method === "GET" && url.pathname === "/api/sessions") {

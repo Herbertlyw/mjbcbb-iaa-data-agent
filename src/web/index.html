@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Lumenfox 数据分析</title>
+  <title>本地数据分析</title>
   <style>
     :root {
       color-scheme: light;
@@ -94,7 +94,7 @@
 <body>
   <header>
     <div>
-      <h1>Lumenfox 数据分析</h1>
+      <h1 id="scenario-title">本地数据分析</h1>
       <p class="banner" id="banner">本地模拟。没有连接生产数据。</p>
       <label>模型 <select id="model"></select></label>
       <label>档位 <select id="reasoning"></select></label>
@@ -205,7 +205,7 @@
         if (!item || item.status === "unknown") return `${item?.table || source.tables.join(",")} 覆盖情况未知。${item?.reason || "没有覆盖回执。"}`;
         const groups = (item.groups || []).filter((group) => group.absent_dates.length || group.null_dates.length || group.predicted_dates.length)
           .map((group) => `${group.dimension}=${group.value} 无记录 ${group.absent_dates.length} 天`);
-        return `${item.table || source.tables.join(",")} 预期 ${item.expected_days} 天 · 无记录 ${item.absent_dates.length} · NULL ${item.null_dates.length} · 真实零 ${item.zero_dates.length} · 预测 ${item.predicted_dates.length} · 实际 ${item.actual_dates.length}${groups.length ? " · " + groups.join("；") : ""}`;
+        return `${item.table || source.tables.join(",")} 预期 ${item.expected_days} 天 · 无记录 ${item.absent_dates.length} · NULL ${item.null_dates.length} · 数值为零 ${item.zero_dates.length} · 预测标记 ${item.predicted_dates.length} · 实际标记 ${item.actual_dates.length} · 状态未声明 ${(item.unknown_prediction_dates || []).length}${groups.length ? " · " + groups.join("；") : ""}`;
       });
       return `${lines.join("；")} · ${receipts || "没有新鲜度回执"}`;
     }
@@ -222,6 +222,10 @@
       }
     }
 
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+    }
+
     function showJob(job) {
       state.jobId = job.job_id;
       badge(job.status);
@@ -234,30 +238,30 @@
         const note = job.status === "cancelled"
           ? "服务端终态：已取消。没有提交分析。"
           : job.error ? job.error.message : pending ? "等待服务端结论。" : `服务端终态：${labels[job.status] || job.status}。没有提交分析。`;
-        resultEl.innerHTML = `<p class="muted">${job.user_text}</p><p>${note}</p>`;
+        resultEl.innerHTML = `<p class="muted">${escapeHtml(job.user_text)}</p><p>${escapeHtml(note)}</p>`;
         return;
       }
-      const limits = analysis.limitations.map((item) => `<li>${item}</li>`).join("");
+      const limits = analysis.limitations.map((item) => `<li>${escapeHtml(item)}</li>`).join("");
       const sources = analysis.sources.map((source) => {
         const head = source.rows[0] ? Object.keys(source.rows[0]) : [];
-        const rows = source.rows.slice(0, 20).map((row) => `<tr>${head.map((key) => `<td>${row[key] === null ? "NULL" : row[key]}</td>`).join("")}</tr>`).join("");
+        const rows = source.rows.slice(0, 20).map((row) => `<tr>${head.map((key) => `<td>${escapeHtml(row[key] === null ? "NULL" : row[key])}</td>`).join("")}</tr>`).join("");
         return `<div class="source">
-          <strong>${source.tables.join(", ")}</strong>
-          <p class="muted">观察，不是推断。${source.sql || ""}</p>
-          <p class="muted">${coverageText(source)}</p>
-          <p class="muted">${source.engine || "本地合成库"} · ${source.time_range.start} 到 ${source.time_range.end} · ${source.time_range.timezone} · ${source.truncated ? "已截断，不是完整总体" : "结果未截断"} · 契约 ${Object.entries(source.contract_revisions || {}).map(([table, revision]) => `${table}@${revision}`).join(", ")}</p>
-          <table><thead><tr>${head.map((key) => `<th>${key}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table>
+          <strong>${escapeHtml(source.tables.join(", "))}</strong>
+          <p class="muted">${source.evidence_eligible ? "当前证据" : "证据不可验证，未展示结果行"}。${escapeHtml(source.sql || "")}</p>
+          <p class="muted">${escapeHtml(source.evidence_eligible ? coverageText(source) : "覆盖与新鲜度未作为当前有效证据使用。")}</p>
+          <p class="muted">${escapeHtml(source.engine || "本地合成库")} · ${escapeHtml(source.time_range.start)} 到 ${escapeHtml(source.time_range.end)} · ${escapeHtml(source.time_range.timezone)} · ${source.truncated ? "已截断，不是完整总体" : "结果未截断"} · 契约 ${Object.entries(source.contract_revisions || {}).map(([table, revision]) => `${escapeHtml(table)}@${escapeHtml(revision)}`).join(", ")}</p>
+          <table><thead><tr>${head.map((key) => `<th>${escapeHtml(key)}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table>
         </div>`;
       }).join("");
-      const calcs = analysis.calculations.map((item) => `<p>计算 ${item.resource_id}：${Object.entries(item.cells).map(([key, value]) => `${key}=${value}`).join("，")}${item.input_truncated ? "（输入已截断）" : ""}</p>`).join("");
+      const calcs = ""; // 已验证计算由服务端按契约渲染；不展示模型自选的单元格别名。
       resultEl.innerHTML = `
-        <p class="muted">${job.user_text}</p>
-        <p class="muted">模型 ${job.model_id || "未记录"} · 档位 ${job.reasoning || "未记录"}</p>
-        <p class="muted">服务端判定：${labels[analysis.status] || analysis.status}。模型建议是 ${analysis.model_suggested_status}，不会单独生效。草稿中的数字不会自动视为已验证。</p>
-        ${job.error ? `<p>${job.error.message}</p>` : ""}
-        <div class="answer">${analysis.answer}</div>
+        <p class="muted">${escapeHtml(job.user_text)}</p>
+        <p class="muted">模型 ${escapeHtml(job.model_id || "未记录")} · 档位 ${escapeHtml(job.reasoning || "未记录")}</p>
+        <p class="muted">服务端判定：${escapeHtml(labels[analysis.status] || analysis.status)}。模型建议是 ${escapeHtml(analysis.model_suggested_status)}，不会单独生效。草稿中的数字不会自动视为已验证。</p>
+        ${job.error ? `<p>${escapeHtml(job.error.message)}</p>` : ""}
+        <div class="answer">${escapeHtml(analysis.answer)}</div>
         <ul>${limits}</ul>
-        ${analysis.clarification_question ? `<p><strong>需要澄清：</strong>${analysis.clarification_question}</p>` : ""}
+        ${analysis.clarification_question ? `<p><strong>需要澄清：</strong>${escapeHtml(analysis.clarification_question)}</p>` : ""}
         ${["failed", "cancelled", "timed_out"].includes(job.status) ? `<button id="retry" class="secondary">用新的幂等键重试</button>` : ""}
         <div class="sources">${sources}${calcs}</div>`;
       document.querySelector("#retry")?.addEventListener("click", () => ask(job.user_text));
@@ -333,7 +337,9 @@
 
     const prompts = document.querySelector("#prompts");
     fetch("/api/demo").then((response) => response.json()).then((body) => {
-      document.querySelector("#banner").textContent = "本地模拟：虚构游戏 Starlane Drift，只读合成库，未连接生产数据。";
+      questionEl.placeholder = body.placeholder;
+      document.title = `${body.scenario} 数据分析`;
+      document.querySelector("#scenario-title").textContent = `${body.scenario} 数据分析`;
       for (const question of body.questions) {
         const button = document.createElement("button");
         button.className = "secondary";
