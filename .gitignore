@@ -6,6 +6,16 @@ __pycache__/
 !/.env.example
 coverage/
 dist/
+node_modules/
+*.tsbuildinfo
+
+# Local demo runtime. Synthetic SQLite files and scratch data stay on disk only.
+.local-runtime/
+tmp/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
 
 # Local private working material; never add to the public repository.
 skill-ignore/

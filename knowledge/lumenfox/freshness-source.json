@@ -1,0 +1,15 @@
+{
+  "source": "offline-local-synthetic-publisher",
+  "simulated": true,
+  "note": "这是离线准备的发布材料。查询时只读已发布副本，不读取本文件，也不计算 MAX(event_date)。",
+  "valid_until": "2027-04-01",
+  "tables": {
+    "daily_installs": { "status": "fresh", "as_of": "2026-10-13T09:00:00-07:00" },
+    "daily_ad_revenue": { "status": "fresh", "as_of": "2026-10-13T09:00:00-07:00" },
+    "daily_unit_economics": { "status": "fresh", "as_of": "2026-10-13T09:00:00-07:00" },
+    "player_device_map": { "status": "fresh", "as_of": "2026-10-13T09:00:00-07:00" },
+    "legacy_installs": { "status": "stale", "as_of": "2025-12-01T09:00:00-08:00" },
+    "finance_ledger": { "status": "fresh", "as_of": "2026-10-13T09:00:00-07:00" },
+    "staging_notes": { "status": "probe_failed", "as_of": null }
+  }
+}

@@ -1,8 +1,41 @@
 {
-  "name": "public-data-agent-materials",
+  "name": "mjbcbb-iaa-data-agent",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "tsx src/index.ts",
+    "start:api": "tsx src/api.ts",
+    "start:worker": "tsx src/worker.ts",
+    "start:dispatcher": "tsx src/dispatcher.ts",
+    "start:freshness": "tsx src/freshness-probe.ts",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "knowledge-check": "tsx src/knowledge-doctor.ts",
+    "export-diagrams": "ruby scripts/重新导出架构图.rb",
+    "check-public-snapshot": "ruby scripts/校验公开快照.rb"
+  },
   "dependencies": {
+    "@clickhouse/client": "1.24.1",
+    "@earendil-works/chord": "1.1.0",
+    "@earendil-works/pi-agent-core": "1.1.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-codemode": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-mcp": "1.1.0",
+    "@earendil-works/pi-telemetry": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
+    "ioredis": "6.0.0",
+    "mysql2": "3.24.6",
+    "node-sql-parser": "^5.3.13",
     "sharp": "^0.34.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
   }
 }

@@ -1,0 +1,68 @@
+{
+  "source": "harborlight-clickhouse",
+  "engine": "clickhouse-local",
+  "valid_until": "2027-04-01",
+  "unimplemented_engines": [
+    "maxcompute",
+    "mysql-business"
+  ],
+  "note": "只读探测本地 ClickHouse 的声明周期。MAX(date) 和连接成功都不是完整。",
+  "targets": [
+    {
+      "table": "fact_fox_daily_install",
+      "engine": "clickhouse-local",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-12"
+    },
+    {
+      "table": "fact_fox_daily_active",
+      "engine": "clickhouse-local",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-12"
+    },
+    {
+      "table": "fact_fox_retention_cohort",
+      "engine": "clickhouse-local",
+      "date_column": "cohort_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-06"
+    },
+    {
+      "table": "fact_fox_ad_receipt",
+      "engine": "clickhouse-local",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-12"
+    },
+    {
+      "table": "fact_fox_daily_spend",
+      "engine": "clickhouse-local",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-12"
+    },
+    {
+      "table": "fact_fox_cohort_payback",
+      "engine": "clickhouse-local",
+      "date_column": "cohort_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-06"
+    },
+    {
+      "table": "fact_fox_experiment_arm",
+      "engine": "clickhouse-local",
+      "date_column": "assigned_on",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-06"
+    },
+    {
+      "table": "fact_fox_experiment_metric",
+      "engine": "clickhouse-local",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-12"
+    }
+  ]
+}

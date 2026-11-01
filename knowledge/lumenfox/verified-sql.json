@@ -1,0 +1,16 @@
+{
+  "revision": "verified-sql-r1",
+  "simulated": true,
+  "examples": [
+    {
+      "example_id": "sql.starlane_us_ios_installs",
+      "title": "星轨漂移美国 iOS 一周新增",
+      "sql": "SELECT event_date, product_id, platform, country_code, channel, new_users FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US'"
+    },
+    {
+      "example_id": "sql.nebula_roi_inputs",
+      "title": "星云渠道实际成本与回收输入",
+      "sql": "SELECT event_date, channel, spend_usd, payback_usd, is_predicted FROM daily_unit_economics WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'"
+    }
+  ]
+}

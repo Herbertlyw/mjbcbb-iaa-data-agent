@@ -1,0 +1,67 @@
+{
+  "asset_id": "contract.fact_fox_retention_cohort",
+  "revision": "contract.fact_fox_retention_cohort-r1",
+  "table": "fact_fox_retention_cohort",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2026-09-01",
+  "valid_until": "2027-04-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "查询只认已发布探测，不认这里的占位。"
+  },
+  "must_filter": [
+    "cohort_date"
+  ],
+  "series": {
+    "date_column": "cohort_date",
+    "dimensions": [
+      "title_id",
+      "platform",
+      "country_code"
+    ],
+    "metrics": [
+      "retained_users"
+    ],
+    "predicted_column": null
+  },
+  "columns": [
+    {
+      "name": "cohort_date",
+      "type": "Date",
+      "description": "业务日期，时区 America/Los_Angeles，分区按月。"
+    },
+    {
+      "name": "title_id",
+      "type": "LowCardinality(String)",
+      "description": "title_id 维度"
+    },
+    {
+      "name": "platform",
+      "type": "LowCardinality(String)",
+      "description": "platform 维度"
+    },
+    {
+      "name": "country_code",
+      "type": "LowCardinality(String)",
+      "description": "country_code 维度"
+    },
+    {
+      "name": "day_n",
+      "type": "UInt16",
+      "description": "留存日龄"
+    },
+    {
+      "name": "retained_users",
+      "type": "Nullable(Int32)",
+      "description": "留存人数。NULL 不是 0。",
+      "nullable": true,
+      "null_means": "缺失，不能当成零",
+      "zero_means": "观测到的真实零"
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "按 cohort 日和留存日龄的留存人数。 粒度：cohort_date + title_id + platform + country_code。主键 cohort_date, title_id, platform, country_code。适用范围：小型集只覆盖纸灯美国 iOS 的 2026-10-06 cohort，日龄 1 和 7。日龄 7 为 NULL。"
+}

@@ -1,0 +1,40 @@
+{
+  "asset_id": "contract.dim_fox_title",
+  "revision": "contract.dim_fox_title-r1",
+  "table": "dim_fox_title",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2026-09-01",
+  "valid_until": "2027-04-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "查询只认已发布探测，不认这里的占位。"
+  },
+  "must_filter": [],
+  "columns": [
+    {
+      "name": "title_id",
+      "type": "LowCardinality(String)",
+      "description": "虚构产品标识"
+    },
+    {
+      "name": "title_name",
+      "type": "String",
+      "description": "虚构产品显示名"
+    },
+    {
+      "name": "genre",
+      "type": "LowCardinality(String)",
+      "description": "虚构题材"
+    },
+    {
+      "name": "launched_on",
+      "type": "Date",
+      "description": "虚构上线日"
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "产品主数据，不含账号。 粒度：每个 title_id 一行。主键 title_id。适用范围：小型集只有 paper_lantern 与 glass_minnow。"
+}

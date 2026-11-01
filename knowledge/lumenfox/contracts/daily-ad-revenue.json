@@ -1,0 +1,34 @@
+{
+  "asset_id": "contract.daily_ad_revenue",
+  "revision": "contract-daily-ad-revenue-r3",
+  "table": "daily_ad_revenue",
+  "engine": "sqlite-local",
+  "simulated": true,
+  "valid_from": "2026-01-01",
+  "valid_until": "2027-04-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "as_of": "2026-10-13T09:00:00-07:00",
+    "status": "fresh",
+    "note": "本地合成数据的虚构刷新时间，不是生产新鲜度探针。"
+  },
+  "must_filter": ["event_date"],
+  "series": {
+    "date_column": "event_date",
+    "dimensions": ["product_id", "platform", "country_code"],
+    "metrics": ["revenue_usd"],
+    "predicted_column": "is_predicted"
+  },
+  "grain": ["event_date", "product_id", "platform", "country_code", "placement"],
+  "columns": [
+    { "name": "event_date", "type": "date", "description": "当地日历日" },
+    { "name": "product_id", "type": "string", "description": "虚构产品，starlane_drift 或 ember_kites" },
+    { "name": "platform", "type": "string", "description": "ios 或 android" },
+    { "name": "country_code", "type": "string", "description": "国家代码" },
+    { "name": "placement", "type": "string", "description": "虚构广告位" },
+    { "name": "revenue_usd", "type": "real", "description": "广告收入", "nullable": true, "null_means": "missing", "zero_means": "observed_zero" },
+    { "name": "is_predicted", "type": "integer", "description": "1 表示预测，0 表示实际观测" }
+  ],
+  "sensitive_columns": [],
+  "notes": "预测行不能并入实际收入。"
+}

@@ -1,0 +1,49 @@
+{
+  "policy_revision": "policy-harborlight-r1",
+  "simulated": true,
+  "note": "虚构权限。表卡读过不等于可以查询。",
+  "roles": {
+    "analyst": {
+      "read": [
+        "catalog.harborlight",
+        "metric.new_users",
+        "metric.ad_revenue",
+        "metric.active_users",
+        "metric.retention",
+        "metric.roi",
+        "sop.weekly_channel",
+        "join.rules",
+        "sql.verified",
+        "policy.analyst",
+        "contract.dim_fox_title",
+        "contract.dim_fox_channel",
+        "contract.fact_fox_daily_install",
+        "contract.fact_fox_daily_active",
+        "contract.fact_fox_retention_cohort",
+        "contract.fact_fox_ad_receipt",
+        "contract.fact_fox_daily_spend",
+        "contract.fact_fox_cohort_payback",
+        "contract.fact_fox_experiment_arm",
+        "contract.fact_fox_experiment_metric"
+      ],
+      "query_tables": [
+        "dim_fox_title",
+        "dim_fox_channel",
+        "fact_fox_daily_install",
+        "fact_fox_daily_active",
+        "fact_fox_retention_cohort",
+        "fact_fox_ad_receipt",
+        "fact_fox_daily_spend",
+        "fact_fox_cohort_payback",
+        "fact_fox_experiment_arm",
+        "fact_fox_experiment_metric"
+      ]
+    },
+    "viewer": {
+      "read": [
+        "catalog.harborlight"
+      ],
+      "query_tables": []
+    }
+  }
+}

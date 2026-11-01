@@ -1,0 +1,203 @@
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+
+export interface AppConfig {
+  host: string;
+  port: number;
+  modelMode: "deterministic" | "pi";
+  piProvider: string;
+  piModel: string;
+  piApiKey: string;
+  piBaseUrl: string;
+  piContextWindow: number;
+  piMaxOutputTokens: number;
+  piReasoning: string;
+  protocolScript: string;
+  maxKnownTokens: number;
+  enabledReasoning: string[];
+  allowRemoteHttps: boolean;
+  knowledgeDir: string;
+  databasePath: string;
+  stateDatabasePath: string;
+  freshnessPath: string;
+  freshnessSourcePath: string;
+  publishFreshnessOnStart: boolean;
+  maxModelCalls: number;
+  maxToolCalls: number;
+  maxContextChars: number;
+  leaseMs: number;
+  heartbeatMs: number;
+  pollMs: number;
+  ephemeralDir?: string;
+  queryTimeoutMs: number;
+  queryLatencyMs: number;
+  maxResultRows: number;
+  maxResultBytes: number;
+  maxAssetReadBytes: number;
+  jobTimeoutMs: number;
+  toolDelayMs: number;
+  simulatedToday: string;
+  defaultRole: string;
+  startWorker: boolean;
+  stateMode: "sqlite" | "mysql";
+  reseedDatabase: boolean;
+  freshnessTargetsPath: string;
+  mysqlHost: string;
+  mysqlPort: number;
+  mysqlUser: string;
+  mysqlPassword: string;
+  mysqlDatabase: string;
+  redisHost: string;
+  redisPort: number;
+  redisPassword: string;
+  redisQueueKey: string;
+  recoveryMs: number;
+  dispatcherPollMs: number;
+  businessEngine: "sqlite" | "clickhouse";
+  clickhouseUrl: string;
+  clickhouseUser: string;
+  clickhousePassword: string;
+  clickhouseDatabase: string;
+  clickhouseMaxRowsToRead: number;
+  compactionReserveTokens: number;
+  compactionKeepRecentTokens: number;
+  fauxContextWindow: number;
+  modelHoldMs: number;
+  toolResultHoldMs: number;
+  toolResultHoldNames: string[];
+}
+
+export function repoRoot(): string {
+  return fileURLToPath(new URL("..", import.meta.url));
+}
+
+function integer(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} 必须是非负整数`);
+  }
+  return value;
+}
+
+export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
+  const modelMode = overrides.modelMode ?? (process.env.MODEL_MODE === "pi" ? "pi" : "deterministic");
+  const config: AppConfig = {
+    host: process.env.HOST || "127.0.0.1",
+    port: integer("PORT", 4317),
+    modelMode,
+    piProvider: process.env.PI_PROVIDER || "anthropic",
+    piModel: process.env.PI_MODEL || "",
+    piApiKey: process.env.PI_API_KEY || "",
+    piBaseUrl: process.env.PI_BASE_URL || "",
+    piContextWindow: integer("PI_CONTEXT_WINDOW", 0),
+    piMaxOutputTokens: integer("PI_MAX_OUTPUT_TOKENS", 0),
+    piReasoning: process.env.PI_REASONING || "off",
+    protocolScript: process.env.PI_PROTOCOL_SCRIPT || "",
+    maxKnownTokens: integer("MAX_KNOWN_TOKENS", 200_000),
+    enabledReasoning: (process.env.PI_ENABLED_REASONING || "off").split(",").map((item) => item.trim()).filter(Boolean),
+    allowRemoteHttps: process.env.PI_ALLOW_REMOTE_HTTPS === "true",
+    knowledgeDir: process.env.KNOWLEDGE_DIR || path.join(repoRoot(), "knowledge", "lumenfox"),
+    databasePath: process.env.DATABASE_PATH || path.join(repoRoot(), ".local-runtime", "lumenfox.sqlite"),
+    stateDatabasePath: process.env.STATE_DATABASE_PATH || path.join(repoRoot(), ".local-runtime", "state.sqlite"),
+    freshnessPath: process.env.FRESHNESS_PATH || path.join(repoRoot(), ".local-runtime", "freshness-current.json"),
+    freshnessSourcePath: process.env.FRESHNESS_SOURCE_PATH || path.join(repoRoot(), "knowledge", "lumenfox", "freshness-source.json"),
+    freshnessTargetsPath: process.env.FRESHNESS_TARGETS_PATH || path.join(repoRoot(), "knowledge", "lumenfox", "freshness-targets.json"),
+    publishFreshnessOnStart: process.env.PUBLISH_FRESHNESS_ON_START === "false" ? false : true,
+    stateMode: process.env.STATE_MODE === "mysql" ? "mysql" : "sqlite",
+    reseedDatabase: process.env.RESEED_DATABASE === "false" ? false : true,
+    mysqlHost: process.env.MYSQL_HOST || "127.0.0.1",
+    mysqlPort: integer("MYSQL_PORT", 3306),
+    mysqlUser: process.env.MYSQL_USER || "",
+    mysqlPassword: process.env.MYSQL_PASSWORD || "",
+    mysqlDatabase: process.env.MYSQL_DATABASE || "",
+    redisHost: process.env.REDIS_HOST || "127.0.0.1",
+    redisPort: integer("REDIS_PORT", 6379),
+    redisPassword: process.env.REDIS_PASSWORD || "",
+    redisQueueKey: process.env.REDIS_QUEUE_KEY || "lumenfox:local:jobs",
+    recoveryMs: integer("RECOVERY_MS", 15_000),
+    dispatcherPollMs: integer("DISPATCHER_POLL_MS", 200),
+    businessEngine: process.env.BUSINESS_ENGINE === "clickhouse" ? "clickhouse" : "sqlite",
+    clickhouseUrl: process.env.CLICKHOUSE_URL || "",
+    clickhouseUser: process.env.CLICKHOUSE_USER || "",
+    clickhousePassword: process.env.CLICKHOUSE_PASSWORD || "",
+    clickhouseDatabase: process.env.CLICKHOUSE_DATABASE || "",
+    clickhouseMaxRowsToRead: integer("CLICKHOUSE_MAX_ROWS_TO_READ", 5_000_000),
+    compactionReserveTokens: integer("COMPACTION_RESERVE_TOKENS", 2048),
+    compactionKeepRecentTokens: integer("COMPACTION_KEEP_RECENT_TOKENS", 4096),
+    fauxContextWindow: integer("PI_FAUX_CONTEXT_WINDOW", 128_000),
+    modelHoldMs: integer("PI_HOLD_BEFORE_MODEL_RESPONSE_MS", 0),
+    toolResultHoldMs: integer("PI_HOLD_AFTER_TOOL_RESULT_MS", 0),
+    toolResultHoldNames: (process.env.PI_HOLD_AFTER_TOOL_NAMES ?? "").split(",").map((item) => item.trim()).filter(Boolean),
+    maxModelCalls: integer("MAX_MODEL_CALLS", 16),
+    maxToolCalls: integer("MAX_TOOL_CALLS", 40),
+    maxContextChars: integer("MAX_CONTEXT_CHARS", 500_000),
+    leaseMs: integer("LEASE_MS", 15_000),
+    heartbeatMs: integer("HEARTBEAT_MS", 2_000),
+    pollMs: integer("POLL_MS", 200),
+    queryTimeoutMs: integer("QUERY_TIMEOUT_MS", 3000),
+    queryLatencyMs: integer("QUERY_LATENCY_MS", 0),
+    maxResultRows: integer("MAX_RESULT_ROWS", 200),
+    maxResultBytes: integer("MAX_RESULT_BYTES", 200_000),
+    maxAssetReadBytes: integer("MAX_ASSET_READ_BYTES", 200_000),
+    jobTimeoutMs: integer("JOB_TIMEOUT_MS", 60_000),
+    toolDelayMs: integer("TOOL_DELAY_MS", 0),
+    simulatedToday: process.env.SIMULATED_TODAY || "2026-10-29",
+    defaultRole: process.env.DEFAULT_ROLE || "analyst",
+    startWorker: true,
+  };
+  const merged = { ...config, ...overrides };
+  validateModelProvider(merged);
+  return merged;
+}
+
+const REASONING_LEVELS = new Set(["off", "low", "medium", "high"]);
+
+export function validateModelProvider(config: AppConfig): void {
+  if (process.env.PI_UNSUPPORTED_PARAM) {
+    throw new Error("不支持的模型参数 PI_UNSUPPORTED_PARAM。不会静默忽略，也不会伪造一个等价参数。");
+  }
+  if (config.protocolScript && !/^[a-z0-9-]{1,32}$/u.test(config.protocolScript)) {
+    throw new Error("PI_PROTOCOL_SCRIPT 只能是短的协议脚本名。");
+  }
+  if (!REASONING_LEVELS.has(config.piReasoning)) {
+    throw new Error(`PI_REASONING=${config.piReasoning} 不在 off、low、medium、high 中。`);
+  }
+  if (config.enabledReasoning.some((level) => !REASONING_LEVELS.has(level))) {
+    throw new Error("PI_ENABLED_REASONING 含有未支持的档位。");
+  }
+  if (!config.enabledReasoning.includes(config.piReasoning)) {
+    throw new Error(`PI_REASONING=${config.piReasoning} 没有出现在 PI_ENABLED_REASONING 中。`);
+  }
+  if (config.modelMode !== "pi" || config.piProvider === "faux") return;
+  if (config.piProvider === "anthropic") {
+    if (!config.piModel.trim() || !config.piApiKey.trim()) {
+      throw new Error("anthropic 需要自行提供 PI_MODEL 和 PI_API_KEY。本构建不预置公司模型名称，也不会改用 faux。");
+    }
+    return;
+  }
+  if (config.piProvider !== "openai-compatible") {
+    throw new Error(`未知供应商 ${config.piProvider}。不会改用 faux。`);
+  }
+  if (!config.piModel.trim()) throw new Error("openai-compatible 需要 PI_MODEL。不会改用 faux。");
+  if (!config.piApiKey.trim()) throw new Error("openai-compatible 需要 PI_API_KEY。不会改用 faux。");
+  if (!config.piBaseUrl.trim()) throw new Error("openai-compatible 需要 PI_BASE_URL。不会改用 faux。");
+  if (config.piContextWindow <= 0) throw new Error("openai-compatible 需要 PI_CONTEXT_WINDOW。不会替模型猜测上下文长度。");
+  if (config.piMaxOutputTokens <= 0) throw new Error("openai-compatible 需要 PI_MAX_OUTPUT_TOKENS。不会替模型猜测输出上限。");
+  let url: URL;
+  try {
+    url = new URL(config.piBaseUrl);
+  } catch {
+    throw new Error("PI_BASE_URL 不是合法 URL。");
+  }
+  if (url.protocol === "https:") {
+    if (!config.allowRemoteHttps) {
+      throw new Error("远程 HTTPS 供应商默认关闭。PI_ALLOW_REMOTE_HTTPS=true 只允许解析配置，本构建仍不会向外网派发，也不会放宽 TLS。");
+    }
+    return;
+  }
+  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port) {
+    throw new Error("未开启远程配置时，只允许 http://127.0.0.1 的端口。不会改用 faux。");
+  }
+}

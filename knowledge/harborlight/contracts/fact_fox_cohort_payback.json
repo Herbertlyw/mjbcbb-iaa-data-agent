@@ -1,0 +1,78 @@
+{
+  "asset_id": "contract.fact_fox_cohort_payback",
+  "revision": "contract.fact_fox_cohort_payback-r1",
+  "table": "fact_fox_cohort_payback",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2026-09-01",
+  "valid_until": "2027-04-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "查询只认已发布探测，不认这里的占位。"
+  },
+  "must_filter": [
+    "cohort_date"
+  ],
+  "series": {
+    "date_column": "cohort_date",
+    "dimensions": [
+      "title_id",
+      "platform",
+      "country_code",
+      "channel_id"
+    ],
+    "metrics": [
+      "payback_usd"
+    ],
+    "predicted_column": "is_predicted"
+  },
+  "columns": [
+    {
+      "name": "cohort_date",
+      "type": "Date",
+      "description": "业务日期，时区 America/Los_Angeles，分区按月。"
+    },
+    {
+      "name": "title_id",
+      "type": "LowCardinality(String)",
+      "description": "title_id 维度"
+    },
+    {
+      "name": "platform",
+      "type": "LowCardinality(String)",
+      "description": "platform 维度"
+    },
+    {
+      "name": "country_code",
+      "type": "LowCardinality(String)",
+      "description": "country_code 维度"
+    },
+    {
+      "name": "channel_id",
+      "type": "LowCardinality(String)",
+      "description": "channel_id 维度"
+    },
+    {
+      "name": "horizon_day",
+      "type": "UInt16",
+      "description": "回收观察日"
+    },
+    {
+      "name": "payback_usd",
+      "type": "Nullable(Float64)",
+      "description": "该周期回收。",
+      "nullable": true,
+      "null_means": "缺失，不能当成零",
+      "zero_means": "观测到的真实零"
+    },
+    {
+      "name": "is_predicted",
+      "type": "UInt8",
+      "description": "1 表示预测。"
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "按 cohort 和回收周期的实际或预测回收。 粒度：cohort_date + title_id + platform + country_code + channel_id。主键 cohort_date, title_id, platform, country_code, channel_id。适用范围：纸灯美国 iOS 雾帆 cohort 2026-10-06：7 日实际，30 日预测，1 日为 NULL。"
+}

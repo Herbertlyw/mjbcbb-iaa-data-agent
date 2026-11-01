@@ -1,0 +1,72 @@
+{
+  "revision": "joins-harborlight-r1",
+  "simulated": true,
+  "joins": [
+    {
+      "join_id": "join.title_install",
+      "tables": [
+        "dim_fox_title",
+        "fact_fox_daily_install"
+      ],
+      "keys": [
+        "title_id"
+      ],
+      "note": "产品维度到新增。"
+    },
+    {
+      "join_id": "join.channel_install",
+      "tables": [
+        "dim_fox_channel",
+        "fact_fox_daily_install"
+      ],
+      "keys": [
+        "channel_id"
+      ],
+      "note": "渠道维度到新增。"
+    },
+    {
+      "join_id": "join.install_active",
+      "tables": [
+        "fact_fox_daily_install",
+        "fact_fox_daily_active"
+      ],
+      "keys": [
+        "event_date",
+        "title_id",
+        "platform",
+        "country_code",
+        "channel_id"
+      ],
+      "note": "同一粒度。"
+    },
+    {
+      "join_id": "join.install_spend",
+      "tables": [
+        "fact_fox_daily_install",
+        "fact_fox_daily_spend"
+      ],
+      "keys": [
+        "event_date",
+        "title_id",
+        "platform",
+        "country_code",
+        "channel_id"
+      ],
+      "note": "成本和新增按渠道对齐。"
+    },
+    {
+      "join_id": "join.install_revenue",
+      "tables": [
+        "fact_fox_daily_install",
+        "fact_fox_ad_receipt"
+      ],
+      "keys": [
+        "event_date",
+        "title_id",
+        "platform",
+        "country_code"
+      ],
+      "note": "变现没有渠道，不能把渠道当连接键。"
+    }
+  ]
+}

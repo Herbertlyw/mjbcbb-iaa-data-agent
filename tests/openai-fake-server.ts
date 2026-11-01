@@ -1,0 +1,231 @@
+import { createServer, type ServerResponse } from "node:http";
+
+export interface ProtocolObservation {
+  script: string;
+  sawUserText: boolean;
+  sawKnowledgeBody: boolean;
+  sawSystemPrompt: boolean;
+  sawToolDefinition: boolean;
+  reasoningEffort: string | null;
+  authorizationPresent: boolean;
+  authorizationMatched: boolean;
+}
+
+export async function startFakeOpenAI(token: string): Promise<{ url: string; observations: ProtocolObservation[]; close: () => Promise<void> }> {
+  const observations: ProtocolObservation[] = [];
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      const header = request.headers.authorization ?? "";
+      const matched = header === `Bearer ${token}`;
+      const script = typeof request.headers["x-script"] === "string" ? request.headers["x-script"] : "happy";
+      let reasoningEffort: string | null = null;
+      try {
+        const parsed = JSON.parse(body) as { reasoning_effort?: unknown };
+        reasoningEffort = typeof parsed.reasoning_effort === "string" ? parsed.reasoning_effort : null;
+      } catch {
+        reasoningEffort = null;
+      }
+      observations.push({
+        script,
+        sawUserText: body.includes("纸灯 在 2026-10-06 到 2026-10-12（美国、iOS、雾帆）的新增用户是多少？"),
+        sawKnowledgeBody: body.includes("NULL 不计入，0 是真实零"),
+        sawSystemPrompt: body.includes("先搜索已发布资产"),
+        sawToolDefinition: body.includes("\"name\":\"search_assets\"") || body.includes("\"name\": \"search_assets\""),
+        reasoningEffort,
+        authorizationPresent: header.length > 0,
+        authorizationMatched: matched,
+      });
+      if (!matched) {
+        response.writeHead(401, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "unauthorized" } }));
+        return;
+      }
+      if (script === "error") {
+        response.writeHead(500, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "scripted failure" } }));
+        return;
+      }
+      if (script === "hold") {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        return;
+      }
+      if (script === "disconnect") {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.write(`data: ${JSON.stringify(chunkFrame(toolDelta("call_partial", "search_assets", "")))}\n\n`);
+        response.destroy();
+        return;
+      }
+      if (script === "no-usage") {
+        writeTextStream(response);
+        return;
+      }
+      const plainBody = body.replaceAll("\\", "");
+      const holdTurn = plainBody.slice(Math.max(0, plainBody.lastIndexOf("请停住")));
+      if (plainBody.includes("请停住") && !holdTurn.includes('"role":"tool"')) {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        return;
+      }
+      const tail = plainBody.slice(-900);
+      if (tail.includes("The messages above are") || tail.includes("Create a concise checkpoint")) {
+        writeTextStream(response, true);
+        return;
+      }
+      const call = script === "bad-args" ? badCall(body) : happyCall(body);
+      if (!call) {
+        writeTextStream(response, true);
+        return;
+      }
+      writeToolStream(response, call, true);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  return {
+    url: `http://127.0.0.1:${port}/v1`,
+    observations,
+    close: () => new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+  };
+}
+
+function happyCall(body: string): { id: string; name: string; arguments: string } | null {
+  const plain = body.replaceAll("\\", "");
+  if (plain.includes("玻璃鲦") && plain.includes("德国")) return scripted(plain, "玻璃鲦", glassSteps);
+  if (plain.includes("日本") && plain.includes("雾帆")) return scripted(plain, "日本", japanSteps);
+  if (plain.includes("连表")) return scripted(plain, "连表", unsafeJoinSteps);
+  if (plain.includes("只说看看收入")) return scripted(plain, "只说看看收入", clarifySteps);
+  if ((plain.match(/"name":"update_analysis","arguments"/g) ?? []).length >= 1) return null;
+  if (plain.includes('"ok":false')) {
+    return { id: "call_stop", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "failed", draft_answer: "查询没有成功。", resource_ids: [] }) };
+  }
+  const results = (plain.match(/tool_call_id/g) ?? []).length;
+  if (results >= 6) return null;
+  const ids = [...plain.matchAll(/resource_id[=:]"?(res_[0-9a-f-]{36})/g)].map((match) => match[1] ?? "");
+  const steps = [
+    { id: "call_search", name: "search_assets", arguments: JSON.stringify({ query: "新增用户" }) },
+    { id: "call_read", name: "read_assets", arguments: JSON.stringify({ asset_ids: ["metric.new_users"] }) },
+    { id: "call_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    {
+      id: "call_query",
+      name: "query",
+      arguments: JSON.stringify({
+        sql: "SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'",
+        purpose: "installs",
+      }),
+    },
+    {
+      id: "call_calc",
+      name: "calculate_session_cells",
+      arguments: JSON.stringify({
+        resource_id: ids[0] ?? "",
+        operations: [
+          { op: "sum", column: "new_users", predicted: "actual_only", as: "new_users_sum" },
+          { op: "count_null", column: "new_users", predicted: "actual_only", as: "new_users_missing" },
+          { op: "count_zero", column: "new_users", predicted: "actual_only", as: "new_users_zero" },
+        ],
+      }),
+    },
+    {
+      id: "call_update",
+      name: "update_analysis",
+      arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "模型草稿不是答案。", resource_ids: ids }),
+    },
+  ];
+  return steps[Math.min(results, steps.length - 1)] ?? steps[0]!;
+}
+
+function scripted(plain: string, marker: string, steps: (ids: string[]) => Array<{ id: string; name: string; arguments: string }>): { id: string; name: string; arguments: string } | null {
+  const turn = plain.slice(Math.max(0, plain.lastIndexOf(marker)));
+  if ((turn.match(/"name":"update_analysis","arguments"/g) ?? []).length >= 1) return null;
+  if (turn.includes('"ok":false')) {
+    return { id: "call_stop", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "failed", draft_answer: "查询没有成功，草稿里的 99999 不能采用。", resource_ids: [] }) };
+  }
+  const results = (turn.match(/tool_call_id/g) ?? []).length;
+  const ids = [...turn.matchAll(/resource_id[=:]"?(res_[0-9a-f-]{36})/g)].map((match) => match[1] ?? "");
+  const planned = steps(ids);
+  return planned[Math.min(results, planned.length - 1)] ?? null;
+}
+
+function glassSteps(ids: string[]) {
+  return [
+    { id: "call_search", name: "search_assets", arguments: JSON.stringify({ query: "新增用户" }) },
+    { id: "call_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "call_query", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND title_id = 'glass_minnow' AND platform = 'ios' AND country_code = 'DE' AND channel_id = 'mist_ads'", purpose: "glass" }) },
+    { id: "call_calc", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "new_users", as: "glass_de_new_users" }, { op: "count_zero", column: "new_users", as: "glass_de_zeros" }] }) },
+    { id: "call_update", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "草稿写成 99999。", resource_ids: ids, findings: [{ label: "玻璃鲦德国新增", value: 48, kind: "actual", resource_id: ids[1] ?? "", cell: "glass_de_new_users", group: { title_id: "glass_minnow", country_code: "DE" }, time_range: { start: "2026-10-06", end: "2026-10-12" } }] }) },
+  ];
+}
+
+function japanSteps(ids: string[]) {
+  return [
+    { id: "call_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "call_query", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'JP' AND channel_id = 'mist_ads'", purpose: "japan" }) },
+    { id: "call_calc", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "new_users", as: "jp_new_users" }] }) },
+    { id: "call_update", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "日本雾帆。", resource_ids: ids, findings: [{ label: "日本雾帆新增", value: 70, kind: "actual", resource_id: ids[1] ?? "", cell: "jp_new_users", group: { country_code: "JP" }, time_range: { start: "2026-10-06", end: "2026-10-12" } }] }) },
+  ];
+}
+
+function unsafeJoinSteps(): Array<{ id: string; name: string; arguments: string }> {
+  return [
+    { id: "call_contract_i", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "call_contract_r", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_ad_receipt" }) },
+    { id: "call_query", name: "query", arguments: JSON.stringify({ sql: "SELECT i.event_date, i.new_users, r.revenue_usd, r.is_predicted FROM fact_fox_daily_install AS i JOIN fact_fox_ad_receipt AS r ON i.event_date = r.event_date AND i.title_id = r.title_id AND i.platform = r.platform AND i.country_code = r.country_code WHERE i.event_date >= '2026-10-06' AND i.event_date <= '2026-10-12' AND r.event_date >= '2026-10-06' AND r.event_date <= '2026-10-12' AND i.title_id = 'paper_lantern' AND i.platform = 'ios' AND i.country_code = 'US'", purpose: "unsafe-join" }) },
+  ];
+}
+
+function clarifySteps(): Array<{ id: string; name: string; arguments: string }> {
+  return [
+    { id: "call_update", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "needs_clarification", draft_answer: "也许是 99999。", clarification_question: "请补充产品、地区、平台、渠道和封闭日期。", resource_ids: [] }) },
+  ];
+}
+
+function badCall(body: string): { id: string; name: string; arguments: string } {
+  if (body.includes('"role":"tool"')) {
+    return { id: "call_bad_stop", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "failed", draft_answer: "参数不合法。", resource_ids: [] }) };
+  }
+  return { id: "call_bad", name: "query", arguments: JSON.stringify({ sql: "DROP TABLE fact_fox_daily_install", purpose: "bad" }) };
+}
+
+function writeTextStream(response: ServerResponse, includeUsage = false): void {
+  response.writeHead(200, { "content-type": "text/event-stream" });
+  response.write(`data: ${JSON.stringify(chunkFrame({ role: "assistant", content: "没有" }))}\n\n`);
+  response.write(`data: ${JSON.stringify(chunkFrame({ content: "用量。" }))}\n\n`);
+  const done: Record<string, unknown> = { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] };
+  if (includeUsage) done.usage = { prompt_tokens: 21, completion_tokens: 9, total_tokens: 30 };
+  response.write(`data: ${JSON.stringify(done)}\n\n`);
+  response.end("data: [DONE]\n\n");
+}
+
+function writeToolStream(response: ServerResponse, call: { id: string; name: string; arguments: string }, includeUsage: boolean): void {
+  response.writeHead(200, { "content-type": "text/event-stream" });
+  const midpoint = Math.max(1, Math.floor(call.arguments.length / 2));
+  const frames = [
+    chunkFrame({ role: "assistant", content: "" }),
+    chunkFrame(toolDelta(call.id, call.name, "")),
+    chunkFrame(toolDelta(call.id, undefined, call.arguments.slice(0, midpoint))),
+    chunkFrame(toolDelta(call.id, undefined, call.arguments.slice(midpoint))),
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], ...(includeUsage ? { usage: { prompt_tokens: 21, completion_tokens: 9, total_tokens: 30 } } : {}) },
+  ];
+  for (const frame of frames) response.write(`data: ${JSON.stringify(frame)}\n\n`);
+  response.end("data: [DONE]\n\n");
+}
+
+function toolDelta(id: string, name: string | undefined, args: string) {
+  return {
+    tool_calls: [
+      {
+        index: 0,
+        id,
+        type: "function",
+        function: { ...(name ? { name } : {}), arguments: args },
+      },
+    ],
+  };
+}
+
+function chunkFrame(delta: Record<string, unknown>) {
+  return { id: "chatcmpl-local", object: "chat.completion.chunk", choices: [{ index: 0, delta, finish_reason: null }] };
+}

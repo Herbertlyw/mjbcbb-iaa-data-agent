@@ -1,0 +1,66 @@
+{
+  "source": "lumenfox-synthetic",
+  "engine": "sqlite-local",
+  "simulated": true,
+  "valid_until": "2027-04-01",
+  "unimplemented_engines": ["maxcompute", "clickhouse", "mysql-business"],
+  "note": "探测按声明的预期日期逐日核对合成库。连接成功或 MAX(date) 都不能单独判定为新鲜。远程引擎只记录未实现，不会发起连接。",
+  "targets": [
+    {
+      "table": "daily_installs",
+      "engine": "sqlite-local",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-12"
+    },
+    {
+      "table": "daily_ad_revenue",
+      "engine": "sqlite-local",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-12"
+    },
+    {
+      "table": "daily_unit_economics",
+      "engine": "sqlite-local",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-12"
+    },
+    {
+      "table": "player_device_map",
+      "engine": "sqlite-local",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-08"
+    },
+    {
+      "table": "legacy_installs",
+      "engine": "sqlite-local",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-12"
+    },
+    {
+      "table": "finance_ledger",
+      "engine": "sqlite-local",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-06"
+    },
+    {
+      "table": "staging_notes",
+      "engine": "sqlite-local",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-12"
+    },
+    {
+      "table": "remote_ads_warehouse",
+      "engine": "maxcompute",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-12"
+    }
+  ]
+}

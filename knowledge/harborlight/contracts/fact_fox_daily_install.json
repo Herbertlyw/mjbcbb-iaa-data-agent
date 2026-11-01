@@ -1,0 +1,76 @@
+{
+  "asset_id": "contract.fact_fox_daily_install",
+  "revision": "contract.fact_fox_daily_install-r1",
+  "table": "fact_fox_daily_install",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2026-09-01",
+  "valid_until": "2027-04-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "查询只认已发布探测，不认这里的占位。"
+  },
+  "must_filter": [
+    "event_date"
+  ],
+  "series": {
+    "date_column": "event_date",
+    "dimensions": [
+      "title_id",
+      "platform",
+      "country_code",
+      "channel_id"
+    ],
+    "metrics": [
+      "new_users"
+    ],
+    "predicted_column": null
+  },
+  "columns": [
+    {
+      "name": "event_date",
+      "type": "Date",
+      "description": "业务日期，时区 America/Los_Angeles，分区按月。"
+    },
+    {
+      "name": "title_id",
+      "type": "LowCardinality(String)",
+      "description": "title_id 维度"
+    },
+    {
+      "name": "platform",
+      "type": "LowCardinality(String)",
+      "description": "platform 维度"
+    },
+    {
+      "name": "country_code",
+      "type": "LowCardinality(String)",
+      "description": "country_code 维度"
+    },
+    {
+      "name": "channel_id",
+      "type": "LowCardinality(String)",
+      "description": "channel_id 维度"
+    },
+    {
+      "name": "new_users",
+      "type": "Nullable(Int32)",
+      "description": "新增用户。NULL 是缺失，0 是真实零。",
+      "nullable": true,
+      "null_means": "缺失，不能当成零",
+      "zero_means": "观测到的真实零"
+    },
+    {
+      "name": "device_token",
+      "type": "Nullable(String)",
+      "description": "虚构设备桶，敏感，不能出现在查询里。",
+      "nullable": true
+    }
+  ],
+  "sensitive_columns": [
+    "device_token"
+  ],
+  "notes": "按日、产品、平台、地区、渠道的新增用户。 粒度：event_date + title_id + platform + country_code + channel_id。主键 event_date, title_id, platform, country_code, channel_id。适用范围：2026-09-29 至 2026-10-12。雾帆美国 iOS 纸灯在 10-09 为 NULL，10-07 为 0。卵石渠道多数日期无行。"
+}

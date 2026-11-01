@@ -1,0 +1,35 @@
+{
+  "asset_id": "contract.dim_fox_channel",
+  "revision": "contract.dim_fox_channel-r1",
+  "table": "dim_fox_channel",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2026-09-01",
+  "valid_until": "2027-04-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "查询只认已发布探测，不认这里的占位。"
+  },
+  "must_filter": [],
+  "columns": [
+    {
+      "name": "channel_id",
+      "type": "LowCardinality(String)",
+      "description": "虚构渠道标识"
+    },
+    {
+      "name": "channel_name",
+      "type": "String",
+      "description": "虚构渠道名"
+    },
+    {
+      "name": "channel_kind",
+      "type": "LowCardinality(String)",
+      "description": "渠道类别"
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "获客渠道主数据。 粒度：每个 channel_id 一行。主键 channel_id。适用范围：小型集只有 mist_ads 与 pebble_net。"
+}

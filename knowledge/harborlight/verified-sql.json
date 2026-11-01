@@ -1,0 +1,12 @@
+{
+  "examples": [
+    {
+      "example_id": "installs_week",
+      "sql": "SELECT event_date, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND title_id = 'paper_lantern'"
+    },
+    {
+      "example_id": "revenue_week",
+      "sql": "SELECT event_date, revenue_usd, is_predicted FROM fact_fox_ad_receipt WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12'"
+    }
+  ]
+}

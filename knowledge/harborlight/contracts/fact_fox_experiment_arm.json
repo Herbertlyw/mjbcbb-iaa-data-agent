@@ -1,0 +1,60 @@
+{
+  "asset_id": "contract.fact_fox_experiment_arm",
+  "revision": "contract.fact_fox_experiment_arm-r1",
+  "table": "fact_fox_experiment_arm",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2026-09-01",
+  "valid_until": "2027-04-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "查询只认已发布探测，不认这里的占位。"
+  },
+  "must_filter": [
+    "assigned_on"
+  ],
+  "columns": [
+    {
+      "name": "assigned_on",
+      "type": "Date",
+      "description": "业务日期，时区 America/Los_Angeles，分区按月。"
+    },
+    {
+      "name": "title_id",
+      "type": "LowCardinality(String)",
+      "description": "title_id 维度"
+    },
+    {
+      "name": "platform",
+      "type": "LowCardinality(String)",
+      "description": "platform 维度"
+    },
+    {
+      "name": "country_code",
+      "type": "LowCardinality(String)",
+      "description": "country_code 维度"
+    },
+    {
+      "name": "experiment_id",
+      "type": "LowCardinality(String)",
+      "description": "虚构实验"
+    },
+    {
+      "name": "variant_id",
+      "type": "LowCardinality(String)",
+      "description": "虚构变体"
+    },
+    {
+      "name": "assigned_users",
+      "type": "Nullable(Int32)",
+      "description": "分配人数。",
+      "nullable": true,
+      "null_means": "缺失，不能当成零",
+      "zero_means": "观测到的真实零"
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "实验变体的分配人数，不是用户明细。 粒度：assigned_on + title_id + platform + country_code。主键 assigned_on, title_id, platform, country_code。适用范围：只有 lantern_holdout 在 2026-10-06 的 hold 与 release。不能和投放表连接。"
+}

@@ -1,0 +1,199 @@
+{
+  "registry_revision": "lumenfox-registry-2026-10-01",
+  "simulated": true,
+  "scenario": "虚构工作室 Lumenfox Interactive 的手游 Starlane Drift。表、指标、账号和数字都是合成的，不能当成任何真实业务。",
+  "timezone": "America/Los_Angeles",
+  "policy_path": "policy.json",
+  "seed_path": "seed.sql",
+  "joins_path": "joins.json",
+  "verified_sql_path": "verified-sql.json",
+  "assets": [
+    {
+      "asset_id": "catalog.starlane",
+      "kind": "catalog",
+      "title": "Starlane Drift 资产目录",
+      "summary": "虚构赛车手游的本地分析资产入口，只描述合成数据集。",
+      "revision": "catalog-starlane-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/catalog-starlane.md"
+    },
+    {
+      "asset_id": "catalog.staging_notes",
+      "kind": "catalog",
+      "title": "暂存备注",
+      "summary": "staging_notes 只有目录卡片，没有已发布的数据契约。",
+      "revision": "catalog-staging-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "staging_notes",
+      "path": "assets/catalog-staging.md"
+    },
+    {
+      "asset_id": "metric.new_users",
+      "kind": "metric",
+      "title": "新增用户口径",
+      "summary": "new_users 的缺失值和真实零不能混用。",
+      "revision": "metric-new-users-r2",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/metric-new-users.md"
+    },
+    {
+      "asset_id": "metric.ad_revenue",
+      "kind": "metric",
+      "title": "广告收入口径",
+      "summary": "实际收入、缺失值和预测值必须分开。",
+      "revision": "metric-ad-revenue-r2",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/metric-ad-revenue.md"
+    },
+    {
+      "asset_id": "sop.weekly_channel",
+      "kind": "analysis_sop",
+      "title": "周度渠道复盘 SOP",
+      "summary": "先检索和读契约，再做有日期范围的只读汇总。",
+      "revision": "sop-weekly-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/sop-weekly.md"
+    },
+    {
+      "asset_id": "sql.example_weekly",
+      "kind": "example_sql",
+      "title": "周度示例 SQL",
+      "summary": "示例语句只帮助发现写法，本身不是查询授权。",
+      "revision": "sql-example-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/sql-example.md"
+    },
+    {
+      "asset_id": "policy.analyst",
+      "kind": "access_policy",
+      "title": "分析师权限政策",
+      "summary": "搜索、读取和查询是三道分开的许可。",
+      "revision": "policy-analyst-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "policy.json"
+    },
+    {
+      "asset_id": "sop.draft_memo",
+      "kind": "analysis_sop",
+      "title": "未发布草稿：内部猜测备忘",
+      "summary": "草稿不可发现，也不能读取。",
+      "revision": "sop-draft-r0",
+      "status": "draft",
+      "discoverable": false,
+      "path": "assets/draft-memo.md"
+    },
+    {
+      "asset_id": "contract.daily_installs",
+      "kind": "data_contract",
+      "title": "每日新增契约",
+      "summary": "合成表 daily_installs，按当地日期、平台和国家汇总新增。",
+      "revision": "contract-daily-installs-r3",
+      "status": "published",
+      "discoverable": true,
+      "table": "daily_installs",
+      "path": "contracts/daily-installs.json"
+    },
+    {
+      "asset_id": "contract.daily_ad_revenue",
+      "kind": "data_contract",
+      "title": "每日广告收入契约",
+      "summary": "合成表 daily_ad_revenue，实际收入和预测分开存放。",
+      "revision": "contract-daily-ad-revenue-r3",
+      "status": "published",
+      "discoverable": true,
+      "table": "daily_ad_revenue",
+      "path": "contracts/daily-ad-revenue.json"
+    },
+    {
+      "asset_id": "contract.player_device_map",
+      "kind": "data_contract",
+      "title": "玩家设备映射契约",
+      "summary": "含虚构设备标识。标识字段禁止投影。",
+      "revision": "contract-player-device-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "player_device_map",
+      "path": "contracts/player-device-map.json"
+    },
+    {
+      "asset_id": "contract.legacy_installs",
+      "kind": "data_contract",
+      "title": "过期新增契约",
+      "summary": "legacy_installs 的契约已过期，不能再查询。",
+      "revision": "contract-legacy-installs-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "legacy_installs",
+      "path": "contracts/legacy-installs.json"
+    },
+    {
+      "asset_id": "contract.finance_ledger",
+      "kind": "data_contract",
+      "title": "财务流水契约",
+      "summary": "分析师角色不能读取或查询这张虚构流水表。",
+      "revision": "contract-finance-ledger-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "finance_ledger",
+      "path": "contracts/finance-ledger.json"
+    },
+    {
+      "asset_id": "contract.daily_unit_economics",
+      "kind": "data_contract",
+      "title": "每日成本与回收契约",
+      "summary": "合成表 daily_unit_economics，实际回收和预测回收分开。",
+      "revision": "contract-daily-unit-economics-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "daily_unit_economics",
+      "path": "contracts/daily-unit-economics.json"
+    },
+    {
+      "asset_id": "metric.roi",
+      "kind": "metric",
+      "title": "实际 ROI 口径",
+      "summary": "实际回收除以实际成本。预测不进分子，缺失不是零，零分母没有比率。",
+      "revision": "metric-roi-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/metric-roi.md"
+    },
+    {
+      "asset_id": "join.rules",
+      "kind": "catalog",
+      "title": "跨表连接约束",
+      "summary": "只有登记过的表对和键可以出现在同一条 SQL。",
+      "revision": "join-rules-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/join-rules.md"
+    },
+    {
+      "asset_id": "sql.verified",
+      "kind": "example_sql",
+      "title": "已验证 SQL 样例",
+      "summary": "样例只说明写法，不授予执行权。",
+      "revision": "verified-sql-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "verified-sql.json"
+    },
+    {
+      "asset_id": "case.ember",
+      "kind": "catalog",
+      "title": "余烬风筝案例",
+      "summary": "第二件虚构产品 Ember Kites，样本在德国。",
+      "revision": "case-ember-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/case-ember.md"
+    }
+  ]
+}

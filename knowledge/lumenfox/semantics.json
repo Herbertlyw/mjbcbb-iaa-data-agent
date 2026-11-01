@@ -1,0 +1,45 @@
+{
+  "simulated": true,
+  "note": "演示槽位编译器使用的虚构枚举。真实模型模式不读取本文件来替用户做理解。",
+  "default_game": "starlane_drift",
+  "sensitive_window": { "start": "2026-10-06", "end": "2026-10-12" },
+  "products": [
+    { "id": "ember_kites", "terms": ["余烬", "ember"] },
+    { "id": "starlane_drift", "terms": ["星轨", "starlane"] }
+  ],
+  "platforms": [
+    { "id": "android", "terms": ["安卓", "android"] },
+    { "id": "ios", "terms": ["苹果", "ios"] }
+  ],
+  "countries": [
+    { "id": "US", "terms": ["美国", "US"] },
+    { "id": "JP", "terms": ["日本", "JP"] },
+    { "id": "DE", "terms": ["德国", "DE"] }
+  ],
+  "channels": [
+    { "id": "nebula_ads", "terms": ["星云", "nebula"] },
+    { "id": "comet_network", "terms": ["彗星", "comet"] }
+  ],
+  "group_by": [
+    { "id": "channel", "terms": ["按渠道", "分渠道", "各渠道"] },
+    { "id": "platform", "terms": ["按平台", "分平台", "各平台"] },
+    { "id": "country", "terms": ["按地区", "按国家", "分国家", "分地区"] },
+    { "id": "product", "terms": ["按产品", "分产品"] }
+  ],
+  "compare_terms": ["环比", "上一等长", "上一窗口", "对比上一周期"],
+  "metrics": [
+    { "id": "new_users", "terms": ["新增", "安装", "新用户"], "contracts": ["contract.daily_installs"] },
+    { "id": "ad_revenue", "terms": ["收入", "进账", "广告"], "contracts": ["contract.daily_ad_revenue"] },
+    { "id": "spend", "terms": ["投放成本", "花费", "成本"], "contracts": ["contract.daily_unit_economics"] },
+    { "id": "actual_payback", "terms": ["实际回收", "实际回款"], "contracts": ["contract.daily_unit_economics"] },
+    { "id": "predicted_payback", "terms": ["预测回收", "预测回款"], "contracts": ["contract.daily_unit_economics"] },
+    { "id": "roi", "terms": ["ROI", "投入产出", "回收比"], "contracts": ["contract.daily_unit_economics"] }
+  ],
+  "unsupported_terms": ["为什么", "原因是什么", "因果", "自动停", "自动加预算", "自动投放", "帮我操作", "停掉预算"],
+  "sensitive_terms": ["设备号", "设备标识", "玩家明细", "player_id", "device_id"],
+  "unauthorized_terms": ["财务", "流水账", "finance"],
+  "retention_terms": ["留存", "retention"],
+  "performance_assets": ["metric.new_users", "metric.ad_revenue", "metric.roi", "sop.weekly_channel", "sql.example_weekly", "sql.verified", "policy.analyst", "join.rules"],
+  "sensitive_contract": "contract.player_device_map",
+  "unauthorized_contract": "contract.finance_ledger"
+}

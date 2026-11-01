@@ -1,0 +1,25 @@
+{
+  "asset_id": "contract.player_device_map",
+  "revision": "contract-player-device-r1",
+  "table": "player_device_map",
+  "engine": "sqlite-local",
+  "simulated": true,
+  "valid_from": "2026-01-01",
+  "valid_until": "2027-04-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "as_of": "2026-10-13T09:00:00-07:00",
+    "status": "fresh",
+    "note": "本地合成标识，不是真实设备。"
+  },
+  "must_filter": ["event_date"],
+  "columns": [
+    { "name": "event_date", "type": "date", "description": "当地日历日" },
+    { "name": "platform", "type": "string", "description": "平台" },
+    { "name": "country_code", "type": "string", "description": "国家代码" },
+    { "name": "device_id", "type": "string", "description": "虚构设备标识，禁止输出" },
+    { "name": "player_id", "type": "string", "description": "虚构玩家标识，禁止输出" }
+  ],
+  "sensitive_columns": ["device_id", "player_id"],
+  "notes": "敏感字段出现在任何投影、过滤或分组中都会被拒绝。"
+}

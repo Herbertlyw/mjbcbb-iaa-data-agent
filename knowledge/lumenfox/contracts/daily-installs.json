@@ -1,0 +1,32 @@
+{
+  "asset_id": "contract.daily_installs",
+  "revision": "contract-daily-installs-r3",
+  "table": "daily_installs",
+  "engine": "sqlite-local",
+  "simulated": true,
+  "valid_from": "2026-01-01",
+  "valid_until": "2027-04-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "as_of": "2026-10-13T09:00:00-07:00",
+    "status": "fresh",
+    "note": "本地合成数据的虚构刷新时间，不是生产新鲜度探针。"
+  },
+  "must_filter": ["event_date"],
+  "series": {
+    "date_column": "event_date",
+    "dimensions": ["product_id", "platform", "country_code", "channel"],
+    "metrics": ["new_users"],
+    "predicted_column": null
+  },
+  "columns": [
+    { "name": "event_date", "type": "date", "description": "当地日历日" },
+    { "name": "product_id", "type": "string", "description": "虚构产品，starlane_drift 或 ember_kites" },
+    { "name": "platform", "type": "string", "description": "ios 或 android" },
+    { "name": "country_code", "type": "string", "description": "国家代码" },
+    { "name": "channel", "type": "string", "description": "虚构渠道" },
+    { "name": "new_users", "type": "integer", "description": "新增用户", "nullable": true, "null_means": "missing", "zero_means": "observed_zero" }
+  ],
+  "sensitive_columns": [],
+  "notes": "只允许聚合或有限日期范围内的分组结果。不要把缺失填成零。"
+}

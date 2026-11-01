@@ -1,0 +1,360 @@
+{
+  "simulated": true,
+  "note": "只给确定性演示槽位编译器。真实模型模式不读它来替用户理解。",
+  "default_game": "paper_lantern",
+  "sensitive_window": {
+    "start": "2026-10-06",
+    "end": "2026-10-12"
+  },
+  "products": [
+    {
+      "id": "glass_minnow",
+      "terms": [
+        "玻璃鲦",
+        "glass_minnow"
+      ]
+    },
+    {
+      "id": "paper_lantern",
+      "terms": [
+        "纸灯",
+        "paper_lantern"
+      ]
+    }
+  ],
+  "platforms": [
+    {
+      "id": "android",
+      "terms": [
+        "安卓",
+        "android"
+      ]
+    },
+    {
+      "id": "ios",
+      "terms": [
+        "苹果",
+        "ios"
+      ]
+    }
+  ],
+  "countries": [
+    {
+      "id": "US",
+      "terms": [
+        "美国",
+        "US"
+      ]
+    },
+    {
+      "id": "JP",
+      "terms": [
+        "日本",
+        "JP"
+      ]
+    },
+    {
+      "id": "DE",
+      "terms": [
+        "德国",
+        "DE"
+      ]
+    }
+  ],
+  "channels": [
+    {
+      "id": "mist_ads",
+      "terms": [
+        "雾帆",
+        "mist_ads"
+      ]
+    },
+    {
+      "id": "pebble_net",
+      "terms": [
+        "卵石",
+        "pebble_net"
+      ]
+    }
+  ],
+  "group_by": [
+    {
+      "id": "channel",
+      "terms": [
+        "按渠道",
+        "分渠道"
+      ]
+    },
+    {
+      "id": "platform",
+      "terms": [
+        "按平台"
+      ]
+    },
+    {
+      "id": "country",
+      "terms": [
+        "按地区",
+        "按国家"
+      ]
+    },
+    {
+      "id": "product",
+      "terms": [
+        "按产品"
+      ]
+    }
+  ],
+  "compare_terms": [
+    "环比",
+    "上一等长"
+  ],
+  "metrics": [
+    {
+      "id": "new_users",
+      "terms": [
+        "新增",
+        "新用户"
+      ],
+      "contracts": [
+        "contract.fact_fox_daily_install"
+      ],
+      "warehouse": {
+        "table": "fact_fox_daily_install",
+        "date_column": "event_date",
+        "title_column": "title_id",
+        "platform_column": "platform",
+        "country_column": "country_code",
+        "channel_column": "channel_id",
+        "value_column": "new_users",
+        "select_columns": [
+          "event_date",
+          "title_id",
+          "platform",
+          "country_code",
+          "channel_id",
+          "new_users"
+        ]
+      }
+    },
+    {
+      "id": "active_users",
+      "terms": [
+        "活跃"
+      ],
+      "contracts": [
+        "contract.fact_fox_daily_active"
+      ],
+      "warehouse": {
+        "table": "fact_fox_daily_active",
+        "date_column": "event_date",
+        "title_column": "title_id",
+        "platform_column": "platform",
+        "country_column": "country_code",
+        "channel_column": "channel_id",
+        "value_column": "active_users",
+        "select_columns": [
+          "event_date",
+          "title_id",
+          "platform",
+          "country_code",
+          "channel_id",
+          "active_users"
+        ]
+      }
+    },
+    {
+      "id": "retention",
+      "terms": [
+        "留存"
+      ],
+      "contracts": [
+        "contract.fact_fox_retention_cohort"
+      ],
+      "warehouse": {
+        "table": "fact_fox_retention_cohort",
+        "date_column": "cohort_date",
+        "title_column": "title_id",
+        "platform_column": "platform",
+        "country_column": "country_code",
+        "value_column": "retained_users",
+        "select_columns": [
+          "cohort_date",
+          "title_id",
+          "platform",
+          "country_code",
+          "retained_users"
+        ]
+      }
+    },
+    {
+      "id": "ad_revenue",
+      "terms": [
+        "收入",
+        "变现",
+        "广告"
+      ],
+      "contracts": [
+        "contract.fact_fox_ad_receipt"
+      ],
+      "warehouse": {
+        "table": "fact_fox_ad_receipt",
+        "date_column": "event_date",
+        "title_column": "title_id",
+        "platform_column": "platform",
+        "country_column": "country_code",
+        "value_column": "revenue_usd",
+        "select_columns": [
+          "event_date",
+          "title_id",
+          "platform",
+          "country_code",
+          "placement",
+          "revenue_usd",
+          "is_predicted"
+        ],
+        "predicted_column": "is_predicted"
+      }
+    },
+    {
+      "id": "spend",
+      "terms": [
+        "投放成本",
+        "花费",
+        "成本"
+      ],
+      "contracts": [
+        "contract.fact_fox_daily_spend"
+      ],
+      "warehouse": {
+        "table": "fact_fox_daily_spend",
+        "date_column": "event_date",
+        "title_column": "title_id",
+        "platform_column": "platform",
+        "country_column": "country_code",
+        "channel_column": "channel_id",
+        "value_column": "spend_usd",
+        "select_columns": [
+          "event_date",
+          "title_id",
+          "platform",
+          "country_code",
+          "channel_id",
+          "spend_usd",
+          "payback_usd",
+          "is_predicted"
+        ],
+        "predicted_column": "is_predicted"
+      }
+    },
+    {
+      "id": "actual_payback",
+      "terms": [
+        "实际回收"
+      ],
+      "contracts": [
+        "contract.fact_fox_daily_spend"
+      ],
+      "warehouse": {
+        "table": "fact_fox_daily_spend",
+        "date_column": "event_date",
+        "title_column": "title_id",
+        "platform_column": "platform",
+        "country_column": "country_code",
+        "channel_column": "channel_id",
+        "value_column": "payback_usd",
+        "select_columns": [
+          "event_date",
+          "title_id",
+          "platform",
+          "country_code",
+          "channel_id",
+          "spend_usd",
+          "payback_usd",
+          "is_predicted"
+        ],
+        "predicted_column": "is_predicted"
+      }
+    },
+    {
+      "id": "predicted_payback",
+      "terms": [
+        "预测回收"
+      ],
+      "contracts": [
+        "contract.fact_fox_cohort_payback"
+      ],
+      "warehouse": {
+        "table": "fact_fox_cohort_payback",
+        "date_column": "cohort_date",
+        "title_column": "title_id",
+        "platform_column": "platform",
+        "country_column": "country_code",
+        "channel_column": "channel_id",
+        "value_column": "payback_usd",
+        "select_columns": [
+          "cohort_date",
+          "title_id",
+          "platform",
+          "country_code",
+          "channel_id",
+          "payback_usd"
+        ]
+      }
+    },
+    {
+      "id": "roi",
+      "terms": [
+        "ROI",
+        "投入产出"
+      ],
+      "contracts": [
+        "contract.fact_fox_daily_spend"
+      ],
+      "warehouse": {
+        "table": "fact_fox_daily_spend",
+        "date_column": "event_date",
+        "title_column": "title_id",
+        "platform_column": "platform",
+        "country_column": "country_code",
+        "channel_column": "channel_id",
+        "value_column": "spend_usd",
+        "select_columns": [
+          "event_date",
+          "title_id",
+          "platform",
+          "country_code",
+          "channel_id",
+          "spend_usd",
+          "payback_usd",
+          "is_predicted"
+        ],
+        "predicted_column": "is_predicted"
+      }
+    }
+  ],
+  "unsupported_terms": [
+    "为什么",
+    "自动投放",
+    "停掉预算"
+  ],
+  "sensitive_terms": [
+    "设备",
+    "device_token"
+  ],
+  "unauthorized_terms": [
+    "财务总账"
+  ],
+  "retention_terms": [],
+  "performance_assets": [
+    "metric.new_users",
+    "metric.ad_revenue",
+    "metric.roi",
+    "sop.weekly_channel",
+    "sql.verified",
+    "policy.analyst",
+    "join.rules"
+  ],
+  "sensitive_contract": "contract.fact_fox_daily_install",
+  "unauthorized_contract": "contract.fact_fox_experiment_metric"
+}

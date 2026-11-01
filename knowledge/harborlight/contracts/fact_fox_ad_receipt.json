@@ -1,0 +1,73 @@
+{
+  "asset_id": "contract.fact_fox_ad_receipt",
+  "revision": "contract.fact_fox_ad_receipt-r1",
+  "table": "fact_fox_ad_receipt",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2026-09-01",
+  "valid_until": "2027-04-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "查询只认已发布探测，不认这里的占位。"
+  },
+  "must_filter": [
+    "event_date"
+  ],
+  "series": {
+    "date_column": "event_date",
+    "dimensions": [
+      "title_id",
+      "platform",
+      "country_code"
+    ],
+    "metrics": [
+      "revenue_usd"
+    ],
+    "predicted_column": "is_predicted"
+  },
+  "grain": ["event_date", "title_id", "platform", "country_code", "placement"],
+  "columns": [
+    {
+      "name": "event_date",
+      "type": "Date",
+      "description": "业务日期，时区 America/Los_Angeles。"
+    },
+    {
+      "name": "title_id",
+      "type": "LowCardinality(String)",
+      "description": "虚构产品"
+    },
+    {
+      "name": "platform",
+      "type": "LowCardinality(String)",
+      "description": "平台"
+    },
+    {
+      "name": "country_code",
+      "type": "LowCardinality(String)",
+      "description": "地区"
+    },
+    {
+      "name": "placement",
+      "type": "LowCardinality(String)",
+      "description": "虚构广告位"
+    },
+    {
+      "name": "revenue_usd",
+      "type": "Nullable(Float64)",
+      "description": "变现金额。NULL 是缺失，0 是真实零。",
+      "nullable": true,
+      "null_means": "缺失，不能当成零",
+      "zero_means": "观测到的真实零"
+    },
+    {
+      "name": "is_predicted",
+      "type": "UInt8",
+      "description": "1 表示预测，不能并入实际。"
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "按日和广告位的变现。预测行不进入实际。 粒度：event_date + title_id + platform + country_code。主键 event_date, title_id, platform, country_code, placement。适用范围：纸灯美国 iOS rewarded：10-08 为 NULL，10-07 为 0，10-10 与 10-11 为预测。没有渠道字段，不能假装按渠道缺失。"
+}

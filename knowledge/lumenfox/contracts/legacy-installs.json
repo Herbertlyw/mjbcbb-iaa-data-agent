@@ -1,0 +1,23 @@
+{
+  "asset_id": "contract.legacy_installs",
+  "revision": "contract-legacy-installs-r1",
+  "table": "legacy_installs",
+  "engine": "sqlite-local",
+  "simulated": true,
+  "valid_from": "2025-01-01",
+  "valid_until": "2026-01-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "as_of": "2025-12-01T09:00:00-08:00",
+    "status": "stale",
+    "note": "契约已过期，新鲜度也不再可用。"
+  },
+  "must_filter": ["event_date"],
+  "columns": [
+    { "name": "event_date", "type": "date", "description": "当地日历日" },
+    { "name": "platform", "type": "string", "description": "平台" },
+    { "name": "new_users", "type": "integer", "description": "历史新增", "nullable": true, "null_means": "missing", "zero_means": "observed_zero" }
+  ],
+  "sensitive_columns": [],
+  "notes": "过期契约可以阅读，但不能形成查询绑定。"
+}

@@ -1,0 +1,222 @@
+{
+  "registry_revision": "harborlight-registry-2026-10-29",
+  "simulated": true,
+  "scenario": "虚构工作室 Harborlight 的合成 ClickHouse。不是任何真实业务库。",
+  "timezone": "America/Los_Angeles",
+  "policy_path": "policy.json",
+  "seed_path": "schema.sql",
+  "joins_path": "joins.json",
+  "verified_sql_path": "verified-sql.json",
+  "assets": [
+    {
+      "asset_id": "catalog.harborlight",
+      "kind": "catalog",
+      "title": "Harborlight 合成目录",
+      "summary": "虚构工作室 Harborlight 的本地 ClickHouse 表卡入口。",
+      "revision": "catalog.harborlight-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/catalog.md"
+    },
+    {
+      "asset_id": "metric.new_users",
+      "kind": "metric",
+      "title": "新增口径",
+      "summary": "new_users 的 NULL 与真实零分开。",
+      "revision": "metric.new_users-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/metric-new-users.md"
+    },
+    {
+      "asset_id": "metric.ad_revenue",
+      "kind": "metric",
+      "title": "变现口径",
+      "summary": "预测变现不并入实际。",
+      "revision": "metric.ad_revenue-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/metric-ad-revenue.md"
+    },
+    {
+      "asset_id": "metric.active_users",
+      "kind": "metric",
+      "title": "活跃口径",
+      "summary": "活跃不从新增填补。",
+      "revision": "metric.active_users-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/metric-active.md"
+    },
+    {
+      "asset_id": "metric.retention",
+      "kind": "metric",
+      "title": "留存口径",
+      "summary": "cohort 留存，NULL 不是零。",
+      "revision": "metric.retention-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/metric-retention.md"
+    },
+    {
+      "asset_id": "metric.roi",
+      "kind": "metric",
+      "title": "ROI 口径",
+      "summary": "实际回收除以实际成本。",
+      "revision": "metric.roi-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/metric-roi.md"
+    },
+    {
+      "asset_id": "sop.weekly_channel",
+      "kind": "analysis_sop",
+      "title": "周度复盘",
+      "summary": "先读表卡再查询。",
+      "revision": "sop.weekly_channel-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/sop.md"
+    },
+    {
+      "asset_id": "join.rules",
+      "kind": "analysis_sop",
+      "title": "连接规则",
+      "summary": "只允许登记过的键。",
+      "revision": "join.rules-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/joins.md"
+    },
+    {
+      "asset_id": "sql.verified",
+      "kind": "example_sql",
+      "title": "已核对 SQL",
+      "summary": "示例不是授权。",
+      "revision": "sql.verified-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "assets/sql.md"
+    },
+    {
+      "asset_id": "policy.analyst",
+      "kind": "access_policy",
+      "title": "权限",
+      "summary": "搜索、读取、查询分开。",
+      "revision": "policy.analyst-r1",
+      "status": "published",
+      "discoverable": true,
+      "path": "policy.json"
+    },
+    {
+      "asset_id": "contract.dim_fox_title",
+      "kind": "data_contract",
+      "title": "虚构产品维度",
+      "summary": "产品主数据，不含账号。",
+      "revision": "contract.dim_fox_title-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "dim_fox_title",
+      "path": "contracts/dim_fox_title.json"
+    },
+    {
+      "asset_id": "contract.dim_fox_channel",
+      "kind": "data_contract",
+      "title": "虚构渠道维度",
+      "summary": "获客渠道主数据。",
+      "revision": "contract.dim_fox_channel-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "dim_fox_channel",
+      "path": "contracts/dim_fox_channel.json"
+    },
+    {
+      "asset_id": "contract.fact_fox_daily_install",
+      "kind": "data_contract",
+      "title": "每日新增",
+      "summary": "按日、产品、平台、地区、渠道的新增用户。",
+      "revision": "contract.fact_fox_daily_install-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "fact_fox_daily_install",
+      "path": "contracts/fact_fox_daily_install.json"
+    },
+    {
+      "asset_id": "contract.fact_fox_daily_active",
+      "kind": "data_contract",
+      "title": "每日活跃",
+      "summary": "同一粒度的活跃用户，不从新增填补。",
+      "revision": "contract.fact_fox_daily_active-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "fact_fox_daily_active",
+      "path": "contracts/fact_fox_daily_active.json"
+    },
+    {
+      "asset_id": "contract.fact_fox_retention_cohort",
+      "kind": "data_contract",
+      "title": "留存 cohort",
+      "summary": "按 cohort 日和留存日龄的留存人数。",
+      "revision": "contract.fact_fox_retention_cohort-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "fact_fox_retention_cohort",
+      "path": "contracts/fact_fox_retention_cohort.json"
+    },
+    {
+      "asset_id": "contract.fact_fox_ad_receipt",
+      "kind": "data_contract",
+      "title": "广告变现",
+      "summary": "按日和广告位的变现。预测行不进入实际。",
+      "revision": "contract.fact_fox_ad_receipt-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "fact_fox_ad_receipt",
+      "path": "contracts/fact_fox_ad_receipt.json"
+    },
+    {
+      "asset_id": "contract.fact_fox_daily_spend",
+      "kind": "data_contract",
+      "title": "每日投放成本",
+      "summary": "按日的成本与当日实际或预测回收。",
+      "revision": "contract.fact_fox_daily_spend-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "fact_fox_daily_spend",
+      "path": "contracts/fact_fox_daily_spend.json"
+    },
+    {
+      "asset_id": "contract.fact_fox_cohort_payback",
+      "kind": "data_contract",
+      "title": "cohort 回收",
+      "summary": "按 cohort 和回收周期的实际或预测回收。",
+      "revision": "contract.fact_fox_cohort_payback-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "fact_fox_cohort_payback",
+      "path": "contracts/fact_fox_cohort_payback.json"
+    },
+    {
+      "asset_id": "contract.fact_fox_experiment_arm",
+      "kind": "data_contract",
+      "title": "实验分组",
+      "summary": "实验变体的分配人数，不是用户明细。",
+      "revision": "contract.fact_fox_experiment_arm-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "fact_fox_experiment_arm",
+      "path": "contracts/fact_fox_experiment_arm.json"
+    },
+    {
+      "asset_id": "contract.fact_fox_experiment_metric",
+      "kind": "data_contract",
+      "title": "实验指标",
+      "summary": "实验变体按日的指标，不含用户明细。",
+      "revision": "contract.fact_fox_experiment_metric-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "fact_fox_experiment_metric",
+      "path": "contracts/fact_fox_experiment_metric.json"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "simulated": true,
+  "note": "预期数字按合成行手工加总，不调用被测的计算函数作为标准。",
+  "cases": [
+    {
+      "id": "wording-new-users",
+      "question": "请汇总 2026-10-06 至 2026-10-12，星轨漂移在美国苹果端的新用户。",
+      "expect_status": "partial",
+      "expect_text": ["480", "NULL"],
+      "hand_sum": "120+0+95+110+80+75=480，10-09 为 NULL，不计入。"
+    },
+    {
+      "id": "period-compare",
+      "question": "环比看 Starlane Drift 美国 iOS 从 2026-10-06 到 2026-10-12 的新增用户。",
+      "expect_status": "partial",
+      "expect_text": ["480", "140"],
+      "hand_sum": "上期 2026-09-29 至 2026-10-05 每天 20，共 140。差额 340。"
+    },
+    {
+      "id": "roi-nebula",
+      "question": "Starlane Drift 美国 iOS 星云渠道 2026-10-06 到 2026-10-12 的实际 ROI 是多少？",
+      "expect_status": "partial",
+      "expect_text": ["1.175", "预测回收"],
+      "hand_sum": "实际成本 10+0+10+8+12=40，实际回收 20+0+5+16+6=47，47/40=1.175。10-10 预测回收 30 排除。10-07 分母单日为真实零，但合计不是零。"
+    },
+    {
+      "id": "channel-group",
+      "question": "按渠道比较 Starlane Drift 美国 iOS 2026-10-06 到 2026-10-12 的投放成本。",
+      "expect_status": "partial",
+      "expect_text": ["nebula_ads=40", "comet_network=5", "无记录"],
+      "hand_sum": "星云实际成本 40，彗星只有 10-06 的 5。"
+    },
+    {
+      "id": "unsupported-causal",
+      "question": "为什么收入跌了，并帮我自动停掉预算。",
+      "expect_status": "needs_clarification",
+      "expect_text": ["不会"],
+      "forbid_tool": "query"
+    }
+  ]
+}

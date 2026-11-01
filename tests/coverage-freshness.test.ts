@@ -1,0 +1,317 @@
+import assert from "node:assert/strict";
+import { readFileSync, writeFileSync } from "node:fs";
+import test from "node:test";
+import type { AddressInfo } from "node:net";
+import { modelPrompt } from "../src/agent.js";
+import { loadConfig } from "../src/config.js";
+import { DEMO_QUESTIONS } from "../src/demo.js";
+import { publishFreshness, readPublication } from "../src/freshness.js";
+import { planFromTranscript } from "../src/planner.js";
+import { startServer } from "../src/server.js";
+import { resolveTurn } from "../src/turn.js";
+import type { CoverageReport } from "../src/types.js";
+import { analyst, ask, bindTables, withRuntime } from "./helpers.js";
+
+const WEEK = "event_date >= '2026-10-06' AND event_date <= '2026-10-12'";
+
+test("无记录、NULL、真实零、预测和未知覆盖分开", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs", "contract.daily_ad_revenue", "contract.daily_unit_economics"]);
+    const absent = await runtime.tools.query(session.session_id, {
+      sql: `SELECT event_date, product_id, platform, country_code, channel, spend_usd, payback_usd, is_predicted FROM daily_unit_economics WHERE ${WEEK} AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'comet_network'`,
+    });
+    assert.equal(absent.ok, true);
+    if (!absent.ok) return;
+    const absentCoverage = absent.coverage as CoverageReport;
+    assert.equal(absentCoverage.status, "known");
+    assert.equal(absentCoverage.absent_dates.length, 6);
+    assert.equal(absentCoverage.zero_dates.length, 0);
+    assert.equal(absentCoverage.actual_dates.length, 1);
+
+    const empty = await runtime.tools.query(session.session_id, {
+      sql: "SELECT event_date, product_id, platform, country_code, channel, new_users FROM daily_installs WHERE event_date >= '2026-01-01' AND event_date <= '2026-01-03' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'",
+    });
+    assert.equal(empty.ok, true);
+    if (!empty.ok) return;
+    const emptyCoverage = empty.coverage as CoverageReport;
+    assert.deepEqual(emptyCoverage.absent_dates, ["2026-01-01", "2026-01-02", "2026-01-03"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_empty");
+    const emptyAnalysis = await runtime.tools.updateAnalysis(session.session_id, {
+      suggested_status: "completed",
+      draft_answer: "模型把空窗口说成 0。",
+      resource_ids: [String(empty.resource_id)],
+    });
+    assert.equal(emptyAnalysis.ok, true);
+    if (!emptyAnalysis.ok) return;
+    assert.equal(emptyAnalysis.status, "partial");
+    assert.match(String(emptyAnalysis.answer), /无记录/);
+    assert.doesNotMatch(String(emptyAnalysis.answer), /观测值为零/);
+
+    runtime.sessions.setActiveJob(session.session_id, "job_zero");
+    const zero = await runtime.tools.query(session.session_id, {
+      sql: "SELECT event_date, product_id, platform, country_code, channel, new_users FROM daily_installs WHERE event_date >= '2026-10-07' AND event_date <= '2026-10-07' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'",
+    });
+    assert.equal(zero.ok, true);
+    if (!zero.ok) return;
+    const zeroCoverage = zero.coverage as CoverageReport;
+    assert.deepEqual(zeroCoverage.zero_dates, ["2026-10-07"]);
+    assert.equal(zeroCoverage.absent_dates.length, 0);
+    const zeroAnalysis = await runtime.tools.updateAnalysis(session.session_id, {
+      suggested_status: "completed",
+      draft_answer: "单日真实零。",
+      resource_ids: [String(zero.resource_id)],
+    });
+    assert.equal(zeroAnalysis.ok, true);
+    if (!zeroAnalysis.ok) return;
+    assert.equal(zeroAnalysis.status, "completed");
+
+    const crossMonth = await runtime.tools.query(session.session_id, {
+      sql: "SELECT event_date, product_id, platform, country_code, channel, new_users FROM daily_installs WHERE event_date >= '2026-09-29' AND event_date <= '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'",
+    });
+    assert.equal(crossMonth.ok, true);
+    if (!crossMonth.ok) return;
+    const crossCoverage = crossMonth.coverage as CoverageReport;
+    assert.equal(crossCoverage.expected_days, 8);
+    assert.equal(crossCoverage.absent_dates.length, 0);
+    assert.equal(crossCoverage.null_dates.length, 0);
+
+    const predicted = await runtime.tools.query(session.session_id, {
+      sql: "SELECT event_date, product_id, platform, country_code, revenue_usd, is_predicted FROM daily_ad_revenue WHERE event_date >= '2026-10-10' AND event_date <= '2026-10-10' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US'",
+    });
+    assert.equal(predicted.ok, true);
+    if (!predicted.ok) return;
+    const predictedCoverage = predicted.coverage as CoverageReport;
+    assert.deepEqual(predictedCoverage.predicted_dates, ["2026-10-10"]);
+    assert.equal(predictedCoverage.actual_dates.length, 0);
+
+    const joined = await runtime.tools.query(session.session_id, {
+      sql: `SELECT a.event_date, b.revenue_usd FROM daily_installs AS a JOIN daily_ad_revenue AS b ON a.event_date = b.event_date AND a.product_id = b.product_id AND a.platform = b.platform AND a.country_code = b.country_code WHERE a.event_date >= '2026-10-06' AND a.event_date <= '2026-10-12' AND b.event_date >= '2026-10-06' AND b.event_date <= '2026-10-12'`,
+    });
+    assert.equal(joined.ok, false);
+    if (joined.ok) return;
+    assert.equal(joined.code, "join_grain_mismatch");
+    const installsCoverage = await runtime.tools.query(session.session_id, {
+      sql: `SELECT event_date, product_id, platform, country_code, channel, new_users FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'`,
+    });
+    assert.equal(installsCoverage.ok, true);
+    if (!installsCoverage.ok) return;
+    assert.equal((installsCoverage.coverage as CoverageReport).null_dates.includes("2026-10-09"), true);
+
+    const comet = await ask(runtime, session.session_id, DEMO_QUESTIONS.find((item) => item.id === "comet-gap")?.text ?? "");
+    assert.equal(comet.status, "partial");
+    assert.match(comet.analysis?.answer ?? "", /无记录/);
+    assert.match(comet.analysis?.answer ?? "", /5/);
+    const nebula = await ask(runtime, session.session_id, "那星云渠道");
+    assert.equal(nebula.turn.kind, "follow_up");
+    assert.equal(nebula.turn.slots.channel, "nebula_ads");
+    assert.equal(nebula.status, "partial");
+    assert.match(nebula.analysis?.answer ?? "", /NULL|真实零|预测/);
+    assert.equal((nebula.analysis?.sources[0]?.coverage.absent_dates.length ?? 1), 0);
+  });
+});
+
+test("新鲜度只读已发布快照，版本变化后不能当成已验证事实", async () => {
+  await withRuntime({ publishFreshnessOnStart: false }, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    const missing = await runtime.tools.query(session.session_id, {
+      sql: `SELECT event_date, new_users FROM daily_installs WHERE ${WEEK} AND platform = 'ios'`,
+    });
+    assert.equal(missing.ok, false);
+    if (missing.ok) return;
+    assert.equal(missing.code, "freshness_not_published");
+  });
+
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    const publication = readPublication(runtime.config.freshnessPath);
+    assert.ok(publication);
+    if (!publication) return;
+    publication.tables.daily_installs = { status: "probe_failed", as_of: null };
+    writeFileSync(runtime.config.freshnessPath, JSON.stringify(publication));
+    const probed = await runtime.tools.query(session.session_id, {
+      sql: `SELECT event_date, new_users FROM daily_installs WHERE ${WEEK} AND platform = 'ios' AND country_code = 'US'`,
+    });
+    assert.equal(probed.ok, false);
+    if (probed.ok) return;
+    assert.equal(probed.code, "freshness_probe_failed");
+    delete publication.tables.daily_installs;
+    writeFileSync(runtime.config.freshnessPath, JSON.stringify(publication));
+    const gone = await runtime.tools.query(session.session_id, {
+      sql: `SELECT event_date, new_users FROM daily_installs WHERE ${WEEK} AND platform = 'ios' AND country_code = 'US'`,
+    });
+    assert.equal(gone.ok, false);
+    if (gone.ok) return;
+    assert.equal(gone.code, "freshness_table_missing");
+    publication.tables.daily_installs = { status: "fresh", as_of: "2026-10-13T09:00:00-07:00" };
+    publication.valid_until = "2020-01-01";
+    writeFileSync(runtime.config.freshnessPath, JSON.stringify(publication));
+    const expired = await runtime.tools.query(session.session_id, {
+      sql: `SELECT event_date, new_users FROM daily_installs WHERE ${WEEK} AND platform = 'ios' AND country_code = 'US'`,
+    });
+    assert.equal(expired.ok, false);
+    if (expired.ok) return;
+    assert.equal(expired.code, "freshness_expired");
+  });
+
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_fresh");
+    const queried = await runtime.tools.query(session.session_id, {
+      sql: "SELECT event_date, product_id, platform, country_code, channel, new_users FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'JP' AND channel = 'nebula_ads'",
+    });
+    assert.equal(queried.ok, true);
+    if (!queried.ok) return;
+    const before = (queried.freshness_receipts as Array<{ version: number }>)[0]?.version;
+    publishFreshness(runtime.config.freshnessSourcePath, runtime.config.freshnessPath);
+    const after = readPublication(runtime.config.freshnessPath);
+    assert.notEqual(after?.version, before);
+    const analysis = await runtime.tools.updateAnalysis(session.session_id, {
+      suggested_status: "completed",
+      draft_answer: "模型忽略了发布版本。",
+      resource_ids: [String(queried.resource_id)],
+    });
+    assert.equal(analysis.ok, true);
+    if (!analysis.ok) return;
+    assert.equal(analysis.status, "partial");
+    assert.ok((analysis.server_reasons as string[]).includes("freshness_version_changed"));
+    assert.match(String(analysis.answer), /10/);
+  });
+});
+
+test("伪造资源、跨会话、自报完成、部分来源失败和修订耗尽", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    const other = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    await bindTables(runtime, other.session_id, ["contract.daily_installs"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_evidence");
+    const forged = await runtime.tools.updateAnalysis(session.session_id, {
+      suggested_status: "completed",
+      draft_answer: "合计是 999999。",
+      resource_ids: ["res_forged"],
+    });
+    assert.equal(forged.ok, false);
+    if (forged.ok) return;
+    assert.equal(forged.code, "evidence_feedback");
+    const exhausted = await runtime.tools.updateAnalysis(session.session_id, {
+      suggested_status: "completed",
+      draft_answer: "合计是 999999。",
+      resource_ids: ["res_forged"],
+    });
+    assert.equal(exhausted.ok, true);
+    if (!exhausted.ok) return;
+    assert.equal(exhausted.status, "partial");
+    assert.ok((exhausted.server_reasons as string[]).includes("revision_exhausted"));
+    assert.equal(String(exhausted.answer).includes("999999"), false);
+
+    const queried = await runtime.tools.query(other.session_id, {
+      sql: "SELECT event_date, product_id, platform, country_code, channel, new_users FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'JP' AND channel = 'nebula_ads'",
+    });
+    assert.equal(queried.ok, true);
+    if (!queried.ok) return;
+    runtime.sessions.setActiveJob(session.session_id, "job_cross");
+    const crossed = await runtime.tools.updateAnalysis(session.session_id, {
+      suggested_status: "completed",
+      draft_answer: "引用了别的会话。",
+      resource_ids: [String(queried.resource_id)],
+    });
+    assert.equal(crossed.ok, false);
+    if (crossed.ok) return;
+    assert.equal(crossed.code, "evidence_feedback");
+    assert.ok((crossed.server_reasons as string[]).includes("cross_session_resource"));
+  });
+});
+
+test("部分查询失败时只提交成功资源", () => {
+  const turn = resolveTurn(null, "Starlane Drift 在 2026-10-06 到 2026-10-12（日本、iOS）的新增用户和广告收入是多少？");
+  const message = planFromTranscript({
+    messages: [
+      { role: "user", content: [{ type: "text", text: `<trusted_turn>${JSON.stringify(turn)}</trusted_turn>\n\n问题` }] },
+      tool("search_assets", {}),
+      tool("read_assets", {}),
+      tool("read_data_contract_view", { asset_id: "contract.daily_installs", queryable: true }),
+      tool("read_data_contract_view", { asset_id: "contract.daily_ad_revenue", queryable: true }),
+      tool("query", { purpose: "installs", resource_id: "res_ok" }),
+      tool("query", { purpose: "revenue", code: "query_execution_failed", message: "收入查询失败" }, true),
+    ],
+  } as never);
+  const call = message.content.find((block) => block.type === "toolCall");
+  assert.equal(call && call.type === "toolCall" ? call.name : "", "update_analysis");
+  const args = call && call.type === "toolCall" ? call.arguments : {};
+  assert.equal(args.suggested_status, "partial");
+  assert.deepEqual(args.resource_ids, ["res_ok"]);
+});
+
+test("真实模式不注入演示槽位，预算耗尽和 mock 身份有边界", async () => {
+  const prompt = modelPrompt("pi", { secret: "slot" }, "用户原话", ["上一句"]);
+  assert.equal(prompt.includes("trusted_turn"), false);
+  assert.match(prompt, /用户原话/);
+  assert.match(prompt, /上一句/);
+  assert.match(modelPrompt("deterministic", { ok: true }, "原话", []), /trusted_turn/);
+
+  assert.throws(() => loadConfig({ modelMode: "pi", piApiKey: "" }), /不会改用 faux/);
+  await withRuntime({ modelMode: "pi", piProvider: "faux" }, async (runtime) => {
+    const session = analyst(runtime);
+    const job = await ask(runtime, session.session_id, DEMO_QUESTIONS[2].text);
+    assert.equal(job.turn.slots.metrics.length, 0);
+    assert.equal(JSON.stringify(job.turn).includes("trusted_turn"), false);
+  });
+
+  await withRuntime({ maxToolCalls: 1 }, async (runtime) => {
+    const session = analyst(runtime);
+    const job = await ask(runtime, session.session_id, DEMO_QUESTIONS[2].text);
+    assert.equal(job.status, "failed");
+    assert.equal(job.error?.code, "budget_exhausted");
+    assert.equal(job.usage?.input_tokens, null);
+    assert.equal(job.usage?.output_tokens, null);
+    assert.equal(job.usage?.cost, null);
+    assert.ok((job.usage?.tool_calls ?? 0) > 0);
+  });
+
+  await withRuntime({ startWorker: false }, async (runtime) => {
+    const server = startServer(runtime);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const port = (server.address() as AddressInfo).port;
+    try {
+      const created = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-demo-actor": "demo-viewer" },
+        body: JSON.stringify({ userId: "root", role: "analyst", title: "观察者" }),
+      });
+      const viewer = (await created.json()) as { role: string; actor_id: string; session_id: string };
+      assert.equal(viewer.role, "viewer");
+      assert.equal(viewer.actor_id, "demo-viewer");
+      const analystList = await fetch(`http://127.0.0.1:${port}/api/sessions`);
+      const analystBody = (await analystList.json()) as { sessions: Array<{ session_id: string }> };
+      assert.equal(analystBody.sessions.some((item) => item.session_id === viewer.session_id), false);
+      const hidden = await fetch(`http://127.0.0.1:${port}/api/sessions/${viewer.session_id}`);
+      assert.equal(hidden.status, 404);
+      const health = await fetch(`http://127.0.0.1:${port}/api/health`);
+      const body = (await health.json()) as { production_mysql: boolean; production_redis: boolean; target_gaps: string[] };
+      assert.equal(body.production_mysql, false);
+      assert.equal(body.production_redis, false);
+      assert.ok(body.target_gaps.some((item) => item.includes("mock")));
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+function tool(name: string, payload: Record<string, unknown>, isError = false) {
+  return {
+    role: "toolResult" as const,
+    toolName: name,
+    isError,
+    content: [{ type: "text" as const, text: JSON.stringify(payload) }],
+  };
+}
+
+test("发布文件可以被再次读回", () => {
+  const raw = readFileSync(new URL("../knowledge/lumenfox/freshness-source.json", import.meta.url), "utf8");
+  assert.match(raw, /offline-local-synthetic-publisher/);
+});

@@ -1,0 +1,18 @@
+{
+  "revision": "joins-lumenfox-r1",
+  "simulated": true,
+  "joins": [
+    {
+      "join_id": "join.installs_revenue",
+      "tables": ["daily_installs", "daily_ad_revenue"],
+      "keys": ["event_date", "product_id", "platform", "country_code"],
+      "note": "收入表还有 placement，连接时不能把它当成安装表的渠道。"
+    },
+    {
+      "join_id": "join.installs_economics",
+      "tables": ["daily_installs", "daily_unit_economics"],
+      "keys": ["event_date", "product_id", "platform", "country_code", "channel"],
+      "note": "成本和回收按同一产品、地区、平台、渠道、日期对齐。"
+    }
+  ]
+}

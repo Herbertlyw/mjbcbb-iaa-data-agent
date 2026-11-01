@@ -1,0 +1,65 @@
+{
+  "asset_id": "contract.fact_fox_experiment_metric",
+  "revision": "contract.fact_fox_experiment_metric-r1",
+  "table": "fact_fox_experiment_metric",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2026-09-01",
+  "valid_until": "2027-04-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "查询只认已发布探测，不认这里的占位。"
+  },
+  "must_filter": [
+    "event_date"
+  ],
+  "columns": [
+    {
+      "name": "event_date",
+      "type": "Date",
+      "description": "业务日期，时区 America/Los_Angeles，分区按月。"
+    },
+    {
+      "name": "title_id",
+      "type": "LowCardinality(String)",
+      "description": "title_id 维度"
+    },
+    {
+      "name": "platform",
+      "type": "LowCardinality(String)",
+      "description": "platform 维度"
+    },
+    {
+      "name": "country_code",
+      "type": "LowCardinality(String)",
+      "description": "country_code 维度"
+    },
+    {
+      "name": "experiment_id",
+      "type": "LowCardinality(String)",
+      "description": "虚构实验"
+    },
+    {
+      "name": "variant_id",
+      "type": "LowCardinality(String)",
+      "description": "虚构变体"
+    },
+    {
+      "name": "metric_name",
+      "type": "LowCardinality(String)",
+      "description": "指标名"
+    },
+    {
+      "name": "metric_value",
+      "type": "Nullable(Float64)",
+      "description": "指标值。NULL 不是 0。",
+      "nullable": true,
+      "null_means": "缺失，不能当成零",
+      "zero_means": "观测到的真实零"
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "实验变体按日的指标，不含用户明细。 粒度：event_date + title_id + platform + country_code。主键 event_date, title_id, platform, country_code。适用范围：2026-10-06 至 2026-10-12。release 在 10-09 为 NULL。没有和新增表登记连接。"
+}

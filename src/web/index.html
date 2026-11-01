@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lumenfox 数据分析</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #1b2420;
+      --paper: #f3efe4;
+      --panel: #fffaf2;
+      --line: #d9d0c0;
+      --teal: #0e6b62;
+      --queued: #3d5a80;
+      --running: #0e6b62;
+      --completed: #1f7a4d;
+      --clarify: #8a5a00;
+      --partial: #9a4d12;
+      --failed: #8d2432;
+      --cancelled: #5c6570;
+      --timeout: #643b86;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, #efe4c8 0, transparent 28rem),
+        var(--paper);
+      font: 16px/1.5 "Avenir Next", "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 1.2rem 1.5rem;
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0; font-family: "Iowan Old Style", Palatino, "Songti SC", serif; font-size: 1.7rem; }
+    .banner { margin: 0.2rem 0 0; color: #5d5348; }
+    main { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 92px); }
+    aside, section { padding: 1rem; }
+    aside { border-right: 1px solid var(--line); }
+    button, textarea { font: inherit; }
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 0.45rem 0.8rem;
+      background: var(--teal);
+      color: white;
+      cursor: pointer;
+    }
+    button.secondary { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+    button:disabled { opacity: 0.55; cursor: wait; }
+    .sessions, .log, .sources { display: grid; gap: 0.5rem; }
+    .session, .event, .source {
+      text-align: left;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 12px;
+      padding: 0.7rem;
+    }
+    .session.active { outline: 2px solid var(--teal); }
+    textarea { width: 100%; min-height: 6rem; border: 1px solid var(--line); border-radius: 12px; padding: 0.8rem; background: white; }
+    .row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.7rem 0; }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 0.1rem 0.65rem;
+      color: white;
+      font-size: 0.85rem;
+    }
+    .status.queued { background: var(--queued); }
+    .status.running { background: var(--running); }
+    .status.completed { background: var(--completed); }
+    .status.needs_clarification { background: var(--clarify); }
+    .status.partial { background: var(--partial); }
+    .status.failed { background: var(--failed); }
+    .status.cancelled { background: var(--cancelled); }
+    .status.timed_out { background: var(--timeout); }
+    .answer { white-space: pre-wrap; font-family: "Iowan Old Style", Palatino, "Songti SC", serif; font-size: 1.15rem; }
+    .muted { color: #655d53; }
+    table { width: 100%; border-collapse: collapse; background: white; }
+    th, td { border-bottom: 1px solid var(--line); padding: 0.35rem 0.45rem; text-align: left; font-variant-numeric: tabular-nums; }
+    @media (max-width: 800px) {
+      main { grid-template-columns: 1fr; }
+      aside { border-right: 0; border-bottom: 1px solid var(--line); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Lumenfox 数据分析</h1>
+      <p class="banner" id="banner">本地模拟。没有连接生产数据。</p>
+      <label>模型 <select id="model"></select></label>
+      <label>档位 <select id="reasoning"></select></label>
+    </div>
+    <button id="new-session" class="secondary">新会话</button>
+  </header>
+  <main>
+    <aside>
+      <h2>会话</h2>
+      <div id="sessions" class="sessions"></div>
+      <h2>本次会话的任务</h2>
+      <div id="history" class="sessions"></div>
+    </aside>
+    <section>
+      <div class="row" id="prompts"></div>
+      <textarea id="question" placeholder="问一个关于 Starlane Drift 的问题"></textarea>
+      <div class="row">
+        <button id="ask">提问</button>
+        <button id="cancel" class="secondary" hidden>取消任务</button>
+        <span id="status" class="status queued" hidden>排队中</span>
+      </div>
+      <article id="result"></article>
+      <h2>工具与事件</h2>
+      <div id="log" class="log"></div>
+    </section>
+  </main>
+  <script>
+    const labels = {
+      queued: "排队中",
+      running: "运行中",
+      completed: "完成",
+      needs_clarification: "需要澄清",
+      partial: "部分完成",
+      failed: "失败",
+      cancelled: "已取消",
+      timed_out: "已超时",
+    };
+    const state = { sessionId: null, jobId: null, source: null, models: [], lastSeq: 0, terminal: false };
+
+    const sessionsEl = document.querySelector("#sessions");
+    const resultEl = document.querySelector("#result");
+    const logEl = document.querySelector("#log");
+    const statusEl = document.querySelector("#status");
+    const questionEl = document.querySelector("#question");
+    const askButton = document.querySelector("#ask");
+    const cancelButton = document.querySelector("#cancel");
+
+    function badge(status) {
+      statusEl.hidden = false;
+      statusEl.className = `status ${status}`;
+      statusEl.textContent = labels[status] || status;
+    }
+
+    async function loadSessions() {
+      const response = await fetch("/api/sessions");
+      const body = await response.json();
+      sessionsEl.innerHTML = "";
+      for (const session of body.sessions) {
+        const button = document.createElement("button");
+        button.className = `session secondary ${session.session_id === state.sessionId ? "active" : ""}`;
+        button.textContent = session.title;
+        button.addEventListener("click", () => openSession(session.session_id));
+        sessionsEl.append(button);
+      }
+    }
+
+    async function openSession(sessionId) {
+      state.sessionId = sessionId;
+      sessionStorage.setItem("lumenfox-session", sessionId);
+      await loadSessions();
+      const response = await fetch(`/api/sessions/${sessionId}`);
+      const session = await response.json();
+      const history = document.querySelector("#history");
+      history.innerHTML = "";
+      for (const job of session.jobs) {
+        const button = document.createElement("button");
+        button.className = "secondary";
+        button.textContent = `${labels[job.status] || job.status} · ${job.user_text.slice(0, 24)}`;
+        button.addEventListener("click", () => showJob(job));
+        history.append(button);
+      }
+      const latest = session.jobs.at(-1);
+      if (latest) showJob(latest);
+      else {
+        resultEl.innerHTML = "<p class=\"muted\">这个会话还没有问题。</p>";
+        logEl.innerHTML = "";
+        statusEl.hidden = true;
+      }
+    }
+
+    async function createSession() {
+      const response = await fetch("/api/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      const session = await response.json();
+      state.sessionId = session.session_id;
+      sessionStorage.setItem("lumenfox-session", session.session_id);
+      resultEl.innerHTML = "<p class=\"muted\">这个会话还没有问题。</p>";
+      logEl.innerHTML = "";
+      document.querySelector("#history").innerHTML = "";
+      statusEl.hidden = true;
+      await loadSessions();
+    }
+
+    function coverageText(source) {
+      const report = source.coverage;
+      const receipts = (source.freshness_receipts || []).map((item) => `${item.table} 发布 v${item.version}`).join(", ");
+      const reports = report?.per_table?.length ? report.per_table : [report];
+      const lines = reports.map((item) => {
+        if (!item || item.status === "unknown") return `${item?.table || source.tables.join(",")} 覆盖情况未知。${item?.reason || "没有覆盖回执。"}`;
+        const groups = (item.groups || []).filter((group) => group.absent_dates.length || group.null_dates.length || group.predicted_dates.length)
+          .map((group) => `${group.dimension}=${group.value} 无记录 ${group.absent_dates.length} 天`);
+        return `${item.table || source.tables.join(",")} 预期 ${item.expected_days} 天 · 无记录 ${item.absent_dates.length} · NULL ${item.null_dates.length} · 真实零 ${item.zero_dates.length} · 预测 ${item.predicted_dates.length} · 实际 ${item.actual_dates.length}${groups.length ? " · " + groups.join("；") : ""}`;
+      });
+      return `${lines.join("；")} · ${receipts || "没有新鲜度回执"}`;
+    }
+
+    function renderEvents(events) {
+      logEl.innerHTML = "";
+      for (const event of events) {
+        const item = document.createElement("div");
+        item.className = "event";
+        const name = event.payload.tool_name ? ` · ${event.payload.tool_name}` : "";
+        const message = event.payload.message ? ` · ${event.payload.message}` : "";
+        item.textContent = `${event.seq}. ${event.type}${name}${message}`;
+        logEl.append(item);
+      }
+    }
+
+    function showJob(job) {
+      state.jobId = job.job_id;
+      badge(job.status);
+      cancelButton.hidden = job.status !== "queued" && job.status !== "running";
+      askButton.disabled = job.status === "queued" || job.status === "running";
+      renderEvents(job.events);
+      const analysis = job.analysis;
+      if (!analysis) {
+        const pending = job.status === "queued" || job.status === "running";
+        const note = job.status === "cancelled"
+          ? "服务端终态：已取消。没有提交分析。"
+          : job.error ? job.error.message : pending ? "等待服务端结论。" : `服务端终态：${labels[job.status] || job.status}。没有提交分析。`;
+        resultEl.innerHTML = `<p class="muted">${job.user_text}</p><p>${note}</p>`;
+        return;
+      }
+      const limits = analysis.limitations.map((item) => `<li>${item}</li>`).join("");
+      const sources = analysis.sources.map((source) => {
+        const head = source.rows[0] ? Object.keys(source.rows[0]) : [];
+        const rows = source.rows.slice(0, 20).map((row) => `<tr>${head.map((key) => `<td>${row[key] === null ? "NULL" : row[key]}</td>`).join("")}</tr>`).join("");
+        return `<div class="source">
+          <strong>${source.tables.join(", ")}</strong>
+          <p class="muted">观察，不是推断。${source.sql || ""}</p>
+          <p class="muted">${coverageText(source)}</p>
+          <p class="muted">${source.engine || "本地合成库"} · ${source.time_range.start} 到 ${source.time_range.end} · ${source.time_range.timezone} · ${source.truncated ? "已截断，不是完整总体" : "结果未截断"} · 契约 ${Object.entries(source.contract_revisions || {}).map(([table, revision]) => `${table}@${revision}`).join(", ")}</p>
+          <table><thead><tr>${head.map((key) => `<th>${key}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table>
+        </div>`;
+      }).join("");
+      const calcs = analysis.calculations.map((item) => `<p>计算 ${item.resource_id}：${Object.entries(item.cells).map(([key, value]) => `${key}=${value}`).join("，")}${item.input_truncated ? "（输入已截断）" : ""}</p>`).join("");
+      resultEl.innerHTML = `
+        <p class="muted">${job.user_text}</p>
+        <p class="muted">模型 ${job.model_id || "未记录"} · 档位 ${job.reasoning || "未记录"}</p>
+        <p class="muted">服务端判定：${labels[analysis.status] || analysis.status}。模型建议是 ${analysis.model_suggested_status}，不会单独生效。草稿中的数字不会自动视为已验证。</p>
+        ${job.error ? `<p>${job.error.message}</p>` : ""}
+        <div class="answer">${analysis.answer}</div>
+        <ul>${limits}</ul>
+        ${analysis.clarification_question ? `<p><strong>需要澄清：</strong>${analysis.clarification_question}</p>` : ""}
+        ${["failed", "cancelled", "timed_out"].includes(job.status) ? `<button id="retry" class="secondary">用新的幂等键重试</button>` : ""}
+        <div class="sources">${sources}${calcs}</div>`;
+      document.querySelector("#retry")?.addEventListener("click", () => ask(job.user_text));
+    }
+
+    function listen(jobId) {
+      if (state.streamJobId !== jobId) {
+        state.streamJobId = jobId;
+        state.lastSeq = 0;
+      }
+      state.source?.close();
+      state.terminal = false;
+      const source = new EventSource(`/api/jobs/${jobId}/events?after=${state.lastSeq}`);
+      state.source = source;
+      source.onmessage = async (event) => {
+        const body = JSON.parse(event.data);
+        const seq = Number(body.seq || event.lastEventId || 0);
+        if (seq && seq <= state.lastSeq) return;
+        if (seq) state.lastSeq = seq;
+        if (body.type === "job_finished" || body.type === "job_failed" || body.type === "job_cancelled" || body.type === "job_timed_out") {
+          state.terminal = true;
+          source.close();
+          const response = await fetch(`/api/jobs/${jobId}`);
+          showJob(await response.json());
+          await loadSessions();
+          const current = await fetch(`/api/sessions/${state.sessionId}`);
+          if (current.ok) await openSession(state.sessionId);
+        } else {
+          const response = await fetch(`/api/jobs/${jobId}`);
+          const job = await response.json();
+          badge(job.status);
+          renderEvents(job.events);
+          cancelButton.hidden = false;
+        }
+      };
+      source.onerror = () => {
+        source.close();
+        if (state.terminal || state.jobId !== jobId) return;
+        setTimeout(() => listen(jobId), 500);
+      };
+    }
+
+    async function ask(text) {
+      if (!state.sessionId) await createSession();
+      askButton.disabled = true;
+      const response = await fetch(`/api/sessions/${state.sessionId}/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          text,
+          idempotency_key: crypto.randomUUID(),
+          model_id: document.querySelector("#model").value,
+          reasoning: document.querySelector("#reasoning").value,
+        }),
+      });
+      const job = await response.json();
+      if (!response.ok) {
+        askButton.disabled = false;
+        resultEl.textContent = job.error?.message || "提交失败";
+        return;
+      }
+      showJob(job);
+      listen(job.job_id);
+    }
+
+    document.querySelector("#new-session").addEventListener("click", () => createSession());
+    askButton.addEventListener("click", () => ask(questionEl.value));
+    cancelButton.addEventListener("click", async () => {
+      if (!state.jobId) return;
+      const response = await fetch(`/api/jobs/${state.jobId}/cancel`, { method: "POST" });
+      showJob(await response.json());
+    });
+
+    const prompts = document.querySelector("#prompts");
+    fetch("/api/demo").then((response) => response.json()).then((body) => {
+      document.querySelector("#banner").textContent = "本地模拟：虚构游戏 Starlane Drift，只读合成库，未连接生产数据。";
+      for (const question of body.questions) {
+        const button = document.createElement("button");
+        button.className = "secondary";
+        button.textContent = question.label;
+        button.addEventListener("click", () => {
+          questionEl.value = question.text;
+          ask(question.text);
+        });
+        prompts.append(button);
+      }
+    });
+    fetch("/api/health").then((response) => response.json()).then((health) => {
+      const banner = document.querySelector("#banner");
+      const select = document.querySelector("#model");
+      const reasoning = document.querySelector("#reasoning");
+      state.models = health.model_catalog?.models ?? [];
+      const fillReasoning = () => {
+        const model = state.models.find((item) => item.id === select.value) || state.models[0];
+        reasoning.innerHTML = "";
+        for (const level of model?.reasoning ?? ["off"]) {
+          const option = document.createElement("option");
+          option.value = level;
+          option.textContent = level;
+          reasoning.append(option);
+        }
+      };
+      for (const model of state.models) {
+        const option = document.createElement("option");
+        option.value = model.id;
+        option.textContent = `${model.id}（${model.provider}，${model.verified_here ? "仅本机协议已验证" : "未做外部联调"}）`;
+        select.append(option);
+      }
+      select.addEventListener("change", fillReasoning);
+      fillReasoning();
+      if (health.model_mode === "deterministic") {
+        banner.textContent = "演示模式：槽位编译器，不是通用语言理解。只读合成库，不是生产数据。";
+      } else if (health.model_provider === "faux") {
+        banner.textContent = "Pi 会话：本地 faux 模型，不是外部模型。业务查询走本机只读库。";
+      } else if (health.remote_dispatch === false) {
+        banner.textContent = "Pi 会话：只向 127.0.0.1 派发已验证的 openai-completions。这不是外部供应商联调，远程 HTTPS 默认关闭。";
+      } else {
+        banner.textContent = "Pi 会话：模型由服务端目录决定。没有密钥时不会改回演示结果。";
+      }
+    });
+    fetch("/api/sessions")
+      .then((response) => response.json())
+      .then((body) => {
+        const saved = sessionStorage.getItem("lumenfox-session");
+        const known = body.sessions?.find((item) => item.session_id === saved);
+        const latest = known || body.sessions?.at(-1);
+        if (latest) return openSession(latest.session_id);
+        return createSession();
+      });
+  </script>
+</body>
+</html>

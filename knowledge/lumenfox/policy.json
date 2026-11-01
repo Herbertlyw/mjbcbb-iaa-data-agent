@@ -1,0 +1,32 @@
+{
+  "policy_revision": "policy-lumenfox-r1",
+  "simulated": true,
+  "note": "这是虚构权限。搜索命中不会写入读取许可，资产 ID 也不是查询凭证。",
+  "roles": {
+    "analyst": {
+      "read": [
+        "catalog.starlane",
+        "catalog.staging_notes",
+        "metric.new_users",
+        "metric.ad_revenue",
+        "sop.weekly_channel",
+        "sql.example_weekly",
+        "sql.verified",
+        "policy.analyst",
+        "metric.roi",
+        "join.rules",
+        "case.ember",
+        "contract.daily_unit_economics",
+        "contract.daily_installs",
+        "contract.daily_ad_revenue",
+        "contract.player_device_map",
+        "contract.legacy_installs"
+      ],
+      "query_tables": ["daily_installs", "daily_ad_revenue", "daily_unit_economics", "player_device_map"]
+    },
+    "viewer": {
+      "read": [],
+      "query_tables": []
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "asset_id": "contract.finance_ledger",
+  "revision": "contract-finance-ledger-r1",
+  "table": "finance_ledger",
+  "engine": "sqlite-local",
+  "simulated": true,
+  "valid_from": "2026-01-01",
+  "valid_until": "2027-04-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": {
+    "as_of": "2026-10-13T09:00:00-07:00",
+    "status": "fresh",
+    "note": "虚构流水，分析师角色不能访问。"
+  },
+  "must_filter": ["event_date"],
+  "columns": [
+    { "name": "event_date", "type": "date", "description": "当地日历日" },
+    { "name": "amount_usd", "type": "real", "description": "虚构金额" }
+  ],
+  "sensitive_columns": [],
+  "notes": "当前分析师政策不授予读取和查询。"
+}
