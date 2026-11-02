@@ -45,6 +45,37 @@ export async function clickHouseQuery(client: ClickHouseClient, sql: string, sig
   return rows.map(normalizeRow);
 }
 
+/** Read a bounded complete result, or stop after observing the first row over
+ * either limit. A truncated result's count is only a lower bound. */
+export async function clickHouseQueryBounded(client: ClickHouseClient, sql: string, maxRows: number, maxBytes: number, signal?: AbortSignal): Promise<{ rows: Array<Record<string, unknown>>; column_types: Record<string, string>; observed_rows: number; truncated: boolean; query_id: string }> {
+  const result = await client.query({ query: sql, format: "JSONCompactEachRowWithNamesAndTypes", abort_signal: signal, clickhouse_settings: { max_block_size: "1024" } });
+  const rows: Array<Record<string, unknown>> = []; let names: string[] | null = null; let types: string[] | null = null; let bytes = 2; let observed = 0; let truncated = false;
+  try {
+    outer: for await (const chunk of result.stream<unknown[]>()) {
+      for (const line of chunk) {
+        const cells = line.json();
+        if (!Array.isArray(cells)) throw new Error("invalid_clickhouse_result_shape");
+        if (!names) {
+          if (cells.some((value) => typeof value !== "string") || new Set(cells).size !== cells.length) throw new Error("duplicate_or_invalid_result_columns");
+          names = cells as string[]; continue;
+        }
+        if (!types) {
+          if (cells.length !== names.length || cells.some((value) => typeof value !== "string")) throw new Error("invalid_result_types");
+          types = cells as string[]; continue;
+        }
+        if (cells.length !== names.length) throw new Error("invalid_clickhouse_result_shape");
+        observed += 1;
+        const row = Object.fromEntries(names.map((name, index) => [name, cells[index]]));
+        const size = Buffer.byteLength(JSON.stringify(row)) + (rows.length ? 1 : 0);
+        if (rows.length >= maxRows || bytes + size > maxBytes) { truncated = true; break outer; }
+        rows.push(normalizeRow(row)); bytes += size;
+      }
+    }
+    if (!names || !types) throw new Error("missing_result_types");
+    return { rows, column_types: Object.fromEntries(names.map((name, index) => [name, types![index]!])), observed_rows: observed, truncated, query_id: result.query_id };
+  } finally { result.close(); }
+}
+
 export async function clickHouseCommand(client: ClickHouseClient, sql: string): Promise<void> {
   await client.command({ query: sql });
 }
