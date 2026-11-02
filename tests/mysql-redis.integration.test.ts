@@ -295,9 +295,37 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
       assert.ok(result && ["needs_clarification", "partial", "completed"].includes(result.status), JSON.stringify(result?.error));
       assert.equal(result.events.filter((event) => event.type === "job_finished").length, 1);
       assert.deepEqual(result.events.map((event) => event.seq), result.events.map((_, index) => index + 1));
+      const resourceSession = slowRuntime.sessions.create("analyst");
+      const resourceJob = slowRuntime.jobs.submit(resourceSession.session_id, "合成查询", `slow-resource-${randomUUID()}`);
+      const resourceClaim = await state.call("claimJob", resourceJob.job_id, slowRuntime.jobs.workerOwner, Date.now(), 10000);
+      assert.ok(resourceClaim);
+      slowRuntime.sessions.setActiveJob(resourceSession.session_id, resourceJob.job_id, { owner: resourceClaim.owner, fence: resourceClaim.fence });
+      await bindTables(slowRuntime, resourceSession.session_id, ["contract.daily_installs"]);
+      await snapshotDb.query("CREATE TRIGGER test_slow_resource BEFORE INSERT ON resources FOR EACH ROW DO SLEEP(0.7)");
+      const query = slowRuntime.tools.query(resourceSession.session_id, { sql: "SELECT event_date, new_users FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'" });
+      let resourceSleeping = false;
+      for (let attempt = 0; attempt < 100 && !resourceSleeping; attempt += 1) {
+        const [rows] = await snapshotDb.query("SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE USER = ? AND STATE = 'User sleep'", [user]);
+        resourceSleeping = Number((rows as Array<{ n: number }>)[0]?.n ?? 0) > 0;
+        if (!resourceSleeping) await delay(20);
+      }
+      assert.equal(resourceSleeping, true, "未观察到隔离 MySQL 的慢资源写入");
+      const resourceStart = Date.now();
+      await delay(80);
+      assert.ok(Date.now() - resourceStart < 500, "工具资源写入不能冻结 worker 定时器");
+      const queryResult = await query;
+      assert.equal(queryResult.ok, true, JSON.stringify(queryResult));
+      if (queryResult.ok) {
+        const saved = await state.call("getResource", String(queryResult.resource_id));
+        assert.equal(saved?.job_id, resourceJob.job_id);
+        assert.equal(saved?.session_id, resourceSession.session_id);
+      }
+      assert.equal(await state.call("finish", resourceJob.job_id, resourceClaim.owner, resourceClaim.fence, "failed", null, { code: "synthetic_done", message: "测试完成" }), true);
+      slowRuntime.sessions.setActiveJob(resourceSession.session_id, undefined);
     } finally {
       await slowRun?.catch(() => undefined);
       await slowRuntime.close({ abandon: true });
+      await snapshotDb.query("DROP TRIGGER IF EXISTS test_slow_resource");
       await snapshotDb.query("DROP TRIGGER IF EXISTS test_slow_snapshot");
       await snapshotDb.end();
     }

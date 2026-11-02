@@ -57,10 +57,10 @@ export class JobService {
       mysqlAsyncState: () => Promise<AsyncMysqlStateStore>;
     },
   ) {
-    host.sessions.setRevisionFn((jobId) => {
+    host.sessions.setRevisionFn(async (jobId) => {
       const fence = this.boundFences.get(jobId);
       if (fence === undefined) return "memory";
-      const reserved = host.state.reserveRevision(jobId, this.owner, fence);
+      const reserved = await this.stateCall("reserveRevision", jobId, this.owner, fence);
       return reserved.ok ? reserved.count : "lost";
     });
   }
@@ -250,7 +250,7 @@ export class JobService {
       this.publish(jobId);
       return;
     }
-    const session = this.host.sessions.require(claimed.session_id);
+    const session = await this.host.sessions.requireAsync(claimed.session_id);
     this.host.sessions.setActiveJob(session.session_id, jobId, { owner: this.owner, fence });
     let timedOut = false;
     const timer = setTimeout(() => {
@@ -304,8 +304,8 @@ export class JobService {
         });
         if (outcome === "lost") lost = true;
       } else {
-      const progress = this.host.state.loadAgentSnapshot(session.session_id, { jobId, kind: "progress" });
-      const settled = progress ? null : this.host.state.loadAgentSnapshot(session.session_id, { kind: "settled" });
+      const progress = await this.stateCall("loadAgentSnapshot", session.session_id, { jobId, kind: "progress" });
+      const settled = progress ? null : await this.stateCall("loadAgentSnapshot", session.session_id, { kind: "settled" });
       const snapshot = (progress ?? settled)?.body as unknown as AgentTranscriptSnapshot | undefined;
       const restoredMessages = snapshot ? withoutUnfinishedToolCall(snapshot.messages) : [];
       const resumeInterrupted = Boolean(progress && snapshot && canContinueTranscript(restoredMessages));
@@ -314,7 +314,7 @@ export class JobService {
         : await ensureAgent(session, this.host.tools, this.host.config);
       this.host.sessions.rememberAgent(session.session_id, agent);
       this.localAgents.set(jobId, agent);
-      unsubscribe = agent.subscribe((event) => {
+      unsubscribe = agent.subscribe(async (event) => {
         if (event.type === "message_end" && event.message.role === "assistant") modelCalls += 1;
         if (event.type === "tool_execution_start") toolCalls += 1;
         if (event.type === "message_end" || event.type === "tool_execution_end") {
@@ -328,60 +328,59 @@ export class JobService {
           agentError = { code: "budget_exhausted", message: "模型调用或工具调用超过预算。未知 token 和费用不会被记成 0。受影响的结论不能当成已验证事实。" };
           agent.abort();
         }
-        if (lost || this.host.sessions.require(session.session_id).active_job_id !== jobId) return;
+        if (lost || this.localAgents.get(jobId) !== agent) return;
+        try {
         if (event.type === "message_end") {
-          const saved = this.host.state.saveAgentSnapshot({
+          const body = captureTranscript(agent, session.session_id) as unknown as Record<string, unknown>;
+          const saved = await this.stateCall("saveAgentSnapshot", {
             sessionId: session.session_id,
             jobId,
             owner: this.owner,
             fence,
             kind: "progress",
-            body: captureTranscript(agent, session.session_id) as unknown as Record<string, unknown>,
+            body,
           });
           if (!saved) lostFence();
           else if (event.message.role === "toolResult") {
-            this.host.state.appendEvent(jobId, this.owner, fence, "transcript_saved", {
+            const receipt = await this.stateCall("appendEvent", jobId, this.owner, fence, "transcript_saved", {
               tool_name: event.message.toolName,
               continuable: true,
               format: "pi-agent-state-messages-v1",
             });
-            this.publish(jobId);
+            if (!receipt) lostFence(); else this.publishEvent(jobId, receipt);
           }
         }
         if (event.type === "tool_execution_start") {
-          if (!this.host.state.appendEvent(jobId, this.owner, fence, "tool_started", { tool_name: event.toolName, args: sanitizeToolArgs(event.args) })) lostFence();
-          this.publish(jobId);
+          const started = await this.stateCall("appendEvent", jobId, this.owner, fence, "tool_started", { tool_name: event.toolName, args: sanitizeToolArgs(event.args) });
+          if (!started) lostFence(); else this.publishEvent(jobId, started);
         }
         if (event.type === "tool_execution_end") {
           const details = event.result && typeof event.result === "object" && "details" in event.result ? event.result.details : undefined;
           const record = details && typeof details === "object" ? (details as Record<string, unknown>) : {};
-          if (
-            !this.host.state.appendEvent(jobId, this.owner, fence, "tool_finished", {
+          const finished = await this.stateCall("appendEvent", jobId, this.owner, fence, "tool_finished", {
               tool_name: event.toolName,
               is_error: event.isError,
               code: record.code ?? null,
               resource_id: record.resource_id ?? null,
-            })
-          ) {
-            lostFence();
-          }
-          this.publish(jobId);
+            });
+          if (!finished) lostFence(); else this.publishEvent(jobId, finished);
         }
+        } catch { lostFence(); }
       });
       const prior = agent.state.messages.some((message) => message.role === "user")
         ? []
-        : this.host.state.listMessages(session.session_id).filter((message) => message.job_id !== jobId).map((message) => message.text);
+        : (await this.stateCall("listMessages", session.session_id)).filter((message) => message.job_id !== jobId).map((message) => message.text);
       if (JSON.stringify(agent.state.messages).length > this.host.config.maxContextChars) {
         agentError = { code: "budget_exhausted", message: "会话上下文超过上限。未知 token 不会被记成 0。" };
       } else if (resumeInterrupted) {
-        this.host.state.appendEvent(jobId, this.owner, fence, "model_context", contextProof(agent.state.messages, true));
-        await agent.continue();
+        const context = await this.stateCall("appendEvent", jobId, this.owner, fence, "model_context", contextProof(agent.state.messages, true));
+        if (!context) lostFence(); else await agent.continue();
       } else {
-        if (snapshot) this.host.state.appendEvent(jobId, this.owner, fence, "model_context", contextProof(agent.state.messages, false));
-        await agent.prompt(modelPrompt(this.host.config.modelMode, claimed.turn, claimed.user_text, prior));
+        if (snapshot && !await this.stateCall("appendEvent", jobId, this.owner, fence, "model_context", contextProof(agent.state.messages, false))) lostFence();
+        if (!lost) await agent.prompt(modelPrompt(this.host.config.modelMode, claimed.turn, claimed.user_text, prior));
       }
       if (!lost) {
-        this.host.state.saveAgentSnapshot({
+        const saved = await this.stateCall("saveAgentSnapshot", {
           sessionId: session.session_id,
           jobId,
           owner: this.owner,
@@ -389,6 +388,7 @@ export class JobService {
           kind: "settled",
           body: captureTranscript(agent, session.session_id) as unknown as Record<string, unknown>,
         });
+        if (!saved) lostFence();
       }
       }
     } catch {
@@ -498,10 +498,14 @@ export class JobService {
           ? {
               sessionId: input.sessionId,
               jobId: input.jobId,
-              actorId: this.host.sessions.require(input.sessionId).actor_id ?? "demo-analyst",
+              actorId: (await this.host.sessions.requireAsync(input.sessionId)).actor_id ?? "demo-analyst",
               owner: this.owner,
               fence: input.fence,
-              state: this.host.state,
+              state: {
+                beginProviderStep: (value) => this.stateCall("beginProviderStep", value),
+                saveProviderPayload: (value) => this.stateCall("saveProviderPayload", value),
+                settleProviderStep: (value) => this.stateCall("settleProviderStep", value),
+              },
             }
           : undefined,
       });

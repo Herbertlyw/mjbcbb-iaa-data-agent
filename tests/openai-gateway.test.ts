@@ -7,8 +7,43 @@ import test from "node:test";
 import { loadConfig, type AppConfig } from "../src/config.js";
 import { analyst, ask, openRuntime, waitForJob, withRuntime } from "./helpers.js";
 import { startFakeOpenAI } from "./openai-fake-server.js";
+import type { ProviderStepBegin, ProviderStepDecision, ProviderStepSettle } from "../src/state-store.js";
 
 const token = "fictional-loopback-token";
+
+test("异步供应商账本必须先预留再派发，结算落定前不执行工具", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: "happy" }), async (runtime) => {
+      let releaseBegin!: () => void; let releaseSettle!: () => void;
+      let markBegin!: () => void; let markSettle!: () => void;
+      const beginGate = new Promise<void>((resolve) => { releaseBegin = resolve; });
+      const settleGate = new Promise<void>((resolve) => { releaseSettle = resolve; });
+      const beginSeen = new Promise<void>((resolve) => { markBegin = resolve; });
+      const settleSeen = new Promise<void>((resolve) => { markSettle = resolve; });
+      const originalBegin = runtime.state.beginProviderStep.bind(runtime.state);
+      const originalSettle = runtime.state.settleProviderStep.bind(runtime.state);
+      const injected = runtime.state as unknown as { beginProviderStep: (input: ProviderStepBegin) => Promise<ProviderStepDecision>; settleProviderStep: (input: ProviderStepSettle) => Promise<ProviderStepDecision> };
+      let firstBegin = true; let firstSettle = true;
+      injected.beginProviderStep = async (input) => { if (firstBegin) { firstBegin = false; markBegin(); await beginGate; } return originalBegin(input); };
+      injected.settleProviderStep = async (input) => { if (firstSettle) { firstSettle = false; markSettle(); await settleGate; } return originalSettle(input); };
+      try {
+        const session = analyst(runtime);
+        const job = runtime.jobs.submit(session.session_id, "合成问题", crypto.randomUUID());
+        await beginSeen;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        assert.equal(fake.observations.length, 0, "预算尚未预留时不能派发");
+        releaseBegin();
+        await settleSeen;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        assert.equal(runtime.jobs.require(job.job_id).events.some((event) => event.type === "tool_started"), false, "结算未落定前不能执行工具");
+        releaseSettle();
+        const result = await waitForJob(runtime, job.job_id);
+        assert.ok(result.events.some((event) => event.type === "tool_started"));
+      } finally { releaseBegin(); releaseSettle(); }
+    });
+  } finally { await fake.close(); }
+});
 
 test("openai-compatible 缺少配置、远程地址或未知参数时失败，不会改用 faux", () => {
   assert.throws(() => loadConfig(gateway({ piBaseUrl: "" })), /PI_BASE_URL/);

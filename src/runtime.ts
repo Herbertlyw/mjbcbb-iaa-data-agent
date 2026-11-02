@@ -30,7 +30,9 @@ export class Runtime {
     readonly state: StateStore,
     readonly clickhouse: ReturnType<typeof createClickHouseClient> | null = null,
   ) {
-    this.sessions = new SessionStore(state);
+    this.sessions = new SessionStore(state, async (sessionId, lease, maxCalls) => config.stateMode === "mysql"
+      ? (await this.mysqlAsyncState()).call("reserveToolCall", sessionId, lease, maxCalls)
+      : state.reserveToolCall(sessionId, lease, maxCalls), config.stateMode === "mysql" ? () => this.mysqlAsyncState() : undefined);
     this.tools = new ToolService({
       config,
       knowledge,
@@ -49,7 +51,8 @@ export class Runtime {
     else await this.jobs.stop();
     this.closing = true;
     this.db.close();
-    this.state.close();
+    if (this.state instanceof MysqlStateStore) await this.state.closeAsync();
+    else this.state.close();
     const asyncState = this.asyncState ?? await this.asyncStateOpening?.catch(() => null);
     if (asyncState) await asyncState.close();
     const freshness = this.mysqlFreshness ?? await this.mysqlFreshnessOpening;

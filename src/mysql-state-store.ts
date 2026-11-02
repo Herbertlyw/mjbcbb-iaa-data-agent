@@ -17,15 +17,12 @@ export interface MysqlConnection {
  * Redis 不在这里。队列消息不能改变租约、围栏或终态。
  */
 export class MysqlStateStore implements StateStore {
-  private readonly worker: Worker;
+  private worker: Worker | null = null;
   private readonly sleep = new Int32Array(new SharedArrayBuffer(4));
   private closed = false;
 
-  constructor(connection: MysqlConnection) {
+  constructor(private readonly connection: MysqlConnection) {
     if (connection.host !== "127.0.0.1") throw new Error("MySQL 状态库只接受 127.0.0.1 上的隔离实例");
-    this.worker = new Worker(new URL("./mysql-bridge-worker.mjs", import.meta.url), { workerData: connection });
-    this.worker.unref();
-    this.call("ping", []);
   }
 
   createSession(session: StoredSession): StoredSession {
@@ -170,6 +167,7 @@ export class MysqlStateStore implements StateStore {
 
   close(): void {
     if (this.closed) return;
+    if (!this.worker) { this.closed = true; return; }
     this.closed = true;
     try {
       this.call("close", []);
@@ -179,8 +177,20 @@ export class MysqlStateStore implements StateStore {
     void this.worker.terminate();
   }
 
+  async closeAsync(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    const worker = this.worker;
+    this.worker = null;
+    if (worker) await worker.terminate();
+  }
+
   private call<T>(op: string, args: unknown[]): T {
     if (this.closed && op !== "close") throw new Error("mysql state store closed");
+    if (!this.worker) {
+      this.worker = new Worker(new URL("./mysql-bridge-worker.mjs", import.meta.url), { workerData: this.connection });
+      this.worker.unref();
+    }
     const channel = new MessageChannel();
     this.worker.postMessage({ op, args, port: channel.port2 }, [channel.port2]);
     const deadline = Date.now() + 20_000;

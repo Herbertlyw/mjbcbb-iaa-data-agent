@@ -13,6 +13,7 @@ if (config.host !== "127.0.0.1") {
   process.exit(1);
 }
 const runtime = createRuntime(config);
+await runtime.mysqlAsyncState();
 const server = startServer(runtime);
 server.listen(config.port, config.host, () => {
   console.log(`Lumenfox API：http://${config.host}:${config.port}`);

@@ -4,11 +4,12 @@ import { assessCoverage, combineCoverage, coverageHasGap, provenCoverageFilters,
 import { plainRows } from "./database.js";
 import { verifyCell, type CellOperation, type VerifiedCell } from "./evidence.js";
 import { compareVerifiedIntegers, type VerifiedComparison } from "./evidence-comparison.js";
+import { compareDecimalAggregates, type AggregateComparison } from "./aggregate-comparison.js";
 import { verifyDatabaseAggregates, type VerifiedAggregate } from "./aggregate-evidence.js";
 import { freshnessManifest, freshnessPeriodKey, matchesFreshnessManifest, readPublication, type FreshnessPublication } from "./freshness.js";
 import type { MysqlFreshnessStore } from "./mysql-freshness.js";
 import { canQueryTable, canRead, contractValidity, tableGrain } from "./knowledge.js";
-import { newId, type SessionStore } from "./session.js";
+import { newId, type SessionRecord, type SessionStore } from "./session.js";
 import type {
   AnalysisRecord,
   AnalysisStatus,
@@ -21,7 +22,7 @@ import type {
   SessionResource,
   ToolFailure,
 } from "./types.js";
-import { clickHouseColumns, clickHouseQuery } from "./clickhouse-client.js";
+import { clickHouseColumns, clickHouseColumnTypes, clickHouseQuery } from "./clickhouse-client.js";
 import { assertJoinKeys, guardSql, parseReadonlySql, SqlRejected, type TableRule } from "./sql.js";
 import type { ClickHouseClient } from "@clickhouse/client";
 import type { DatabaseSync } from "node:sqlite";
@@ -44,14 +45,14 @@ export class ToolService {
 
   constructor(private readonly ctx: ToolContext) { this.configuredScanLimit = ctx.config.clickhouseMaxRowsToRead; }
 
-  reserveToolCall(sessionId: string): "ok" | "budget_exhausted" | "lost" {
+  async reserveToolCall(sessionId: string): Promise<"ok" | "budget_exhausted" | "lost"> {
     return this.ctx.sessions.reserveToolCall(sessionId, this.ctx.config.maxToolCalls);
   }
 
   async searchAssets(sessionId: string, input: { query?: string; kinds?: string[] }, signal?: AbortSignal): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
-    const session = this.ctx.sessions.require(sessionId);
+    const session = await this.ctx.sessions.requireAsync(sessionId);
     const query = (input.query ?? "").trim().toLowerCase();
     const kinds = new Set(input.kinds ?? []);
     const hits = this.ctx.knowledge.assets
@@ -89,7 +90,7 @@ export class ToolService {
   async readAsset(sessionId: string, input: { asset_id?: string; body_offset?: number; body_limit?: number; expected_content_hash?: string }, signal?: AbortSignal): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
-    const decision = this.authorizeRead(sessionId, input.asset_id ?? "");
+    const decision = await this.authorizeRead(sessionId, input.asset_id ?? "");
     if (!decision.ok) return decision;
     const offset = input.body_offset ?? 0;
     const limit = input.body_limit ?? 4000;
@@ -165,14 +166,14 @@ export class ToolService {
   async readDataContractView(sessionId: string, input: { asset_id?: string }, signal?: AbortSignal): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
-    const decision = this.authorizeRead(sessionId, input.asset_id ?? "");
+    const decision = await this.authorizeRead(sessionId, input.asset_id ?? "");
     if (!decision.ok) return { ...decision, asset_id: input.asset_id ?? "" };
     const asset = decision.asset;
     if (asset.kind !== "data_contract" || !asset.contract) {
       return fail("missing_data_contract", "这个资产没有数据契约", { asset_id: asset.asset_id });
     }
     const contract = asset.contract;
-    const session = this.ctx.sessions.require(sessionId);
+    const session = await this.ctx.sessions.requireAsync(sessionId);
     const validity = contractValidity(contract, currentCalendarDate(this.ctx.config, contract.timezone));
     const allowed = canQueryTable(this.ctx.knowledge, session.role, contract.table);
     const queryable = !validity && allowed;
@@ -196,7 +197,7 @@ export class ToolService {
       read_at: new Date().toISOString(),
     };
     session.bindings = [...session.bindings.filter((item) => item.table !== contract.table), binding];
-    this.ctx.sessions.save(session);
+    await this.ctx.sessions.saveAsync(session);
     return {
       ok: true,
       asset_id: asset.asset_id,
@@ -229,24 +230,25 @@ export class ToolService {
   async query(sessionId: string, input: { sql?: string; purpose?: string }, signal?: AbortSignal): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
-    const session = this.ctx.sessions.require(sessionId);
+    const session = await this.ctx.sessions.requireAsync(sessionId);
     const sql = input.sql ?? "";
     let guarded;
     try {
       const parsed = parseReadonlySql(sql);
-      const rules = parsed.tables.map((table) => this.ruleFor(session.session_id, session.role, table));
+      const rules = parsed.tables.map((table) => this.ruleFor(session, table));
       guarded = guardSql(sql, rules, this.ctx.businessEngine === "clickhouse" ? "clickhouse" : "sqlite");
     } catch (error) {
       if (error instanceof SqlRejected) return fail(error.code, error.message);
       throw error;
     }
-    const bindings = guarded.tables.map((table) => this.queryableBinding(session.session_id, table));
+    const bindings = guarded.tables.map((table) => this.queryableBinding(session, table));
     const timezones = new Set(bindings.map((binding) => binding.timezone));
     if (timezones.size !== 1) return fail("timezone_conflict", "一张查询里的契约时区不一致");
     const revisions = new Set(bindings.map((binding) => binding.registry_revision));
     if (revisions.size !== 1 || !revisions.has(this.ctx.knowledge.registry_revision)) {
       return fail("stale_data_contract_binding", "契约绑定不是当前目录修订");
     }
+    const decimalTypes: Record<string, string> = {};
     for (const binding of bindings) {
       const asset = this.ctx.knowledge.by_id.get(binding.asset_id);
       if (!asset || asset.content_hash !== binding.content_hash) {
@@ -257,6 +259,15 @@ export class ToolService {
       const expected = [...binding.allowed_columns, ...binding.sensitive_columns];
       if (expected.some((column) => !columns.has(column))) {
         return fail("schema_contract_mismatch", `${binding.table} 的库表字段和契约不一致`);
+      }
+      const decimalColumns = asset.contract?.columns.filter((column) => /^(?:nullable\()?\s*decimal\(/iu.test(column.type)) ?? [];
+      if (decimalColumns.length && this.ctx.businessEngine === "clickhouse" && this.ctx.clickhouse) {
+        const actual = await clickHouseColumnTypes(this.ctx.clickhouse, binding.table);
+        for (const column of decimalColumns) {
+          const actualType = actual[column.name];
+          if (!actualType || actualType.replace(/\s/gu, "").toLowerCase() !== column.type.replace(/\s/gu, "").toLowerCase()) return fail("schema_contract_mismatch", `${binding.table} 的十进制类型与契约不一致`);
+          decimalTypes[`${binding.table}.${column.name}`] = actualType;
+        }
       }
     }
     try {
@@ -347,6 +358,7 @@ export class ToolService {
       engine: this.ctx.businessEngine === "clickhouse" ? "clickhouse-local" : "sqlite-local",
       elapsed_ms: elapsedMs,
       ...(this.ctx.businessEngine === "clickhouse" ? { scan_limit: this.configuredScanLimit } : {}),
+      ...(Object.keys(decimalTypes).length ? { decimal_types: decimalTypes } : {}),
       simulated: true,
       sql: guarded.sql,
       tables: guarded.tables,
@@ -366,7 +378,7 @@ export class ToolService {
       coverage,
       freshness_receipts: freshnessReceipts,
     };
-    this.ctx.sessions.saveResource(resource);
+    await this.ctx.sessions.saveResourceAsync(resource);
     return {
       ok: true,
       resource_id: resource.resource_id,
@@ -400,11 +412,11 @@ export class ToolService {
   ): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
-    const found = this.ctx.sessions.lookupResource(sessionId, input.resource_id ?? "");
+    const found = await this.ctx.sessions.lookupResourceAsync(sessionId, input.resource_id ?? "");
     if (!found.ok) return fail(found.code, found.message);
     if (found.resource.kind !== "query_result") return fail("resource_not_calculable", "只能计算查询结果资源");
     const source = found.resource;
-    const activeJob = this.ctx.sessions.require(sessionId).active_job_id;
+    const activeJob = (await this.ctx.sessions.requireAsync(sessionId)).active_job_id;
     if (activeJob && source.job_id !== activeJob) return fail("resource_from_other_execution", "只能计算当前任务的查询结果；请重新查询并复核契约与新鲜度。");
     const cells: Record<string, number> = {};
     const notes: string[] = [];
@@ -419,7 +431,7 @@ export class ToolService {
       session_id: sessionId,
       kind: "calculation",
       created_at: new Date().toISOString(),
-      ...(sessionId && this.ctx.sessions.require(sessionId).active_job_id ? { job_id: this.ctx.sessions.require(sessionId).active_job_id } : {}),
+      ...(activeJob ? { job_id: activeJob } : {}),
       source_resource_id: source.resource_id,
       cells,
       operations,
@@ -430,7 +442,7 @@ export class ToolService {
       predicted_means: "forecast_not_actual",
       notes,
     };
-    this.ctx.sessions.saveResource(resource);
+    await this.ctx.sessions.saveResourceAsync(resource);
     return {
       ok: true,
       resource_id: resource.resource_id,
@@ -449,7 +461,7 @@ export class ToolService {
   async readSessionResource(sessionId: string, input: { resource_id?: string; row_offset?: number; row_limit?: number; columns?: string[]; expected_resource_hash?: string }, signal?: AbortSignal): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
-    const found = this.ctx.sessions.lookupResource(sessionId, input.resource_id ?? "");
+    const found = await this.ctx.sessions.lookupResourceAsync(sessionId, input.resource_id ?? "");
     if (!found.ok) return fail(found.code, found.message);
     const hash = createHash("sha256").update(JSON.stringify(found.resource)).digest("hex");
     const offset = input.row_offset ?? 0;
@@ -482,7 +494,7 @@ export class ToolService {
   async updateAnalysis(sessionId: string, input: AnalysisInput, signal?: AbortSignal): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
-    const session = this.ctx.sessions.require(sessionId);
+    const session = await this.ctx.sessions.requireAsync(sessionId);
     const jobId = session.active_job_id ?? "";
     const citations: AnalysisRecord["citations"] = [];
     const sources: AnalysisRecord["sources"] = [];
@@ -490,7 +502,7 @@ export class ToolService {
     const reasons: string[] = [];
     const resources: SessionResource[] = [];
     for (const resourceId of input.resource_ids ?? []) {
-      const found = this.ctx.sessions.lookupResource(sessionId, resourceId);
+      const found = await this.ctx.sessions.lookupResourceAsync(sessionId, resourceId);
       if (!found.ok) {
         reasons.push(found.code);
         continue;
@@ -500,7 +512,7 @@ export class ToolService {
         continue;
       }
       if (found.resource.kind === "calculation" && jobId) {
-        const source = this.ctx.sessions.lookupResource(sessionId, found.resource.source_resource_id);
+        const source = await this.ctx.sessions.lookupResourceAsync(sessionId, found.resource.source_resource_id);
         if (!source.ok || source.resource.kind !== "query_result" || source.resource.job_id !== jobId || !(input.resource_ids ?? []).includes(source.resource.resource_id)) {
           reasons.push("resource_from_other_execution");
           continue;
@@ -532,7 +544,7 @@ export class ToolService {
     const claimsNumbers = input.suggested_status === "completed" || input.suggested_status === "partial";
     const verifiedQueries = sources.filter((source) => source.sql && source.freshness_receipts.length > 0);
     if (claimsNumbers && !input.clarification_question && verifiedQueries.length === 0) {
-      const attempt = this.nextRevision(sessionId, jobId);
+      const attempt = await this.nextRevision(sessionId, jobId);
       if (attempt === "lost") return fail("provider_fence_rejected", "任务围栏已经变化，修订次数没有重置。");
       if (attempt <= 1) {
         return fail("evidence_feedback", "候选回答缺少本次执行的成功查询和新鲜度回执。请改为引用本次查询资源，或改成澄清。模型文字里的数字不会被采用。", {
@@ -639,6 +651,7 @@ export class ToolService {
       calculations.push({ resource_id: resource.resource_id, source_resource_id: resource.source_resource_id, cells, verified_cells: accepted, input_truncated: resource.input_truncated, complete_population: resource.complete_population });
     }
     const comparisons: VerifiedComparison[] = [];
+    const aggregateComparisons: AggregateComparison[] = [];
     for (const request of (input.comparisons ?? []).slice(0, 20)) {
       if (!request || !request.left || !request.right || typeof request.left.resource_id !== "string" || typeof request.left.cell !== "string" || typeof request.right.resource_id !== "string" || typeof request.right.cell !== "string") {
         reasons.push("comparison_unverifiable");
@@ -654,7 +667,13 @@ export class ToolService {
         { calculation_id: request.right.resource_id, cell: request.right.cell, source: b }, aSource, bSource, contract,
       );
       if (comparison) comparisons.push(comparison);
-      else reasons.push("comparison_unverifiable");
+      else {
+        const left = aggregates.filter((item) => item.source_resource_id === request.left.resource_id && item.output_column === request.left.cell);
+        const right = aggregates.filter((item) => item.source_resource_id === request.right.resource_id && item.output_column === request.right.cell);
+        const decimal = left.length === 1 && right.length === 1 ? compareDecimalAggregates(left[0]!, right[0]!) : null;
+        if (decimal) aggregateComparisons.push(decimal);
+        else reasons.push("comparison_unverifiable");
+      }
     }
     if (input.comparisons && input.comparisons.length > 20) reasons.push("comparison_unverifiable");
     if (reasons.includes("comparison_unverifiable") && status === "completed") status = "partial";
@@ -681,7 +700,7 @@ export class ToolService {
     if (reasons.includes("predicted_values_disclosed")) limitations.push("预测值和实际值分开列出。");
     if (aggregates.some((item) => Object.keys(item.group).length)) limitations.push("分组只展示查询中出现的取值，未出现的组合没有补零。");
     limitations.push("数据来自本地合成库，不是生产数据。");
-    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...comparisons.map(renderComparison), ...aggregates.map(renderAggregate)];
+    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...comparisons.map(renderComparison), ...aggregates.map(renderAggregate), ...aggregateComparisons.map(renderAggregateComparison)];
     let answer = renderAnswer(status, verified, sources, input.clarification_question, derivedLines);
     const draftNumbers = input.draft_answer.match(/\d+(?:\.\d+)?/g) ?? [];
     if (draftNumbers.some((item) => !answer.includes(item))) {
@@ -701,6 +720,7 @@ export class ToolService {
       sources,
       calculations,
       comparisons,
+      aggregate_comparisons: aggregateComparisons,
       aggregates,
       model_suggested_status: input.suggested_status,
       model_draft: input.draft_answer,
@@ -716,8 +736,8 @@ export class ToolService {
     };
   }
 
-  private nextRevision(sessionId: string, jobId: string): number | "lost" {
-    const persisted = this.ctx.sessions.consumeRevision(jobId);
+  private async nextRevision(sessionId: string, jobId: string): Promise<number | "lost"> {
+    const persisted = await this.ctx.sessions.consumeRevision(jobId);
     if (persisted === "lost") return "lost";
     if (typeof persisted === "number") return persisted;
     const key = jobId || sessionId;
@@ -780,8 +800,8 @@ export class ToolService {
     return combineCoverage(parts);
   }
 
-  private authorizeRead(sessionId: string, assetId: string): { ok: true; asset: KnowledgeBase["assets"][number] } | ToolFailure {
-    const session = this.ctx.sessions.require(sessionId);
+  private async authorizeRead(sessionId: string, assetId: string): Promise<{ ok: true; asset: KnowledgeBase["assets"][number] } | ToolFailure> {
+    const session = await this.ctx.sessions.requireAsync(sessionId);
     const asset = this.ctx.knowledge.by_id.get(assetId);
     if (!asset) return fail("asset_not_found", "没有这个资产", { asset_id: assetId });
     if (asset.status !== "published") return fail("asset_not_published", "资产尚未发布", { asset_id: assetId });
@@ -791,7 +811,7 @@ export class ToolService {
     return { ok: true, asset };
   }
 
-  private ruleFor(sessionId: string, role: string, table: string): TableRule {
+  private ruleFor(session: SessionRecord, table: string): TableRule {
     if (table.startsWith("sqlite_")) throw new SqlRejected("system_table", `系统表 ${table} 不能查询`);
     const contractAsset = this.ctx.knowledge.contract_by_table.get(table);
     if (!contractAsset?.contract) {
@@ -803,8 +823,7 @@ export class ToolService {
     if (validity === "expired") throw new SqlRejected("expired_contract", `${table} 的契约已过期`);
     if (validity === "not_yet_valid") throw new SqlRejected("contract_not_yet_valid", `${table} 的契约尚未生效`);
     if (validity === "invalid") throw new SqlRejected("invalid_contract_period", `${table} 的契约有效期无效`);
-    if (!canQueryTable(this.ctx.knowledge, role, table)) throw new SqlRejected("table_not_authorized", `当前角色不能查询 ${table}`);
-    const session = this.ctx.sessions.require(sessionId);
+    if (!canQueryTable(this.ctx.knowledge, session.role, table)) throw new SqlRejected("table_not_authorized", `当前角色不能查询 ${table}`);
     const binding = session.bindings.find((item) => item.table === table);
     if (!binding) throw new SqlRejected("missing_data_contract_evidence", `${table} 还没有当前契约读取记录`);
     if (!binding.queryable) throw new SqlRejected(binding.deny_reason ?? "table_not_authorized", `${table} 的契约绑定不可查询`);
@@ -819,15 +838,14 @@ export class ToolService {
     };
   }
 
-  private queryableBinding(sessionId: string, table: string): ContractBinding {
-    const binding = this.ctx.sessions.require(sessionId).bindings.find((item) => item.table === table && item.queryable);
+  private queryableBinding(session: SessionRecord, table: string): ContractBinding {
+    const binding = session.bindings.find((item) => item.table === table && item.queryable);
     if (!binding) throw new SqlRejected("missing_data_contract_evidence", `${table} 没有可查询绑定`);
     return binding;
   }
 
   private async gate(sessionId: string, signal?: AbortSignal): Promise<ToolFailure | undefined> {
-    // Let timers and cancellation run between tools. This does not make an
-    // individual synchronous MySQL bridge call non-blocking.
+    // Let timers and cancellation run between tools.
     await new Promise<void>((resolve) => setImmediate(resolve));
     if (signal?.aborted) return fail("tool_cancelled", "工具已取消");
     const delay = this.ctx.config.toolDelayMs;
@@ -835,7 +853,7 @@ export class ToolService {
       const aborted = await delayUnlessAborted(delay, signal);
       if (aborted) return fail("tool_cancelled", "工具已取消");
     }
-    this.ctx.sessions.require(sessionId);
+    await this.ctx.sessions.requireAsync(sessionId);
     return undefined;
   }
 
@@ -908,6 +926,11 @@ function renderAggregate(item: VerifiedAggregate): string {
   const filters = Object.entries(item.filters).map(([key, value]) => `${key}=${value}`).join("，") || "无";
   const group = Object.entries(item.group).map(([key, value]) => `${key}=${value}`).join("，");
   return `${item.table}.${item.column}（${item.description}）：数据库${item.operation === "sum" ? "求和" : "非 NULL 计数"} ${item.value}；单位 ${item.unit}；实际（契约声明仅观察值）；筛选 ${filters}${group ? `；分组 ${group}` : ""}；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${item.source_resource_id}。`;
+}
+
+function renderAggregateComparison(item: AggregateComparison): string {
+  const scope = (value: VerifiedAggregate) => `${Object.entries({ ...value.filters, ...value.group }).map(([key, part]) => `${key}=${part}`).join("，")}；${value.range.start} 到 ${value.range.end}（${value.range.timezone}）；来源 ${value.source_resource_id}`;
+  return `${item.left.table}.${item.left.column} 精确十进制比较：${item.left.value}（${scope(item.left)}）减 ${item.right.value}（${scope(item.right)}）= ${item.difference} ${item.left.unit}；${item.ratio === null ? "基准为零，比例和变化率不可计算" : `比例 ${item.ratio}，变化率 ${item.change_percent}%（四舍五入，半数远离零）`}；实际（契约声明仅观察值）。`;
 }
 
 function computeCell(source: QueryResource, operation: CellOperation, notes: string[]): number {

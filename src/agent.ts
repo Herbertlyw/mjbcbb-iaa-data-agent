@@ -253,8 +253,9 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     ...tool,
     execute: async (id, params, signal, onUpdate) => {
       if (signal?.aborted) return pack({ ok: false, code: "tool_cancelled" });
-      const reservation = tools.reserveToolCall(sessionId);
+      const reservation = await tools.reserveToolCall(sessionId);
       if (reservation !== "ok") return pack({ ok: false, code: reservation === "lost" ? "execution_fence_rejected" : "budget_exhausted" });
+      if (signal?.aborted) return pack({ ok: false, code: "tool_cancelled" });
       return tool.execute(id, params, signal, onUpdate);
     },
   }));

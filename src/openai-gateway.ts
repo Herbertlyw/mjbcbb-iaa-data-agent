@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { streamSimple as openAICompletions } from "@earendil-works/pi-ai/api/openai-completions";
-import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEvent, type Model } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AppConfig } from "./config.js";
 import { thinkingLevelMap } from "./model-catalog.js";
@@ -12,7 +12,7 @@ export interface ProviderLedger {
   actorId: string;
   owner: string;
   fence: number;
-  state: StateStore;
+  state: { [K in "beginProviderStep" | "saveProviderPayload" | "settleProviderStep"]: (...args: Parameters<StateStore[K]>) => Promise<ReturnType<StateStore[K]>> };
 }
 
 export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfig, ledger: ProviderLedger): void {
@@ -37,11 +37,13 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
       },
     ],
     streamSimple: (model, context, options) => {
-      assertDispatchTarget(config.piBaseUrl);
+      const outer = createAssistantMessageEventStream();
       const estimate = estimateContextTokens(context);
       const stepId = `step_${randomUUID()}`;
       const started = Date.now();
-      const began = ledger.state.beginProviderStep({
+      void (async () => {
+      assertDispatchTarget(config.piBaseUrl);
+      const began = await ledger.state.beginProviderStep({
         stepId,
         sessionId: ledger.sessionId,
         jobId: ledger.jobId,
@@ -61,7 +63,7 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
         maxResourceBytes: config.maxResultBytes,
       });
       if (!began.ok) throw new Error(began.code);
-      const recorded = ledger.state.saveProviderPayload({
+      const recorded = await ledger.state.saveProviderPayload({
         payloadId: `req_${stepId}`,
         stepId,
         sessionId: ledger.sessionId,
@@ -73,12 +75,17 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
         body: JSON.stringify({ format: "metadata-only", estimated_input: estimate.tokens, estimate_source: estimate.source }),
       });
       if (!recorded) throw new Error("provider_fence_rejected");
+      if (options?.signal?.aborted) {
+        const settled = await ledger.state.settleProviderStep({ stepId, jobId: ledger.jobId, owner: ledger.owner, fence: ledger.fence, status: "error", inputTokens: null, outputTokens: null, usageSource: "unknown", durationMs: Date.now() - started, errorCode: "provider_cancelled" });
+        if (!settled.ok) throw new Error(settled.code);
+        throw new Error("provider_cancelled");
+      }
       const physical = { ...model, api: "openai-completions" as const, baseUrl: config.piBaseUrl, provider: "openai-compatible" };
       let stream;
       try {
         stream = openAICompletions(physical as Model<"openai-completions">, context, options);
       } catch (error) {
-        ledger.state.settleProviderStep({
+        const settled = await ledger.state.settleProviderStep({
           stepId,
           jobId: ledger.jobId,
           owner: ledger.owner,
@@ -90,26 +97,29 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
           durationMs: Date.now() - started,
           errorCode: safeProviderError(error).code,
         });
+        if (!settled.ok) throw new Error(settled.code);
         throw error;
       }
-      void stream.result().then(
-        (message) => settleFromMessage(ledger, stepId, started, message),
-        (error) => {
-          ledger.state.settleProviderStep({
-            stepId,
-            jobId: ledger.jobId,
-            owner: ledger.owner,
-            fence: ledger.fence,
-            status: "error",
-            inputTokens: null,
-            outputTokens: null,
-            usageSource: "unknown",
-            durationMs: Date.now() - started,
-            errorCode: safeProviderError(error).code,
-          });
-        },
-      );
-      return stream;
+      // Hold the terminal event until the response metadata and budget are
+      // durably settled. Otherwise Pi could start the next tool/model call
+      // while a failed or stale ledger write is still in flight.
+      let terminal: AssistantMessageEvent | undefined;
+      for await (const event of stream) {
+        if (event.type === "done" || event.type === "error") terminal = event;
+        else outer.push(event);
+      }
+      if (!terminal) throw new Error("provider_outcome_unknown");
+      const message = await stream.result();
+      await settleFromMessage(ledger, stepId, started, message);
+      outer.push(terminal);
+      outer.end(message);
+      })().catch((error: unknown) => {
+        const code = error instanceof Error && /mysql_state_(?:outcome_unknown|closed|operation_failed)/u.test(error.message) ? "provider_outcome_unknown" : safeProviderError(error).code;
+        const message: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "error", errorMessage: code, timestamp: started };
+        outer.push({ type: "error", reason: "error", error: message });
+        outer.end(message);
+      });
+      return outer;
     },
   });
 }
@@ -167,10 +177,10 @@ export function safeProviderError(error: unknown): { code: string; message: stri
   return { code: "provider_error", message: "供应商请求失败。日志不包含密钥、请求头或用户原文。" };
 }
 
-function settleFromMessage(ledger: ProviderLedger, stepId: string, started: number, message: AssistantMessage): void {
+async function settleFromMessage(ledger: ProviderLedger, stepId: string, started: number, message: AssistantMessage): Promise<void> {
   const sawUsage = message.usage.input > 0 || message.usage.output > 0 || message.usage.totalTokens > 0;
   const failed = message.stopReason === "error" || message.stopReason === "aborted";
-  ledger.state.saveProviderPayload({
+  const recorded = await ledger.state.saveProviderPayload({
     payloadId: `res_${stepId}`,
     stepId,
     sessionId: ledger.sessionId,
@@ -181,7 +191,8 @@ function settleFromMessage(ledger: ProviderLedger, stepId: string, started: numb
     kind: "response",
     body: JSON.stringify({ format: "metadata-only", failed, usage_source: sawUsage ? "simulated" : "unknown" }),
   });
-  ledger.state.settleProviderStep({
+  if (!recorded) throw new Error("provider_fence_rejected");
+  const settled = await ledger.state.settleProviderStep({
     stepId,
     jobId: ledger.jobId,
     owner: ledger.owner,
@@ -193,4 +204,5 @@ function settleFromMessage(ledger: ProviderLedger, stepId: string, started: numb
     durationMs: Date.now() - started,
     errorCode: failed ? safeProviderError(new Error(message.errorMessage || message.stopReason)).code : null,
   });
+  if (!settled.ok) throw new Error(settled.code);
 }

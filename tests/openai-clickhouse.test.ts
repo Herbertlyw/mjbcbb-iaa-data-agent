@@ -221,6 +221,28 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.ok(thirdResource.freshness_receipts.length > 0);
     await thirdDb.end();
     assert.ok(fake.observations.some((item) => item.userMessages.length === 3 && item.userMessages[2] === "日期改成 2026-10-06 到 2026-10-08。"));
+    const decimalSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const decimalSessionId = ((await decimalSession.json()) as { session_id: string }).session_id;
+    const decimal = await postQuestion(apiPort, decimalSessionId, "合成精确金额：比较 2026-10-06 和 2026-10-08。");
+    assert.equal(decimal.status, "completed", JSON.stringify(decimal.error));
+    assert.match(decimal.analysis?.answer ?? "", /90071992547409\.91/);
+    assert.match(decimal.analysis?.answer ?? "", /90071992547408\.91/);
+    assert.match(decimal.analysis?.answer ?? "", /90071992547409\.9100/);
+    assert.equal(decimal.analysis?.sources?.length, 2);
+    assert.equal(decimal.analysis?.sources?.every((source) => source.engine === "clickhouse-local" && source.freshness_receipts?.length), true);
+    const decimalIds = decimal.analysis?.sources?.map((source) => source.resource_id) ?? [];
+    assert.equal(new Set(decimalIds).size, 2);
+    const decimalDb = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password: statePassword, database: "lumenfox_it" });
+    try {
+      for (const id of decimalIds) {
+        const [rows] = await decimalDb.query("SELECT body_json FROM resources WHERE resource_id = ?", [id]);
+        const resource = JSON.parse(String((rows as Array<{ body_json: string }>)[0]?.body_json)) as { session_id: string; job_id: string; rows: Array<{ total: unknown }>; freshness_receipts: unknown[] };
+        assert.equal(resource.session_id, decimalSessionId);
+        assert.equal(resource.job_id, decimal.job_id);
+        assert.equal(typeof resource.rows[0]?.total, "string");
+        assert.ok(resource.freshness_receipts.length > 0);
+      }
+    } finally { await decimalDb.end(); }
     // Optional manual browser regression: a loopback proxy really drops the first
     // SSE socket and records the browser's subsequent cursor and event IDs.
     if (process.env.BROWSER_TRACE_DIR) {
@@ -429,7 +451,7 @@ async function waitJob(port: number, jobId: string) {
       job_id: string;
       error?: { code?: string; message?: string };
       usage?: { input_tokens: number | null; usage_source?: string };
-      analysis?: { status?: string; answer?: string; sources?: Array<{ engine?: string; resource_id?: string }> };
+      analysis?: { status?: string; answer?: string; sources?: Array<{ engine?: string; resource_id?: string; freshness_receipts?: unknown[] }> };
       events: Array<{ type: string; payload: Record<string, unknown> }>;
     };
     if (!["queued", "running"].includes(job.status)) return job;

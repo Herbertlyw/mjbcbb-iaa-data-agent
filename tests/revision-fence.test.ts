@@ -33,6 +33,6 @@ test("修订次数写在任务上，旧围栏不能增加，新运行时也不�
 test("直接工具调用没有围栏时仍使用进程内计数，避免把测试路径写进任务", async () => {
   await withRuntime({ startWorker: false }, async (runtime) => {
     const session = analyst(runtime);
-    assert.equal(runtime.sessions.consumeRevision("job_missing"), "memory");
+    assert.equal(await runtime.sessions.consumeRevision("job_missing"), "memory");
   });
 });

@@ -18,6 +18,7 @@ import { createRuntime } from "../src/runtime.js";
 import { resolveTurn } from "../src/turn.js";
 import { bulkInstalls, chunks, createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
 import { bindTables } from "./helpers.js";
+import { verifyDatabaseAggregates } from "../src/aggregate-evidence.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const knowledgeDir = path.join(root, "knowledge", "harborlight");
@@ -242,10 +243,47 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
 
 async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, reader: ReturnType<typeof createClickHouseClient>, freshnessPath: string) {
   const session = runtime.sessions.create("analyst");
-  await bindTables(runtime, session.session_id, ["contract.fact_fox_daily_install", "contract.fact_fox_daily_active", "contract.fact_fox_ad_receipt", "contract.fact_fox_daily_spend"]);
+  await bindTables(runtime, session.session_id, ["contract.fact_fox_daily_install", "contract.fact_fox_daily_active", "contract.fact_fox_daily_payment", "contract.fact_fox_ad_receipt", "contract.fact_fox_daily_spend"]);
   runtime.sessions.setActiveJob(session.session_id, "job_evidence_lineage");
   const time = "event_date >= '2026-10-06' AND event_date <= '2026-10-12'";
   const common = "title_id = 'paper_lantern' AND platform = 'ios'";
+  async function decimalDay(date: string) {
+    const result = await runtime.tools.query(session.session_id, { sql: `SELECT SUM(amount_usd) AS total FROM fact_fox_daily_payment WHERE event_date >= '${date}' AND event_date <= '${date}' AND ${common} AND country_code = 'US' AND channel_id = 'mist_ads'` });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    if (!result.ok) throw new Error("decimal query rejected");
+    return result;
+  }
+  const high = await decimalDay("2026-10-06");
+  const fraction = await decimalDay("2026-10-07");
+  const one = await decimalDay("2026-10-08");
+  const missing = await decimalDay("2026-10-09");
+  const zero = await decimalDay("2026-10-10");
+  assert.equal((high.rows as Array<{ total: unknown }>)[0]?.total, "90071992547409.91");
+  const highResource = runtime.sessions.lookupResource(session.session_id, String(high.resource_id));
+  const decimalContract = runtime.knowledge.contract_by_table.get("fact_fox_daily_payment")?.contract;
+  assert.ok(highResource.ok && highResource.resource.kind === "query_result" && decimalContract);
+  if (highResource.ok && highResource.resource.kind === "query_result" && decimalContract) {
+    assert.equal(verifyDatabaseAggregates({ ...highResource.resource, rows: [{ total: 90071992547409.9 }] }, decimalContract), null, "已转浮点的金额不可恢复精度");
+    assert.equal(verifyDatabaseAggregates({ ...highResource.resource, decimal_types: { "fact_fox_daily_payment.amount_usd": "Nullable(Decimal(19,2))" } }, decimalContract), null, "物理类型与契约不一致时不能交付");
+    assert.equal(verifyDatabaseAggregates({ ...highResource.resource, truncated: true }, decimalContract), null);
+  }
+  const exact = await runtime.tools.updateAnalysis(session.session_id, {
+    suggested_status: "completed", draft_answer: "", resource_ids: [high, fraction, one, zero].map((item) => String(item.resource_id)),
+    comparisons: [
+      { left: { resource_id: String(high.resource_id), cell: "total" }, right: { resource_id: String(one.resource_id), cell: "total" } },
+      { left: { resource_id: String(one.resource_id), cell: "total" }, right: { resource_id: String(fraction.resource_id), cell: "total" } },
+      { left: { resource_id: String(one.resource_id), cell: "total" }, right: { resource_id: String(zero.resource_id), cell: "total" } },
+    ],
+  });
+  assert.equal(exact.ok, true, JSON.stringify(exact));
+  if (!exact.ok) throw new Error("decimal analysis rejected");
+  assert.equal(exact.status, "completed", JSON.stringify(exact));
+  const exactComparisons = exact.aggregate_comparisons as Array<{ difference: string; ratio: string | null; change_percent: string | null }>;
+  assert.deepEqual(exactComparisons.map(({ difference, ratio, change_percent }) => [difference, ratio, change_percent]), [["90071992547408.91", "90071992547409.9100", "9007199254740891.00"], ["0.91", "11.1111", "1011.11"], ["1.00", null, null]]);
+  assert.match(String(exact.answer), /90071992547409\.91/);
+  const missingAnswer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(missing.resource_id)] });
+  assert.equal(missingAnswer.ok, true);
+  if (missingAnswer.ok) { assert.notEqual(missingAnswer.status, "completed"); assert.deepEqual(missingAnswer.aggregates, []); }
   const aggregateQuery = await runtime.tools.query(session.session_id, { sql: `SELECT country_code, SUM(new_users) AS total, COUNT(new_users) AS n FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND ${common} AND channel_id = 'mist_ads' GROUP BY country_code ORDER BY country_code` });
   assert.equal(aggregateQuery.ok, true, JSON.stringify(aggregateQuery));
   if (!aggregateQuery.ok) throw new Error("aggregate query rejected");
@@ -263,6 +301,14 @@ async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, 
   if (!channelResult.ok) throw new Error("channel analysis rejected");
   assert.equal(channelResult.status, "completed", JSON.stringify(channelResult));
   assert.deepEqual((channelResult.aggregates as Array<{ value: string; group: Record<string, string> }>).map((a) => [a.group.channel_id, a.value]), [["mist_ads", "100"], ["pebble_net", "5"]]);
+  const multi = await runtime.tools.query(session.session_id, { sql: `SELECT country_code, channel_id, SUM(new_users) AS total FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND ${common} GROUP BY country_code, channel_id ORDER BY country_code, channel_id` });
+  assert.equal(multi.ok, true, JSON.stringify(multi));
+  if (!multi.ok) throw new Error("multi-group query rejected");
+  const multiResult = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(multi.resource_id)] });
+  assert.equal(multiResult.ok, true, JSON.stringify(multiResult));
+  if (!multiResult.ok) throw new Error("multi-group analysis rejected");
+  assert.equal(multiResult.status, "completed", JSON.stringify(multiResult));
+  assert.deepEqual((multiResult.aggregates as Array<{ value: string; group: Record<string, string> }>).map((a) => [a.group.country_code, a.group.channel_id, a.value]), [["JP", "mist_ads", "10"], ["US", "mist_ads", "100"], ["US", "pebble_net", "5"]]);
   async function calculate(sql: string, column: string, predicted: "any" | "actual_only" | "predicted_only" = "any") {
     const query = await runtime.tools.query(session.session_id, { sql });
     assert.equal(query.ok, true, JSON.stringify(query));

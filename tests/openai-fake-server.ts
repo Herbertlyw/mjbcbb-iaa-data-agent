@@ -116,12 +116,23 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   const latest = turn[0] ? messageText(turn[0]) : "";
   const earlierUsers = messages.slice(0, messages.length - turn.length).filter((message) => message.role === "user").map(messageText);
   const hasBase = earlierUsers.some((text) => text.includes("纸灯") && text.includes("美国") && text.includes("iOS") && text.includes("雾帆") && text.includes("2026-10-06") && text.includes("2026-10-12"));
+  if (latest.includes("合成精确金额")) return scripted(turn, decimalSteps);
   if (latest.includes("玻璃鲦") && latest.includes("德国")) return scripted(turn, glassSteps);
   if (latest.includes("只说看看收入") || (latest.includes("日本") && !hasBase && !latest.includes("纸灯"))) return scripted(turn, clarifySteps);
   if (latest.includes("日期改成") && hasBase && earlierUsers.some((text) => text.includes("日本"))) return scripted(turn, shortJapanSteps);
   if (latest.includes("日本") && (hasBase || latest.includes("雾帆"))) return scripted(turn, japanSteps);
   if (latest.includes("连表")) return scripted(turn, unsafeJoinSteps);
   return scripted(turn, defaultSteps);
+}
+
+function decimalSteps(ids: string[]) {
+  const query = (day: string) => `SELECT SUM(amount_usd) AS total FROM fact_fox_daily_payment WHERE event_date >= '${day}' AND event_date <= '${day}' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'`;
+  return [
+    { id: "decimal_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "decimal_first", name: "query", arguments: JSON.stringify({ sql: query("2026-10-06") }) },
+    { id: "decimal_second", name: "query", arguments: JSON.stringify({ sql: query("2026-10-08") }) },
+    { id: "decimal_analysis", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids, comparisons: [{ left: { resource_id: ids[0] ?? "", cell: "total" }, right: { resource_id: ids[1] ?? "", cell: "total" } }] }) },
+  ];
 }
 
 function scripted(turn: ProtocolMessage[], steps: (ids: string[]) => Array<{ id: string; name: string; arguments: string }>): { id: string; name: string; arguments: string } | null {
