@@ -249,7 +249,7 @@
           <strong>${escapeHtml(source.tables.join(", "))}</strong>
           <p class="muted">${source.evidence_eligible ? "当前证据" : "证据不可验证，未展示结果行"}。${escapeHtml(source.sql || "")}</p>
           <p class="muted">${escapeHtml(source.evidence_eligible ? coverageText(source) : "覆盖与新鲜度未作为当前有效证据使用。")}</p>
-          <p class="muted">${escapeHtml(source.engine || "本地合成库")} · ${escapeHtml(source.time_range.start)} 到 ${escapeHtml(source.time_range.end)} · ${escapeHtml(source.time_range.timezone)} · ${source.truncated ? "已截断，不是完整总体" : "结果未截断"} · 契约 ${Object.entries(source.contract_revisions || {}).map(([table, revision]) => `${escapeHtml(table)}@${escapeHtml(revision)}`).join(", ")}</p>
+          <p class="muted">${escapeHtml(source.engine || "本地合成库")} · ${escapeHtml(source.time_range.start)} 到 ${escapeHtml(source.time_range.end)} · ${escapeHtml(source.time_range.timezone)} · ${source.complete_population ? "结果未截断" : "源结果受限制，不是完整总体"} · 契约 ${Object.entries(source.contract_revisions || {}).map(([table, revision]) => `${escapeHtml(table)}@${escapeHtml(revision)}`).join(", ")}</p>
           <table><thead><tr>${head.map((key) => `<th>${escapeHtml(key)}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table>
         </div>`;
       }).join("");

@@ -5,6 +5,8 @@ import { plainRows } from "./database.js";
 import { verifyCell, type CellOperation, type VerifiedCell } from "./evidence.js";
 import { compareVerifiedIntegers, type VerifiedComparison } from "./evidence-comparison.js";
 import { compareDecimalAggregates, type AggregateComparison } from "./aggregate-comparison.js";
+import { computeArithmetic, fromAggregate, sumDecimalStrings, type ArithmeticOp, type ArithmeticValue } from "./exact-arithmetic.js";
+import { verifyDecimalCell, type VerifiedDecimalCell } from "./decimal-cell-evidence.js";
 import { verifyDatabaseAggregates, type VerifiedAggregate } from "./aggregate-evidence.js";
 import { freshnessManifest, freshnessPeriodKey, matchesFreshnessManifest, readPublication, type FreshnessPublication } from "./freshness.js";
 import type { MysqlFreshnessStore } from "./mysql-freshness.js";
@@ -13,6 +15,8 @@ import { newId, type SessionRecord, type SessionStore } from "./session.js";
 import type {
   AnalysisRecord,
   AnalysisStatus,
+  ArithmeticRef,
+  ArithmeticResource,
   CalculationResource,
   ContractBinding,
   DataContract,
@@ -22,7 +26,7 @@ import type {
   SessionResource,
   ToolFailure,
 } from "./types.js";
-import { clickHouseColumns, clickHouseColumnTypes, clickHouseQuery } from "./clickhouse-client.js";
+import { clickHouseColumns, clickHouseColumnTypes, clickHouseQueryBounded } from "./clickhouse-client.js";
 import { assertJoinKeys, guardSql, parseReadonlySql, SqlRejected, type TableRule } from "./sql.js";
 import type { ClickHouseClient } from "@clickhouse/client";
 import type { DatabaseSync } from "node:sqlite";
@@ -49,13 +53,15 @@ export class ToolService {
     return this.ctx.sessions.reserveToolCall(sessionId, this.ctx.config.maxToolCalls);
   }
 
-  async searchAssets(sessionId: string, input: { query?: string; kinds?: string[] }, signal?: AbortSignal): Promise<ToolResult> {
+  async searchAssets(sessionId: string, input: { query?: string; kinds?: string[]; offset?: number; limit?: number; expected_search_hash?: string }, signal?: AbortSignal): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
     const session = await this.ctx.sessions.requireAsync(sessionId);
     const query = (input.query ?? "").trim().toLowerCase();
     const kinds = new Set(input.kinds ?? []);
-    const hits = this.ctx.knowledge.assets
+    const offset = input.offset ?? 0; const limit = input.limit ?? 50;
+    if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) return fail("invalid_search_page", "搜索偏移须为非负整数，每页限 1 到 100 项。");
+    const assets = this.ctx.knowledge.assets
       .filter((asset) => asset.discoverable && asset.status === "published")
       .filter((asset) => kinds.size === 0 || kinds.has(asset.kind))
       .filter((asset) => {
@@ -68,7 +74,18 @@ export class ToolService {
         if (haystack.includes(query)) return true;
         return query.split(/\s+/u).filter((part) => part.length >= 2).some((part) => haystack.includes(part));
       })
-      .map((asset) => ({
+      .sort((a, b) => a.asset_id < b.asset_id ? -1 : a.asset_id > b.asset_id ? 1 : 0);
+    const searchHash = createHash("sha256").update(JSON.stringify({ role: session.role, query, kinds: [...kinds].sort(), registry: this.ctx.knowledge.registry_revision, results: assets.map((asset) => [asset.asset_id, asset.content_hash]) })).digest("hex");
+    if ((offset > 0 && !input.expected_search_hash) || (input.expected_search_hash && input.expected_search_hash !== searchHash)) return fail("search_version_changed", "续页须使用首页 search_hash；查询、权限或结果变化后请从头搜索。");
+    if (offset > assets.length) return fail("invalid_search_page", "搜索偏移超出结果长度。");
+    const hits = assets.slice(offset, offset + limit).map((asset) => {
+      const readable = canRead(this.ctx.knowledge, session.role, asset.asset_id);
+      const term = (input.query ?? "").trim();
+      const match = readable && term ? asset.body.indexOf(term) : -1;
+      const codePointOffset = match < 0 ? -1 : Array.from(asset.body.slice(0, match)).length;
+      const excerptStart = Math.max(0, codePointOffset - 30);
+      const excerpt = codePointOffset < 0 ? null : Array.from(asset.body).slice(excerptStart, excerptStart + 120).join("");
+      return {
         asset_id: asset.asset_id,
         kind: asset.kind,
         title: asset.title,
@@ -77,12 +94,19 @@ export class ToolService {
         content_hash: asset.content_hash,
         path: asset.path,
         status: asset.status,
+      ...(excerpt === null ? {} : { match_excerpt: excerpt, excerpt_offset: excerptStart, excerpt_offset_unit: "unicode_code_points" }),
         ...(asset.table ? { table: asset.table } : {}),
-      }));
+      };
+    });
     return {
       ok: true,
       hits,
       role: session.role,
+      search_hash: searchHash,
+      total: assets.length,
+      offset,
+      has_more: offset + hits.length < assets.length,
+      next_offset: offset + hits.length < assets.length ? offset + hits.length : null,
       notice: "搜索只用于发现资产，不授予读取正文或查询数据的权限。",
     };
   }
@@ -128,17 +152,19 @@ export class ToolService {
     };
   }
 
-  async readAssets(sessionId: string, input: { asset_ids?: string[]; offset?: number; limit?: number }, signal?: AbortSignal): Promise<ToolResult> {
+  async readAssets(sessionId: string, input: { asset_ids?: string[]; requests?: Array<{ asset_id: string; body_offset?: number; body_limit?: number; expected_content_hash?: string }>; offset?: number; limit?: number }, signal?: AbortSignal): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
-    const ids = input.asset_ids ?? [];
-    const offset = Number.isInteger(input.offset) && (input.offset ?? 0) > 0 ? (input.offset as number) : 0;
-    const limit = Number.isInteger(input.limit) && (input.limit ?? 0) >= 0 ? (input.limit as number) : ids.length;
-    const page = ids.slice(offset, offset + limit);
+    if (input.asset_ids && input.requests) return fail("invalid_asset_page", "请只提供资产 ID 列表或逐项读取请求。");
+    const requests = input.requests ?? (input.asset_ids ?? []).map((asset_id) => ({ asset_id }));
+    const offset = input.offset ?? 0; const limit = input.limit ?? 50;
+    if (!Array.isArray(requests) || requests.length > 100 || !Number.isInteger(offset) || offset < 0 || offset > requests.length || !Number.isInteger(limit) || limit < 1 || limit > 100) return fail("invalid_asset_page", "批量读取最多 100 项，偏移与页大小须在有效范围。");
+    const page = requests.slice(offset, offset + limit);
     const results = [];
-    for (const assetId of page) {
-      const result = await this.readAsset(sessionId, { asset_id: assetId }, signal);
-      results.push({ ...result, asset_id: assetId });
+    for (const request of page) {
+      if (!request || typeof request.asset_id !== "string") { results.push(fail("invalid_asset_page", "资产读取请求无效。")); continue; }
+      const result = await this.readAsset(sessionId, request, signal);
+      results.push({ ...result, asset_id: request.asset_id });
     }
     const anyOk = results.some((item) => item.ok);
     if (!anyOk) {
@@ -149,7 +175,9 @@ export class ToolService {
         results,
         offset,
         limit,
-        total: ids.length,
+        total: requests.length,
+        has_more: offset + page.length < requests.length,
+        next_offset: offset + page.length < requests.length ? offset + page.length : null,
         notice: "批量读取逐个授权。成功读取不会创建查询绑定。",
       };
     }
@@ -158,12 +186,14 @@ export class ToolService {
       results,
       offset,
       limit,
-      total: ids.length,
-      notice: "批量读取逐个授权；每项返回正文首页，后续使用 read_asset 和内容哈希续读。成功读取不会创建查询绑定。",
+      total: requests.length,
+      has_more: offset + page.length < requests.length,
+      next_offset: offset + page.length < requests.length ? offset + page.length : null,
+      notice: "批量读取逐项授权；正文偏移按 Unicode 码点，续读须带该资产的内容哈希。成功读取不会创建查询绑定。",
     };
   }
 
-  async readDataContractView(sessionId: string, input: { asset_id?: string }, signal?: AbortSignal): Promise<ToolResult> {
+  async readDataContractView(sessionId: string, input: { asset_id?: string; columns_offset?: number; columns_limit?: number; expected_content_hash?: string }, signal?: AbortSignal): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
     const decision = await this.authorizeRead(sessionId, input.asset_id ?? "");
@@ -173,6 +203,9 @@ export class ToolService {
       return fail("missing_data_contract", "这个资产没有数据契约", { asset_id: asset.asset_id });
     }
     const contract = asset.contract;
+    const offset = input.columns_offset ?? 0; const limit = input.columns_limit ?? 100;
+    if (!Number.isInteger(offset) || offset < 0 || offset > contract.columns.length || !Number.isInteger(limit) || limit < 1 || limit > 100) return fail("invalid_contract_page", "字段偏移或页大小无效。");
+    if ((offset > 0 && !input.expected_content_hash) || (input.expected_content_hash && input.expected_content_hash !== asset.content_hash)) return fail("asset_version_changed", "续页须带首页的内容哈希，版本变化后请重新读取。");
     const session = await this.ctx.sessions.requireAsync(sessionId);
     const validity = contractValidity(contract, currentCalendarDate(this.ctx.config, contract.timezone));
     const allowed = canQueryTable(this.ctx.knowledge, session.role, contract.table);
@@ -198,6 +231,9 @@ export class ToolService {
     };
     session.bindings = [...session.bindings.filter((item) => item.table !== contract.table), binding];
     await this.ctx.sessions.saveAsync(session);
+    const freshnessResult = await this.currentFreshness();
+    const publication = freshnessResult.ok ? freshnessResult.publication : null;
+    const publishedTable = publication?.tables[contract.table];
     return {
       ok: true,
       asset_id: asset.asset_id,
@@ -210,7 +246,9 @@ export class ToolService {
       timezone: contract.timezone,
       must_filter: contract.must_filter,
       series: contract.series ?? null,
-      columns: contract.columns.map((column) => ({
+      content_hash: asset.content_hash,
+      grain: tableGrain(this.ctx.knowledge, contract.table),
+      columns: contract.columns.slice(offset, offset + limit).map((column) => ({
         name: column.name,
         type: column.type,
         unit: column.unit ?? null,
@@ -220,21 +258,31 @@ export class ToolService {
         null_means: column.null_means ?? null,
         zero_means: column.zero_means ?? null,
       })),
+      columns_offset: offset,
+      columns_total: contract.columns.length,
+      columns_has_more: offset + limit < contract.columns.length,
+      columns_next_offset: offset + limit < contract.columns.length ? offset + limit : null,
       freshness: contract.freshness,
+      published_freshness: publication && publishedTable ? { ...publishedTable, status: publication.valid_until < currentCalendarDate(this.ctx.config, this.ctx.knowledge.timezone) ? "expired" : publishedTable.status, publication_id: publication.publication_id, version: publication.version, valid_until: publication.valid_until } : { status: freshnessResult.ok ? "not_published" : "unavailable" },
+      valid_from: contract.valid_from,
       valid_until: contract.valid_until,
       simulated: true,
       notice: queryable ? "服务端已记录当前契约绑定。模型提交的资产 ID 本身不是授权。" : "契约已读取，但不能用于查询。",
     };
   }
 
-  async query(sessionId: string, input: { sql?: string; purpose?: string }, signal?: AbortSignal): Promise<ToolResult> {
+  async query(sessionId: string, input: { sql?: string; purpose?: string; preview_limit?: number }, signal?: AbortSignal): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
     const session = await this.ctx.sessions.requireAsync(sessionId);
     const sql = input.sql ?? "";
+    const previewLimit = input.preview_limit ?? 20;
+    if (!Number.isInteger(previewLimit) || previewLimit < 0 || previewLimit > 100) return fail("invalid_resource_page", "预览行数须在 0 到 100 之间。");
+    let sqlLimited = false;
     let guarded;
     try {
       const parsed = parseReadonlySql(sql);
+      sqlLimited = containsSqlLimit(parsed.ast);
       const rules = parsed.tables.map((table) => this.ruleFor(session, table));
       guarded = guardSql(sql, rules, this.ctx.businessEngine === "clickhouse" ? "clickhouse" : "sqlite");
     } catch (error) {
@@ -305,9 +353,14 @@ export class ToolService {
     if (latency === "cancelled") return fail("query_cancelled", "查询已取消");
     if (latency === "timeout") return fail("query_timeout", "查询超时，没有留下结果");
     let rows: Array<Record<string, unknown>>;
+    let bounded: Awaited<ReturnType<typeof clickHouseQueryBounded>> | null = null;
     const started = Date.now();
     try {
-      rows = await this.executeGuarded(guarded.sql, signal);
+      if (this.ctx.businessEngine === "clickhouse") {
+        if (!this.ctx.clickhouse) throw new Error("clickhouse_unavailable");
+        bounded = await clickHouseQueryBounded(this.ctx.clickhouse, guarded.sql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
+        rows = bounded.rows;
+      } else rows = await this.executeGuarded(guarded.sql, signal);
     } catch (error) {
       if (signal?.aborted) return fail("query_cancelled", "查询已取消");
       const message = error instanceof Error ? error.message : "查询执行失败";
@@ -336,9 +389,9 @@ export class ToolService {
     if (!afterCoverage.publication || afterCoverage.publication.publication_id !== published.publication_id || afterCoverage.publication.version !== freshnessVersion) {
       return fail("freshness_version_changed", "覆盖统计期间新鲜度发布变了，这次没有留下可引用结果。");
     }
-    const total = rows.length;
+    const total = bounded?.observed_rows ?? rows.length;
     let returned = rows;
-    let truncated = false;
+    let truncated = bounded?.truncated ?? false;
     if (returned.length > this.ctx.config.maxResultRows) {
       returned = returned.slice(0, this.ctx.config.maxResultRows);
       truncated = true;
@@ -357,6 +410,7 @@ export class ToolService {
       ...(session.active_job_id ? { job_id: session.active_job_id } : {}),
       engine: this.ctx.businessEngine === "clickhouse" ? "clickhouse-local" : "sqlite-local",
       elapsed_ms: elapsedMs,
+      ...(bounded ? { execution_id: bounded.query_id, column_types: bounded.column_types } : {}),
       ...(this.ctx.businessEngine === "clickhouse" ? { scan_limit: this.configuredScanLimit } : {}),
       ...(Object.keys(decimalTypes).length ? { decimal_types: decimalTypes } : {}),
       simulated: true,
@@ -369,16 +423,19 @@ export class ToolService {
       time_range: { ...guarded.time_range, timezone },
       freshness: bindings.map((binding) => binding.freshness),
       truncated,
+      sql_limited: sqlLimited,
       total_rows: total,
+      total_rows_exact: !truncated,
       returned_rows: returned.length,
-      complete_population: !truncated,
+      complete_population: !truncated && !sqlLimited,
       value_semantics: { null: "missing", zero: "observed_zero", predicted_flag: "is_predicted" },
-      columns: returned[0] ? Object.keys(returned[0]) : guarded.columns,
+      columns: bounded ? Object.keys(bounded.column_types) : returned[0] ? Object.keys(returned[0]) : guarded.columns,
       rows: returned,
       coverage,
       freshness_receipts: freshnessReceipts,
     };
     await this.ctx.sessions.saveResourceAsync(resource);
+    const resourceHash = createHash("sha256").update(JSON.stringify(resource)).digest("hex");
     return {
       ok: true,
       resource_id: resource.resource_id,
@@ -391,40 +448,56 @@ export class ToolService {
       timezone: resource.time_range.timezone,
       freshness: resource.freshness,
       truncated: resource.truncated,
+      sql_limited: resource.sql_limited,
       total_rows: resource.total_rows,
+      total_rows_exact: resource.total_rows_exact,
       returned_rows: resource.returned_rows,
       complete_population: resource.complete_population,
       value_semantics: resource.value_semantics,
       simulated: true,
       engine: resource.engine,
+      execution_id: resource.execution_id ?? null,
+      column_types: resource.column_types ?? null,
       elapsed_ms: resource.elapsed_ms,
-      rows: resource.rows,
+      columns: resource.columns,
+      rows: resource.rows.slice(0, previewLimit),
+      resource_hash: resourceHash,
+      preview_has_more: previewLimit < resource.rows.length,
+      next_row_offset: previewLimit < resource.rows.length ? previewLimit : null,
       coverage: resource.coverage,
       freshness_receipts: resource.freshness_receipts,
-      notice: truncated ? `结果已截断，不能当作完整总体。resource_id=${resource.resource_id}` : `结果来自本地合成 ${resource.engine}。resource_id=${resource.resource_id}`,
+      notice: truncated || sqlLimited ? `源结果受截断或 SQL LIMIT 约束，不能当作完整总体。resource_id=${resource.resource_id}` : `结果来自本地合成 ${resource.engine}。预览与保存资源分页分开。resource_id=${resource.resource_id}`,
     };
   }
 
   async calculateSessionCells(
     sessionId: string,
-    input: { resource_id?: string; operations?: CellOperation[] },
+    input: { resource_id?: string; operations?: CellOperation[]; arithmetic?: { op: ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef } },
     signal?: AbortSignal,
   ): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
+    if (input.arithmetic) {
+      if (input.resource_id || input.operations) return fail("invalid_arithmetic", "四则运算与单资源汇总须分开提交。");
+      return this.calculateArithmetic(sessionId, input.arithmetic);
+    }
+    if (!Array.isArray(input.operations) || input.operations.length < 1 || input.operations.length > 40) return fail("invalid_calculation", "每次须提供 1 到 40 个计算操作。");
     const found = await this.ctx.sessions.lookupResourceAsync(sessionId, input.resource_id ?? "");
     if (!found.ok) return fail(found.code, found.message);
     if (found.resource.kind !== "query_result") return fail("resource_not_calculable", "只能计算查询结果资源");
     const source = found.resource;
     const activeJob = (await this.ctx.sessions.requireAsync(sessionId)).active_job_id;
     if (activeJob && source.job_id !== activeJob) return fail("resource_from_other_execution", "只能计算当前任务的查询结果；请重新查询并复核契约与新鲜度。");
-    const cells: Record<string, number> = {};
+    const cells: Record<string, number | string | null> = {};
     const notes: string[] = [];
     const operations: Record<string, CellOperation> = Object.create(null) as Record<string, CellOperation>;
-    for (const operation of input.operations ?? []) {
-      if (!operation.as || Object.hasOwn(operations, operation.as)) return fail("duplicate_cell", "计算单元格名称必须非空且不重复。");
+    for (const operation of input.operations) {
+      if (!operation || !["sum", "count_null", "count_zero", "count_rows"].includes(operation.op) || operation.predicted && !["any", "actual_only", "predicted_only"].includes(operation.predicted)) return fail("invalid_calculation", "不支持的计算或预测筛选。");
+      if (typeof operation.as !== "string" || !operation.as || operation.as.length > 80 || Object.hasOwn(operations, operation.as)) return fail("duplicate_cell", "计算单元格名称必须非空、长度有限且不重复。");
+      if (operation.op !== "count_rows" && (!operation.column || !source.columns.includes(operation.column))) return fail("column_not_in_resource", "计算字段不在已保存资源中。");
       operations[operation.as] = { ...operation };
-      Object.defineProperty(cells, operation.as, { value: computeCell(source, operation, notes), enumerable: true, configurable: true, writable: true });
+      const contract = source.tables.length === 1 ? this.ctx.knowledge.contract_by_table.get(source.tables[0]!)?.contract : undefined;
+      Object.defineProperty(cells, operation.as, { value: computeCell(source, contract, operation, notes), enumerable: true, configurable: true, writable: true });
     }
     const resource: CalculationResource = {
       resource_id: newId("res"),
@@ -435,7 +508,7 @@ export class ToolService {
       source_resource_id: source.resource_id,
       cells,
       operations,
-      input_truncated: source.truncated,
+      input_truncated: source.truncated || source.sql_limited === true,
       complete_population: source.complete_population && !source.truncated,
       null_means: "missing",
       zero_means: "observed_zero",
@@ -456,6 +529,75 @@ export class ToolService {
       notes,
       notice: `resource_id=${resource.resource_id}`,
     };
+  }
+
+  private async calculateArithmetic(sessionId: string, expression: { op: ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef }): Promise<ToolResult> {
+    if (!expression || !["add", "subtract", "multiply", "divide"].includes(expression.op)) return fail("invalid_arithmetic", "未支持的运算。");
+    const session = await this.ctx.sessions.requireAsync(sessionId);
+    const jobId = session.active_job_id;
+    if (!jobId) return fail("missing_active_job", "四则运算需要当前任务及其证据资源。");
+    const fresh = await this.currentFreshness();
+    if (!fresh.ok) return fresh;
+    if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
+    const left = await this.resolveArithmetic(session, jobId, expression.left, fresh.publication, new Set());
+    const right = await this.resolveArithmetic(session, jobId, expression.right, fresh.publication, new Set());
+    if (!left || !right) return fail("arithmetic_lineage_unsupported", "输入不属于当前任务、已变化或不能证明完整血缘。");
+    const result = computeArithmetic(expression.op, left.value, right.value);
+    if (!result) return fail("arithmetic_scope_incompatible", "输入的指标、单位、覆盖或范围不能安全组合。");
+    const resource: ArithmeticResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "arithmetic", created_at: new Date().toISOString(), operation: expression.op, left: expression.left, right: expression.right, input_hashes: { ...left.hashes, ...right.hashes }, result, input_truncated: false, complete_population: true };
+    await this.ctx.sessions.saveResourceAsync(resource);
+    return { ok: true, resource_id: resource.resource_id, result: resource.result, dependencies: Object.keys(resource.input_hashes), notice: `${result.value === null ? "除数为零，结果不可计算；没有补成零。" : "定点计算；除法保留 18 位小数、半数远离零。正式结论须引用所有来源并经服务端复核。"} resource_id=${resource.resource_id}` };
+  }
+
+  private async resolveArithmetic(session: SessionRecord, jobId: string, ref: ArithmeticRef, publication: FreshnessPublication, path: Set<string>): Promise<{ value: ArithmeticValue; hashes: Record<string, string>; leaves: string[] } | null> {
+    if (!ref || typeof ref.resource_id !== "string" || typeof ref.cell !== "string" || path.has(ref.resource_id) || path.size >= 8) return null;
+    const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, ref.resource_id);
+    if (!found.ok || found.resource.job_id !== jobId) return null;
+    const resource = found.resource;
+    const ownHash = createHash("sha256").update(JSON.stringify(resource)).digest("hex");
+    const next = new Set(path); next.add(resource.resource_id);
+    if (resource.kind === "query_result") {
+      const contract = this.arithmeticContract(session, resource, publication);
+      if (!contract) return null;
+      const canonical = (group: Record<string, string>) => JSON.stringify(Object.entries(group).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+      const matching = verifyDatabaseAggregates(resource, contract)?.filter((item) => item.output_column === ref.cell && canonical(item.group) === canonical(ref.group ?? {})) ?? [];
+      if (matching.length !== 1) return null;
+      return { value: fromAggregate(matching[0]!), hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id] };
+    }
+    if (resource.kind === "calculation") {
+      if (ref.group || !resource.operations || !Object.hasOwn(resource.operations, ref.cell)) return null;
+      const foundSource = await this.ctx.sessions.lookupResourceAsync(session.session_id, resource.source_resource_id);
+      if (!foundSource.ok || foundSource.resource.kind !== "query_result" || foundSource.resource.job_id !== jobId) return null;
+      const source = foundSource.resource; const contract = this.arithmeticContract(session, source, publication);
+      const operation = resource.operations[ref.cell]; const stored = resource.cells[ref.cell];
+      if (!contract || !operation || operation.op !== "sum" || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length) return null;
+      const decimal = typeof stored === "string" ? verifyDecimalCell(source, contract, operation, stored) : null;
+      const integer = typeof stored === "number" ? verifyCell(source, contract, operation, stored) : null;
+      if (!decimal && (!integer || integer.precision !== "exact_integer" || !integer.column || integer.unit === "契约未声明" || !integer.prediction.startsWith("实际（") || integer.excludedNulls)) return null;
+      const base = decimal ?? integer!;
+      const column = base.column!; const value = String(base.value);
+      const scale = decimal ? (value.split(".")[1]?.length ?? 0) : 0;
+      const aggregate: VerifiedAggregate = { source_resource_id: source.resource_id, table: base.table, column, output_column: operation.column ?? "", operation: "sum", value, scale, unit: base.unit, description: base.description, filters: base.filters, group: {}, range: base.range, prediction: "actual_observed_only" };
+      return { value: fromAggregate(aggregate), hashes: { [source.resource_id]: createHash("sha256").update(JSON.stringify(source)).digest("hex"), [resource.resource_id]: ownHash }, leaves: [source.resource_id] };
+    }
+    if (resource.kind !== "arithmetic" || ref.cell !== "result" || ref.group) return null;
+    const left = await this.resolveArithmetic(session, jobId, resource.left, publication, next);
+    const right = await this.resolveArithmetic(session, jobId, resource.right, publication, next);
+    if (!left || !right) return null;
+    const hashes = { ...left.hashes, ...right.hashes };
+    const stable = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+    if (stable(hashes) !== stable(resource.input_hashes)) return null;
+    const value = computeArithmetic(resource.operation, left.value, right.value);
+    if (!value || JSON.stringify(value) !== JSON.stringify(resource.result)) return null;
+    return { value, hashes: { ...hashes, [resource.resource_id]: ownHash }, leaves: [...new Set([...left.leaves, ...right.leaves])] };
+  }
+
+  private arithmeticContract(session: SessionRecord, resource: QueryResource, publication: FreshnessPublication): DataContract | null {
+    if (resource.tables.length !== 1 || resource.truncated || !resource.complete_population) return null;
+    const asset = this.ctx.knowledge.contract_by_table.get(resource.tables[0]!); const contract = asset?.contract;
+    if (!asset || !contract || resource.registry_revision !== this.ctx.knowledge.registry_revision || resource.contract_revisions[contract.table] !== contract.revision || resource.asset_hashes[asset.asset_id] !== asset.content_hash || !canQueryTable(this.ctx.knowledge, session.role, contract.table) || contractValidity(contract, currentCalendarDate(this.ctx.config, contract.timezone))) return null;
+    if (publication.valid_until < currentCalendarDate(this.ctx.config, this.ctx.knowledge.timezone) || resource.freshness_receipts.length !== 1 || resource.freshness_receipts[0]?.table !== contract.table || resource.freshness_receipts[0]?.publication_id !== publication.publication_id || resource.freshness_receipts[0]?.version !== publication.version || publication.tables[contract.table]?.status !== "fresh") return null;
+    return contract;
   }
 
   async readSessionResource(sessionId: string, input: { resource_id?: string; row_offset?: number; row_limit?: number; columns?: string[]; expected_resource_hash?: string }, signal?: AbortSignal): Promise<ToolResult> {
@@ -486,7 +628,8 @@ export class ToolService {
       row_limit: limit,
       has_more: next < source.rows.length,
       next_row_offset: next < source.rows.length ? next : null,
-      resource_truncated: source.truncated,
+      resource_truncated: source.truncated || source.sql_limited === true,
+      sql_limited: source.sql_limited === true,
       notice: "has_more 仅表示已保存资源还有页面；resource_truncated 表示源查询结果不完整。历史资源可回读，但不能当作当前任务的证据。",
     };
   }
@@ -531,6 +674,7 @@ export class ToolService {
           freshness: found.resource.freshness,
           truncated: found.resource.truncated,
           total_rows: found.resource.total_rows,
+          total_rows_exact: found.resource.total_rows_exact,
           returned_rows: found.resource.returned_rows,
           complete_population: found.resource.complete_population,
           simulated: true,
@@ -628,6 +772,7 @@ export class ToolService {
       }
     }
     const verified: VerifiedCell[] = [];
+    const verifiedDecimal: VerifiedDecimalCell[] = [];
     const verifiedByCalculation = new Map<string, Map<string, VerifiedCell>>();
     for (const resource of resources) {
       if (resource.kind !== "calculation") continue;
@@ -635,20 +780,26 @@ export class ToolService {
       const asset = original && original.tables.length === 1 ? this.ctx.knowledge.contract_by_table.get(original.tables[0] ?? "") : undefined;
       const contract = asset?.contract;
       const accepted: VerifiedCell[] = [];
+      const acceptedDecimal: VerifiedDecimalCell[] = [];
       if (original && contract && eligible.has(original.resource_id) && resource.operations) {
         for (const [name, operation] of Object.entries(resource.operations)) {
-          const cell = verifyCell(original, contract, operation, resource.cells[name] ?? Number.NaN);
+          const stored = resource.cells[name];
+          const cell = typeof stored === "number" ? verifyCell(original, contract, operation, stored) : null;
           if (cell) {
             accepted.push(cell); verified.push(cell);
             const cells = verifiedByCalculation.get(resource.resource_id) ?? new Map<string, VerifiedCell>();
             cells.set(name, cell);
             verifiedByCalculation.set(resource.resource_id, cells);
           }
-          else reasons.push("calculation_lineage_unsupported");
+          else if (typeof stored === "string") {
+            const decimal = verifyDecimalCell(original, contract, operation, stored);
+            if (decimal) { acceptedDecimal.push(decimal); verifiedDecimal.push(decimal); }
+            else reasons.push("calculation_lineage_unsupported");
+          } else reasons.push("calculation_lineage_unsupported");
         }
       } else reasons.push("calculation_lineage_unsupported");
-      const cells = Object.fromEntries(accepted.map((cell, index) => [`cell_${index + 1}`, cell.value]));
-      calculations.push({ resource_id: resource.resource_id, source_resource_id: resource.source_resource_id, cells, verified_cells: accepted, input_truncated: resource.input_truncated, complete_population: resource.complete_population });
+      const cells = Object.fromEntries([...accepted, ...acceptedDecimal].map((cell, index) => [`cell_${index + 1}`, cell.value]));
+      calculations.push({ resource_id: resource.resource_id, source_resource_id: resource.source_resource_id, cells, verified_cells: accepted, verified_decimal_cells: acceptedDecimal, input_truncated: resource.input_truncated, complete_population: resource.complete_population });
     }
     const comparisons: VerifiedComparison[] = [];
     const aggregateComparisons: AggregateComparison[] = [];
@@ -677,6 +828,18 @@ export class ToolService {
     }
     if (input.comparisons && input.comparisons.length > 20) reasons.push("comparison_unverifiable");
     if (reasons.includes("comparison_unverifiable") && status === "completed") status = "partial";
+    const arithmeticResults: NonNullable<AnalysisRecord["arithmetic_results"]> = [];
+    for (const resource of resources) {
+      if (resource.kind !== "arithmetic") continue;
+      const checked = liveFreshness && jobId ? await this.resolveArithmetic(session, jobId, { resource_id: resource.resource_id, cell: "result" }, liveFreshness, new Set()) : null;
+      if (!checked || checked.leaves.some((id) => !eligible.has(id))) {
+        reasons.push("arithmetic_lineage_unsupported");
+        if (status === "completed") status = "partial";
+        continue;
+      }
+      arithmeticResults.push({ resource_id: resource.resource_id, operation: resource.operation, left: resource.left, right: resource.right, result: checked.value });
+      if (checked.value.value === null && status === "completed") status = "partial";
+    }
     if (verified.some((cell) => cell.precision === "floating_point_approximate")) {
       reasons.push("floating_point_approximate");
       if (status === "completed") status = "partial";
@@ -690,6 +853,7 @@ export class ToolService {
     if (input.findings?.length || input.limitations?.length) limitations.push("模型提供的标签、分组、单位、状态和自由文字未作为事实采用；数值与范围由服务端元数据生成。");
     if (reasons.includes("calculation_lineage_unsupported") || reasons.includes("query_lineage_unsupported")) limitations.push("部分表达式或计算缺少可证明的血缘，没有作为已验证数值展示。");
     if (reasons.includes("comparison_unverifiable")) limitations.push("部分比较的范围、覆盖、单位、预测状态或整数精度无法证明，没有展示比较结果。");
+    if (reasons.includes("arithmetic_lineage_unsupported")) limitations.push("部分四则运算的递归来源、资源哈希、授权或新鲜度无法证明，没有展示结果。");
     if (reasons.includes("alias_preview_hidden")) limitations.push("含模型自选列别名的结果预览已隐藏；正式数值按契约字段及单位展示。");
     if (reasons.includes("floating_point_approximate")) limitations.push("浮点字段及其派生值仅是近似数，尚未实现可验证的精确十进制金额计算。");
     if (reasons.includes("coverage_unknown")) limitations.push("预期覆盖范围无法确定，覆盖情况未知。");
@@ -700,7 +864,7 @@ export class ToolService {
     if (reasons.includes("predicted_values_disclosed")) limitations.push("预测值和实际值分开列出。");
     if (aggregates.some((item) => Object.keys(item.group).length)) limitations.push("分组只展示查询中出现的取值，未出现的组合没有补零。");
     limitations.push("数据来自本地合成库，不是生产数据。");
-    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...comparisons.map(renderComparison), ...aggregates.map(renderAggregate), ...aggregateComparisons.map(renderAggregateComparison)];
+    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...verifiedDecimal.map(renderDecimalCell), ...comparisons.map(renderComparison), ...aggregates.map(renderAggregate), ...aggregateComparisons.map(renderAggregateComparison), ...arithmeticResults.map(renderArithmetic)];
     let answer = renderAnswer(status, verified, sources, input.clarification_question, derivedLines);
     const draftNumbers = input.draft_answer.match(/\d+(?:\.\d+)?/g) ?? [];
     if (draftNumbers.some((item) => !answer.includes(item))) {
@@ -721,6 +885,7 @@ export class ToolService {
       calculations,
       comparisons,
       aggregate_comparisons: aggregateComparisons,
+      arithmetic_results: arithmeticResults,
       aggregates,
       model_suggested_status: input.suggested_status,
       model_draft: input.draft_answer,
@@ -757,7 +922,8 @@ export class ToolService {
   private async executeGuarded(sql: string, signal?: AbortSignal): Promise<Array<Record<string, unknown>>> {
     if (this.ctx.businessEngine === "clickhouse") {
       if (!this.ctx.clickhouse) throw new Error("ClickHouse 客户端没有配置");
-      return clickHouseQuery(this.ctx.clickhouse, sql, signal);
+      const result = await clickHouseQueryBounded(this.ctx.clickhouse, sql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
+      return result.rows;
     }
     return plainRows(this.ctx.db.prepare(sql).all());
   }
@@ -773,7 +939,8 @@ export class ToolService {
         .map(([column, value]) => ` AND ${column} = '${value}'`)
         .join("");
       const sql = `SELECT ${names.join(", ")} FROM ${contract.table} WHERE ${series.date_column} >= '${timeRange.start}' AND ${series.date_column} <= '${timeRange.end}'${filters}`;
-      return clickHouseQuery(this.ctx.clickhouse, sql, signal);
+      const result = await clickHouseQueryBounded(this.ctx.clickhouse, sql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
+      return result.truncated ? null : result.rows;
     }
     return readSeriesRows(this.ctx.db, contract, equalities, timeRange);
   }
@@ -795,7 +962,9 @@ export class ToolService {
       const permitted = new Set(bindings.find((binding) => binding.table === table)?.allowed_columns ?? []);
       const needed = [contract.series.date_column, ...contract.series.dimensions, ...contract.series.metrics, ...(contract.series.predicted_column ? [contract.series.predicted_column] : [])];
       if (needed.some((column) => !permitted.has(column))) return { table, report: unknownCoverage("覆盖统计需要未授权字段，未读取这些字段。") };
-      return { table, report: assessCoverage(contract, applicable, timeRange, await this.seriesRows(contract, applicable, timeRange, signal)) };
+      const rows = await this.seriesRows(contract, applicable, timeRange, signal);
+      if (!rows) return { table, report: unknownCoverage("覆盖查询超过保存预算，未把预览当作完整覆盖。") };
+      return { table, report: assessCoverage(contract, applicable, timeRange, rows) };
     }));
     return combineCoverage(parts);
   }
@@ -933,33 +1102,56 @@ function renderAggregateComparison(item: AggregateComparison): string {
   return `${item.left.table}.${item.left.column} 精确十进制比较：${item.left.value}（${scope(item.left)}）减 ${item.right.value}（${scope(item.right)}）= ${item.difference} ${item.left.unit}；${item.ratio === null ? "基准为零，比例和变化率不可计算" : `比例 ${item.ratio}，变化率 ${item.change_percent}%（四舍五入，半数远离零）`}；实际（契约声明仅观察值）。`;
 }
 
-function computeCell(source: QueryResource, operation: CellOperation, notes: string[]): number {
-  if (operation.op === "count_rows") return source.rows.length;
-  const column = operation.column ?? "";
-  if (!source.columns.includes(column) && source.rows.some((row) => !(column in row))) {
-    notes.push(`${column} 不在结果中`);
-  }
-  const rows = source.rows.filter((row) => matchesPredicted(row, operation.predicted ?? "any", notes));
-  if (operation.op === "count_null") return rows.filter((row) => row[column] === null || row[column] === undefined).length;
-  if (operation.op === "count_zero") return rows.filter((row) => row[column] === 0).length;
-  return rows.reduce((total, row) => {
-    const value = row[column];
-    if (value === null || value === undefined) return total;
-    return total + Number(value);
-  }, 0);
+function renderArithmetic(item: NonNullable<AnalysisRecord["arithmetic_results"]>[number]): string {
+  const value = item.result.value === null ? "除数为零，结果不可计算" : `${item.result.value} ${item.result.unit}`;
+  const scope = item.result.scopes.map((entry) => `${Object.entries(entry.filters).map(([key, part]) => `${key}=${part}`).join("，")}；${entry.start} 到 ${entry.end}`).join(" / ");
+  return `${item.result.basis.table}.${item.result.basis.column} 可复核四则运算 ${item.operation}：${value}；范围 ${scope}（${item.result.basis.timezone}）；输入 ${item.left.resource_id}、${item.right.resource_id}；计算资源 ${item.resource_id}。除法保留 18 位，半数远离零。`;
 }
 
-function matchesPredicted(row: Record<string, unknown>, predicted: "actual_only" | "predicted_only" | "any", notes: string[]): boolean {
-  if (predicted === "any") return true;
-  if (!("is_predicted" in row)) {
-    if (predicted === "predicted_only") {
-      notes.push("结果没有预测标记，预测合计按 0 处理。");
-      return false;
+function renderDecimalCell(item: VerifiedDecimalCell): string {
+  const filters = Object.entries(item.filters).map(([key, value]) => `${key}=${value}`).join("，") || "无";
+  return `${item.table}.${item.column}（${item.description}）：完整资源精确十进制合计 ${item.value}；单位 ${item.unit}；实际（契约声明仅观察值）；筛选 ${filters}；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${item.source_resource_id}。`;
+}
+
+function computeCell(source: QueryResource, contract: DataContract | undefined, operation: CellOperation, notes: string[]): number | string | null {
+  const series = contract?.series; const predicted = operation.predicted ?? "any";
+  let rows = source.rows;
+  if (series?.predicted_column) {
+    const flag = series.predicted_column; const mapping = series.prediction_values;
+    const valid = mapping && mapping.actual !== mapping.predicted && source.columns.includes(flag) && rows.every((row) => (typeof row[flag] === "number" || typeof row[flag] === "string") && [mapping.actual, mapping.predicted].includes(Number(row[flag])));
+    if (!valid && (predicted !== "any" || operation.op === "sum")) { notes.push("预测状态或映射未知，不能计算该筛选或合计。"); return null; }
+    if (valid && mapping) {
+      if (predicted !== "any") rows = rows.filter((row) => Number(row[flag]) === (predicted === "actual_only" ? mapping.actual : mapping.predicted));
+      else if (operation.op === "sum" && new Set(rows.map((row) => Number(row[flag]))).size > 1) { notes.push("实际与预测混合，不能合计。"); return null; }
     }
-    return true;
+  } else if (predicted !== "any") {
+    if (series?.prediction_mode !== "observed_only") { notes.push("契约未证明实际或预测状态。"); return null; }
+    if (predicted === "predicted_only") rows = [];
   }
-  const flag = Number(row.is_predicted);
-  return predicted === "predicted_only" ? flag === 1 : flag !== 1;
+  if (operation.op === "count_rows") return rows.length;
+  const column = operation.column ?? "";
+  if (rows.some((row) => !Object.hasOwn(row, column))) { notes.push("保存结果缺少计算字段。"); return null; }
+  if (operation.op === "count_null") return rows.filter((row) => row[column] === null).length;
+  if (operation.op === "count_zero") {
+    const numericString = /^(?:nullable\()?\s*(?:decimal\(|u?int(?:64|128|256))/iu.test(source.column_types?.[column] ?? "");
+    return rows.filter((row) => row[column] === 0 || numericString && typeof row[column] === "string" && /^-?0+(?:\.0+)?$/u.test(row[column] as string)).length;
+  }
+  const values = rows.map((row) => row[column]).filter((value) => value !== null);
+  if (!values.length) { notes.push("没有非 NULL 值，合计不是零。"); return null; }
+  const type = source.column_types?.[column] ?? "";
+  const decimal = /^(?:nullable\()?\s*decimal\(\s*\d+\s*,\s*(\d+)\s*\)\s*\)?$/iu.exec(type);
+  const integerString = /^(?:nullable\()?\s*u?int(?:64|128|256)\s*\)?$/iu.test(type);
+  if (decimal || integerString) {
+    const scale = decimal ? Number(decimal[1]) : 0;
+    const result = sumDecimalStrings(values, scale);
+    if (result === null) notes.push("精确数值不可解析或超过限制，未转换为浮点。");
+    return result;
+  }
+  if (values.some((value) => typeof value !== "number" || !Number.isFinite(value))) { notes.push("字段不是可计算的数值，不能强制转换。"); return null; }
+  const numbers = values as number[]; const sum = numbers.reduce((a, b) => a + b, 0);
+  if (!Number.isFinite(sum) || numbers.every(Number.isInteger) && (!numbers.every(Number.isSafeInteger) || !Number.isSafeInteger(sum))) { notes.push("整数超过安全精度，未计算。"); return null; }
+  if (numbers.some((value) => !Number.isInteger(value))) notes.push("浮点结果为近似值，不是精确十进制。");
+  return sum;
 }
 
 function renderAnswer(
@@ -1072,6 +1264,14 @@ function formatNumber(value: number): string {
 
 function unique(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))];
+}
+
+function containsSqlLimit(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  if (Array.isArray(value)) return value.some(containsSqlLimit);
+  const record = value as Record<string, unknown>;
+  if (record.type === "select" && record.limit) return true;
+  return Object.values(record).some(containsSqlLimit);
 }
 
 function readSeriesRows(

@@ -125,6 +125,9 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
       assert.equal(installs.ok, true, JSON.stringify(installs));
       if (!installs.ok) return;
       assert.equal(installs.engine, "clickhouse-local");
+      assert.equal(typeof installs.execution_id, "string");
+      assert.match(String((installs.column_types as Record<string, string>).new_users), /Int32/);
+      assert.equal(installs.total_rows_exact, true);
       const coverage = installs.coverage as { null_dates: string[]; zero_dates: string[]; absent_dates: string[] };
       assert.deepEqual(coverage.null_dates, ["2026-10-09"]);
       assert.deepEqual(coverage.zero_dates, ["2026-10-07"]);
@@ -258,6 +261,24 @@ async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, 
   const one = await decimalDay("2026-10-08");
   const missing = await decimalDay("2026-10-09");
   const zero = await decimalDay("2026-10-10");
+  const rawDecimal = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, amount_usd FROM fact_fox_daily_payment WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND ${common} AND country_code = 'US' AND channel_id = 'mist_ads' ORDER BY event_date`, preview_limit: 1 });
+  assert.equal(rawDecimal.ok, true, JSON.stringify(rawDecimal));
+  if (!rawDecimal.ok) throw new Error("decimal detail rejected");
+  assert.equal(rawDecimal.preview_has_more, true);
+  const rawSum = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(rawDecimal.resource_id), operations: [{ op: "sum", column: "amount_usd", as: "exact" }] });
+  assert.equal(rawSum.ok, true, JSON.stringify(rawSum));
+  if (!rawSum.ok) throw new Error("decimal detail calculation rejected");
+  assert.equal((rawSum.cells as Record<string, string>).exact, "90071992547411.00");
+  const rawAnswer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(rawDecimal.resource_id), String(rawSum.resource_id)] });
+  assert.equal(rawAnswer.ok, true);
+  if (rawAnswer.ok) { assert.equal(rawAnswer.status, "completed"); assert.match(String(rawAnswer.answer), /完整资源精确十进制合计 90071992547411\.00/); }
+  const rawNull = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, amount_usd FROM fact_fox_daily_payment WHERE event_date >= '2026-10-09' AND event_date <= '2026-10-09' AND ${common} AND country_code = 'US' AND channel_id = 'mist_ads'` });
+  assert.equal(rawNull.ok, true);
+  if (rawNull.ok) {
+    const nullSum = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(rawNull.resource_id), operations: [{ op: "sum", column: "amount_usd", as: "amount" }] });
+    assert.equal(nullSum.ok, true);
+    if (nullSum.ok) assert.equal((nullSum.cells as Record<string, unknown>).amount, null);
+  }
   assert.equal((high.rows as Array<{ total: unknown }>)[0]?.total, "90071992547409.91");
   const highResource = runtime.sessions.lookupResource(session.session_id, String(high.resource_id));
   const decimalContract = runtime.knowledge.contract_by_table.get("fact_fox_daily_payment")?.contract;
@@ -388,6 +409,10 @@ async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, 
   runtime.config.maxResultRows = 2;
   try {
     const cut = await calculate(`SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE ${time} AND ${common} AND country_code = 'JP' AND channel_id = 'mist_ads'`, "new_users");
+    assert.equal(cut.query.truncated, true);
+    assert.equal(cut.query.total_rows_exact, false);
+    assert.equal(cut.query.total_rows, 3);
+    assert.equal((cut.query.coverage as { status: string }).status, "unknown");
     const result = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(cut.query.resource_id), String(cut.calculation.resource_id)] });
     assert.equal(result.ok, true);
     if (result.ok) { assert.notEqual(result.status, "completed"); assert.doesNotMatch(String(result.answer), /合计 20/); assert.deepEqual((result.sources as Array<{ rows: unknown[] }>)[0]?.rows, []); }

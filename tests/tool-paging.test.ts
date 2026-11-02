@@ -1,0 +1,86 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { analyst, withRuntime } from "./helpers.js";
+
+test("搜索稳定续页，版本变化与越权正文不泄露", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    const page = await runtime.tools.searchAssets(session.session_id, { query: "", limit: 2 });
+    assert.equal(page.ok, true);
+    if (!page.ok) return;
+    assert.equal(page.has_more, true);
+    const next = await runtime.tools.searchAssets(session.session_id, { query: "", offset: Number(page.next_offset), limit: 2, expected_search_hash: String(page.search_hash) });
+    assert.equal(next.ok, true);
+    if (!next.ok) return;
+    const firstIds = (page.hits as Array<{ asset_id: string }>).map((item) => item.asset_id);
+    const secondIds = (next.hits as Array<{ asset_id: string }>).map((item) => item.asset_id);
+    assert.equal(new Set([...firstIds, ...secondIds]).size, 4);
+    const changed = runtime.knowledge.by_id.get(firstIds[0]!);
+    assert.ok(changed); changed.content_hash = "synthetic_changed_version";
+    const stale = await runtime.tools.searchAssets(session.session_id, { query: "", offset: 2, limit: 2, expected_search_hash: String(page.search_hash) });
+    assert.equal(stale.ok, false);
+    if (!stale.ok) assert.equal(stale.code, "search_version_changed");
+  });
+});
+
+test("批量阅读逐资产分页、错误隔离和契约字段续页", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    const asset = runtime.knowledge.by_id.get("metric.new_users");
+    assert.ok(asset); asset.body = "甲🙂乙丙"; asset.content_hash = "synthetic_version";
+    const first = await runtime.tools.readAssets(session.session_id, { requests: [{ asset_id: asset.asset_id, body_limit: 2 }, { asset_id: "contract.not_found", body_limit: 2 }] });
+    assert.equal(first.ok, true);
+    if (!first.ok) return;
+    const results = first.results as Array<Record<string, unknown>>;
+    assert.equal(results[0]?.body, "甲🙂");
+    assert.equal(results[0]?.next_body_offset, 2);
+    assert.equal(results[1]?.ok, false);
+    const next = await runtime.tools.readAssets(session.session_id, { requests: [{ asset_id: asset.asset_id, body_offset: 2, body_limit: 2, expected_content_hash: "synthetic_version" }] });
+    assert.equal(next.ok, true);
+    if (next.ok) assert.equal((next.results as Array<Record<string, unknown>>)[0]?.body, "乙丙");
+    const invalid = await runtime.tools.readAssets(session.session_id, { requests: [{ asset_id: asset.asset_id, body_offset: 2, expected_content_hash: "stale" }, { asset_id: "metric.ad_revenue", body_limit: 1 }] });
+    assert.equal(invalid.ok, true);
+    if (invalid.ok) assert.equal((invalid.results as Array<Record<string, unknown>>)[0]?.code, "asset_version_changed");
+    const contract = await runtime.tools.readDataContractView(session.session_id, { asset_id: "contract.daily_installs", columns_limit: 2 });
+    assert.equal(contract.ok, true);
+    if (!contract.ok) return;
+    assert.equal((contract.columns as unknown[]).length, 2);
+    assert.equal(contract.columns_has_more, true);
+    assert.equal((contract.published_freshness as { status: string }).status, "fresh");
+    const contractNext = await runtime.tools.readDataContractView(session.session_id, { asset_id: "contract.daily_installs", columns_offset: 2, columns_limit: 2, expected_content_hash: String(contract.content_hash) });
+    assert.equal(contractNext.ok, true);
+    if (contractNext.ok) assert.equal((contractNext.columns as unknown[]).length, 2);
+    const staleContract = await runtime.tools.readDataContractView(session.session_id, { asset_id: "contract.daily_installs", columns_offset: 2, expected_content_hash: "stale" });
+    assert.equal(staleContract.ok, false);
+  });
+});
+
+test("查询预览分页不截断完整资源，SQL LIMIT 不冒充完整总体", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    assert.equal((await runtime.tools.readDataContractView(session.session_id, { asset_id: "contract.daily_installs" })).ok, true);
+    runtime.sessions.setActiveJob(session.session_id, "synthetic_page_job");
+    const sql = "SELECT event_date, new_users FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads' ORDER BY event_date";
+    const query = await runtime.tools.query(session.session_id, { sql, preview_limit: 2 });
+    assert.equal(query.ok, true);
+    if (!query.ok) return;
+    assert.equal((query.rows as unknown[]).length, 2);
+    assert.equal(query.preview_has_more, true);
+    assert.equal(query.complete_population, true);
+    const page = await runtime.tools.readSessionResource(session.session_id, { resource_id: String(query.resource_id), row_offset: 2, row_limit: 3, expected_resource_hash: String(query.resource_hash) });
+    assert.equal(page.ok, true);
+    if (page.ok) assert.equal((page.resource as { rows: unknown[] }).rows.length, 3);
+    const calculation = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(query.resource_id), operations: [{ op: "sum", column: "new_users", as: "total" }] });
+    assert.equal(calculation.ok, true);
+    if (calculation.ok) assert.equal((calculation.cells as Record<string, number>).total, 480);
+    const limited = await runtime.tools.query(session.session_id, { sql: `${sql} LIMIT 2`, preview_limit: 1 });
+    assert.equal(limited.ok, true);
+    if (!limited.ok) return;
+    assert.equal(limited.sql_limited, true);
+    assert.equal(limited.truncated, false);
+    assert.equal(limited.complete_population, false);
+    const pageLimited = await runtime.tools.readSessionResource(session.session_id, { resource_id: String(limited.resource_id) });
+    assert.equal(pageLimited.ok, true);
+    if (pageLimited.ok) assert.equal(pageLimited.resource_truncated, true);
+  });
+});

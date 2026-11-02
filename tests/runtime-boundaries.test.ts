@@ -87,6 +87,7 @@ test("按正文检索仅使用主体有读取权限的资产", async () => {
     assert.equal(hidden.ok, true);
     if (!found.ok || !hidden.ok) return;
     assert.ok((found.hits as Array<{ asset_id: string }>).some((hit) => hit.asset_id === asset.asset_id));
+    assert.match(String((found.hits as Array<{ asset_id: string; match_excerpt?: string }>).find((hit) => hit.asset_id === asset.asset_id)?.match_excerpt), /synthetic_body_only_6d28/);
     assert.equal((hidden.hits as Array<{ asset_id: string }>).some((hit) => hit.asset_id === asset.asset_id), false);
   });
 });

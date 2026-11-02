@@ -228,6 +228,8 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.match(decimal.analysis?.answer ?? "", /90071992547409\.91/);
     assert.match(decimal.analysis?.answer ?? "", /90071992547408\.91/);
     assert.match(decimal.analysis?.answer ?? "", /90071992547409\.9100/);
+    assert.match(decimal.analysis?.answer ?? "", /90071992547408\.910000000000000000/);
+    assert.equal(decimal.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === "calculate_session_cells").length, 2);
     assert.equal(decimal.analysis?.sources?.length, 2);
     assert.equal(decimal.analysis?.sources?.every((source) => source.engine === "clickhouse-local" && source.freshness_receipts?.length), true);
     const decimalIds = decimal.analysis?.sources?.map((source) => source.resource_id) ?? [];
@@ -243,6 +245,13 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
         assert.ok(resource.freshness_receipts.length > 0);
       }
     } finally { await decimalDb.end(); }
+    const withoutRecordSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const withoutRecordId = ((await withoutRecordSession.json()) as { session_id: string }).session_id;
+    const withoutRecord = await postQuestion(apiPort, withoutRecordId, "合成问题：不调用记录工具，查询日本新增。");
+    assert.equal(withoutRecord.status, "partial", JSON.stringify(withoutRecord.error));
+    assert.match(withoutRecord.analysis?.answer ?? "", /数据库求和 70；单位 人/);
+    assert.equal(withoutRecord.events.some((event) => event.type === "tool_started" && event.payload.tool_name === "update_analysis"), false);
+    assert.equal(withoutRecord.events.filter((event) => event.type === "analysis_synthesized").length, 1);
     // Optional manual browser regression: a loopback proxy really drops the first
     // SSE socket and records the browser's subsequent cursor and event IDs.
     if (process.env.BROWSER_TRACE_DIR) {

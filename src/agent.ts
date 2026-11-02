@@ -139,8 +139,11 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
       parameters: Type.Object({
         query: Type.String({ description: "搜索词" }),
         kinds: Type.Optional(Type.Array(Type.String(), { description: "可选的资产类型过滤" })),
+        offset: Type.Optional(Type.Integer({ minimum: 0 })),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+        expected_search_hash: Type.Optional(Type.String()),
       }),
-      execute: async (_toolCallId, params, signal) => pack(await tools.searchAssets(sessionId, params as { query?: string; kinds?: string[] }, signal)),
+      execute: async (_toolCallId, params, signal) => pack(await tools.searchAssets(sessionId, params as { query?: string; kinds?: string[]; offset?: number; limit?: number; expected_search_hash?: string }, signal)),
     },
     {
       name: "read_asset",
@@ -159,19 +162,20 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
       label: "批量读取资产",
       description: "逐个授权读取多个资产正文。任一资产失败不会放开其余资产。",
       parameters: Type.Object({
-        asset_ids: Type.Array(Type.String(), { description: "资产 ID 列表" }),
-        offset: Type.Optional(Type.Number({ description: "资产列表的分页起点，不是正文偏移" })),
-        limit: Type.Optional(Type.Number({ description: "本页资产条数" })),
+        asset_ids: Type.Optional(Type.Array(Type.String(), { description: "资产 ID 列表" })),
+        requests: Type.Optional(Type.Array(Type.Object({ asset_id: Type.String(), body_offset: Type.Optional(Type.Integer({ minimum: 0 })), body_limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 4000 })), expected_content_hash: Type.Optional(Type.String()) }), { maxItems: 100 })),
+        offset: Type.Optional(Type.Integer({ minimum: 0, description: "资产列表的分页起点，不是正文偏移" })),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "本页资产条数" })),
       }),
       execute: async (_toolCallId, params, signal) =>
-        pack(await tools.readAssets(sessionId, params as { asset_ids?: string[]; offset?: number; limit?: number }, signal)),
+        pack(await tools.readAssets(sessionId, params as { asset_ids?: string[]; requests?: Array<{ asset_id: string; body_offset?: number; body_limit?: number; expected_content_hash?: string }>; offset?: number; limit?: number }, signal)),
     },
     {
       name: "read_data_contract_view",
       label: "读取数据契约",
       description: "读取表契约的受控视图。只有服务端判定可查询时才会写下当前绑定。",
-      parameters: Type.Object({ asset_id: Type.String({ description: "契约资产 ID" }) }),
-      execute: async (_toolCallId, params, signal) => pack(await tools.readDataContractView(sessionId, params as { asset_id?: string }, signal)),
+      parameters: Type.Object({ asset_id: Type.String({ description: "契约资产 ID" }), columns_offset: Type.Optional(Type.Integer({ minimum: 0 })), columns_limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })), expected_content_hash: Type.Optional(Type.String()) }),
+      execute: async (_toolCallId, params, signal) => pack(await tools.readDataContractView(sessionId, params as { asset_id?: string; columns_offset?: number; columns_limit?: number; expected_content_hash?: string }, signal)),
     },
     {
       name: "query",
@@ -180,28 +184,34 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
       parameters: Type.Object({
         sql: Type.String({ description: "单条只读 SQL" }),
         purpose: Type.Optional(Type.String({ description: "查询用途" })),
+        preview_limit: Type.Optional(Type.Integer({ minimum: 0, maximum: 100 })),
         knowledge_body_visible: Type.Optional(Type.Boolean({ description: "模型是否已在本轮上下文看到资产正文。服务端不把它当作查询许可。" })),
       }),
       executionMode: "sequential",
-      execute: async (_toolCallId, params, signal) => pack(await tools.query(sessionId, params as { sql?: string; purpose?: string }, signal)),
+      execute: async (_toolCallId, params, signal) => pack(await tools.query(sessionId, params as { sql?: string; purpose?: string; preview_limit?: number }, signal)),
     },
     {
       name: "calculate_session_cells",
       label: "计算会话单元格",
-      description: "只对当前会话中的查询资源做汇总。缺失值不会被当成零，预测值不会并入实际值。",
+      description: "汇总当前任务查询资源，或对可证明的同指标聚合/先前四则运算资源做定点四则运算；正式交付须同时引用所有查询来源。",
       parameters: Type.Object({
-        resource_id: Type.String({ description: "当前会话的查询资源 ID" }),
-        operations: Type.Array(
+        resource_id: Type.Optional(Type.String({ description: "当前会话的查询资源 ID" })),
+        operations: Type.Optional(Type.Array(
           Type.Object({
             op: Type.Union([Type.Literal("sum"), Type.Literal("count_null"), Type.Literal("count_zero"), Type.Literal("count_rows")]),
             column: Type.Optional(Type.String()),
             predicted: Type.Optional(Type.Union([Type.Literal("actual_only"), Type.Literal("predicted_only"), Type.Literal("any")])),
             as: Type.String(),
           }),
-        ),
+        )),
+        arithmetic: Type.Optional(Type.Object({
+          op: Type.Union([Type.Literal("add"), Type.Literal("subtract"), Type.Literal("multiply"), Type.Literal("divide")]),
+          left: Type.Object({ resource_id: Type.String(), cell: Type.String(), group: Type.Optional(Type.Record(Type.String(), Type.String())) }),
+          right: Type.Object({ resource_id: Type.String(), cell: Type.String(), group: Type.Optional(Type.Record(Type.String(), Type.String())) }),
+        })),
       }),
       execute: async (_toolCallId, params, signal) =>
-        pack(await tools.calculateSessionCells(sessionId, params as { resource_id?: string; operations?: CellOperation[] }, signal)),
+        pack(await tools.calculateSessionCells(sessionId, params as Parameters<ToolService["calculateSessionCells"]>[1], signal)),
     },
     {
       name: "read_session_resource",

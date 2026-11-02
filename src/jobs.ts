@@ -303,6 +303,22 @@ export class JobService {
           },
         });
         if (outcome === "lost") lost = true;
+        // update_analysis is optional: if the model stopped successfully after
+        // producing resources, the host can assemble a conservative partial
+        // answer from the same evidence checks. It never promotes model prose.
+        if (!lost && !agentError && !timedOut && !recoveredAnalysis && !sessionAnalyses(session).some((item) => item.job_id === jobId)) {
+          const current = await this.stateCall("getJob", jobId);
+          if (current && !current.cancel_requested && current.fence === fence && current.status === "running") {
+            const ids = [...new Set(current.events.filter((event) => event.type === "tool_finished" && event.payload.is_error === false && typeof event.payload.resource_id === "string").map((event) => String(event.payload.resource_id)))];
+            if (ids.length) {
+              const candidate = await this.host.tools.updateAnalysis(session.session_id, { suggested_status: "partial", draft_answer: "", resource_ids: ids });
+              if (candidate.ok) {
+                const recorded = await this.stateCall("appendEvent", jobId, this.owner, fence, "analysis_synthesized", { resource_count: ids.length, status: "partial" });
+                if (!recorded) lostFence();
+              }
+            }
+          }
+        }
       } else {
       const progress = await this.stateCall("loadAgentSnapshot", session.session_id, { jobId, kind: "progress" });
       const settled = progress ? null : await this.stateCall("loadAgentSnapshot", session.session_id, { kind: "settled" });

@@ -212,6 +212,8 @@ export interface QueryResource {
   engine: "sqlite-local" | "clickhouse-local";
   simulated: true;
   elapsed_ms?: number;
+  execution_id?: string;
+  column_types?: Record<string, string>;
   scan_limit?: number;
   decimal_types?: Record<string, string>;
   sql: string;
@@ -223,7 +225,9 @@ export interface QueryResource {
   time_range: { start: string; end: string; timezone: string };
   freshness: Freshness[];
   truncated: boolean;
+  sql_limited?: boolean;
   total_rows: number;
+  total_rows_exact?: boolean;
   returned_rows: number;
   complete_population: boolean;
   value_semantics: {
@@ -244,7 +248,7 @@ export interface CalculationResource {
   created_at: string;
   job_id?: string;
   source_resource_id: string;
-  cells: Record<string, number>;
+  cells: Record<string, number | string | null>;
   operations?: Record<string, import("./evidence.js").CellOperation>;
   input_truncated: boolean;
   complete_population: boolean;
@@ -254,7 +258,23 @@ export interface CalculationResource {
   notes: string[];
 }
 
-export type SessionResource = QueryResource | CalculationResource;
+export interface ArithmeticRef { resource_id: string; cell: string; group?: Record<string, string> }
+export interface ArithmeticResource {
+  resource_id: string;
+  session_id: string;
+  job_id: string;
+  kind: "arithmetic";
+  created_at: string;
+  operation: import("./exact-arithmetic.js").ArithmeticOp;
+  left: ArithmeticRef;
+  right: ArithmeticRef;
+  input_hashes: Record<string, string>;
+  result: import("./exact-arithmetic.js").ArithmeticValue;
+  input_truncated: false;
+  complete_population: true;
+}
+
+export type SessionResource = QueryResource | CalculationResource | ArithmeticResource;
 
 export interface AnalysisSource {
   resource_id: string;
@@ -266,6 +286,7 @@ export interface AnalysisSource {
   freshness: Freshness[];
   truncated: boolean;
   total_rows: number;
+  total_rows_exact?: boolean;
   returned_rows: number;
   complete_population: boolean;
   simulated: true;
@@ -289,13 +310,15 @@ export interface AnalysisRecord {
   calculations: Array<{
     resource_id: string;
     source_resource_id: string;
-    cells: Record<string, number>;
+    cells: Record<string, number | string>;
     verified_cells?: import("./evidence.js").VerifiedCell[];
+    verified_decimal_cells?: import("./decimal-cell-evidence.js").VerifiedDecimalCell[];
     input_truncated: boolean;
     complete_population: boolean;
   }>;
   comparisons?: import("./evidence-comparison.js").VerifiedComparison[];
   aggregate_comparisons?: import("./aggregate-comparison.js").AggregateComparison[];
+  arithmetic_results?: Array<{ resource_id: string; operation: import("./exact-arithmetic.js").ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef; result: import("./exact-arithmetic.js").ArithmeticValue }>;
   aggregates?: import("./aggregate-evidence.js").VerifiedAggregate[];
   model_suggested_status: string;
   model_draft: string;

@@ -252,6 +252,25 @@ test("缺失、真实零和预测值不会被混成一个完成结论", async ()
     if (!installCells.ok || !revenueCells.ok) return;
     assert.deepEqual(installCells.cells, { new_users_sum: 480, new_users_missing: 1, new_users_zero: 1 });
     assert.deepEqual(revenueCells.cells, { revenue_actual: 43.5, revenue_predicted: 27.5, revenue_missing: 1, revenue_zero: 1 });
+    const separated = await runtime.tools.calculateSessionCells(session.session_id, {
+      resource_id: String(revenue.resource_id),
+      operations: [
+        { op: "sum", column: "revenue_usd", predicted: "any", as: "mixed" },
+        { op: "count_rows", predicted: "actual_only", as: "actual_rows" },
+        { op: "count_rows", predicted: "predicted_only", as: "predicted_rows" },
+      ],
+    });
+    assert.equal(separated.ok, true);
+    const stored = runtime.sessions.lookupResource(session.session_id, String(revenue.resource_id));
+    assert.ok(stored.ok && stored.resource.kind === "query_result");
+    if (separated.ok && stored.ok && stored.resource.kind === "query_result") {
+      assert.deepEqual(separated.cells, {
+        mixed: null,
+        actual_rows: stored.resource.rows.filter((row) => row.is_predicted === 0).length,
+        predicted_rows: stored.resource.rows.filter((row) => row.is_predicted === 1).length,
+      });
+      assert.ok((separated.cells as { actual_rows: number; predicted_rows: number }).predicted_rows > 0);
+    }
     session.active_job_id = "job_test";
     const analysis = await runtime.tools.updateAnalysis(session.session_id, {
       suggested_status: "completed",
