@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -11,12 +10,16 @@ import { openRuntime } from "./helpers.js";
 import type { ProviderStepBegin } from "../src/state-store.js";
 
 test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围栏不会放宽额度", async () => {
-  const port = await freePort();
   const password = randomBytes(12).toString("hex");
   const name = `lumenfox-budget-${randomUUID()}`;
   const dir = mkdtempSync(path.join(tmpdir(), "lumenfox-budget-"));
-  await docker(["run", "--pull=never", "-d", "--name", name, "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", `127.0.0.1:${port}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${password}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${password}`, "mysql:8.0.32"]);
   try {
+    // Ask Docker to allocate a loopback port atomically: closing a temporary
+    // Node listener before docker run races with parallel integration tests.
+    await docker(["run", "--pull=never", "-d", "--name", name, "--label", `dataagent.test.run=${name}`, "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", "127.0.0.1::3306", "-e", `MYSQL_ROOT_PASSWORD=${password}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${password}`, "mysql:8.0.32"]);
+    const binding = await dockerOutput(["port", name, "3306/tcp"]);
+    const port = Number(/^127\.0\.0\.1:(\d+)\s*$/u.exec(binding)?.[1]);
+    assert.ok(Number.isInteger(port) && port > 0 && port <= 65535, "MySQL must bind a random loopback port");
     await waitMysql(port, password);
     const runtime = openRuntime(dir, {
       stateMode: "mysql",
@@ -150,7 +153,8 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
     assert.notEqual(winner, "");
     await runtime.close({ abandon: true });
   } finally {
-    await docker(["rm", "-f", name]);
+    const label = await dockerOutput(["inspect", "--format", '{{index .Config.Labels "dataagent.test.run"}}', name]).catch(() => "");
+    if (label.trim() === name) await docker(["rm", "-f", name]);
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -183,14 +187,13 @@ function docker(args: string[]) {
   });
 }
 
-function freePort() {
-  return new Promise<number>((resolve, reject) => {
-    const server = createServer();
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      server.close(() => resolve(typeof address === "object" && address ? address.port : 0));
-    });
-    server.on("error", reject);
+function dockerOutput(args: string[]) {
+  return new Promise<string>((resolve, reject) => {
+    const child = spawn("docker", args, { stdio: ["ignore", "pipe", "ignore"] });
+    let output = "";
+    child.stdout.on("data", (chunk: Buffer) => { output += chunk.toString("utf8"); });
+    child.on("error", reject);
+    child.on("exit", (code) => code === 0 ? resolve(output) : reject(new Error(`docker ${code}`)));
   });
 }
 
