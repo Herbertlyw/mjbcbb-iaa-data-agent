@@ -19,6 +19,12 @@
       }
     },
     {
+      "table": "fact_fox_daily_payment",
+      "engine": "clickhouse-local",
+      "date_column": "event_date",
+      "period": { "timezone": "America/Los_Angeles", "lag_days": 17, "window_days": 7 }
+    },
+    {
       "table": "fact_fox_daily_active",
       "engine": "clickhouse-local",
       "date_column": "event_date",

@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { currentCalendarDate, isCalendarDate } from "./config.js";
 
 export const WAREHOUSE_DATABASE = "harborlight";
 export const WAREHOUSE_DATES = enumerate("2026-09-29", "2026-10-12");
@@ -51,6 +52,9 @@ export const WAREHOUSE_TABLES: TableSpec[] = [
   fact("fact_fox_daily_active", "每日活跃", "同一粒度的活跃用户，不从新增填补。", "event_date", ["active_users"], null, [], [
     metric("active_users", "Nullable(Int32)", "活跃用户。NULL 是缺失，0 是真实零。", true, "人"),
   ], "与新增同一批日期。10-12 日本 iOS 纸灯雾帆是合成异常波动。"),
+  fact("fact_fox_daily_payment", "合成精确金额", "演示 Decimal 保留精度，不是真实交易。", "event_date", ["amount_usd"], null, [], [
+    metric("amount_usd", "Nullable(Decimal(18,2))", "虚构金额，使用精确十进制美元。", true, "USD"),
+  ], "合成金额仅用于验证定点计算。"),
   {
     ...fact("fact_fox_retention_cohort", "留存 cohort", "按 cohort 日和留存日龄的留存人数。", "cohort_date", ["retained_users"], null, [], [
       { name: "day_n", chType: "UInt16", description: "留存日龄" },
@@ -183,6 +187,7 @@ export function smallWarehouse() {
   }
   const revenue: RevenueRow[] = [];
   const spend: SpendRow[] = [];
+  const payments = WAREHOUSE_DATES.map((date) => ({ event_date: date, title_id: "paper_lantern", platform: "ios", country_code: "US", channel_id: "mist_ads", amount_usd: date === "2026-10-06" ? "90071992547409.91" : date === "2026-10-07" ? "0.09" : date === "2026-10-08" ? "1.00" : date === "2026-10-09" ? null : "0.00" }));
   const revenuePlan: Record<string, [number | null, number]> = {
     "2026-10-06": [12.5, 0],
     "2026-10-07": [0, 0],
@@ -220,6 +225,7 @@ export function smallWarehouse() {
     ],
     installs,
     active,
+    payments,
     revenue,
     spend,
     retention: [
@@ -240,6 +246,25 @@ export function smallWarehouse() {
       { event_date: date, title_id: "paper_lantern", platform: "ios", country_code: "US", experiment_id: "lantern_holdout", variant_id: "release", metric_name: "new_users", metric_value: date === "2026-10-09" ? null : 9 },
     ]),
   };
+}
+
+/** Shift the immutable synthetic fixture as a whole so that its most recent
+ * observation ends 17 calendar days before today in the contract timezone.
+ * Relative NULL/zero/forecast examples and cohort relationships are preserved. */
+export function rollingWarehouse(clock: { now?: Date; simulatedToday?: string } = {}): ReturnType<typeof smallWarehouse> {
+  if (clock.simulatedToday && !isCalendarDate(clock.simulatedToday)) throw new Error("invalid_synthetic_clock");
+  const today = currentCalendarDate({ simulatedToday: clock.simulatedToday ?? "" }, "America/Los_Angeles", clock.now);
+  if (!isCalendarDate(today) || today < "1971-01-01" || today > "2148-12-31") throw new Error("invalid_synthetic_clock");
+  const delta = (Date.parse(`${today}T00:00:00Z`) - Date.parse("2026-10-29T00:00:00Z")) / 86_400_000;
+  const dateFields = new Set(["event_date", "cohort_date", "assigned_on", "launched_on"]);
+  const fixture = smallWarehouse();
+  const shifted = Object.fromEntries(Object.entries(fixture).map(([table, rows]) => [table, rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => {
+    if (!dateFields.has(key) || typeof value !== "string") return [key, value];
+    const shiftedDate = new Date(Date.parse(`${value}T00:00:00Z`) + delta * 86_400_000).toISOString().slice(0, 10);
+    if (shiftedDate < "1970-01-01" || shiftedDate > "2149-06-06") throw new Error("synthetic_date_out_of_range");
+    return [key, shiftedDate];
+  })))]));
+  return shifted as ReturnType<typeof smallWarehouse>;
 }
 
 export function bulkInstalls(count: number): InstallRow[] {
@@ -333,7 +358,7 @@ export function emitHarborlightKnowledge(root: string): void {
     });
   }
   writeFileSync(path.join(root, "registry.json"), JSON.stringify({
-    registry_revision: "harborlight-registry-2026-11-01",
+    registry_revision: "harborlight-registry-2026-11-02",
     simulated: true,
     scenario: "虚构工作室 Harborlight 的合成 ClickHouse。不是任何真实业务库。",
     timezone: "America/Los_Angeles",

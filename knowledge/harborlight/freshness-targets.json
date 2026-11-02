@@ -16,6 +16,13 @@
       "expected_end": "2026-10-12"
     },
     {
+      "table": "fact_fox_daily_payment",
+      "engine": "clickhouse-local",
+      "date_column": "event_date",
+      "expected_start": "2026-10-06",
+      "expected_end": "2026-10-12"
+    },
+    {
       "table": "fact_fox_daily_active",
       "engine": "clickhouse-local",
       "date_column": "event_date",

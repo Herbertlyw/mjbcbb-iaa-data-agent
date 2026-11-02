@@ -31,7 +31,7 @@ test("Harborlight 表卡驱动槽位，不把 SQLite 表名写进这条链", () 
   assert.equal(turn.slots.channel, "mist_ads");
   assert.equal(turn.warehouse?.new_users?.table, "fact_fox_daily_install");
   assert.equal(diagnoseKnowledge(knowledgeDir).length, 0);
-  assert.equal(WAREHOUSE_TABLES.length, 10);
+  assert.equal(WAREHOUSE_TABLES.length, 11);
   assert.equal(chunks(bulkInstalls(20_000), 5_000).length, 4);
 });
 
@@ -68,6 +68,7 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
     await clickHouseInsert(admin, "dim_fox_channel", data.channels);
     await clickHouseInsert(admin, "fact_fox_daily_install", data.installs);
     await clickHouseInsert(admin, "fact_fox_daily_active", data.active);
+    await clickHouseInsert(admin, "fact_fox_daily_payment", data.payments);
     await clickHouseInsert(admin, "fact_fox_ad_receipt", data.revenue);
     await clickHouseInsert(admin, "fact_fox_daily_spend", data.spend);
     await clickHouseInsert(admin, "fact_fox_retention_cohort", data.retention);

@@ -1,0 +1,24 @@
+{
+  "asset_id": "contract.fact_fox_daily_payment",
+  "revision": "contract.fact_fox_daily_payment-r1",
+  "table": "fact_fox_daily_payment",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2026-09-01",
+  "valid_until": "2027-04-01",
+  "timezone": "America/Los_Angeles",
+  "freshness": { "as_of": null, "status": "unknown", "note": "查询只认已发布探测。" },
+  "must_filter": ["event_date"],
+  "grain": ["event_date", "title_id", "platform", "country_code", "channel_id"],
+  "series": { "date_column": "event_date", "dimensions": ["title_id", "platform", "country_code", "channel_id"], "metrics": ["amount_usd"], "predicted_column": null, "prediction_mode": "observed_only" },
+  "columns": [
+    { "name": "event_date", "type": "Date", "description": "洛杉矶业务日期。" },
+    { "name": "title_id", "type": "LowCardinality(String)", "description": "虚构产品标识。" },
+    { "name": "platform", "type": "LowCardinality(String)", "description": "虚构平台。" },
+    { "name": "country_code", "type": "LowCardinality(String)", "description": "虚构地区。" },
+    { "name": "channel_id", "type": "LowCardinality(String)", "description": "虚构渠道。" },
+    { "name": "amount_usd", "type": "Nullable(Decimal(18,2))", "description": "虚构金额，使用精确十进制美元。", "unit": "USD", "nullable": true, "null_means": "缺失，不能当成零", "zero_means": "观测到的真实零" }
+  ],
+  "sensitive_columns": [],
+  "notes": "合成数据，仅用于验证精确金额；不是交易记录。"
+}

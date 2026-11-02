@@ -1,5 +1,5 @@
 {
-  "registry_revision": "harborlight-registry-2026-11-01",
+  "registry_revision": "harborlight-registry-2026-11-02",
   "simulated": true,
   "scenario": "虚构工作室 Harborlight 的合成 ClickHouse。不是任何真实业务库。",
   "timezone": "America/Los_Angeles",
@@ -140,6 +140,17 @@
       "discoverable": true,
       "table": "fact_fox_daily_install",
       "path": "contracts/fact_fox_daily_install.json"
+    },
+    {
+      "asset_id": "contract.fact_fox_daily_payment",
+      "kind": "data_contract",
+      "title": "合成精确金额",
+      "summary": "按日、产品、平台、地区、渠道记录的虚构 Decimal 金额。",
+      "revision": "contract.fact_fox_daily_payment-r1",
+      "status": "published",
+      "discoverable": true,
+      "table": "fact_fox_daily_payment",
+      "path": "contracts/fact_fox_daily_payment.json"
     },
     {
       "asset_id": "contract.fact_fox_daily_active",

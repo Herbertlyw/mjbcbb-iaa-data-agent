@@ -54,6 +54,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     await clickHouseInsert(admin, "dim_fox_channel", data.channels);
     await clickHouseInsert(admin, "fact_fox_daily_install", data.installs);
     await clickHouseInsert(admin, "fact_fox_daily_active", data.active);
+    await clickHouseInsert(admin, "fact_fox_daily_payment", data.payments);
     await clickHouseInsert(admin, "fact_fox_ad_receipt", data.revenue);
     await clickHouseInsert(admin, "fact_fox_daily_spend", data.spend);
     await clickHouseInsert(admin, "fact_fox_retention_cohort", data.retention);
@@ -63,6 +64,20 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     await clickHouseCommand(admin, `CREATE USER IF NOT EXISTS fox_reader IDENTIFIED BY '${readerPassword}'`);
     await clickHouseCommand(admin, "GRANT SELECT ON harborlight.* TO fox_reader");
     await admin.close();
+    // Exercise the actual seed command against this test's isolated ClickHouse.
+    const seedEnv = { PATH: process.env.PATH ?? "", CLICKHOUSE_URL: clickhouseUrl, SYNTHETIC_DATABASE: "synthetic_rolling_it", SYNTHETIC_ADMIN_USER: "default", SYNTHETIC_ADMIN_PASSWORD: adminPassword, SYNTHETIC_READER_USER: "synthetic_rolling_reader", SYNTHETIC_READER_PASSWORD: readerPassword, SIMULATED_TODAY: "2027-02-15" };
+    const seed = spawn(process.execPath, ["--import", "tsx", "src/seed-clickhouse.ts"], { cwd: root, env: seedEnv, stdio: "ignore" });
+    assert.equal(await new Promise((resolve) => seed.once("exit", resolve)), 0);
+    const duplicateSeed = spawn(process.execPath, ["--import", "tsx", "src/seed-clickhouse.ts"], { cwd: root, env: seedEnv, stdio: "ignore" });
+    assert.notEqual(await new Promise((resolve) => duplicateSeed.once("exit", resolve)), 0, "不能覆盖已存在的数据库");
+    const rollingReader = createClickHouseClient({ url: clickhouseUrl, username: "synthetic_rolling_reader", password: readerPassword, database: "synthetic_rolling_it", maxRowsToRead: 5_000_000, timeoutSeconds: 10 }, true);
+    try {
+      const observed = await probeClickHouseFreshness({ targetsPath: path.join(knowledgeDir, "freshness-targets-rolling.example.json"), simulatedToday: "2027-02-15", query: (sql) => clickHouseQuery(rollingReader, sql) as Promise<Array<{ event_date: string }>> });
+      assert.equal(observed.tables.fact_fox_daily_install?.status, "fresh");
+      assert.equal(observed.tables.fact_fox_retention_cohort?.status, "fresh");
+      const values = await clickHouseQuery(rollingReader, "SELECT event_date, new_users FROM fact_fox_daily_install WHERE title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads' AND event_date >= '2027-01-23' AND event_date <= '2027-01-29' ORDER BY event_date");
+      assert.deepEqual(values.map((row) => row.new_users), [100, 0, 120, null, 140, 150, 160]);
+    } finally { await rollingReader.close(); }
     const reader = createClickHouseClient({ url: clickhouseUrl, username: "fox_reader", password: readerPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 10 }, true);
     const freshnessPath = path.join(dir, "freshness.json");
     await waitMysql(mysqlPort, statePassword);
