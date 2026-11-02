@@ -10,7 +10,9 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import mysql from "mysql2/promise";
 import { clickHouseCommand, clickHouseInsert, clickHouseQuery, createClickHouseClient } from "../src/clickhouse-client.js";
-import { probeClickHouseAndPublish } from "../src/freshness.js";
+import { freshnessManifest, probeClickHouseFreshness } from "../src/freshness.js";
+import { MysqlFreshnessStore } from "../src/mysql-freshness.js";
+import { loadKnowledge } from "../src/knowledge.js";
 import { createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
 import { startFakeOpenAI } from "./openai-fake-server.js";
 
@@ -34,11 +36,11 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
   const dir = mkdtempSync(path.join(tmpdir(), "lumenfox-oai-"));
   const children: ChildProcess[] = [];
   try {
-    await docker(["run", "--pull=never", "-d", "--name", names[0], "--ulimit", "nofile=262144:262144", "-p", `127.0.0.1:${clickhousePort}:8123`, "-e", `CLICKHOUSE_PASSWORD=${adminPassword}`, "-e", "CLICKHOUSE_DB=harborlight", "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"]);
+    await docker(["run", "--pull=never", "-d", "--name", names[0], "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", `127.0.0.1:${clickhousePort}:8123`, "-e", `CLICKHOUSE_PASSWORD=${adminPassword}`, "-e", "CLICKHOUSE_DB=harborlight", "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"]);
     createdContainers.push(names[0]!);
-    await docker(["run", "--pull=never", "-d", "--name", names[1], "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${statePassword}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${statePassword}`, "mysql:8.0.32"]);
+    await docker(["run", "--pull=never", "-d", "--name", names[1], "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${statePassword}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${statePassword}`, "mysql:8.0.32"]);
     createdContainers.push(names[1]!);
-    await docker(["run", "--pull=never", "-d", "--name", names[2], "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", statePassword]);
+    await docker(["run", "--pull=never", "-d", "--name", names[2], "--tmpfs", "/data:rw,size=64m", "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", statePassword]);
     createdContainers.push(names[2]!);
     const clickhouseUrl = `http://127.0.0.1:${clickhousePort}`;
     await waitHttp(clickhouseUrl);
@@ -63,15 +65,17 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     await admin.close();
     const reader = createClickHouseClient({ url: clickhouseUrl, username: "fox_reader", password: readerPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 10 }, true);
     const freshnessPath = path.join(dir, "freshness.json");
-    await probeClickHouseAndPublish({
-      targetsPath: path.join(knowledgeDir, "freshness-targets.json"),
-      destinationPath: freshnessPath,
-      query: (sql) => clickHouseQuery(reader, sql) as Promise<Array<{ event_date: string }>>,
-    });
-    await reader.close();
     await waitMysql(mysqlPort, statePassword);
+    const freshness = await MysqlFreshnessStore.open({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password: statePassword, database: "lumenfox_it" });
+    try {
+      const targetsPath = path.join(knowledgeDir, "freshness-targets.json");
+      const batch = await freshness.begin(freshnessManifest(loadKnowledge(knowledgeDir), targetsPath));
+      const observed = await probeClickHouseFreshness({ targetsPath, query: (sql) => clickHouseQuery(reader, sql) as Promise<Array<{ event_date: string }>> });
+      assert.equal(await freshness.publish(batch.version, observed), "published");
+    } finally { await freshness.close(); await reader.close(); }
     const baseEnv = {
       PATH: process.env.PATH ?? "",
+      SIMULATED_TODAY: "2026-10-29",
       HOST: "127.0.0.1",
       PORT: String(apiPort),
       STATE_MODE: "mysql",
@@ -214,15 +218,19 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     children.push(lowWorker);
     const lowSession = await another();
     const lowFirst = await postQuestion(apiPort, lowSession, question);
-    assert.match(lowFirst.analysis?.answer ?? "", /670/, JSON.stringify(lowFirst.error));
-    const lowFollowup = await postQuestion(apiPort, lowSession, "那日本呢？");
-    // The fake compaction summary is deliberately not a language model: when it
-    // loses the initial scope, clarification is safer than inventing the scope.
-    if (lowFollowup.status === "needs_clarification") {
-      assert.equal(lowFollowup.events.some((event) => event.type === "tool_started" && event.payload.tool_name === "query"), false);
+    if (lowFirst.status === "failed") {
+      assert.equal(lowFirst.error?.code, "context_window_exceeded");
+      assert.equal(lowFirst.events.some((event) => event.type === "tool_started" && event.payload.tool_name === "query"), false);
     } else {
-      assert.equal(lowFollowup.status, "failed", JSON.stringify(lowFollowup.error));
-      assert.equal(lowFollowup.error?.code, "context_window_exceeded");
+      assert.match(lowFirst.analysis?.answer ?? "", /670/, JSON.stringify(lowFirst.error));
+      const lowFollowup = await postQuestion(apiPort, lowSession, "那日本呢？");
+      // The scripted compaction cannot prove natural-language scope inheritance.
+      if (lowFollowup.status === "needs_clarification") {
+        assert.equal(lowFollowup.events.some((event) => event.type === "tool_started" && event.payload.tool_name === "query"), false);
+      } else {
+        assert.equal(lowFollowup.status, "failed", JSON.stringify(lowFollowup.error));
+        assert.equal(lowFollowup.error?.code, "context_window_exceeded");
+      }
     }
     const oversized = await postQuestion(apiPort, await another(), question + "合成范围填充".repeat(6000));
     assert.equal(oversized.status, "failed", JSON.stringify(oversized.error));

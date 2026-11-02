@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Agent } from "@earendil-works/pi-agent-core";
-import type { StateStore, StoredSession } from "./state-store.js";
+import type { ExecutionLease, StateStore, StoredSession } from "./state-store.js";
 import type { SessionResource } from "./types.js";
 
 export interface SessionRecord extends StoredSession {
@@ -11,6 +11,7 @@ export interface SessionRecord extends StoredSession {
 export class SessionStore {
   private readonly agents = new Map<string, Agent>();
   private readonly activeJobs = new Map<string, string>();
+  private readonly activeLeases = new Map<string, ExecutionLease>();
   private revisionFn: ((jobId: string) => number | "lost" | "memory") | null = null;
 
   setRevisionFn(fn: (jobId: string) => number | "lost" | "memory"): void {
@@ -19,6 +20,11 @@ export class SessionStore {
 
   consumeRevision(jobId: string): number | "lost" | "memory" {
     return this.revisionFn ? this.revisionFn(jobId) : "memory";
+  }
+
+  reserveToolCall(sessionId: string, maxCalls: number): "ok" | "budget_exhausted" | "lost" {
+    const lease = this.activeLeases.get(sessionId);
+    return lease ? this.state.reserveToolCall(sessionId, lease, maxCalls) : "ok";
   }
 
   constructor(private readonly state: StateStore) {}
@@ -51,7 +57,7 @@ export class SessionStore {
   }
 
   save(session: SessionRecord): void {
-    this.state.saveSession(storedSession(session));
+    this.state.saveSession(storedSession(session), this.activeLeases.get(session.session_id));
   }
 
   rememberAgent(sessionId: string, agent: Agent): void {
@@ -62,13 +68,19 @@ export class SessionStore {
     return this.agents.get(sessionId);
   }
 
-  setActiveJob(sessionId: string, jobId: string | undefined): void {
-    if (jobId) this.activeJobs.set(sessionId, jobId);
-    else this.activeJobs.delete(sessionId);
+  setActiveJob(sessionId: string, jobId: string | undefined, authority?: { owner: string; fence: number }): void {
+    if (jobId) {
+      this.activeJobs.set(sessionId, jobId);
+      if (authority) this.activeLeases.set(sessionId, { jobId, ...authority });
+      else this.activeLeases.delete(sessionId);
+    } else {
+      this.activeJobs.delete(sessionId);
+      this.activeLeases.delete(sessionId);
+    }
   }
 
   saveResource(resource: SessionResource): SessionResource {
-    this.state.saveResource(resource);
+    this.state.saveResource(resource, this.activeLeases.get(resource.session_id));
     return resource;
   }
 

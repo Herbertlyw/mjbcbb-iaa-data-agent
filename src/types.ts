@@ -292,6 +292,7 @@ export interface AnalysisRecord {
     input_truncated: boolean;
     complete_population: boolean;
   }>;
+  comparisons?: import("./evidence-comparison.js").VerifiedComparison[];
   model_suggested_status: string;
   model_draft: string;
   server_reasons: string[];

@@ -4,6 +4,25 @@ import { analyst, bindTables, withRuntime } from "./helpers.js";
 
 const WEEK = "event_date >= '2026-10-06' AND event_date <= '2026-10-12'";
 
+test("未生效和无效日期的契约均不能用于查询", async () => {
+  await withRuntime({ simulatedToday: "2026-10-29" }, async (runtime) => {
+    const session = analyst(runtime);
+    const asset = runtime.knowledge.by_id.get("contract.daily_installs");
+    assert.ok(asset?.contract);
+    asset.contract.valid_from = "2026-11-01";
+    const future = await runtime.tools.readDataContractView(session.session_id, { asset_id: asset.asset_id });
+    assert.equal(future.ok, true);
+    if (future.ok) { assert.equal(future.queryable, false); assert.equal(future.reason, "contract_not_yet_valid"); }
+    const result = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, new_users FROM daily_installs WHERE ${WEEK}` });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, "contract_not_yet_valid");
+    asset.contract.valid_from = "2026-02-30";
+    const invalid = await runtime.tools.readDataContractView(session.session_id, { asset_id: asset.asset_id });
+    assert.equal(invalid.ok, true);
+    if (invalid.ok) { assert.equal(invalid.queryable, false); assert.equal(invalid.reason, "invalid_contract_period"); }
+  });
+});
+
 test("未授权资产、缺少契约和过期契约不能查询", async () => {
   await withRuntime({}, async (runtime) => {
     const session = analyst(runtime);

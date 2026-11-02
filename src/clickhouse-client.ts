@@ -1,4 +1,4 @@
-import { createClient, type ClickHouseClient } from "@clickhouse/client";
+import { ClickHouseLogLevel, createClient, type ClickHouseClient } from "@clickhouse/client";
 
 export interface ClickHouseConfig {
   url: string;
@@ -23,6 +23,9 @@ export function createClickHouseClient(config: ClickHouseConfig, readonly: boole
     username: config.username,
     password: config.password,
     database: config.database,
+    // Driver error logs can include database-provided text and query details.
+    // The tool layer maps failures to safe error codes instead.
+    log: { level: ClickHouseLogLevel.OFF },
     request_timeout: Math.max(config.timeoutSeconds, 1) * 1000,
     clickhouse_settings: {
       readonly: readonly ? "1" : "0",

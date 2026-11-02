@@ -211,6 +211,9 @@ export async function openGovernedSession(input: {
   modelId?: string;
   reasoning?: string;
 }): Promise<GovernedSession> {
+  if (input.config.piProvider !== "faux" && input.config.piProvider !== "openai-compatible") {
+    throw new SessionSnapshotError("provider_unavailable", "该供应商尚未接入统一派发和预算账本，已禁用。");
+  }
   if (input.config.modelMode === "pi" && input.config.piProvider !== "faux" && !input.config.piApiKey) {
     throw new SessionSnapshotError("provider_unavailable", "MODEL_MODE=pi 需要 PI_API_KEY，或显式 PI_PROVIDER=faux。不会改用消息数组。");
   }
@@ -273,13 +276,7 @@ export async function openGovernedSession(input: {
     faux.setResponses([step]);
     runtime.registerNativeProvider(faux.provider);
     model = runtime.getModel("lumenfox-local", "deterministic-analyst");
-  } else {
-    if (input.config.piProvider !== "anthropic") {
-      throw new SessionSnapshotError("provider_unavailable", `当前只接了 anthropic 或显式 faux，收到 ${input.config.piProvider}。`);
-    }
-    await runtime.setRuntimeApiKey(input.config.piProvider, input.config.piApiKey);
-    model = runtime.getModel(input.config.piProvider, selectedModel);
-  }
+  } else throw new SessionSnapshotError("provider_unavailable", "供应商未启用。");
   if (!model) throw new SessionSnapshotError("provider_unavailable", "ModelRuntime 没有返回可用模型。");
   const sessionManager = input.snapshot ? openSnapshot(input.snapshot.jsonl, sessionDir, cwd) : SessionManager.create(cwd, sessionDir);
   if (input.snapshot) {

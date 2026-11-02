@@ -43,6 +43,12 @@ export interface Heartbeat {
   cancel_requested: boolean;
 }
 
+export interface ExecutionLease {
+  jobId: string;
+  owner: string;
+  fence: number;
+}
+
 /**
  * 可替换的本地状态接口。默认实现是单机 SQLite。
  * 它不提供多机共识、跨主机时钟或分布式租约。
@@ -51,10 +57,10 @@ export interface StateStore {
   createSession(session: StoredSession): StoredSession;
   getSession(sessionId: string): StoredSession | undefined;
   listSessions(): StoredSession[];
-  saveSession(session: StoredSession): void;
+  saveSession(session: StoredSession, lease?: ExecutionLease): void;
   addMessage(message: StoredMessage): void;
   listMessages(sessionId: string): StoredMessage[];
-  saveResource(resource: SessionResource): void;
+  saveResource(resource: SessionResource, lease?: ExecutionLease): void;
   getResource(resourceId: string): SessionResource | undefined;
   countResources(): number;
   createJob(input: {
@@ -89,7 +95,8 @@ export interface StateStore {
   listProviderSteps(jobId: string): ProviderStepRecord[];
   getTurnBudget(jobId: string): TurnBudgetRecord | null;
   reserveRevision(jobId: string, owner: string, fence: number): { ok: true; count: number } | { ok: false; count: number };
-  saveProviderPayload(input: ProviderPayloadWrite): void;
+  reserveToolCall(sessionId: string, lease: ExecutionLease, maxCalls: number): "ok" | "budget_exhausted" | "lost";
+  saveProviderPayload(input: ProviderPayloadWrite): boolean;
   listProviderPayloads(jobId: string, actorId: string): ProviderPayloadSummary[];
   readProviderPayload(input: ProviderPayloadRead): ProviderPayloadPage | null;
   close(): void;
@@ -111,7 +118,7 @@ export interface ProviderStepBegin {
   model: string;
   estimatedInput: number;
   reservedOutput: number;
-  estimateSource: "char_estimate";
+  estimateSource: "char_estimate" | "utf8_byte_estimate";
   contextWindow: number;
   maxTokens: number;
   maxModelCalls: number;
@@ -150,7 +157,7 @@ export interface ProviderStepRecord {
   estimated_input: number;
   reserved_output: number;
   reserved_total: number;
-  estimate_source: "char_estimate";
+  estimate_source: "char_estimate" | "utf8_byte_estimate";
   settlement: "pending" | "settled" | "held_unknown";
 }
 
@@ -176,6 +183,8 @@ export interface ProviderPayloadWrite {
   sessionId: string;
   actorId: string;
   jobId: string;
+  owner: string;
+  fence: number;
   kind: "request" | "response";
   body: string;
 }
@@ -284,6 +293,8 @@ export class SqliteStateStore implements StateStore {
         model_id TEXT,
         reasoning TEXT,
         revision_count INTEGER NOT NULL DEFAULT 0,
+        tool_call_count INTEGER NOT NULL DEFAULT 0,
+        tool_call_limit INTEGER,
         UNIQUE (session_id, idempotency_key)
       );
       CREATE TABLE IF NOT EXISTS job_events (
@@ -357,6 +368,8 @@ export class SqliteStateStore implements StateStore {
     this.ensureColumn("jobs", "model_id", "TEXT");
     this.ensureColumn("jobs", "reasoning", "TEXT");
     this.ensureColumn("jobs", "revision_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("jobs", "tool_call_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("jobs", "tool_call_limit", "INTEGER");
   }
 
   createSession(session: StoredSession): StoredSession {
@@ -375,13 +388,13 @@ export class SqliteStateStore implements StateStore {
     return (this.db.prepare("SELECT * FROM sessions ORDER BY created_at").all() as Array<Record<string, unknown>>).map((row) => this.sessionFromRow(row));
   }
 
-  saveSession(session: StoredSession): void {
-    this.db.prepare("UPDATE sessions SET title = ?, slots_json = ?, bindings_json = ? WHERE session_id = ?").run(
-      session.title,
-      JSON.stringify(session.slots),
-      JSON.stringify(session.bindings),
-      session.session_id,
-    );
+  saveSession(session: StoredSession, lease?: ExecutionLease): void {
+    this.transaction(() => {
+      if (lease) this.assertExecutionLease(session.session_id, lease);
+      this.db.prepare("UPDATE sessions SET title = ?, slots_json = ?, bindings_json = ? WHERE session_id = ?").run(
+        session.title, JSON.stringify(session.slots), JSON.stringify(session.bindings), session.session_id,
+      );
+    });
   }
 
   addMessage(message: StoredMessage): void {
@@ -406,12 +419,22 @@ export class SqliteStateStore implements StateStore {
     }));
   }
 
-  saveResource(resource: SessionResource): void {
-    this.db.prepare("INSERT OR REPLACE INTO resources (resource_id, session_id, body_json) VALUES (?, ?, ?)").run(
-      resource.resource_id,
-      resource.session_id,
-      JSON.stringify(resource),
-    );
+  saveResource(resource: SessionResource, lease?: ExecutionLease): void {
+    this.transaction(() => {
+      if (lease) {
+        if (resource.job_id !== lease.jobId) throw new Error("execution_fence_rejected");
+        this.assertExecutionLease(resource.session_id, lease);
+      }
+      this.db.prepare("INSERT OR REPLACE INTO resources (resource_id, session_id, body_json) VALUES (?, ?, ?)").run(
+        resource.resource_id, resource.session_id, JSON.stringify(resource),
+      );
+    });
+  }
+
+  private assertExecutionLease(sessionId: string, lease: ExecutionLease): void {
+    const row = this.db.prepare("SELECT job_id FROM jobs WHERE job_id = ? AND session_id = ? AND lease_owner = ? AND fence = ? AND status = 'running' AND lease_until > ? AND cancel_requested = 0")
+      .get(lease.jobId, sessionId, lease.owner, lease.fence, Date.now());
+    if (!row) throw new Error("execution_fence_rejected");
   }
 
   getResource(resourceId: string): SessionResource | undefined {
@@ -514,22 +537,23 @@ export class SqliteStateStore implements StateStore {
   heartbeat(jobId: string, owner: string, fence: number, now: number, leaseMs: number): Heartbeat {
     const updated = this.db.prepare(
       `UPDATE jobs SET lease_until = ?
-       WHERE job_id = ? AND lease_owner = ? AND fence = ? AND status = 'running'`,
-    ).run(now + leaseMs, jobId, owner, fence);
-    const row = this.db.prepare("SELECT cancel_requested FROM jobs WHERE job_id = ? AND lease_owner = ? AND fence = ? AND status = 'running'").get(
+       WHERE job_id = ? AND lease_owner = ? AND fence = ? AND status = 'running' AND lease_until > ?`,
+    ).run(now + leaseMs, jobId, owner, fence, now);
+    const row = this.db.prepare("SELECT cancel_requested FROM jobs WHERE job_id = ? AND lease_owner = ? AND fence = ? AND status = 'running' AND lease_until > ?").get(
       jobId,
       owner,
       fence,
+      now,
     ) as { cancel_requested: number } | undefined;
     return { ok: updated.changes === 1 && row !== undefined, cancel_requested: row?.cancel_requested === 1 };
   }
 
   appendEvent(jobId: string, owner: string, fence: number, type: string, payload: Record<string, unknown>): JobEvent | null {
     return this.transaction(() => {
-      const row = this.db.prepare("SELECT fence, lease_owner, status, next_seq FROM jobs WHERE job_id = ?").get(jobId) as
-        | { fence: number; lease_owner: string | null; status: string; next_seq: number }
+      const row = this.db.prepare("SELECT fence, lease_owner, lease_until, status, next_seq FROM jobs WHERE job_id = ?").get(jobId) as
+        | { fence: number; lease_owner: string | null; lease_until: number | null; status: string; next_seq: number }
         | undefined;
-      if (!row || row.fence !== fence || row.lease_owner !== owner || isTerminal(row.status as JobStatus)) return null;
+      if (!row || row.fence !== fence || row.lease_owner !== owner || row.status !== "running" || !row.lease_until || row.lease_until <= Date.now()) return null;
       const event = this.insertEvent(jobId, Number(row.next_seq), type, payload);
       const bumped = this.db.prepare("UPDATE jobs SET next_seq = next_seq + 1 WHERE job_id = ? AND fence = ? AND lease_owner = ?").run(jobId, fence, owner);
       if (bumped.changes !== 1) return null;
@@ -547,13 +571,13 @@ export class SqliteStateStore implements StateStore {
     usage: JobUsage | null = null,
   ): boolean {
     return this.transaction(() => {
-      const row = this.db.prepare("SELECT fence, lease_owner, status, next_seq, cancel_requested FROM jobs WHERE job_id = ?").get(jobId) as
-        | { fence: number; lease_owner: string | null; status: string; next_seq: number; cancel_requested: number }
+      const row = this.db.prepare("SELECT fence, lease_owner, lease_until, status, next_seq, cancel_requested FROM jobs WHERE job_id = ?").get(jobId) as
+        | { fence: number; lease_owner: string | null; lease_until: number | null; status: string; next_seq: number; cancel_requested: number }
         | undefined;
-      if (!row || row.fence !== fence || row.lease_owner !== owner || row.status !== "running") return false;
+      if (!row || row.fence !== fence || row.lease_owner !== owner || row.status !== "running" || !row.lease_until || row.lease_until <= Date.now()) return false;
       const terminal = row.cancel_requested === 1 && status !== "timed_out" && status !== "failed" ? "cancelled" : status;
       const type = terminal === "cancelled" ? "job_cancelled" : terminal === "timed_out" ? "job_timed_out" : terminal === "failed" ? "job_failed" : "job_finished";
-      this.insertEvent(jobId, Number(row.next_seq), type, { status: terminal, analysis: terminal === "cancelled" ? null : analysis, error });
+      this.insertEvent(jobId, Number(row.next_seq), type, { status: terminal, error_code: error?.code ?? null });
       const updated = this.db.prepare(
         `UPDATE jobs
          SET status = ?, analysis_json = ?, error_json = ?, usage_json = ?, finished_at = ?, lease_owner = NULL, lease_until = NULL,
@@ -561,7 +585,7 @@ export class SqliteStateStore implements StateStore {
          WHERE job_id = ? AND fence = ? AND lease_owner = ? AND status = 'running'`,
       ).run(
         terminal,
-        terminal === "cancelled" ? null : analysis ? JSON.stringify(analysis) : null,
+        ["cancelled", "failed", "timed_out"].includes(terminal) ? null : analysis ? JSON.stringify(analysis) : null,
         error ? JSON.stringify(error) : null,
         usage ? JSON.stringify(usage) : null,
         new Date().toISOString(),
@@ -620,10 +644,10 @@ export class SqliteStateStore implements StateStore {
 
   saveAgentSnapshot(input: AgentSnapshotWrite): boolean {
     return this.transaction(() => {
-      const row = this.db.prepare("SELECT fence, lease_owner, status FROM jobs WHERE job_id = ?").get(input.jobId) as
-        | { fence: number; lease_owner: string | null; status: string }
+      const row = this.db.prepare("SELECT fence, lease_owner, lease_until, status, session_id FROM jobs WHERE job_id = ?").get(input.jobId) as
+        | { fence: number; lease_owner: string | null; lease_until: number | null; status: string; session_id: string }
         | undefined;
-      if (!row || row.fence !== input.fence || row.lease_owner !== input.owner || row.status !== "running") return false;
+      if (!row || row.fence !== input.fence || row.lease_owner !== input.owner || row.status !== "running" || row.session_id !== input.sessionId || !row.lease_until || row.lease_until <= Date.now()) return false;
       this.db.prepare(
         "INSERT INTO agent_snapshots (session_id, job_id, fence, kind, body_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
       ).run(input.sessionId, input.jobId, input.fence, input.kind, JSON.stringify(input.body), new Date().toISOString());
@@ -633,10 +657,10 @@ export class SqliteStateStore implements StateStore {
 
   beginProviderStep(input: ProviderStepBegin): ProviderStepDecision {
     return this.transaction(() => {
-      const row = this.db.prepare("SELECT fence, lease_owner, status FROM jobs WHERE job_id = ?").get(input.jobId) as
-        | { fence: number; lease_owner: string | null; status: string }
+      const row = this.db.prepare("SELECT fence, lease_owner, lease_until, status, session_id FROM jobs WHERE job_id = ?").get(input.jobId) as
+        | { fence: number; lease_owner: string | null; lease_until: number | null; status: string; session_id: string }
         | undefined;
-      if (!row || row.fence !== input.fence || row.lease_owner !== input.owner || row.status !== "running") {
+      if (!row || row.fence !== input.fence || row.lease_owner !== input.owner || row.status !== "running" || row.session_id !== input.sessionId || !row.lease_until || row.lease_until <= Date.now()) {
         return { ok: false, code: "provider_fence_rejected" };
       }
       const reserve = input.estimatedInput + input.reservedOutput;
@@ -676,7 +700,7 @@ export class SqliteStateStore implements StateStore {
         `INSERT INTO provider_steps (
           step_id, session_id, job_id, actor_id, fence, provider, model, status, usage_source, created_at,
           estimated_input, reserved_output, reserved_total, estimate_source, settlement
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched', 'unknown', ?, ?, ?, ?, 'char_estimate', 'pending')`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched', 'unknown', ?, ?, ?, ?, ?, 'pending')`,
       ).run(
         input.stepId,
         input.sessionId,
@@ -689,6 +713,7 @@ export class SqliteStateStore implements StateStore {
         input.estimatedInput,
         input.reservedOutput,
         reserve,
+        input.estimateSource,
       );
       this.db.prepare(
         "UPDATE turn_budgets SET reserved_tokens = reserved_tokens + ?, model_calls_reserved = model_calls_reserved + 1 WHERE job_id = ?",
@@ -699,12 +724,12 @@ export class SqliteStateStore implements StateStore {
 
   settleProviderStep(input: ProviderStepSettle): ProviderStepDecision {
     return this.transaction(() => {
-      const job = this.db.prepare("SELECT fence, lease_owner, status FROM jobs WHERE job_id = ?").get(input.jobId) as
-        | { fence: number; lease_owner: string | null; status: string }
+      const job = this.db.prepare("SELECT fence, lease_owner, lease_until, status FROM jobs WHERE job_id = ?").get(input.jobId) as
+        | { fence: number; lease_owner: string | null; lease_until: number | null; status: string }
         | undefined;
       const step = this.db.prepare("SELECT * FROM provider_steps WHERE step_id = ?").get(input.stepId) as Record<string, unknown> | undefined;
       if (!step) return { ok: false, code: "step_missing" };
-      if (!job || job.lease_owner !== input.owner || job.status !== "running" || job.fence !== input.fence) {
+      if (!job || job.lease_owner !== input.owner || job.status !== "running" || job.fence !== input.fence || !job.lease_until || job.lease_until <= Date.now()) {
         return { ok: false, code: "provider_fence_rejected" };
       }
       const settlement = String(step.settlement ?? "pending");
@@ -771,11 +796,21 @@ export class SqliteStateStore implements StateStore {
     return this.transaction(() => {
       const updated = this.db.prepare(
         `UPDATE jobs SET revision_count = revision_count + 1
-         WHERE job_id = ? AND fence = ? AND lease_owner = ? AND status = 'running'`,
-      ).run(jobId, fence, owner);
+         WHERE job_id = ? AND fence = ? AND lease_owner = ? AND status = 'running' AND lease_until > ?`,
+      ).run(jobId, fence, owner, Date.now());
       const row = this.db.prepare("SELECT revision_count FROM jobs WHERE job_id = ?").get(jobId) as { revision_count?: number } | undefined;
       const count = Number(row?.revision_count ?? 0);
       return updated.changes === 1 ? { ok: true, count } : { ok: false, count };
+    });
+  }
+
+  reserveToolCall(sessionId: string, lease: ExecutionLease, maxCalls: number): "ok" | "budget_exhausted" | "lost" {
+    return this.transaction(() => {
+      try { this.assertExecutionLease(sessionId, lease); } catch { return "lost"; }
+      this.db.prepare("UPDATE jobs SET tool_call_limit = COALESCE(tool_call_limit, ?) WHERE job_id = ?").run(maxCalls, lease.jobId);
+      const updated = this.db.prepare(`UPDATE jobs SET tool_call_count = tool_call_count + 1
+        WHERE job_id = ? AND tool_call_count < MIN(tool_call_limit, ?)`).run(lease.jobId, maxCalls);
+      return updated.changes === 1 ? "ok" : "budget_exhausted";
     });
   }
 
@@ -784,11 +819,16 @@ export class SqliteStateStore implements StateStore {
     return row ? budgetFromRow(row) : null;
   }
 
-  saveProviderPayload(input: ProviderPayloadWrite): void {
-    this.db.prepare(
-      `INSERT INTO provider_payloads (payload_id, step_id, session_id, actor_id, job_id, kind, body, bytes)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(input.payloadId, input.stepId, input.sessionId, input.actorId, input.jobId, input.kind, input.body, Buffer.byteLength(input.body));
+  saveProviderPayload(input: ProviderPayloadWrite): boolean {
+    return this.transaction(() => {
+      try { this.assertExecutionLease(input.sessionId, { jobId: input.jobId, owner: input.owner, fence: input.fence }); } catch { return false; }
+      const step = this.db.prepare("SELECT step_id FROM provider_steps WHERE step_id = ? AND job_id = ? AND session_id = ? AND actor_id = ? AND fence = ?")
+        .get(input.stepId, input.jobId, input.sessionId, input.actorId, input.fence);
+      if (!step) return false;
+      this.db.prepare(`INSERT INTO provider_payloads (payload_id, step_id, session_id, actor_id, job_id, kind, body, bytes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(input.payloadId, input.stepId, input.sessionId, input.actorId, input.jobId, input.kind, input.body, Buffer.byteLength(input.body));
+      return true;
+    });
   }
 
   listProviderPayloads(jobId: string, actorId: string): ProviderPayloadSummary[] {
@@ -940,7 +980,7 @@ function stepFromSqlite(row: Record<string, unknown>): ProviderStepRecord {
     estimated_input: Number(row.estimated_input ?? 0),
     reserved_output: Number(row.reserved_output ?? 0),
     reserved_total: Number(row.reserved_total ?? 0),
-    estimate_source: "char_estimate",
+    estimate_source: row.estimate_source === "utf8_byte_estimate" ? "utf8_byte_estimate" : "char_estimate",
     settlement: String(row.settlement ?? "pending") as ProviderStepRecord["settlement"],
   };
 }

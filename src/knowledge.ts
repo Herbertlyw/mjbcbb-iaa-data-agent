@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import type { AccessPolicy, AssetRecord, DataContract, JoinConstraint, KnowledgeBase } from "./types.js";
+import { isCalendarDate } from "./config.js";
 
 interface RegistryFile {
   registry_revision: string;
@@ -66,8 +67,11 @@ export function canQueryTable(knowledge: KnowledgeBase, role: string, table: str
   return knowledge.policy.roles[role]?.query_tables.includes(table) ?? false;
 }
 
-export function contractExpired(contract: DataContract, today: string): boolean {
-  return contract.valid_until < today;
+export function contractValidity(contract: DataContract, today: string): "invalid" | "not_yet_valid" | "expired" | null {
+  if (!isCalendarDate(contract.valid_from) || !isCalendarDate(contract.valid_until) || contract.valid_from > contract.valid_until || !isCalendarDate(today)) return "invalid";
+  if (today < contract.valid_from) return "not_yet_valid";
+  if (contract.valid_until < today) return "expired";
+  return null;
 }
 
 export function tableGrain(knowledge: KnowledgeBase, table: string): string[] {

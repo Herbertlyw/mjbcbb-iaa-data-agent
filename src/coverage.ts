@@ -1,4 +1,48 @@
 import type { CoverageGroup, CoverageReport, DataContract } from "./types.js";
+import { parseReadonlySql } from "./sql.js";
+import { isCalendarDate } from "./config.js";
+
+/** The coverage query must describe the same population as the user's WHERE.
+ * Until expression lineage is implemented, accept only one physical table and
+ * conjunctive date bounds plus literal equality filters on series dimensions. */
+export function provenCoverageFilters(sql: string, contract: DataContract, timeRange: { start: string; end: string }): Record<string, string> | null {
+  const series = contract.series;
+  if (!series) return null;
+  let ast: Record<string, unknown>;
+  try { ast = parseReadonlySql(sql).ast; } catch { return null; }
+  if (ast.with || ast._next || ast.limit || ast.having || ast.groupby || ast.distinct || ast.options) return null;
+  const from = Array.isArray(ast.from) ? ast.from : [];
+  const relation = object(from[0]);
+  if (from.length !== 1 || !relation || relation.table !== contract.table || relation.db || relation.expr || relation.join) return null;
+  const qualifier = typeof relation.as === "string" ? relation.as : contract.table;
+  const dimensions = new Set(series.dimensions);
+  const equalities: Record<string, string> = {};
+  let start = "";
+  let end = "";
+  function visit(value: unknown): boolean {
+    const expr = object(value);
+    if (!expr || expr.type !== "binary_expr") return false;
+    if (expr.operator === "AND") return visit(expr.left) && visit(expr.right);
+    const left = object(expr.left);
+    const right = object(expr.right);
+    if (!left || left.type !== "column_ref" || typeof left.column !== "string" || (left.table && left.table !== qualifier) || !right || right.type !== "single_quote_string" || typeof right.value !== "string") return false;
+    if (left.column === series!.date_column) {
+      if (!/^\d{4}-\d{2}-\d{2}$/u.test(right.value)) return false;
+      if (expr.operator === ">=" && !start) start = right.value;
+      else if (expr.operator === "<=" && !end) end = right.value;
+      else return false;
+      return true;
+    }
+    if (expr.operator !== "=" || !dimensions.has(left.column) || Object.hasOwn(equalities, left.column) || !/^[A-Za-z0-9_-]+$/u.test(right.value)) return false;
+    equalities[left.column] = right.value;
+    return true;
+  }
+  return visit(ast.where) && start === timeRange.start && end === timeRange.end && Boolean(start && end) ? equalities : null;
+}
+
+function object(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
 
 export function assessCoverage(
   contract: DataContract | undefined,
@@ -134,7 +178,7 @@ function classify(
 }
 
 function enumerateDates(start: string, end: string): string[] | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/u.test(start) || !/^\d{4}-\d{2}-\d{2}$/u.test(end) || start > end) return null;
+  if (!isCalendarDate(start) || !isCalendarDate(end) || start > end) return null;
   const dates: string[] = [];
   const cursor = new Date(`${start}T00:00:00Z`);
   const last = new Date(`${end}T00:00:00Z`);

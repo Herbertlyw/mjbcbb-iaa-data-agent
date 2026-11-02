@@ -1,11 +1,11 @@
 import { loadConfig } from "./config.js";
-import { MysqlStateStore } from "./mysql-state-store.js";
+import { AsyncMysqlStateStore } from "./async-mysql-state-store.js";
 import { RedisJobQueue } from "./redis-queue.js";
 import { assertIsolatedMysql } from "./runtime.js";
 
 const config = loadConfig({ stateMode: "mysql", startWorker: false, publishFreshnessOnStart: false, reseedDatabase: false });
 assertIsolatedMysql(config);
-const state = new MysqlStateStore({
+const state = await AsyncMysqlStateStore.open({
   host: config.mysqlHost,
   port: config.mysqlPort,
   user: config.mysqlUser,
@@ -23,18 +23,27 @@ process.on("SIGTERM", () => {
   running = false;
 });
 console.log("Lumenfox dispatcher：从 MySQL outbox 投递到 Redis。投递成功不等于任务完成。");
-while (running) {
-  const pending = state.listPendingOutbox(20);
-  for (const item of pending) {
+try {
+  while (running) {
     try {
-      await queue.publish({ job_id: item.job_id, outbox_id: item.outbox_id });
-      state.markOutboxDispatched(item.outbox_id);
+      const pending = await state.call("listPendingOutbox", 20);
+      for (const item of pending) {
+        try {
+          await queue.publish({ job_id: item.job_id, outbox_id: item.outbox_id });
+          await state.call("markOutboxDispatched", item.outbox_id);
+        } catch {
+          // Redis is only a wakeup channel. A timed-out acknowledgement may
+          // have committed; duplicate wakeups remain possible and harmless.
+          await state.call("recordOutboxAttempt", item.outbox_id).catch(() => undefined);
+          console.error("outbox 投递结果不明或失败；重复唤醒不决定任务终态。");
+        }
+      }
     } catch {
-      state.recordOutboxAttempt(item.outbox_id);
-      console.error("outbox 投递失败，稍后重试。队列里即使出现重复消息，也不能产生第二个终态。");
+      console.error("outbox 状态暂不可用，稍后重新读取。");
     }
+    await new Promise((resolve) => setTimeout(resolve, config.dispatcherPollMs));
   }
-  await new Promise((resolve) => setTimeout(resolve, config.dispatcherPollMs));
+} finally {
+  await queue.close();
+  await state.close();
 }
-await queue.close();
-state.close();

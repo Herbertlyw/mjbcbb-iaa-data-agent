@@ -13,6 +13,7 @@ if (config.host !== "127.0.0.1") {
   process.exit(1);
 }
 const runtime = createRuntime(config);
+const claims = await runtime.mysqlAsyncState();
 const queue = new RedisJobQueue({
   host: config.redisHost,
   port: config.redisPort,
@@ -28,11 +29,11 @@ console.log("Lumenfox worker：Redis 只用来唤醒。领取、续租和终态�
 while (running) {
   const message = await queue.take(1);
   if (message?.job_id) {
-    const claim = runtime.state.claimJob(message.job_id, runtime.jobs.workerOwner, Date.now(), config.leaseMs);
+    const claim = await claims.call("claimJob", message.job_id, runtime.jobs.workerOwner, Date.now(), config.leaseMs);
     if (claim) await runtime.jobs.runClaimed(claim);
   }
   if (Date.now() >= nextRecovery) {
-    const recovered = runtime.state.claimNext(runtime.jobs.workerOwner, Date.now(), config.leaseMs);
+    const recovered = await claims.call("claimNext", runtime.jobs.workerOwner, Date.now(), config.leaseMs);
     if (recovered) await runtime.jobs.runClaimed(recovered);
     nextRecovery = Date.now() + config.recoveryMs;
   }

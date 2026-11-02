@@ -1,6 +1,6 @@
 {
   "asset_id": "contract.dim_fox_channel",
-  "revision": "contract.dim_fox_channel-r1",
+  "revision": "contract.dim_fox_channel-r2",
   "table": "dim_fox_channel",
   "engine": "clickhouse-local",
   "simulated": true,
@@ -13,6 +13,7 @@
     "note": "查询只认已发布探测，不认这里的占位。"
   },
   "must_filter": [],
+  "grain": ["channel_id"],
   "columns": [
     {
       "name": "channel_id",

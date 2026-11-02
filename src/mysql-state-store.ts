@@ -1,6 +1,6 @@
 import { MessageChannel, Worker, receiveMessageOnPort } from "node:worker_threads";
 import type { AnalysisRecord, JobRecord, JobStatus, SessionResource } from "./types.js";
-import type { AgentSnapshotRecord, AgentSnapshotWrite, Claim, Heartbeat, JobUsage, OutboxMessage, ProviderPayloadPage, ProviderPayloadRead, ProviderPayloadSummary, ProviderPayloadWrite, ProviderStepBegin, ProviderStepDecision, ProviderStepRecord, ProviderStepSettle, StateStore, StoredMessage, StoredSession, TurnBudgetRecord } from "./state-store.js";
+import type { AgentSnapshotRecord, AgentSnapshotWrite, Claim, ExecutionLease, Heartbeat, JobUsage, OutboxMessage, ProviderPayloadPage, ProviderPayloadRead, ProviderPayloadSummary, ProviderPayloadWrite, ProviderStepBegin, ProviderStepDecision, ProviderStepRecord, ProviderStepSettle, StateStore, StoredMessage, StoredSession, TurnBudgetRecord } from "./state-store.js";
 import type { JobEvent } from "./types.js";
 
 export interface MysqlConnection {
@@ -13,7 +13,7 @@ export interface MysqlConnection {
 
 /**
  * MySQL 是任务状态权威。调用保持同步，是因为现有执行循环按同步状态接口编写。
- * 实际 SQL 在独立 worker 线程里执行，避免堵住主线程的事件循环。
+ * SQL 在独立 worker 线程执行，但同步等待响应仍会阻塞主线程；慢查询可能延迟心跳和取消。
  * Redis 不在这里。队列消息不能改变租约、围栏或终态。
  */
 export class MysqlStateStore implements StateStore {
@@ -40,8 +40,8 @@ export class MysqlStateStore implements StateStore {
     return this.call("listSessions", []);
   }
 
-  saveSession(session: StoredSession): void {
-    this.call("saveSession", [session]);
+  saveSession(session: StoredSession, lease?: ExecutionLease): void {
+    this.call("saveSession", [session, lease]);
   }
 
   addMessage(message: StoredMessage): void {
@@ -52,8 +52,8 @@ export class MysqlStateStore implements StateStore {
     return this.call("listMessages", [sessionId]);
   }
 
-  saveResource(resource: SessionResource): void {
-    this.call("saveResource", [resource]);
+  saveResource(resource: SessionResource, lease?: ExecutionLease): void {
+    this.call("saveResource", [resource, lease]);
   }
 
   getResource(resourceId: string): SessionResource | undefined {
@@ -152,8 +152,12 @@ export class MysqlStateStore implements StateStore {
     return this.call("reserveRevision", [jobId, owner, fence]);
   }
 
-  saveProviderPayload(input: ProviderPayloadWrite): void {
-    this.call("saveProviderPayload", [input]);
+  reserveToolCall(sessionId: string, lease: ExecutionLease, maxCalls: number): "ok" | "budget_exhausted" | "lost" {
+    return this.call("reserveToolCall", [sessionId, lease, maxCalls]);
+  }
+
+  saveProviderPayload(input: ProviderPayloadWrite): boolean {
+    return this.call("saveProviderPayload", [input]);
   }
 
   listProviderPayloads(jobId: string, actorId: string): ProviderPayloadSummary[] {
@@ -191,7 +195,7 @@ export class MysqlStateStore implements StateStore {
         }
         return body.result;
       }
-      Atomics.wait(this.sleep, 0, 0, 20);
+      Atomics.wait(this.sleep, 0, 0, 1);
     }
     throw new Error(`MySQL 状态调用超时：${op}`);
   }

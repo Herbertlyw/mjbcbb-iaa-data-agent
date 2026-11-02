@@ -1,6 +1,10 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
+import type { KnowledgeBase } from "./types.js";
+import type { FreshnessManifest } from "./mysql-freshness.js";
+import { isCalendarDate } from "./config.js";
 
 export interface TableFreshness {
   status: "fresh" | "stale" | "missing" | "probe_failed";
@@ -43,6 +47,26 @@ interface TargetFile {
   targets: ProbeTarget[];
 }
 
+export type FreshnessObservation = Omit<FreshnessPublication, "publication_id" | "version" | "published_at">;
+
+export function freshnessManifest(knowledge: KnowledgeBase, targetsPath: string): FreshnessManifest {
+  const raw = readFileSync(targetsPath, "utf8");
+  const targets = JSON.parse(raw) as TargetFile;
+  const targetTables = targets.targets.map((target) => target.table);
+  const contractHashes: Record<string, string> = {};
+  for (const table of targetTables) {
+    const asset = knowledge.contract_by_table.get(table);
+    if (asset) contractHashes[table] = asset.content_hash;
+  }
+  return { registry_revision: knowledge.registry_revision, target_hash: createHash("sha256").update(raw).digest("hex"), contract_hashes: contractHashes, target_tables: targetTables };
+}
+
+export function matchesFreshnessManifest(actual: FreshnessManifest, expected: FreshnessManifest): boolean {
+  return actual.registry_revision === expected.registry_revision && actual.target_hash === expected.target_hash
+    && JSON.stringify([...actual.target_tables].sort()) === JSON.stringify([...expected.target_tables].sort())
+    && JSON.stringify(Object.entries(actual.contract_hashes).sort()) === JSON.stringify(Object.entries(expected.contract_hashes).sort());
+}
+
 export function publishFreshness(sourcePath: string, destinationPath: string): FreshnessPublication {
   const source = JSON.parse(readFileSync(sourcePath, "utf8")) as Omit<FreshnessPublication, "publication_id" | "version" | "published_at">;
   const previous = readPublication(destinationPath);
@@ -61,32 +85,34 @@ export function publishFreshness(sourcePath: string, destinationPath: string): F
 }
 
 export function probeAndPublish(input: { databasePath: string; targetsPath: string; destinationPath: string }): FreshnessPublication {
+  const observation = probeSqliteFreshness(input);
+  const previous = readPublication(input.destinationPath);
+  const publication: FreshnessPublication = { ...observation, publication_id: `fp_${Date.now().toString(36)}`, version: (previous?.version ?? 0) + 1, published_at: new Date().toISOString() };
+  writeAtomic(input.destinationPath, publication);
+  return publication;
+}
+
+export function probeSqliteFreshness(input: { databasePath: string; targetsPath: string }): FreshnessObservation {
   const targets = JSON.parse(readFileSync(input.targetsPath, "utf8")) as TargetFile;
   const probedAt = new Date().toISOString();
   let database: DatabaseSync | null = null;
   try {
     database = new DatabaseSync(input.databasePath, { readOnly: true });
-  } catch (error) {
-    throw new Error(`合成库无法只读打开，本次不发布：${error instanceof Error ? error.message : "open failed"}`);
+  } catch {
+    throw new Error("合成库无法只读打开，本次不发布。");
   }
   try {
     const tables: FreshnessPublication["tables"] = {};
     for (const target of targets.targets) {
       tables[target.table] = probeTarget(database, target, probedAt);
     }
-    const previous = readPublication(input.destinationPath);
-    const publication: FreshnessPublication = {
-      publication_id: `fp_${Date.now().toString(36)}`,
-      version: (previous?.version ?? 0) + 1,
-      published_at: probedAt,
+    return {
       source: targets.source,
       engine: targets.engine,
       valid_until: targets.valid_until,
       unimplemented_engines: targets.unimplemented_engines ?? [],
       tables,
     };
-    writeAtomic(input.destinationPath, publication);
-    return publication;
   } finally {
     database.close();
   }
@@ -97,25 +123,30 @@ export async function probeClickHouseAndPublish(input: {
   targetsPath: string;
   destinationPath: string;
 }): Promise<FreshnessPublication> {
+  const observation = await probeClickHouseFreshness(input);
+  const previous = readPublication(input.destinationPath);
+  const publication: FreshnessPublication = { ...observation, publication_id: `fp_${Date.now().toString(36)}`, version: (previous?.version ?? 0) + 1, published_at: new Date().toISOString() };
+  writeAtomic(input.destinationPath, publication);
+  return publication;
+}
+
+export async function probeClickHouseFreshness(input: {
+  query: (sql: string) => Promise<Array<{ event_date: string }>>;
+  targetsPath: string;
+}): Promise<FreshnessObservation> {
   const targets = JSON.parse(readFileSync(input.targetsPath, "utf8")) as TargetFile;
   const probedAt = new Date().toISOString();
   const tables: FreshnessPublication["tables"] = {};
   for (const target of targets.targets) {
     tables[target.table] = await probeClickHouseTarget(input.query, target, probedAt);
   }
-  const previous = readPublication(input.destinationPath);
-  const publication: FreshnessPublication = {
-    publication_id: `fp_${Date.now().toString(36)}`,
-    version: (previous?.version ?? 0) + 1,
-    published_at: probedAt,
+  return {
     source: targets.source,
     engine: "clickhouse-local",
     valid_until: targets.valid_until,
     unimplemented_engines: targets.unimplemented_engines ?? [],
     tables,
   };
-  writeAtomic(input.destinationPath, publication);
-  return publication;
 }
 
 async function probeClickHouseTarget(
@@ -147,8 +178,8 @@ async function probeClickHouseTarget(
     rows = await query(
       `SELECT toString(${target.date_column}) AS event_date FROM ${target.table} WHERE ${target.date_column} >= '${target.expected_start}' AND ${target.date_column} <= '${target.expected_end}'`,
     );
-  } catch (error) {
-    return { ...base, failure_reason: error instanceof Error ? error.message : "probe_query_failed" };
+  } catch {
+    return { ...base, failure_reason: "probe_query_failed" };
   }
   const seen = [...new Set(rows.map((row) => String(row.event_date).slice(0, 10)))].sort();
   const missing = expected.filter((date) => !seen.includes(date));
@@ -192,8 +223,8 @@ function probeTarget(database: DatabaseSync, target: ProbeTarget, probedAt: stri
     rows = database
       .prepare(`SELECT ${target.date_column} AS event_date FROM ${target.table} WHERE ${target.date_column} >= ? AND ${target.date_column} <= ?`)
       .all(target.expected_start, target.expected_end) as Array<{ event_date: string }>;
-  } catch (error) {
-    return { ...base, failure_reason: error instanceof Error ? error.message : "probe_query_failed" };
+  } catch {
+    return { ...base, failure_reason: "probe_query_failed" };
   }
   const seen = [...new Set(rows.map((row) => String(row.event_date)))].sort();
   const missing = expected.filter((date) => !seen.includes(date));
@@ -210,7 +241,7 @@ function probeTarget(database: DatabaseSync, target: ProbeTarget, probedAt: stri
 }
 
 function enumerateDates(start: string, end: string): string[] | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/u.test(start) || !/^\d{4}-\d{2}-\d{2}$/u.test(end) || start > end) return null;
+  if (!isCalendarDate(start) || !isCalendarDate(end) || start > end) return null;
   const dates: string[] = [];
   const cursor = new Date(`${start}T00:00:00Z`);
   const last = new Date(`${end}T00:00:00Z`);

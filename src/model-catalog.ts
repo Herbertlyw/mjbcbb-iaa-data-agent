@@ -53,16 +53,6 @@ export function modelCatalog(config: AppConfig): ModelCatalog {
       max_output_tokens: config.piMaxOutputTokens,
       verified_here: true,
     });
-  } else if (config.piProvider === "anthropic" && config.piModel.trim()) {
-    models.push({
-      id: config.piModel,
-      provider: "anthropic",
-      reasoning: config.enabledReasoning,
-      enabled: true,
-      context_window: null,
-      max_output_tokens: null,
-      verified_here: false,
-    });
   }
   return {
     remote_https_configured: config.allowRemoteHttps,

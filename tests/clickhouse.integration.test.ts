@@ -10,7 +10,9 @@ import { fileURLToPath } from "node:url";
 import { Redis } from "ioredis";
 import mysql from "mysql2/promise";
 import { clickHouseColumns, clickHouseCommand, clickHouseInsert, clickHouseQuery, createClickHouseClient } from "../src/clickhouse-client.js";
-import { probeClickHouseAndPublish } from "../src/freshness.js";
+import { freshnessManifest, probeClickHouseAndPublish, probeClickHouseFreshness } from "../src/freshness.js";
+import { MysqlFreshnessStore } from "../src/mysql-freshness.js";
+import { loadKnowledge } from "../src/knowledge.js";
 import { compareLiveColumns, diagnoseKnowledge } from "../src/knowledge-doctor.js";
 import { createRuntime } from "../src/runtime.js";
 import { resolveTurn } from "../src/turn.js";
@@ -42,6 +44,7 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
   try {
     await runQuiet("docker", [
       "run", "--pull=never", "-d", "--name", container,
+      "--tmpfs", "/var/lib/clickhouse:rw,size=512m",
       "--ulimit", "nofile=262144:262144",
       "-p", `127.0.0.1:${port}:8123`,
       "-e", `CLICKHOUSE_PASSWORD=${adminPassword}`,
@@ -162,6 +165,13 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
         assert.equal(result.ok, false, sql);
         if (!result.ok) assert.equal(result.code, code, sql);
       }
+      const resourcesBeforeNested = runtime.sessions.resourceCount();
+      const nestedJoin = await runtime.tools.query(session.session_id, {
+        sql: "WITH x AS (SELECT a.event_date FROM fact_fox_daily_install a JOIN fact_fox_experiment_metric b ON a.event_date = b.event_date WHERE a.event_date >= '2026-10-06' AND a.event_date <= '2026-10-12' AND b.event_date >= '2026-10-06' AND b.event_date <= '2026-10-12') SELECT event_date FROM x",
+      });
+      assert.equal(nestedJoin.ok, false);
+      if (!nestedJoin.ok) assert.equal(nestedJoin.code, "missing_join_constraint");
+      assert.equal(runtime.sessions.resourceCount(), resourcesBeforeNested);
       const nested = await runtime.tools.query(session.session_id, {
         sql: "SELECT event_date, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND title_id IN (SELECT title_id FROM fact_fox_daily_install)",
       });
@@ -337,12 +347,13 @@ async function runSplitProcess(clickhouseUrl: string, freshnessPath: string, dir
   const statePassword = randomBytes(12).toString("hex");
   const children: ChildProcess[] = [];
   try {
-    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", mysqlName, "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${statePassword}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${statePassword}`, "mysql:8.0.32"], statePassword);
+    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", mysqlName, "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${statePassword}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${statePassword}`, "mysql:8.0.32"], statePassword);
     mysqlCreated = true;
-    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", redisName, "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", statePassword], statePassword);
+    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", redisName, "--tmpfs", "/data:rw,size=64m", "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", statePassword], statePassword);
     redisCreated = true;
     const env = {
       PATH: process.env.PATH ?? "",
+      SIMULATED_TODAY: "2026-10-29",
       HOST: "127.0.0.1",
       PORT: String(apiPort),
       STATE_MODE: "mysql",
@@ -375,6 +386,14 @@ async function runSplitProcess(clickhouseUrl: string, freshnessPath: string, dir
     };
     void clickhousePort;
     await waitForMysql(mysqlPort, statePassword);
+    const freshness = await MysqlFreshnessStore.open({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password: statePassword, database: "lumenfox_it" });
+    const freshnessReader = createClickHouseClient({ url: clickhouseUrl, username: "fox_reader", password: readerPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 10 }, true);
+    try {
+      const targetsPath = path.join(knowledgeDir, "freshness-targets.json");
+      const batch = await freshness.begin(freshnessManifest(loadKnowledge(knowledgeDir), targetsPath));
+      const observed = await probeClickHouseFreshness({ targetsPath, query: (sql) => clickHouseQuery(freshnessReader, sql) as Promise<Array<{ event_date: string }>> });
+      assert.equal(await freshness.publish(batch.version, observed), "published");
+    } finally { await freshness.close(); await freshnessReader.close(); }
     const logs: string[] = [];
     const api = spawn(process.execPath, ["--import", "tsx", "src/api.ts"], { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });
     children.push(api);
@@ -422,6 +441,21 @@ async function runSplitProcess(clickhouseUrl: string, freshnessPath: string, dir
     const interruptedJob = (await interrupted.json()) as { job_id: string };
     const sawTool = await waitForEvent(apiPort, interruptedJob.job_id, "transcript_saved");
     assert.equal(sawTool, true);
+    // Wait for the next tool to start and remain unfinished; killing immediately
+    // after the saved receipt races with the agent starting its next tool.
+    const unfinishedStart = Date.now();
+    let sawUnfinished = false;
+    while (Date.now() - unfinishedStart < 10_000) {
+      const progress = await jobBody(apiPort, interruptedJob.job_id);
+      const saved = progress.events.filter((event) => event.type === "transcript_saved").at(-1);
+      const started = progress.events.filter((event) => event.type === "tool_started").at(-1);
+      if (saved && started && started.seq > saved.seq && !progress.events.some((event) => event.type === "tool_finished" && event.payload.tool_call_id === started.payload.tool_call_id)) {
+        sawUnfinished = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    assert.equal(sawUnfinished, true);
     worker?.kill("SIGKILL");
     await new Promise((resolve) => setTimeout(resolve, 2200));
     const recoveredWorker = spawn(process.execPath, ["--import", "tsx", "src/worker.ts"], { cwd: root, env, stdio: ["ignore", "pipe", "pipe"] });

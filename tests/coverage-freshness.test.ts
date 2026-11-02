@@ -3,9 +3,9 @@ import { readFileSync, writeFileSync } from "node:fs";
 import test from "node:test";
 import type { AddressInfo } from "node:net";
 import { modelPrompt } from "../src/agent.js";
-import { assessCoverage } from "../src/coverage.js";
+import { assessCoverage, provenCoverageFilters } from "../src/coverage.js";
 import { verifyCell } from "../src/evidence.js";
-import { loadConfig } from "../src/config.js";
+import { currentCalendarDate, isCalendarDate, loadConfig } from "../src/config.js";
 import { DEMO_QUESTIONS } from "../src/demo.js";
 import { publishFreshness, readPublication } from "../src/freshness.js";
 import { planFromTranscript } from "../src/planner.js";
@@ -15,6 +15,36 @@ import type { CoverageReport, DataContract, QueryResource } from "../src/types.j
 import { analyst, ask, bindTables, withRuntime } from "./helpers.js";
 
 const WEEK = "event_date >= '2026-10-06' AND event_date <= '2026-10-12'";
+
+test("当前日期使用显式时区，模拟时钟和无效日期有明确边界", () => {
+  const instant = new Date("2026-01-01T01:00:00.000Z");
+  assert.equal(currentCalendarDate({ simulatedToday: "" }, "America/Los_Angeles", instant), "2025-12-31");
+  assert.equal(currentCalendarDate({ simulatedToday: "" }, "Asia/Shanghai", instant), "2026-01-01");
+  assert.equal(currentCalendarDate({ simulatedToday: "2026-10-29" }, "Asia/Shanghai", instant), "2026-10-29");
+  assert.equal(isCalendarDate("2026-02-30"), false);
+  assert.equal(isCalendarDate("2024-02-29"), true);
+  assert.throws(() => loadConfig({ simulatedToday: "2026-02-30" }), /SIMULATED_TODAY/);
+});
+
+test("覆盖统计只接受能证明与主查询完全一致的筛选", async () => {
+  const contract = JSON.parse(readFileSync(new URL("../knowledge/lumenfox/contracts/daily-installs.json", import.meta.url), "utf8")) as DataContract;
+  const range = { start: "2026-10-06", end: "2026-10-12" };
+  const base = `SELECT event_date, new_users FROM daily_installs WHERE ${WEEK}`;
+  assert.deepEqual(provenCoverageFilters(`${base} AND country_code = 'US'`, contract, range), { country_code: "US" });
+  for (const suffix of [" AND new_users > 0", " AND country_code IN ('US', 'JP')", " AND (country_code = 'US' OR country_code = 'JP')", " AND country_code = 'US' AND country_code = 'JP'", " LIMIT 3"]) {
+    assert.equal(provenCoverageFilters(base + suffix, contract, range), null, suffix);
+  }
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    const result = await runtime.tools.query(session.session_id, { sql: `${base} AND new_users > 0` });
+    assert.equal(result.ok, true);
+    if (result.ok) assert.equal((result.coverage as CoverageReport).status, "unknown");
+    const invalid = await runtime.tools.query(session.session_id, { sql: "SELECT event_date, new_users FROM daily_installs WHERE event_date >= '2026-02-30' AND event_date <= '2026-03-03'" });
+    assert.equal(invalid.ok, false);
+    if (!invalid.ok) assert.equal(invalid.code, "invalid_date_range");
+  });
+});
 
 test("同一天的 NULL、零、实际和预测分别记录；无映射不推断实际", () => {
   const contract = JSON.parse(readFileSync(new URL("../knowledge/harborlight/contracts/fact_fox_ad_receipt.json", import.meta.url), "utf8")) as DataContract;

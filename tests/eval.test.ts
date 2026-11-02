@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { diagnoseKnowledge } from "../src/knowledge-doctor.js";
 import { ask, analyst, bindTables, withRuntime } from "./helpers.js";
@@ -11,6 +13,27 @@ const cases = JSON.parse(readFileSync(new URL("../eval/lumenfox-cases.json", imp
 test("知识体检只检查，不改文件", () => {
   const issues = diagnoseKnowledge();
   assert.deepEqual(issues, []);
+});
+
+test("知识体检发现契约序列、单位、时区和连接键错误", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "synthetic-knowledge-doctor-"));
+  try {
+    cpSync(new URL("../knowledge/harborlight", import.meta.url), dir, { recursive: true });
+    const contractPath = path.join(dir, "contracts", "fact_fox_daily_install.json");
+    const contract = JSON.parse(readFileSync(contractPath, "utf8"));
+    contract.timezone = "Invalid/Synthetic";
+    contract.valid_from = "2026-02-30";
+    contract.series.date_column = "missing_date";
+    const metric = contract.columns.find((column: { name: string }) => column.name === contract.series.metrics[0]);
+    delete metric.unit;
+    writeFileSync(contractPath, JSON.stringify(contract));
+    const joinsPath = path.join(dir, "joins.json");
+    const joins = JSON.parse(readFileSync(joinsPath, "utf8"));
+    joins.joins[0].keys.push("missing_key");
+    writeFileSync(joinsPath, JSON.stringify(joins));
+    const codes = new Set(diagnoseKnowledge(dir).map((issue) => issue.code));
+    for (const code of ["contract_timezone_invalid", "contract_validity_invalid", "series_contract_column_missing", "metric_unit_missing", "join_key_missing"]) assert.ok(codes.has(code), code);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("合成评测题对照手工预期，不把代理计算当金标准", async () => {

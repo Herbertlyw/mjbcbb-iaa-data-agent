@@ -1,11 +1,13 @@
 import { rmSync } from "node:fs";
 import { loadConfig, type AppConfig } from "./config.js";
 import { assertLocalClickHouse, createClickHouseClient } from "./clickhouse-client.js";
-import { probeAndPublish, probeClickHouseAndPublish } from "./freshness.js";
+import { freshnessManifest, matchesFreshnessManifest, probeAndPublish, readPublication } from "./freshness.js";
 import { openSimulatedDatabase } from "./database.js";
 import { JobService } from "./jobs.js";
 import { loadKnowledge } from "./knowledge.js";
 import { MysqlStateStore } from "./mysql-state-store.js";
+import { AsyncMysqlStateStore } from "./async-mysql-state-store.js";
+import { MysqlFreshnessStore } from "./mysql-freshness.js";
 import { SessionStore } from "./session.js";
 import { SqliteStateStore, type StateStore } from "./state-store.js";
 import { ToolService } from "./tools.js";
@@ -15,6 +17,11 @@ export class Runtime {
   readonly sessions: SessionStore;
   readonly tools: ToolService;
   readonly jobs: JobService;
+  private mysqlFreshness: MysqlFreshnessStore | null = null;
+  private mysqlFreshnessOpening: Promise<MysqlFreshnessStore | null> | null = null;
+  private asyncState: AsyncMysqlStateStore | null = null;
+  private asyncStateOpening: Promise<AsyncMysqlStateStore> | null = null;
+  private closing = false;
 
   constructor(
     readonly config: AppConfig,
@@ -31,6 +38,7 @@ export class Runtime {
       sessions: this.sessions,
       businessEngine: config.businessEngine,
       clickhouse,
+      ...(config.stateMode === "mysql" ? { mysqlFreshness: () => this.getMysqlFreshness() } : {}),
     });
     this.jobs = new JobService({ config, sessions: this.sessions, tools: this.tools, state });
     if (config.startWorker) this.jobs.start();
@@ -39,10 +47,57 @@ export class Runtime {
   async close(options: { abandon?: boolean } = {}): Promise<void> {
     if (options.abandon) await this.jobs.abandon();
     else await this.jobs.stop();
+    this.closing = true;
     this.db.close();
     this.state.close();
+    const asyncState = this.asyncState ?? await this.asyncStateOpening?.catch(() => null);
+    if (asyncState) await asyncState.close();
+    const freshness = this.mysqlFreshness ?? await this.mysqlFreshnessOpening;
+    if (freshness) await freshness.close();
     if (this.clickhouse) await this.clickhouse.close();
     if (!options.abandon && this.config.ephemeralDir) rmSync(this.config.ephemeralDir, { recursive: true, force: true });
+  }
+
+  async mysqlAsyncState(): Promise<AsyncMysqlStateStore> {
+    if (this.closing || this.config.stateMode !== "mysql") throw new Error("mysql_state_closed");
+    if (this.asyncState?.available) return this.asyncState;
+    if (this.asyncState) {
+      const failed = this.asyncState;
+      this.asyncState = null;
+      await failed.close();
+    }
+    if (this.closing) throw new Error("mysql_state_closed");
+    if (!this.asyncStateOpening) {
+      const config = this.config;
+      this.asyncStateOpening = AsyncMysqlStateStore.open({ host: config.mysqlHost, port: config.mysqlPort, user: config.mysqlUser, password: config.mysqlPassword, database: config.mysqlDatabase })
+        .then((state) => { this.asyncState = state; return state; })
+        .finally(() => { this.asyncStateOpening = null; });
+    }
+    return this.asyncStateOpening;
+  }
+
+  private async getMysqlFreshness(): Promise<MysqlFreshnessStore | null> {
+    if (this.closing) return null;
+    if (this.mysqlFreshness) return this.mysqlFreshness;
+    if (!this.mysqlFreshnessOpening) {
+      const config = this.config;
+      this.mysqlFreshnessOpening = MysqlFreshnessStore.open({ host: config.mysqlHost, port: config.mysqlPort, user: config.mysqlUser, password: config.mysqlPassword, database: config.mysqlDatabase })
+        .then((store) => { this.mysqlFreshness = store; return store; })
+        .catch(() => null)
+        .finally(() => { this.mysqlFreshnessOpening = null; });
+    }
+    return this.mysqlFreshnessOpening;
+  }
+
+  async freshnessHealth(): Promise<{ source: string; status: string }> {
+    if (this.config.stateMode !== "mysql") return { source: "sqlite-demo-file", status: readPublication(this.config.freshnessPath) ? "published" : "not_published" };
+    try {
+      const store = await this.getMysqlFreshness();
+      if (!store) return { source: "mysql", status: "unavailable" };
+      const publication = await store.current();
+      if (!publication) return { source: "mysql", status: "not_published" };
+      return { source: "mysql", status: matchesFreshnessManifest(publication.manifest, freshnessManifest(this.knowledge, this.config.freshnessTargetsPath)) ? "published" : "manifest_changed" };
+    } catch { return { source: "mysql", status: "unavailable" }; }
   }
 }
 
@@ -56,7 +111,7 @@ export function createRuntime(overrides: Partial<AppConfig> = {}): Runtime {
   const db = config.businessEngine === "clickhouse"
     ? openSimulatedDatabase(config.databasePath, "SELECT 1")
     : openSimulatedDatabase(config.databasePath, knowledge.seed_sql, { reseed: config.reseedDatabase });
-  if (config.publishFreshnessOnStart && config.businessEngine === "sqlite") {
+  if (config.publishFreshnessOnStart && config.businessEngine === "sqlite" && config.stateMode === "sqlite") {
     probeAndPublish({ databasePath: config.databasePath, targetsPath: config.freshnessTargetsPath, destinationPath: config.freshnessPath });
   }
   const state = config.stateMode === "mysql"

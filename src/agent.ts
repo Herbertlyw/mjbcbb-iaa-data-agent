@@ -121,33 +121,17 @@ export function createDeterministicStream(): ModelStream {
   return { model, streamFn: models.streamSimple.bind(models) as StreamFn };
 }
 
-async function createLiveStream(config: AppConfig): Promise<ModelStream> {
-  if (!config.piApiKey) {
-    throw new Error("MODEL_MODE=pi 需要 PI_API_KEY。本地演示请使用 MODEL_MODE=deterministic，它不会访问外部模型。");
-  }
-  const { createModels: createLiveModels } = await import("@earendil-works/pi-ai");
-  const models = createLiveModels();
-  if (config.piProvider !== "anthropic") {
-    throw new Error(`当前适配层只接了 anthropic，收到 ${config.piProvider}。`);
-  }
-  const { anthropicProvider } = await import("@earendil-works/pi-ai/providers/anthropic");
-  models.setProvider(anthropicProvider());
-  const model = models.getModel(config.piProvider, config.piModel);
-  if (!model) throw new Error(`找不到模型 ${config.piProvider}/${config.piModel}`);
-  return {
-    model: model as Model<string>,
-    streamFn: models.streamSimple.bind(models) as StreamFn,
-    getApiKey: () => config.piApiKey,
-  };
+async function createLiveStream(_config: AppConfig): Promise<ModelStream> {
+  throw new Error("未治理的旧供应商路径已禁用；Pi 模式须通过受治理的 AgentSession 派发。");
 }
 
 export function domainTools(sessionId: string, tools: ToolService): AgentTool[] {
-  const pack = (result: { ok: boolean }) => ({
+  const pack = (result: { ok: boolean; [key: string]: unknown }) => ({
     content: [{ type: "text" as const, text: JSON.stringify(result) }],
     details: result,
     isError: result.ok === false,
   });
-  return [
+  const registered: AgentTool[] = [
     {
       name: "search_assets",
       label: "搜索资产",
@@ -161,9 +145,14 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "read_asset",
       label: "读取资产",
-      description: "读取一个已授权资产的正文。这不会创建查询绑定。",
-      parameters: Type.Object({ asset_id: Type.String({ description: "资产 ID" }) }),
-      execute: async (_toolCallId, params, signal) => pack(await tools.readAsset(sessionId, params as { asset_id?: string }, signal)),
+      description: "读取一个已授权资产的正文页面，偏移和长度按 Unicode 码点计；续读须带上首页 content_hash。这不会创建查询绑定。",
+      parameters: Type.Object({
+        asset_id: Type.String({ description: "资产 ID" }),
+        body_offset: Type.Optional(Type.Integer({ minimum: 0, description: "正文起点，单位为 Unicode 码点" })),
+        body_limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 4000, description: "每页最多 4000 个 Unicode 码点" })),
+        expected_content_hash: Type.Optional(Type.String({ description: "续读时必须使用首页返回的 content_hash" })),
+      }),
+      execute: async (_toolCallId, params, signal) => pack(await tools.readAsset(sessionId, params as { asset_id?: string; body_offset?: number; body_limit?: number; expected_content_hash?: string }, signal)),
     },
     {
       name: "read_assets",
@@ -171,8 +160,8 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
       description: "逐个授权读取多个资产正文。任一资产失败不会放开其余资产。",
       parameters: Type.Object({
         asset_ids: Type.Array(Type.String(), { description: "资产 ID 列表" }),
-        offset: Type.Optional(Type.Number({ description: "分页起点" })),
-        limit: Type.Optional(Type.Number({ description: "本页条数" })),
+        offset: Type.Optional(Type.Number({ description: "资产列表的分页起点，不是正文偏移" })),
+        limit: Type.Optional(Type.Number({ description: "本页资产条数" })),
       }),
       execute: async (_toolCallId, params, signal) =>
         pack(await tools.readAssets(sessionId, params as { asset_ids?: string[]; offset?: number; limit?: number }, signal)),
@@ -217,9 +206,15 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "read_session_resource",
       label: "读取会话资源",
-      description: "读取当前会话已经生成的查询或计算结果。不能跨会话读取。",
-      parameters: Type.Object({ resource_id: Type.String({ description: "资源 ID" }) }),
-      execute: async (_toolCallId, params, signal) => pack(await tools.readSessionResource(sessionId, params as { resource_id?: string }, signal)),
+      description: "按行分页读取当前会话资源；续页使用 resource_hash。has_more 是保存结果的续页，resource_truncated 是查询被截断。不能跨会话读取。",
+      parameters: Type.Object({
+        resource_id: Type.String({ description: "资源 ID" }),
+        row_offset: Type.Optional(Type.Integer({ minimum: 0 })),
+        row_limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+        columns: Type.Optional(Type.Array(Type.String())),
+        expected_resource_hash: Type.Optional(Type.String({ description: "续页时须填写首页 resource_hash" })),
+      }),
+      execute: async (_toolCallId, params, signal) => pack(await tools.readSessionResource(sessionId, params as { resource_id?: string; row_offset?: number; row_limit?: number; columns?: string[]; expected_resource_hash?: string }, signal)),
     },
     {
       name: "update_analysis",
@@ -236,6 +231,10 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
         resource_ids: Type.Array(Type.String(), { description: "本会话证据资源" }),
         clarification_question: Type.Optional(Type.String()),
         limitations: Type.Optional(Type.Array(Type.String())),
+        comparisons: Type.Optional(Type.Array(Type.Object({
+          left: Type.Object({ resource_id: Type.String(), cell: Type.String() }),
+          right: Type.Object({ resource_id: Type.String(), cell: Type.String() }),
+        }), { maxItems: 20 })),
         findings: Type.Optional(Type.Array(Type.Object({
           label: Type.String(),
           value: Type.Union([Type.Number(), Type.Null()]),
@@ -250,6 +249,15 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
       execute: async (_toolCallId, params, signal) => pack(await tools.updateAnalysis(sessionId, params as AnalysisInput, signal)),
     },
   ];
+  return registered.map((tool) => ({
+    ...tool,
+    execute: async (id, params, signal, onUpdate) => {
+      if (signal?.aborted) return pack({ ok: false, code: "tool_cancelled" });
+      const reservation = tools.reserveToolCall(sessionId);
+      if (reservation !== "ok") return pack({ ok: false, code: reservation === "lost" ? "execution_fence_rejected" : "budget_exhausted" });
+      return tool.execute(id, params, signal, onUpdate);
+    },
+  }));
 }
 
 export function trustedPrompt(turn: unknown, rawText: string): string {

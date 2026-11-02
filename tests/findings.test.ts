@@ -111,3 +111,93 @@ test("当前任务不能用旧任务查询重新计算并冒充本轮证据", as
     if (!attempt.ok) assert.equal(attempt.code, "evidence_feedback");
   });
 });
+
+test("同任务完整整数来源支持可追溯比较，零分母和不兼容范围不伪造变化率", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_compare");
+    const ids: string[] = [];
+    async function cell(date: string, country = "US") {
+      const result = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, new_users FROM daily_installs WHERE event_date >= '${date}' AND event_date <= '${date}' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = '${country}' AND channel = 'nebula_ads'` });
+      assert.equal(result.ok, true);
+      if (!result.ok) throw new Error("synthetic query failed");
+      const calculation = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(result.resource_id), operations: [{ op: "sum", column: "new_users", as: "total" }] });
+      assert.equal(calculation.ok, true);
+      if (!calculation.ok) throw new Error("synthetic calculation failed");
+      ids.push(String(result.resource_id), String(calculation.resource_id));
+      return { resource_id: String(calculation.resource_id), cell: "total", value: (calculation.cells as Record<string, number>).total };
+    }
+    // Independent fixture: the seed explicitly contains 120, 95, 0 and 10.
+    const baseline = await cell("2026-10-06");
+    const current = await cell("2026-10-08");
+    const zero = await cell("2026-10-07");
+    const japan = await cell("2026-10-08", "JP");
+    assert.deepEqual([baseline.value, current.value, zero.value, japan.value], [120, 95, 0, 10]);
+    const result = await runtime.tools.updateAnalysis(session.session_id, {
+      suggested_status: "completed", draft_answer: "", resource_ids: ids,
+      comparisons: [
+        { left: current, right: baseline },
+        { left: current, right: zero },
+        { left: japan, right: current },
+        // Both country and date differ: cannot attribute the change.
+        { left: japan, right: baseline },
+      ],
+    });
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    const comparisons = result.comparisons as Array<{ difference: number; change_percent: string | null }>;
+    assert.deepEqual(comparisons.map(({ difference, change_percent }) => ({ difference, change_percent })), [
+      { difference: -25, change_percent: "-20.83" },
+      { difference: 95, change_percent: null },
+      { difference: -85, change_percent: "-89.47" },
+    ]);
+    assert.equal(result.status, "partial");
+    assert.ok((result.server_reasons as string[]).includes("comparison_unverifiable"));
+    assert.match(String(result.answer), /基准为零，变化率不可计算/);
+    assert.match(String(result.answer), /2026-10-08/);
+  });
+});
+
+test("按国家对原始授权行分组后由服务端交付，未出现的组合不补零", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_group_fixture");
+    const query = await runtime.tools.query(session.session_id, { sql: "SELECT event_date, country_code, new_users FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads'" });
+    assert.equal(query.ok, true);
+    if (!query.ok) return;
+    const calculation = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(query.resource_id), operations: [{ op: "sum", column: "new_users", as: "total" }] });
+    assert.equal(calculation.ok, true);
+    if (!calculation.ok) return;
+    assert.equal((calculation.cells as Record<string, number>).total, 130);
+    const answer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(query.resource_id), String(calculation.resource_id)] });
+    assert.equal(answer.ok, true);
+    if (!answer.ok) return;
+    assert.match(String(answer.answer), /按 country_code 分组/);
+    assert.match(String(answer.answer), /US=120/);
+    assert.match(String(answer.answer), /JP=10/);
+    assert.doesNotMatch(String(answer.answer), /DE=0/);
+  });
+});
+
+test("浮点金额不冒充精确十进制结论", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_ad_revenue"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_float_fixture");
+    const query = await runtime.tools.query(session.session_id, { sql: "SELECT event_date, revenue_usd, is_predicted FROM daily_ad_revenue WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US'" });
+    assert.equal(query.ok, true);
+    if (!query.ok) return;
+    const calculation = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(query.resource_id), operations: [{ op: "sum", column: "revenue_usd", predicted: "actual_only", as: "amount" }] });
+    assert.equal(calculation.ok, true);
+    if (!calculation.ok) return;
+    assert.equal((calculation.cells as Record<string, number>).amount, 12.5);
+    const result = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(query.resource_id), String(calculation.resource_id)] });
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.status, "partial");
+    assert.match(String(result.answer), /浮点近似，非精确十进制.*12\.5；单位 USD/);
+    assert.ok((result.server_reasons as string[]).includes("floating_point_approximate"));
+  });
+});

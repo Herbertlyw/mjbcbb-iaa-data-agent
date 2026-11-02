@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { isCalendarDate } from "./config.js";
 
 const require = createRequire(import.meta.url);
 const loaded = require("node-sql-parser") as {
@@ -86,15 +87,35 @@ export interface RegisteredJoin {
 
 export function assertJoinKeys(rawSql: string, joins: RegisteredJoin[], grains: Map<string, string[]> = new Map()): void {
   const parsed = parseReadonlySql(rawSql);
-  const from = Array.isArray(parsed.ast.from) ? parsed.ast.from : [];
+  // Walk every SELECT, including CTEs, derived tables, scalar subqueries and UNION arms.
+  // A derived relation used as a JOIN operand remains unsupported because its
+  // output-column lineage and grain cannot yet be proved from the contracts.
+  const cteNames = new Set<string>();
+  walk(parsed.ast, (record) => {
+    if (Array.isArray(record.with)) for (const item of record.with) {
+      const name = cteName(asRecord(item));
+      if (name) cteNames.add(name);
+    }
+  });
+  walk(parsed.ast, (statement) => {
+    if (statement.type === "select") assertSelectJoinKeys(statement, joins, grains, cteNames);
+  });
+}
+
+function assertSelectJoinKeys(statement: Record<string, unknown>, joins: RegisteredJoin[], grains: Map<string, string[]>, cteNames: Set<string>): void {
+  const from = Array.isArray(statement.from) ? statement.from : [];
   if (from.length < 2) return;
   const relations = from.map((item, index) => relationOf(item, index));
+  if (relations.some((item) => cteNames.has(item.table))) {
+    throw new SqlRejected("join_structure_unsupported", "CTE 作为连接输入时无法证明输出列与粒度的来源。请直接连接已登记的物理表。");
+  }
   if (relations.some((item) => item.derived)) {
     throw new SqlRejected("join_structure_unsupported", "连接的来源不能是子查询。请分别查询后在会话里计算，或先按登记粒度预聚合。");
   }
   const seen: Relation[] = [];
-  for (const relation of relations) {
+  for (const [index, relation] of relations.entries()) {
     if (!relation.join) {
+      if (index !== 0) throw new SqlRejected("join_structure_unsupported", "不支持逗号连接或缺少 ON 的笛卡尔积。");
       seen.push(relation);
       continue;
     }
@@ -106,6 +127,7 @@ export function assertJoinKeys(rawSql: string, joins: RegisteredJoin[], grains: 
     const otherAlias = [...otherAliases][0] ?? "";
     const other = seen.find((item) => item.alias === otherAlias);
     if (!other) throw new SqlRejected("join_column_ambiguous", `别名 ${otherAlias} 不是这个 FROM 里的表。`);
+    if (seen.some((item) => item.alias === relation.alias)) throw new SqlRejected("join_column_ambiguous", "同一查询层级不能重复使用表别名。");
     for (const pair of pairs) {
       const sides = [pair.left.alias, pair.right.alias].sort().join("|");
       const expected = [relation.alias, other.alias].sort().join("|");
@@ -120,6 +142,9 @@ export function assertJoinKeys(rawSql: string, joins: RegisteredJoin[], grains: 
     if (missing.length) throw new SqlRejected("join_key_missing", `连接键缺少 ${missing.join("、")}。列名出现不等于等值关系成立。`);
     const extra = got.filter((key) => !required.includes(key));
     if (extra.length) throw new SqlRejected("join_key_not_allowed", `ON 里的 ${extra.join("、")} 不是登记连接键。筛选请写在 WHERE。`);
+    if (!grains.has(other.table) || !grains.has(relation.table) || !grains.get(other.table)?.length || !grains.get(relation.table)?.length) {
+      throw new SqlRejected("join_grain_unknown", "连接双方必须有可核对的契约粒度；CTE 输出或未知粒度不能直接参与连接。");
+    }
     const leftLeftover = leftoverGrain(grains.get(other.table) ?? [], required);
     const rightLeftover = leftoverGrain(grains.get(relation.table) ?? [], required);
     if (leftLeftover.length && rightLeftover.length) {
@@ -143,7 +168,7 @@ export function guardSql(rawSql: string, rules: TableRule[], dialect: "sqlite" |
   let end = "";
   for (const rule of rules.filter((rule) => parsed.tables.includes(rule.table))) {
     for (const column of rule.must_filter) {
-      const bounds = dateBounds(parsed.ast, column);
+      const bounds = dateBounds(parsed.ast.where, column);
       if (bounds.start && bounds.end) {
         start = bounds.start;
         end = bounds.end;
@@ -227,6 +252,18 @@ function authorizeSelect(statement: Record<string, unknown>, cteNames: Set<strin
     }
   }
   const direct = directTables(statement, localCtes);
+  const scopedAliases = new Map<string, string>();
+  if (Array.isArray(statement.from)) {
+    for (const item of statement.from) {
+      const relation = asRecord(item);
+      if (typeof relation?.table !== "string") continue;
+      const table = relation.table.toLowerCase();
+      if (localCtes.has(table)) continue;
+      const alias = typeof relation.as === "string" && relation.as ? relation.as.toLowerCase() : table;
+      if (scopedAliases.has(alias)) throw new SqlRejected("join_column_ambiguous", "同一查询层级不能重复使用表别名。");
+      scopedAliases.set(alias, table);
+    }
+  }
   const localColumns = shallowColumns(statement);
   if (localColumns.some((column) => column === "*")) throw new SqlRejected("wildcard_projection", "禁止 SELECT * 或 table.*，不会按契约展开通配符");
   if (hasOperator(statement.where, "OR")) throw new SqlRejected("unsafe_predicate", "不接受可能绕过日期范围的 OR 条件");
@@ -239,13 +276,29 @@ function authorizeSelect(statement: Record<string, unknown>, cteNames: Set<strin
       throw new SqlRejected("column_not_in_contract", `字段 ${column} 不在当前契约允许的字段中`);
     }
   }
+  for (const key of ["columns", "where", "groupby", "having", "orderby"]) {
+    walkShallow(statement[key], (record) => {
+      if (record.type !== "column_ref" || typeof record.table !== "string" || typeof record.column !== "string") return;
+      const alias = record.table.toLowerCase();
+      const table = scopedAliases.get(alias);
+      // CTE and derived output lineage is handled conservatively by the JOIN guard.
+      if (!table && direct.length) throw new SqlRejected("column_scope_unsupported", "无法确认列所属表或关联子查询的作用域。");
+      if (!table) return;
+      const rule = rules.get(table);
+      const column = record.column.toLowerCase();
+      if (rule?.sensitive_columns.includes(column)) throw new SqlRejected("sensitive_field", `字段 ${column} 是敏感字段，不能出现在查询中`);
+      if (!rule?.allowed_columns.includes(column)) throw new SqlRejected("column_not_in_contract", `字段 ${column} 不属于该别名对应的契约`);
+    });
+  }
   columns.push(...localColumns);
   for (const table of direct) {
     const rule = rules.get(table);
     if (!rule) throw new SqlRejected("unknown_table", `表 ${table} 不在本次绑定中`);
     for (const column of rule.must_filter) {
-      const bounds = dateBounds(statement.where, column);
+      const alias = [...scopedAliases].find(([, scopedTable]) => scopedTable === table)?.[0];
+      const bounds = dateBounds(statement.where, column, alias, direct.length > 1);
       if (!bounds.start || !bounds.end) throw new SqlRejected("unbounded_query", `必须为 ${table}.${column} 提供封闭的日期范围`);
+      if (!isCalendarDate(bounds.start) || !isCalendarDate(bounds.end) || bounds.start > bounds.end) throw new SqlRejected("invalid_date_range", `${table}.${column} 的日期范围无效`);
     }
   }
   walkShallow(statement, (record) => {
@@ -320,12 +373,26 @@ function functionName(record: Record<string, unknown>): string | undefined {
   return text.toLowerCase();
 }
 
-function dateBounds(where: unknown, column: string): { start?: string; end?: string } {
+function dateBounds(where: unknown, column: string, alias?: string, requireQualified = false): { start?: string; end?: string } {
   const bounds: { start?: string; end?: string } = {};
-  walkShallow(where, (record) => {
+  const matches = (value: unknown): boolean => {
+    const record = asRecord(value);
+    if (!record || columnOf(record) !== column) return false;
+    const qualifier = typeof record.table === "string" ? record.table.toLowerCase() : undefined;
+    if (requireQualified && !qualifier) return false;
+    return !alias || !qualifier || qualifier === alias;
+  };
+  const visit = (node: unknown): void => {
+    const record = asRecord(node);
+    if (!record) return;
     if (record.type !== "binary_expr" || typeof record.operator !== "string") return;
     const operator = record.operator.toUpperCase();
-    if (operator === "BETWEEN" && columnOf(record.left) === column) {
+    if (operator === "AND") {
+      visit(record.left);
+      visit(record.right);
+      return;
+    }
+    if (operator === "BETWEEN" && matches(record.left)) {
       const values = asRecord(record.right);
       const list = Array.isArray(values?.value) ? values.value : [];
       const start = literal(list[0]);
@@ -336,12 +403,13 @@ function dateBounds(where: unknown, column: string): { start?: string; end?: str
       }
       return;
     }
-    if (columnOf(record.left) !== column) return;
+    if (!matches(record.left)) return;
     const value = literal(record.right);
     if (!value) return;
     if (operator === ">=" || operator === ">") bounds.start = value;
     if (operator === "<=" || operator === "<") bounds.end = value;
-  });
+  };
+  visit(where);
   return bounds;
 }
 

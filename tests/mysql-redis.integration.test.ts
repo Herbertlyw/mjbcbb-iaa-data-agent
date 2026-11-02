@@ -10,8 +10,13 @@ import { fileURLToPath } from "node:url";
 import mysql from "mysql2/promise";
 import { DEMO_QUESTIONS } from "../src/demo.js";
 import { MysqlStateStore } from "../src/mysql-state-store.js";
+import { AsyncMysqlStateStore } from "../src/async-mysql-state-store.js";
+import { MysqlFreshnessStore } from "../src/mysql-freshness.js";
 import { RedisJobQueue } from "../src/redis-queue.js";
 import { createRuntime } from "../src/runtime.js";
+import { freshnessManifest, probeSqliteFreshness } from "../src/freshness.js";
+import { bindTables } from "./helpers.js";
+import type { AnalysisRecord } from "../src/types.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const password = randomBytes(18).toString("hex");
@@ -44,17 +49,257 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
   let mysqlCreated = false;
   let redisCreated = false;
   try {
-    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", mysqlName, "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${password}`, "-e", `MYSQL_DATABASE=${database}`, "-e", `MYSQL_USER=${user}`, "-e", `MYSQL_PASSWORD=${password}`, "mysql:8.0.32", "--bind-address=0.0.0.0"], password);
+    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", mysqlName, "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${password}`, "-e", `MYSQL_DATABASE=${database}`, "-e", `MYSQL_USER=${user}`, "-e", `MYSQL_PASSWORD=${password}`, "mysql:8.0.32", "--bind-address=0.0.0.0", "--skip-log-bin"], password);
     mysqlCreated = true;
-    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", redisName, "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", password], password);
+    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", redisName, "--tmpfs", "/data:rw,size=64m", "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", password], password);
     redisCreated = true;
     await waitForMysql(mysqlPort);
     await waitForRedis(redisPort);
     const authority = store();
+    const freshnessA = await MysqlFreshnessStore.open({ host: "127.0.0.1", port: mysqlPort, user, password, database });
+    const freshnessB = await MysqlFreshnessStore.open({ host: "127.0.0.1", port: mysqlPort, user, password, database });
+    try {
+      const manifest = { registry_revision: "synthetic-r1", target_hash: "a".repeat(64), contract_hashes: { sample: "b".repeat(64) }, target_tables: ["sample"] };
+      const observation = (status: "fresh" | "probe_failed") => ({ source: "synthetic", engine: "clickhouse-local", valid_until: "2027-01-01", unimplemented_engines: [], tables: { sample: { status, as_of: null } } });
+      assert.equal(await freshnessA.current(), null);
+      const firstBatch = await freshnessA.begin(manifest);
+      assert.equal(await freshnessA.publish(firstBatch.version, observation("fresh")), "published");
+      const older = await freshnessA.begin(manifest);
+      const newer = await freshnessB.begin(manifest);
+      await assert.rejects(() => freshnessB.publish(newer.version, { ...observation("fresh"), tables: {} }), /freshness_batch_incomplete/);
+      assert.equal((await freshnessA.current())?.version, firstBatch.version);
+      assert.equal(await freshnessB.publish(newer.version, observation("probe_failed")), "published");
+      assert.equal(await freshnessA.publish(older.version, observation("fresh")), "superseded");
+      assert.equal((await freshnessA.current())?.tables.sample?.status, "probe_failed");
+      assert.equal((await freshnessB.get(firstBatch.version))?.tables.sample?.status, "fresh");
+      const abandoned = await freshnessA.begin(manifest);
+      assert.ok(abandoned.version > newer.version);
+      assert.equal((await freshnessB.current())?.version, newer.version, "未发布批次不可见");
+      const publisherEnv = isolatedEnv({ mysqlPort, redisPort, apiPort, databasePath, freshnessPath, recoveryMs: "60000" });
+      const startPublisher = () => spawn(process.execPath, ["--import", "tsx", "tests/freshness-publisher-child.ts"], { cwd: root, env: publisherEnv, stdio: ["ignore", "ignore", "ignore", "ipc"] });
+      const processA = startPublisher();
+      const processB = startPublisher();
+      children.push(processA, processB);
+      const waitMessage = (child: ChildProcess) => new Promise<Record<string, unknown>>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("freshness publisher timeout")), 10000);
+        child.once("message", (message) => { clearTimeout(timer); resolve(message as Record<string, unknown>); });
+        child.once("error", reject);
+      });
+      assert.equal((await Promise.all([waitMessage(processA), waitMessage(processB)])).every((message) => message.ready === true), true);
+      const beginA = waitMessage(processA); processA.send({ action: "begin", manifest });
+      const versionA = Number(((await beginA).batch as { version: number }).version);
+      const beginB = waitMessage(processB); processB.send({ action: "begin", manifest });
+      const versionB = Number(((await beginB).batch as { version: number }).version);
+      assert.ok(versionB > versionA);
+      const publishB = waitMessage(processB); processB.send({ action: "publish", version: versionB, observation: observation("probe_failed") });
+      assert.equal((await publishB).result, "published");
+      const publishA = waitMessage(processA); processA.send({ action: "publish", version: versionA, observation: observation("fresh") });
+      assert.equal((await publishA).result, "superseded");
+      assert.equal((await freshnessA.current())?.version, versionB);
+      const closeA = waitMessage(processA); processA.send({ action: "close" });
+      const closeB = waitMessage(processB); processB.send({ action: "close" });
+      await Promise.all([closeA, closeB]);
+      const timeoutFreshness = await MysqlFreshnessStore.open({ host: "127.0.0.1", port: mysqlPort, user, password, database }, 500);
+      const lockConnection = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user, password, database });
+      try {
+        const uncertain = await timeoutFreshness.begin(manifest);
+        await lockConnection.beginTransaction();
+        await lockConnection.query("SELECT version FROM freshness_pointer WHERE singleton = 1 FOR UPDATE");
+        const pending = timeoutFreshness.publish(uncertain.version, observation("fresh"));
+        await assert.rejects(() => pending, /freshness_state_outcome_unknown/);
+        await lockConnection.commit();
+        let observedVersion = 0;
+        for (let attempt = 0; attempt < 40 && observedVersion !== uncertain.version; attempt += 1) {
+          await delay(50);
+          observedVersion = (await freshnessA.current())?.version ?? 0;
+        }
+        assert.equal(observedVersion, uncertain.version, "发布超时不证明事务未提交");
+      } finally {
+        await lockConnection.rollback().catch(() => undefined);
+        await lockConnection.end();
+        await timeoutFreshness.close();
+      }
+      const actualManifest = freshnessManifest(seeded.knowledge, seeded.config.freshnessTargetsPath);
+      const probeObservation = () => probeSqliteFreshness({ databasePath, targetsPath: seeded.config.freshnessTargetsPath });
+      const checkRuntime = createRuntime({ stateMode: "mysql", mysqlHost: "127.0.0.1", mysqlPort, mysqlUser: user, mysqlPassword: password, mysqlDatabase: database, redisHost: "127.0.0.1", redisPort, databasePath, freshnessPath, reseedDatabase: false, publishFreshnessOnStart: false, startWorker: false, ephemeralDir: undefined, queryLatencyMs: 1000 });
+      try {
+        const session = checkRuntime.sessions.create("analyst");
+        await bindTables(checkRuntime, session.session_id, ["contract.daily_installs"]);
+        checkRuntime.sessions.setActiveJob(session.session_id, "job_freshness_test");
+        const sql = "SELECT event_date, new_users FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12'";
+        const before = await checkRuntime.tools.query(session.session_id, { sql });
+        assert.equal(before.ok, false);
+        if (!before.ok) assert.equal(before.code, "freshness_manifest_changed", "旧文件和不匹配的数据库版本都不能冒充当前权威状态");
+        assert.equal((await checkRuntime.freshnessHealth()).status, "manifest_changed");
+        const actualBatch = await freshnessA.begin(actualManifest);
+        assert.equal(await freshnessA.publish(actualBatch.version, probeObservation()), "published");
+        assert.equal((await checkRuntime.freshnessHealth()).status, "published");
+        await runQuiet("docker", ["pause", mysqlName], password);
+        try {
+          const beforeHealth = Date.now();
+          assert.equal((await checkRuntime.freshnessHealth()).status, "unavailable");
+          assert.ok(Date.now() - beforeHealth < 15000, "权威库暂停时健康检查必须有限时返回");
+        } finally { await runQuiet("docker", ["unpause", mysqlName], password); }
+        let recoveredHealth = "unavailable";
+        for (let attempt = 0; attempt < 10 && recoveredHealth !== "published"; attempt += 1) {
+          await delay(200);
+          recoveredHealth = (await checkRuntime.freshnessHealth()).status;
+        }
+        assert.equal(recoveredHealth, "published");
+        const duringQuery = checkRuntime.tools.query(session.session_id, { sql });
+        await delay(300);
+        const changedBatch = await freshnessB.begin(actualManifest);
+        assert.equal(await freshnessB.publish(changedBatch.version, probeObservation()), "published");
+        const changed = await duringQuery;
+        assert.equal(changed.ok, false);
+        if (!changed.ok) assert.equal(changed.code, "freshness_version_changed");
+        const query = await checkRuntime.tools.query(session.session_id, { sql });
+        assert.equal(query.ok, true);
+        if (query.ok) {
+          const calc = await checkRuntime.tools.calculateSessionCells(session.session_id, { resource_id: String(query.resource_id), operations: [{ op: "sum", column: "new_users", as: "total" }] });
+          assert.equal(calc.ok, true);
+          if (calc.ok) {
+            const afterQuery = await freshnessA.begin(actualManifest);
+            assert.equal(await freshnessA.publish(afterQuery.version, probeObservation()), "published");
+            const delivery = await checkRuntime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(query.resource_id), String(calc.resource_id)] });
+            assert.equal(delivery.ok, true);
+            if (delivery.ok) assert.ok((delivery.server_reasons as string[]).includes("freshness_version_changed"));
+          }
+        }
+        // The candidate has already passed the service check. Publish between
+        // that check and finish to exercise the transactional delivery barrier.
+        const finishJob = authority.createJob({
+          job: fakeJob(session.session_id, "终态前发布", `fresh-finish-${randomUUID()}`),
+          session,
+          message: { message_id: `msg_${randomUUID()}`, session_id: session.session_id, job_id: "pending", role: "user", text: "终态前发布", created_at: new Date().toISOString() },
+        });
+        const finishClaim = authority.claimJob(finishJob.job_id, "fresh-finish-owner", Date.now(), 15000);
+        assert.ok(finishClaim);
+        checkRuntime.sessions.setActiveJob(session.session_id, finishJob.job_id, { owner: finishClaim.owner, fence: finishClaim.fence });
+        const finishQuery = await checkRuntime.tools.query(session.session_id, { sql });
+        assert.equal(finishQuery.ok, true);
+        if (!finishQuery.ok) throw new Error("freshness test query failed");
+        const finishCalc = await checkRuntime.tools.calculateSessionCells(session.session_id, { resource_id: String(finishQuery.resource_id), operations: [{ op: "sum", column: "new_users", as: "total" }] });
+        assert.equal(finishCalc.ok, true);
+        if (!finishCalc.ok) throw new Error("freshness test calculation failed");
+        const candidate = await checkRuntime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(finishQuery.resource_id), String(finishCalc.resource_id)] });
+        assert.equal(candidate.ok, true);
+        if (!candidate.ok) throw new Error("freshness test candidate failed");
+        const candidateRecord = candidate as unknown as AnalysisRecord;
+        assert.ok(candidateRecord.sources.some((source) => source.evidence_eligible));
+        const beforeFinish = await freshnessB.begin(actualManifest);
+        assert.equal(await freshnessB.publish(beforeFinish.version, probeObservation()), "published");
+        assert.equal(authority.finish(finishJob.job_id, finishClaim.owner, finishClaim.fence, candidateRecord.status, candidateRecord, null), true);
+        const finished = authority.getJob(finishJob.job_id);
+        assert.equal(finished?.status, "failed");
+        assert.equal(finished?.error?.code, "freshness_version_changed");
+        assert.equal(finished?.analysis, null);
+        assert.equal(finished?.events.filter((event) => event.type === "job_failed").length, 1);
+        const failedJob = authority.createJob({
+          job: fakeJob(session.session_id, "失败后候选", `failed-candidate-${randomUUID()}`),
+          session,
+          message: { message_id: `msg_${randomUUID()}`, session_id: session.session_id, job_id: "pending", role: "user", text: "失败后候选", created_at: new Date().toISOString() },
+        });
+        const failedClaim = authority.claimJob(failedJob.job_id, "failed-candidate-owner", Date.now(), 5000);
+        assert.ok(failedClaim);
+        assert.equal(authority.finish(failedJob.job_id, failedClaim.owner, failedClaim.fence, "failed", candidateRecord, { code: "synthetic_failure", message: "合成失败" }), true);
+        assert.equal(authority.getJob(failedJob.job_id)?.analysis, null, "失败终态不能保存候选为正式答案");
+        checkRuntime.sessions.setActiveJob(session.session_id, undefined);
+      } finally { await checkRuntime.close(); }
+      const versionBeforeProbe = (await freshnessB.current())?.version ?? 0;
+      const probe = startRole("src/freshness-probe.ts", isolatedEnv({ mysqlPort, redisPort, apiPort, databasePath, freshnessPath, recoveryMs: "60000" }));
+      children.push(probe);
+      const probeExit = await new Promise<number | null>((resolve, reject) => {
+        probe.once("error", reject);
+        probe.once("exit", (code) => resolve(code));
+      });
+      assert.equal(probeExit, 0, "独立 freshness 进程应发布 MySQL 新版本");
+      assert.ok(((await freshnessA.current())?.version ?? 0) > versionBeforeProbe);
+    } finally {
+      await freshnessA.close();
+      await freshnessB.close();
+    }
+    const delayProbeSession = authority.createSession({ session_id: `ses_${randomUUID()}`, title: "延迟探针", role: "analyst", actor_id: "demo-analyst", created_at: new Date().toISOString(), slots: null, bindings: [] });
+    const delayConnection = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user, password, database });
+    const asyncAuthority = await AsyncMysqlStateStore.open({ host: "127.0.0.1", port: mysqlPort, user, password, database }, 5000);
+    const shortTimeoutAuthority = await AsyncMysqlStateStore.open({ host: "127.0.0.1", port: mysqlPort, user, password, database }, 100);
+    try {
+      await delayConnection.query("CREATE TRIGGER test_session_delay BEFORE UPDATE ON sessions FOR EACH ROW DO SLEEP(0.35)");
+      let timerFired = false;
+      const timer = setTimeout(() => { timerFired = true; }, 40);
+      const before = Date.now();
+      authority.saveSession({ ...delayProbeSession, title: "探针完成" });
+      const elapsed = Date.now() - before;
+      assert.ok(elapsed >= 300);
+      assert.equal(timerFired, false, "同步桥接调用期间 Node 定时器不能运行");
+      await delay(10);
+      assert.equal(timerFired, true);
+      clearTimeout(timer);
+      let asyncTimerFired = false;
+      const asyncTimer = setTimeout(() => { asyncTimerFired = true; }, 40);
+      const asyncStart = Date.now();
+      await asyncAuthority.call("saveSession", { ...delayProbeSession, title: "异步探针" });
+      assert.ok(Date.now() - asyncStart >= 300);
+      assert.equal(asyncTimerFired, true, "异步桥接等待期间定时器应继续运行");
+      clearTimeout(asyncTimer);
+      await assert.rejects(() => shortTimeoutAuthority.call("saveSession", { ...delayProbeSession, title: "超时结果未知" }), /mysql_state_outcome_unknown/);
+      await delay(500);
+      assert.equal((await asyncAuthority.call("getSession", delayProbeSession.session_id))?.title, "超时结果未知", "超时不能被当成数据库回滚");
+      const lockJob = authority.createJob({
+        job: fakeJob(delayProbeSession.session_id, "租约锁等待", "lease-lock"),
+        session: delayProbeSession,
+        message: { message_id: `msg_${randomUUID()}`, session_id: delayProbeSession.session_id, job_id: "pending", role: "user", text: "租约锁等待", created_at: new Date().toISOString() },
+      });
+      const lockClaim = authority.claimJob(lockJob.job_id, "lock-owner", Date.now(), 1200);
+      assert.ok(lockClaim);
+      await delayConnection.beginTransaction();
+      await delayConnection.query("SELECT job_id FROM jobs WHERE job_id = ? FOR UPDATE", [lockJob.job_id]);
+      const waitingHeartbeat = asyncAuthority.call("heartbeat", lockJob.job_id, lockClaim.owner, lockClaim.fence, Date.now(), 5000);
+      await delay(1600);
+      await delayConnection.commit();
+      assert.equal((await waitingHeartbeat).ok, false, "等待锁期间租约过期后不能复活");
+      const lockRecovery = authority.claimJob(lockJob.job_id, "lock-recovery", Date.now(), 5000);
+      assert.ok(lockRecovery);
+      assert.equal(authority.finish(lockJob.job_id, lockRecovery.owner, lockRecovery.fence, "failed", null, { code: "synthetic_done", message: "测试完成" }), true);
+    } finally {
+      await asyncAuthority.close();
+      await shortTimeoutAuthority.close();
+      await delayConnection.query("DROP TRIGGER IF EXISTS test_session_delay");
+      await delayConnection.end();
+    }
     const baseEnv = isolatedEnv({ mysqlPort, redisPort, apiPort, databasePath, freshnessPath, recoveryMs: "60000" });
     const api = startRole("src/api.ts", baseEnv);
     children.push(api);
     await waitForHealth(apiPort);
+    // A sleeping database write must not freeze unrelated requests or the
+    // same API process's SSE pump. All ports and this trigger belong to this test.
+    const slowApiSession = await postSession(apiPort);
+    const slowApiJob = await postJob(apiPort, slowApiSession.session_id, "合成慢数据库测试", `slow-api-${randomUUID()}`);
+    const eventStream = await fetch(`http://127.0.0.1:${apiPort}/api/jobs/${slowApiJob.job_id}/events?after=0`);
+    assert.equal(eventStream.status, 200);
+    const slowApiDb = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user, password, database });
+    try {
+      await slowApiDb.query("CREATE TRIGGER test_api_session_delay BEFORE INSERT ON sessions FOR EACH ROW DO SLEEP(1.2)");
+      const slowStarted = Date.now();
+      const slowSession = postSession(apiPort);
+      await delay(250);
+      const fastStarted = Date.now();
+      const [demo, cancel] = await Promise.all([
+        fetch(`http://127.0.0.1:${apiPort}/api/demo`),
+        fetch(`http://127.0.0.1:${apiPort}/api/jobs/${slowApiJob.job_id}/cancel`, { method: "POST" }),
+      ]);
+      assert.equal(demo.status, 200);
+      assert.equal(cancel.status, 200);
+      assert.ok(Date.now() - fastStarted < 900, "1.2 秒慢写期间，独立请求和取消应能完成（容忍调度抖动）");
+      const events = await eventStream.text();
+      assert.match(events, /job_cancelled/);
+      assert.equal((events.match(/job_cancelled/g) ?? []).length, 1);
+      await slowSession;
+      assert.ok(Date.now() - slowStarted >= 1100, "测试必须确实经过受控数据库延迟");
+    } finally {
+      await slowApiDb.query("DROP TRIGGER IF EXISTS test_api_session_delay");
+      await slowApiDb.end();
+    }
     const worker = startRole("src/worker.ts", baseEnv);
     const dispatcher = startRole("src/dispatcher.ts", baseEnv);
     children.push(worker, dispatcher);
@@ -156,11 +401,33 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
     assert.equal(claims.filter((claim) => claim !== null).length, 1);
     assert.ok(winner);
     if (!winner) return;
+    assert.equal(other.claimJob(fenceJob.job_id, "clock-skew-worker", Date.now() + 86_400_000, 5000), null, "客户端未来时钟不能抢走有效租约");
+    const oldLease = { jobId: fenceJob.job_id, owner: winner.owner, fence: winner.fence };
+    assert.equal(authority.reserveToolCall(fenceSession.session_id, oldLease, 1), "ok");
+    const fencedResource = {
+      resource_id: `res_${randomUUID()}`, session_id: fenceSession.session_id, job_id: fenceJob.job_id,
+      kind: "calculation" as const, created_at: new Date().toISOString(), source_resource_id: "res_synthetic",
+      cells: {}, input_truncated: false, complete_population: true, null_means: "missing" as const,
+      zero_means: "observed_zero" as const, predicted_means: "forecast_not_actual" as const, notes: [],
+    };
+    authority.saveResource(fencedResource, oldLease);
     authority.expireLease(fenceJob.job_id);
+    assert.equal(authority.heartbeat(fenceJob.job_id, winner.owner, winner.fence, Date.now() - 86_400_000, 172_800_000).ok, false, "过期租约不能借客户端旧时钟复活");
+    assert.throws(() => authority.saveSession({ ...fenceSession, title: "stale" }, oldLease), /execution_fence_rejected/);
+    assert.throws(() => authority.saveResource(fencedResource, oldLease), /execution_fence_rejected/);
+    assert.equal(authority.appendEvent(fenceJob.job_id, winner.owner, winner.fence, "tool_finished", {}), null);
+    assert.equal(authority.heartbeat(fenceJob.job_id, winner.owner, winner.fence, Date.now(), 5000).ok, false);
+    assert.equal(authority.reserveRevision(fenceJob.job_id, winner.owner, winner.fence).ok, false);
+    assert.equal(authority.reserveToolCall(fenceSession.session_id, oldLease, 1), "lost");
+    assert.equal(authority.saveAgentSnapshot({ sessionId: fenceSession.session_id, jobId: fenceJob.job_id, owner: winner.owner, fence: winner.fence, kind: "progress", body: {} }), false);
     const second = other.claimJob(fenceJob.job_id, "owner-b", Date.now(), 5_000);
     assert.ok(second);
     if (!second) return;
     assert.notEqual(second.fence, winner.fence);
+    assert.equal(other.reserveToolCall(fenceSession.session_id, { jobId: fenceJob.job_id, owner: second.owner, fence: second.fence }, 20), "budget_exhausted");
+    assert.throws(() => authority.saveResource(fencedResource, oldLease), /execution_fence_rejected/);
+    other.saveSession({ ...fenceSession, title: "current" }, { jobId: fenceJob.job_id, owner: second.owner, fence: second.fence });
+    assert.equal(other.getSession(fenceSession.session_id)?.title, "current");
     assert.equal(authority.appendEvent(fenceJob.job_id, winner.owner, winner.fence, "tool_finished", { late: true }), null);
     assert.equal(authority.finish(fenceJob.job_id, winner.owner, winner.fence, "completed", null, null), false);
     assert.equal(other.finish(fenceJob.job_id, second.owner, second.fence, "failed", null, { code: "recovered", message: "新执行者收口" }), true);
@@ -238,6 +505,7 @@ function fakeJob(sessionId: string, text: string, key: string) {
 function isolatedEnv(input: { mysqlPort: number; redisPort: number; apiPort: number; databasePath: string; freshnessPath: string; recoveryMs: string }) {
   return {
     PATH: process.env.PATH ?? "",
+    SIMULATED_TODAY: "2026-10-29",
     HOST: "127.0.0.1",
     PORT: String(input.apiPort),
     STATE_MODE: "mysql",
@@ -280,7 +548,8 @@ async function waitJob(store: MysqlStateStore, jobId: string) {
     if (job && !["queued", "running"].includes(job.status)) return job;
     await delay(50);
   }
-  throw new Error(`任务没有在 MySQL 中结束：${store.getJob(jobId)?.status ?? "missing"}`);
+  const last = store.getJob(jobId);
+  throw new Error(`任务没有在 MySQL 中结束：${last?.status ?? "missing"}；事件类型：${last?.events.map((event) => event.type).join(",") ?? "none"}`);
 }
 
 async function postSession(port: number) {
@@ -333,9 +602,10 @@ async function waitForHealth(port: number) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/api/health`);
       if (response.ok) {
-        const body = (await response.json()) as { state_mode: string; queue: string };
+        const body = (await response.json()) as { state_mode: string; queue: string; freshness_status: string };
         assert.equal(body.state_mode, "mysql");
         assert.equal(body.queue, "redis-wake-only");
+        assert.equal(body.freshness_status, "published");
         return;
       }
     } catch {

@@ -1,11 +1,34 @@
 import { loadConfig } from "./config.js";
 import { clickHouseQuery, createClickHouseClient } from "./clickhouse-client.js";
 import { openSimulatedDatabase } from "./database.js";
-import { probeAndPublish, probeClickHouseAndPublish } from "./freshness.js";
+import { freshnessManifest, probeAndPublish, probeClickHouseAndPublish, probeClickHouseFreshness, probeSqliteFreshness } from "./freshness.js";
 import { loadKnowledge } from "./knowledge.js";
+import { MysqlFreshnessStore } from "./mysql-freshness.js";
 
 const config = loadConfig();
-const publication = config.businessEngine === "clickhouse" ? await probeClickHouse() : probeSqlite();
+const publication = config.stateMode === "mysql" ? await probeMysql() : config.businessEngine === "clickhouse" ? await probeClickHouse() : probeSqlite();
+
+async function probeMysql() {
+  if (!config.mysqlUser || !config.mysqlPassword || !config.mysqlDatabase) throw new Error("MySQL freshness 需要本机隔离库和临时凭据。");
+  const store = await MysqlFreshnessStore.open({ host: config.mysqlHost, port: config.mysqlPort, user: config.mysqlUser, password: config.mysqlPassword, database: config.mysqlDatabase });
+  try {
+    const batch = await store.begin(freshnessManifest(loadKnowledge(config.knowledgeDir), config.freshnessTargetsPath));
+    let observation;
+    if (config.businessEngine === "clickhouse") {
+      const client = createClickHouseClient({ url: config.clickhouseUrl, username: config.clickhouseUser, password: config.clickhousePassword, database: config.clickhouseDatabase, maxRowsToRead: config.clickhouseMaxRowsToRead, timeoutSeconds: 30 }, true);
+      try {
+        observation = await probeClickHouseFreshness({ targetsPath: config.freshnessTargetsPath, query: (sql) => clickHouseQuery(client, sql) as Promise<Array<{ event_date: string }>> });
+      } finally { await client.close(); }
+    } else {
+      if (config.reseedDatabase) openSimulatedDatabase(config.databasePath, loadKnowledge(config.knowledgeDir).seed_sql).close();
+      observation = probeSqliteFreshness({ databasePath: config.databasePath, targetsPath: config.freshnessTargetsPath });
+    }
+    if (await store.publish(batch.version, observation) !== "published") throw new Error("freshness_batch_superseded");
+    const published = await store.get(batch.version);
+    if (!published) throw new Error("freshness_publication_unavailable");
+    return published;
+  } finally { await store.close(); }
+}
 
 async function probeClickHouse() {
   const client = createClickHouseClient({

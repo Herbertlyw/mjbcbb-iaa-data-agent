@@ -10,6 +10,7 @@ export interface CellOperation {
 
 export interface VerifiedCell {
   value: number;
+  precision: "exact_integer" | "floating_point_approximate";
   table: string;
   column: string | null;
   description: string;
@@ -97,6 +98,7 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
   } else if ((operation.predicted ?? "any") !== "any") return null;
   if (op !== "count_rows" && rows.length === 0) return null;
   let actual: number;
+  let precision: VerifiedCell["precision"] = "exact_integer";
   let excludedNulls = 0;
   if (op === "count_rows") actual = rows.length;
   else {
@@ -108,12 +110,22 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
     else {
       const numeric = values.filter((value): value is number => typeof value === "number");
       if (!numeric.length) return null;
+      const integerType = declared && /^(?:nullable\()?\s*(?:u?int\d*|integer)\s*\)?$/iu.test(declared.type);
+      if (integerType) {
+        let magnitude = 0n;
+        for (const value of numeric) {
+          if (!Number.isSafeInteger(value)) return null;
+          const n = BigInt(value);
+          magnitude += n < 0n ? -n : n;
+          if (magnitude > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+        }
+      } else precision = "floating_point_approximate";
       actual = numeric.reduce((a, b) => a + b, 0);
     }
   }
   if (!Number.isFinite(storedValue) || Math.abs(actual - storedValue) > 1e-9) return null;
   return {
-    value: actual, table: contract.table, column, description: declared?.description ?? "查询结果行数",
+    value: actual, precision, table: contract.table, column, description: declared?.description ?? "查询结果行数",
     unit: op === "sum" ? (declared?.unit || "契约未声明") : "行",
     operation: op, prediction, predictionFilter: operation.predicted ?? "any", filters, range: source.time_range, sourceResourceId: source.resource_id, excludedNulls,
   };

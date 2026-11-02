@@ -297,7 +297,7 @@ export function emitHarborlightKnowledge(root: string): void {
   for (const table of WAREHOUSE_TABLES) {
     const body = {
       asset_id: table.asset_id,
-      revision: `${table.asset_id}-r${table.series ? 2 : 1}`,
+      revision: `${table.asset_id}-r${table.series || table.table.startsWith("dim_") ? 2 : 1}`,
       table: table.table,
       engine: "clickhouse-local",
       simulated: true,
@@ -306,6 +306,7 @@ export function emitHarborlightKnowledge(root: string): void {
       timezone: "America/Los_Angeles",
       freshness: { as_of: null, status: "unknown", note: "查询只认已发布探测，不认这里的占位。" },
       must_filter: table.date_column ? [table.date_column] : [],
+      ...(table.table.startsWith("dim_") || table.table === "fact_fox_ad_receipt" ? { grain: table.primary_key } : {}),
       ...(table.series ? { series: { ...table.series, ...(table.series.predicted_column ? { prediction_values: { actual: 0, predicted: 1 } } : { prediction_mode: "observed_only" }) } } : {}),
       ...(table.table === "fact_fox_daily_spend" ? { derived_metrics: [{ id: "roi", label: "实际 ROI", operation: "divide", numerator: "payback_usd", denominator: "spend_usd", prediction: "actual_only", unit: "比值" }] } : {}),
       columns: table.columns.map((column) => ({
@@ -324,7 +325,7 @@ export function emitHarborlightKnowledge(root: string): void {
       kind: "data_contract",
       title: table.title,
       summary: table.purpose,
-      revision: `${table.asset_id}-r${table.series ? 2 : 1}`,
+      revision: `${table.asset_id}-r${table.series || table.table.startsWith("dim_") ? 2 : 1}`,
       status: "published",
       discoverable: true,
       table: table.table,

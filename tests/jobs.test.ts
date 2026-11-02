@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import { DEMO_QUESTIONS } from "../src/demo.js";
 import { RequestError } from "../src/jobs.js";
 import { startServer } from "../src/server.js";
 import { resolveTurn } from "../src/turn.js";
+import type { AnalysisRecord } from "../src/types.js";
 import { ask, analyst, waitForJob, withRuntime } from "./helpers.js";
 
 test("追问、纠正和换题由服务端合并范围", () => {
@@ -121,6 +123,38 @@ test("任务超时和客户端断开", async () => {
     } finally {
       server.closeAllConnections();
       await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+});
+
+test("失败、超时或取消时不交付旧候选，历史记录也不会被 API 当正式答案展示", async () => {
+  await withRuntime({ startWorker: false }, async (runtime) => {
+    const server = startServer(runtime);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("没有测试端口");
+    const database = new DatabaseSync(runtime.config.stateDatabasePath);
+    try {
+      for (const terminal of ["failed", "timed_out", "cancelled"] as const) {
+        const session = analyst(runtime);
+        const job = runtime.jobs.submit(session.session_id, "synthetic candidate", `candidate-${terminal}`);
+        const claim = runtime.state.claimJob(job.job_id, "candidate-worker", Date.now(), 10_000);
+        assert.ok(claim);
+        const candidate = { answer: "synthetic_candidate_must_not_be_delivered" } as AnalysisRecord;
+        assert.equal(runtime.state.finish(job.job_id, claim.owner, claim.fence, terminal, candidate, { code: "synthetic_failure", message: "synthetic failure" }), true);
+        assert.equal(runtime.state.getJob(job.job_id)?.analysis, null);
+        // Reproduce an old record without rewriting or deleting any real history.
+        database.prepare("UPDATE jobs SET analysis_json = ? WHERE job_id = ?").run(JSON.stringify(candidate), job.job_id);
+        const response = await fetch(`http://127.0.0.1:${address.port}/api/jobs/${job.job_id}`);
+        const body = await response.json() as { status: string; analysis: unknown };
+        assert.equal(body.status, terminal);
+        assert.equal(body.analysis, null);
+        assert.notEqual(runtime.state.getJob(job.job_id)?.analysis, null, "API 屏蔽不得改写历史记录");
+      }
+    } finally {
+      database.close();
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
   });
 });

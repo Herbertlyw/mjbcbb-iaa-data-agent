@@ -16,7 +16,8 @@ import {
 } from "./pi-session.js";
 import type { AppConfig } from "./config.js";
 import { newId, storedSession, type SessionStore } from "./session.js";
-import type { StateStore } from "./state-store.js";
+import type { StateStore, StoredSession } from "./state-store.js";
+import type { AsyncMysqlStateStore } from "./async-mysql-state-store.js";
 import { sessionAnalyses, type ToolService } from "./tools.js";
 import { passthroughTurn, resolveTurn } from "./turn.js";
 import { isTerminal, type AnalysisRecord, type JobRecord, type JobStatus } from "./types.js";
@@ -30,6 +31,12 @@ export class RequestError extends Error {
     super(message);
     this.name = "RequestError";
   }
+}
+
+function submissionError(error: unknown): unknown {
+  if (error instanceof Error && error.name === "session_busy") return new RequestError("session_busy", "这个会话还有未结束的任务", 409);
+  if (error instanceof Error && error.name === "idempotency_conflict") return new RequestError("idempotency_conflict", "同一个幂等键对应了不同的问题内容", 409);
+  return error;
 }
 
 export class JobService {
@@ -89,6 +96,25 @@ export class JobService {
   }
 
   submit(sessionId: string, text: string, idempotencyKey: string, requested?: { modelId?: string; reasoning?: string }): JobRecord {
+    const session = this.host.sessions.require(sessionId);
+    const input = this.prepareSubmission(session, text, idempotencyKey, requested);
+    try {
+      const stored = this.host.state.createJob(input);
+      this.wake();
+      return stored;
+    } catch (error) { throw submissionError(error); }
+  }
+
+  async submitAsync(state: AsyncMysqlStateStore, session: StoredSession, text: string, idempotencyKey: string, requested?: { modelId?: string; reasoning?: string }): Promise<JobRecord> {
+    const input = this.prepareSubmission(session, text, idempotencyKey, requested);
+    try {
+      const stored = await state.call("createJob", input);
+      this.wake();
+      return stored;
+    } catch (error) { throw submissionError(error); }
+  }
+
+  private prepareSubmission(session: StoredSession, text: string, idempotencyKey: string, requested?: { modelId?: string; reasoning?: string }) {
     if (!idempotencyKey.trim()) throw new RequestError("invalid_request", "缺少幂等键", 400);
     if (!text.trim()) throw new RequestError("invalid_request", "问题不能为空", 400);
     let choice;
@@ -101,8 +127,8 @@ export class JobService {
       }
       throw error;
     }
-    const session = this.host.sessions.require(sessionId);
     const turn = this.host.config.modelMode === "pi" ? passthroughTurn(text.trim()) : resolveTurn(session.slots, text.trim(), this.host.config.knowledgeDir);
+    const sessionId = session.session_id;
     const createdAt = new Date().toISOString();
     const job: JobRecord = {
       job_id: `job_${randomUUID()}`,
@@ -126,23 +152,11 @@ export class JobService {
       reasoning: choice.reasoning,
       created_at: createdAt,
     };
-    try {
-      const stored = this.host.state.createJob({
-        job,
-        session: { ...storedSession(session), slots: turn.slots, title: session.title === "新会话" ? text.trim().slice(0, 32) : session.title },
-        message: { message_id: newId("msg"), session_id: sessionId, job_id: job.job_id, role: "user", text: text.trim(), created_at: createdAt },
-      });
-      this.wake();
-      return stored;
-    } catch (error) {
-      if (error instanceof Error && error.name === "session_busy") {
-        throw new RequestError("session_busy", "这个会话还有未结束的任务", 409);
-      }
-      if (error instanceof Error && error.name === "idempotency_conflict") {
-        throw new RequestError("idempotency_conflict", "同一个幂等键对应了不同的问题内容", 409);
-      }
-      throw error;
-    }
+    return {
+      job,
+      session: { ...storedSession(session), slots: turn.slots, title: session.title === "新会话" ? text.trim().slice(0, 32) : session.title },
+      message: { message_id: newId("msg"), session_id: sessionId, job_id: job.job_id, role: "user" as const, text: text.trim(), created_at: createdAt },
+    };
   }
 
   cancel(jobId: string): JobRecord {
@@ -151,6 +165,8 @@ export class JobService {
     this.publish(jobId);
     return job;
   }
+
+  abortLocal(jobId: string): void { this.localAgents.get(jobId)?.abort(); }
 
   require(jobId: string): JobRecord {
     const job = this.host.state.getJob(jobId);
@@ -194,8 +210,8 @@ export class JobService {
       }
       try {
         await this.execute(claim.job, claim.fence);
-      } catch (error) {
-        console.error("worker failed", error instanceof Error ? error.message : error);
+      } catch {
+        console.error("worker failed; execution details omitted");
       }
     }
   }
@@ -217,15 +233,24 @@ export class JobService {
     if (!this.host.state.appendEvent(jobId, this.owner, fence, "job_started", { status: "running", fence, owner: this.owner })) {
       return;
     }
-    this.host.state.appendEvent(jobId, this.owner, fence, "turn_resolved", { turn: claimed.turn });
+    this.host.state.appendEvent(jobId, this.owner, fence, "turn_resolved", { kind: claimed.turn.kind });
     this.publish(jobId);
+    // started_at survives lease takeover; recovery does not receive a fresh wall-clock budget.
+    const startedAt = claimed.started_at ? Date.parse(claimed.started_at) : Date.now();
+    const remainingMs = this.host.config.jobTimeoutMs - Math.max(0, Date.now() - startedAt);
+    if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+      this.host.state.finish(jobId, this.owner, fence, "timed_out", null, { code: "job_timed_out", message: "任务的墙钟预算已耗尽，恢复后不会重新开始计时。" });
+      this.boundFences.delete(jobId);
+      this.publish(jobId);
+      return;
+    }
     const session = this.host.sessions.require(claimed.session_id);
-    this.host.sessions.setActiveJob(session.session_id, jobId);
+    this.host.sessions.setActiveJob(session.session_id, jobId, { owner: this.owner, fence });
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
       this.localAgents.get(jobId)?.abort();
-    }, this.host.config.jobTimeoutMs);
+    }, remainingMs);
     const heartbeat = setInterval(() => {
       if (this.suppressHeartbeat) return;
       const beat = this.host.state.heartbeat(jobId, this.owner, fence, Date.now(), this.host.config.leaseMs);
@@ -325,7 +350,6 @@ export class JobService {
               is_error: event.isError,
               code: record.code ?? null,
               resource_id: record.resource_id ?? null,
-              message: clipEventText(record.message ?? record.notice ?? null),
             })
           ) {
             lostFence();
@@ -356,8 +380,8 @@ export class JobService {
         });
       }
       }
-    } catch (error) {
-      if (!agentError) agentError = { code: "agent_failed", message: error instanceof Error ? error.message : "代理运行失败" };
+    } catch {
+      if (!agentError) agentError = { code: "agent_failed", message: "代理运行失败，原始错误未写入通用事件。" };
     } finally {
       clearTimeout(timer);
       clearInterval(heartbeat);
@@ -474,7 +498,7 @@ export class JobService {
         return "ok";
       }
       const code = error instanceof SessionSnapshotError ? error.code : "session_snapshot_corrupt";
-      input.onError({ code, message: error instanceof Error ? error.message : "会话快照无法打开" });
+      input.onError({ code, message: error instanceof SessionSnapshotError ? error.message : "会话快照无法打开。" });
       return "ok";
     }
     input.onDispose(governed.dispose);
@@ -558,8 +582,8 @@ export class JobService {
               }
             } catch (error) {
               if (error instanceof SessionSnapshotError && error.code === "session_snapshot_missing") return;
-              console.error("pi progress snapshot failed", error instanceof Error ? error.message : error);
-              fail({ code: "session_snapshot_write_failed", message: error instanceof Error ? error.message : "会话快照写入失败" });
+              console.error("pi progress snapshot failed; details omitted");
+              fail({ code: "session_snapshot_write_failed", message: "会话快照写入失败" });
             }
           });
         }
@@ -577,7 +601,6 @@ export class JobService {
               is_error: event.isError,
               code: detailsRecord.code ?? null,
               resource_id: detailsRecord.resource_id ?? null,
-              message: clipEventText(detailsRecord.message ?? detailsRecord.notice ?? null),
             })
           ) {
             markLost();
@@ -659,7 +682,7 @@ export class JobService {
       else {
         const safe = safeProviderError(error);
         fail(safe.code === "provider_error" && !(error instanceof Error && /provider_|budget_|context_window|remote_dispatch|model_not_enabled|reasoning_not_enabled/.test(error.message))
-          ? { code: "agent_failed", message: error instanceof Error ? error.message : "代理运行失败" }
+          ? { code: "agent_failed", message: "代理运行失败，原始错误未写入通用事件。" }
           : safe);
       }
     }
@@ -728,18 +751,8 @@ function contextProof(messages: ReadonlyArray<{ role?: string; toolName?: string
 
 function sanitizeToolArgs(args: unknown): unknown {
   if (!args || typeof args !== "object" || Array.isArray(args)) return {};
-  const copy: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(args)) {
-    if (/^(authorization|api[_-]?key|headers?|reasoning|thinking|body|sql)$/iu.test(key)) continue;
-    if (typeof value === "string") copy[key] = value.length > 80 ? { redacted: true, bytes: Buffer.byteLength(value) } : value;
-    else if (typeof value === "number" || typeof value === "boolean" || value === null) copy[key] = value;
-  }
-  return copy;
-}
-
-function clipEventText(value: unknown): string | null {
-  if (typeof value !== "string" || !value) return null;
-  return value.length > 160 ? `${value.slice(0, 160)}…` : value;
+  const visible = (args as Record<string, unknown>).knowledge_body_visible;
+  return typeof visible === "boolean" ? { knowledge_body_visible: visible } : {};
 }
 
 function measuredUsage(

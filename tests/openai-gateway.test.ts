@@ -37,6 +37,15 @@ test("本地假 HTTP 服务经 Pi SDK 适配器处理错误、缺用量和非法
       assert.equal(job.usage?.usage_source, "unknown");
       assert.equal(job.events.some((event) => event.type === "tool_started"), false);
       assert.equal(JSON.stringify(job.error).includes(token), false);
+      const payloads = runtime.state.listProviderPayloads(job.job_id, session.actor_id ?? "demo-analyst");
+      assert.ok(payloads.length > 0);
+      for (const payload of payloads) {
+        const page = runtime.state.readProviderPayload({ payloadId: payload.payload_id, actorId: session.actor_id ?? "demo-analyst", sessionId: session.session_id, offset: 0, limit: 4000 });
+        assert.ok(page);
+        assert.match(page.text, /metadata-only/);
+        assert.equal(page.text.includes("纸灯"), false);
+        assert.equal(page.text.includes(token), false);
+      }
     });
     await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: "no-usage" }), async (runtime) => {
       const session = analyst(runtime);
@@ -160,7 +169,7 @@ function gateway(overrides: Partial<AppConfig> = {}): Partial<AppConfig> {
     piModel: "local-protocol",
     piApiKey: token,
     piBaseUrl: "http://127.0.0.1:9/v1",
-    piContextWindow: 8000,
+    piContextWindow: 64000,
     piMaxOutputTokens: 512,
     piReasoning: "off",
     ...overrides,

@@ -143,13 +143,33 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     maxAssetReadBytes: integer("MAX_ASSET_READ_BYTES", 200_000),
     jobTimeoutMs: integer("JOB_TIMEOUT_MS", 60_000),
     toolDelayMs: integer("TOOL_DELAY_MS", 0),
-    simulatedToday: process.env.SIMULATED_TODAY || "2026-10-29",
+    // Empty means real time in the contract/knowledge timezone. Tests and
+    // explicitly simulated demos can inject a fixed calendar date.
+    simulatedToday: process.env.SIMULATED_TODAY || "",
     defaultRole: process.env.DEFAULT_ROLE || "analyst",
     startWorker: true,
   };
   const merged = { ...config, ...overrides };
+  if ((overrides.knowledgeDir || process.env.KNOWLEDGE_DIR) && !overrides.freshnessTargetsPath && !process.env.FRESHNESS_TARGETS_PATH) {
+    merged.freshnessTargetsPath = path.join(merged.knowledgeDir, "freshness-targets.json");
+  }
+  if (merged.host !== "127.0.0.1") throw new Error("本地 mock 身份只允许监听 127.0.0.1。");
+  if (merged.simulatedToday && !isCalendarDate(merged.simulatedToday)) throw new Error("SIMULATED_TODAY 必须是真实的 YYYY-MM-DD 日历日期。");
   validateModelProvider(merged);
   return merged;
+}
+
+export function isCalendarDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+export function currentCalendarDate(config: Pick<AppConfig, "simulatedToday">, timezone: string, now = new Date()): string {
+  if (config.simulatedToday) return config.simulatedToday;
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(now);
+  const field = (type: string) => parts.find((part) => part.type === type)?.value;
+  return `${field("year")}-${field("month")}-${field("day")}`;
 }
 
 const REASONING_LEVELS = new Set(["off", "low", "medium", "high"]);
@@ -172,10 +192,7 @@ export function validateModelProvider(config: AppConfig): void {
   }
   if (config.modelMode !== "pi" || config.piProvider === "faux") return;
   if (config.piProvider === "anthropic") {
-    if (!config.piModel.trim() || !config.piApiKey.trim()) {
-      throw new Error("anthropic 需要自行提供 PI_MODEL 和 PI_API_KEY。本构建不预置公司模型名称，也不会改用 faux。");
-    }
-    return;
+    throw new Error("供应商 anthropic 当前禁用：尚未接入统一派发和预算账本，不会向外网发送请求，也不会改用 faux。");
   }
   if (config.piProvider !== "openai-compatible") {
     throw new Error(`未知供应商 ${config.piProvider}。不会改用 faux。`);
@@ -192,10 +209,7 @@ export function validateModelProvider(config: AppConfig): void {
     throw new Error("PI_BASE_URL 不是合法 URL。");
   }
   if (url.protocol === "https:") {
-    if (!config.allowRemoteHttps) {
-      throw new Error("远程 HTTPS 供应商默认关闭。PI_ALLOW_REMOTE_HTTPS=true 只允许解析配置，本构建仍不会向外网派发，也不会放宽 TLS。");
-    }
-    return;
+    throw new Error("远程 HTTPS 供应商默认关闭。本构建只允许本机假服务，不会向外网派发。");
   }
   if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port) {
     throw new Error("未开启远程配置时，只允许 http://127.0.0.1 的端口。不会改用 faux。");

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { repoRoot } from "./config.js";
+import { isCalendarDate, repoRoot } from "./config.js";
 import { loadKnowledge } from "./knowledge.js";
 import { parseReadonlySql } from "./sql.js";
 import type { KnowledgeBase } from "./types.js";
@@ -25,6 +25,32 @@ export function diagnoseKnowledge(root = path.join(repoRoot(), "knowledge", "lum
   if (new Set(ids).size !== ids.length) issues.push({ code: "duplicate_asset_id", message: "资产 ID 不唯一" });
   for (const asset of knowledge.assets) {
     if (!asset.revision || !asset.content_hash) issues.push({ code: "missing_revision", message: `${asset.asset_id} 缺少版本或内容哈希` });
+    if (asset.contract) {
+      const contract = asset.contract;
+      const names = contract.columns.map((column) => column.name);
+      const columns = new Set(names);
+      if (columns.size !== names.length) issues.push({ code: "duplicate_contract_column", message: `${contract.table} 的字段名重复` });
+      for (const column of [...contract.must_filter, ...contract.sensitive_columns, ...(contract.grain ?? [])]) {
+        if (!columns.has(column)) issues.push({ code: "contract_column_missing", message: `${contract.table} 的契约引用了不存在的字段 ${column}` });
+      }
+      if (!isCalendarDate(contract.valid_from) || !isCalendarDate(contract.valid_until) || contract.valid_from > contract.valid_until) {
+        issues.push({ code: "contract_validity_invalid", message: `${contract.table} 的契约有效期无效` });
+      }
+      try { new Intl.DateTimeFormat("en", { timeZone: contract.timezone }); }
+      catch { issues.push({ code: "contract_timezone_invalid", message: `${contract.table} 的时区无效` }); }
+      const series = contract.series;
+      if (series) {
+        for (const name of [series.date_column, ...series.dimensions, ...series.metrics, ...(series.predicted_column ? [series.predicted_column] : [])]) {
+          if (!columns.has(name)) issues.push({ code: "series_contract_column_missing", message: `${contract.table} 的序列引用了契约中不存在的字段 ${name}` });
+        }
+        for (const metric of series.metrics) {
+          if (!contract.columns.find((column) => column.name === metric)?.unit) issues.push({ code: "metric_unit_missing", message: `${contract.table}.${metric} 未声明单位` });
+        }
+      }
+      for (const metric of contract.derived_metrics ?? []) {
+        if (!columns.has(metric.numerator) || !columns.has(metric.denominator) || !metric.unit) issues.push({ code: "derived_metric_invalid", message: `${contract.table} 的派生指标 ${metric.id} 缺少来源字段或单位` });
+      }
+    }
     if (asset.contract?.grain) {
       const names = new Set(asset.contract.columns.map((column) => column.name));
       for (const column of asset.contract.grain) {
@@ -99,8 +125,13 @@ export function diagnoseKnowledge(root = path.join(repoRoot(), "knowledge", "lum
     for (const join of knowledge.joins) {
       if (join.tables.length < 2) issues.push({ code: "join_incomplete", message: `${join.join_id} 没有两张表` });
       for (const table of join.tables) {
-        if (!knowledge.contract_by_table.has(table)) issues.push({ code: "join_unknown_table", message: `${join.join_id} 指向未登记表 ${table}` });
+        const contract = knowledge.contract_by_table.get(table)?.contract;
+        if (!contract) issues.push({ code: "join_unknown_table", message: `${join.join_id} 指向未登记表 ${table}` });
+        else for (const key of join.keys) {
+          if (!contract.columns.some((column) => column.name === key)) issues.push({ code: "join_key_missing", message: `${join.join_id} 的键 ${key} 不在 ${table} 契约中` });
+        }
       }
+      if (!join.keys.length || new Set(join.keys).size !== join.keys.length) issues.push({ code: "join_keys_invalid", message: `${join.join_id} 的连接键为空或重复` });
     }
   } finally {
     database.close();

@@ -61,15 +61,18 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
         maxResourceBytes: config.maxResultBytes,
       });
       if (!began.ok) throw new Error(began.code);
-      ledger.state.saveProviderPayload({
+      const recorded = ledger.state.saveProviderPayload({
         payloadId: `req_${stepId}`,
         stepId,
         sessionId: ledger.sessionId,
         actorId: ledger.actorId,
         jobId: ledger.jobId,
+        owner: ledger.owner,
+        fence: ledger.fence,
         kind: "request",
-        body: redactProviderBody(context),
+        body: JSON.stringify({ format: "metadata-only", estimated_input: estimate.tokens, estimate_source: estimate.source }),
       });
+      if (!recorded) throw new Error("provider_fence_rejected");
       const physical = { ...model, api: "openai-completions" as const, baseUrl: config.piBaseUrl, provider: "openai-compatible" };
       let stream;
       try {
@@ -111,9 +114,11 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
   });
 }
 
-export function estimateContextTokens(context: unknown): { tokens: number; source: "char_estimate" } {
+export function estimateContextTokens(context: unknown): { tokens: number; source: "utf8_byte_estimate" } {
   const text = JSON.stringify(context);
-  return { tokens: Math.max(1, Math.ceil(text.length / 4)), source: "char_estimate" };
+  // A deliberately conservative UTF-8 heuristic, not measured provider usage
+  // or a guaranteed upper bound for an unknown provider tokenizer.
+  return { tokens: Math.max(1, Math.ceil(Buffer.byteLength(text, "utf8") / 2)), source: "utf8_byte_estimate" };
 }
 
 export function assertDispatchTarget(baseUrl: string): void {
@@ -121,26 +126,6 @@ export function assertDispatchTarget(baseUrl: string): void {
   if (url.protocol !== "http:" || url.hostname !== "127.0.0.1") {
     throw new Error("remote_dispatch_disabled");
   }
-}
-
-export function redactProviderBody(value: unknown): string {
-  const text = typeof value === "string" ? value : JSON.stringify(stripHiddenReasoning(value));
-  return text
-    .replace(/sk-[A-Za-z0-9_-]+/g, "[redacted]")
-    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
-    .replace(/(api[_-]?key\\?"?\s*[:=]\s*\\?"?)[^"\\,\s]+/gi, "$1[redacted]");
-}
-
-function stripHiddenReasoning(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripHiddenReasoning);
-  if (!value || typeof value !== "object") return value;
-  const source = value as Record<string, unknown>;
-  const copy: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(source)) {
-    if (/^(reasoning|thinking|reasoning_content|signature)$/iu.test(key)) continue;
-    copy[key] = stripHiddenReasoning(item);
-  }
-  return copy;
 }
 
 export function usageFromSteps(steps: ProviderStepRecord[]): {
@@ -191,8 +176,10 @@ function settleFromMessage(ledger: ProviderLedger, stepId: string, started: numb
     sessionId: ledger.sessionId,
     actorId: ledger.actorId,
     jobId: ledger.jobId,
+    owner: ledger.owner,
+    fence: ledger.fence,
     kind: "response",
-    body: redactProviderBody(message),
+    body: JSON.stringify({ format: "metadata-only", failed, usage_source: sawUsage ? "simulated" : "unknown" }),
   });
   ledger.state.settleProviderStep({
     stepId,

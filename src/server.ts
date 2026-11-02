@@ -1,10 +1,12 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { demoForScenario } from "./demo.js";
 import { RequestError } from "./jobs.js";
 import { modelCatalog } from "./model-catalog.js";
 import type { Runtime } from "./runtime.js";
 import type { JobRecord } from "./types.js";
+import type { StateStore, StoredSession } from "./state-store.js";
 
 const indexHtml = readFileSync(new URL("./web/index.html", import.meta.url), "utf8");
 
@@ -24,6 +26,7 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
       return;
     }
     if (method === "GET" && url.pathname === "/api/health") {
+      const freshnessHealth = await runtime.freshnessHealth();
       send(res, 200, {
         ok: true,
         simulated: true,
@@ -53,7 +56,8 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
         identity: "local-mock-not-authentication",
         leases: runtime.config.stateMode === "mysql" ? "mysql-fence" : "single-host-fence",
         multi_host: false,
-        freshness: "published-snapshot",
+        freshness: runtime.config.stateMode === "mysql" ? "mysql-published-snapshot" : "sqlite-demo-file-snapshot",
+        freshness_status: freshnessHealth.status,
         target_gaps: [
           "默认演示进程仍是 SQLite。MySQL、outbox 和 Redis 只在显式的本地隔离模式里运行，不能把 SQLite 测试当成它们的验证。",
           "Redis 只做调度提醒。队列消息不是完成证明，也不是身份证明。",
@@ -71,15 +75,16 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
       return;
     }
     if (method === "GET" && url.pathname === "/api/sessions") {
+      const sessions = (await stateCall(runtime, "listSessions")).filter((session) => (session.actor_id ?? "demo-analyst") === actorOf(req));
       send(res, 200, {
-        sessions: runtime.sessions.list(actorOf(req)).map((session) => ({
+        sessions: await Promise.all(sessions.map(async (session) => ({
           actor_id: session.actor_id ?? "demo-analyst",
           session_id: session.session_id,
           title: session.title,
           role: session.role,
           created_at: session.created_at,
-          jobs: runtime.jobs.list(session.session_id).map(publicJob),
-        })),
+          jobs: (await stateCall(runtime, "listJobs", session.session_id)).map(publicJob),
+        }))),
       });
       return;
     }
@@ -87,40 +92,43 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
       const body = await readJson(req);
       const actor = actorOf(req);
       const role = actor === "demo-viewer" ? "viewer" : "analyst";
-      const session = runtime.sessions.create(role, stringField(body, "title") || "新会话", actor);
+      const session = await stateCall(runtime, "createSession", { session_id: `ses_${randomUUID()}`, title: stringField(body, "title") || "新会话", role, actor_id: actor, created_at: new Date().toISOString(), slots: null, bindings: [] });
       send(res, 201, { session_id: session.session_id, title: session.title, role: session.role, actor_id: session.actor_id, created_at: session.created_at });
       return;
     }
     const sessionMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)$/u);
     if (method === "GET" && sessionMatch?.[1]) {
-      const session = ownedSession(runtime, req, decodeURIComponent(sessionMatch[1]));
+      const session = await ownedSession(runtime, req, decodeURIComponent(sessionMatch[1]));
       send(res, 200, {
         session_id: session.session_id,
         title: session.title,
         role: session.role,
         created_at: session.created_at,
         slots: session.slots,
-        jobs: runtime.jobs.list(session.session_id).map(publicJob),
+        jobs: (await stateCall(runtime, "listJobs", session.session_id)).map(publicJob),
       });
       return;
     }
     const messageMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/u);
     if (method === "POST" && messageMatch?.[1]) {
       const body = await readJson(req);
-      ownedSession(runtime, req, decodeURIComponent(messageMatch[1]));
-      const job = runtime.jobs.submit(decodeURIComponent(messageMatch[1]), stringField(body, "text"), stringField(body, "idempotency_key"), {
+      const session = await ownedSession(runtime, req, decodeURIComponent(messageMatch[1]));
+      const selection = {
         modelId: stringField(body, "model_id"),
         reasoning: stringField(body, "reasoning"),
-      });
+      };
+      const job = runtime.config.stateMode === "mysql"
+        ? await runtime.jobs.submitAsync(await runtime.mysqlAsyncState(), session, stringField(body, "text"), stringField(body, "idempotency_key"), selection)
+        : runtime.jobs.submit(session.session_id, stringField(body, "text"), stringField(body, "idempotency_key"), selection);
       send(res, 202, publicJob(job));
       return;
     }
     const payloadMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/provider-payloads\/([^/]+)$/u);
     if (method === "GET" && payloadMatch?.[1] && payloadMatch[2]) {
-      const session = ownedSession(runtime, req, decodeURIComponent(payloadMatch[1]));
+      const session = await ownedSession(runtime, req, decodeURIComponent(payloadMatch[1]));
       const offset = Number(url.searchParams.get("offset") ?? "0");
       const limit = Number(url.searchParams.get("limit") ?? "1000");
-      const page = runtime.state.readProviderPayload({
+      const page = await stateCall(runtime, "readProviderPayload", {
         payloadId: decodeURIComponent(payloadMatch[2]),
         actorId: session.actor_id ?? "demo-analyst",
         sessionId: session.session_id,
@@ -133,31 +141,33 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
     }
     const payloadListMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/provider-payloads$/u);
     if (method === "GET" && payloadListMatch?.[1]) {
-      const session = ownedSession(runtime, req, decodeURIComponent(payloadListMatch[1]));
+      const session = await ownedSession(runtime, req, decodeURIComponent(payloadListMatch[1]));
       const jobId = url.searchParams.get("job_id") ?? "";
-      const job = runtime.jobs.require(jobId);
+      const job = await requireJob(runtime, jobId);
       if (job.session_id !== session.session_id) throw new Error("session_not_found");
-      send(res, 200, { payloads: runtime.state.listProviderPayloads(jobId, session.actor_id ?? "demo-analyst") });
+      send(res, 200, { payloads: await stateCall(runtime, "listProviderPayloads", jobId, session.actor_id ?? "demo-analyst") });
       return;
     }
     const jobMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)$/u);
     if (method === "GET" && jobMatch?.[1]) {
-      const job = runtime.jobs.require(decodeURIComponent(jobMatch[1]));
-      ownedSession(runtime, req, job.session_id);
+      const job = await requireJob(runtime, decodeURIComponent(jobMatch[1]));
+      await ownedSession(runtime, req, job.session_id);
       send(res, 200, publicJob(job));
       return;
     }
     const cancelMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/cancel$/u);
     if (method === "POST" && cancelMatch?.[1]) {
-      const existing = runtime.jobs.require(decodeURIComponent(cancelMatch[1]));
-      ownedSession(runtime, req, existing.session_id);
-      send(res, 200, publicJob(runtime.jobs.cancel(existing.job_id)));
+      const existing = await requireJob(runtime, decodeURIComponent(cancelMatch[1]));
+      await ownedSession(runtime, req, existing.session_id);
+      const cancelled = await stateCall(runtime, "requestCancel", existing.job_id);
+      runtime.jobs.abortLocal(existing.job_id);
+      send(res, 200, publicJob(cancelled));
       return;
     }
     const eventMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/events$/u);
     if (method === "GET" && eventMatch?.[1]) {
-      const streamed = runtime.jobs.require(decodeURIComponent(eventMatch[1]));
-      ownedSession(runtime, req, streamed.session_id);
+      const streamed = await requireJob(runtime, decodeURIComponent(eventMatch[1]));
+      await ownedSession(runtime, req, streamed.session_id);
       streamEvents(runtime, streamed.job_id, url, req, res);
       return;
     }
@@ -175,7 +185,7 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
       send(res, 400, { error: { code: "invalid_json", message: "请求体不是 JSON" } });
       return;
     }
-    send(res, 500, { error: { code: "internal_error", message: error instanceof Error ? error.message : "内部错误" } });
+    send(res, 500, { error: { code: "internal_error", message: "内部操作失败，请检查本机服务状态。" } });
   }
 }
 
@@ -186,14 +196,26 @@ function actorOf(req: IncomingMessage): string {
   return "demo-analyst";
 }
 
-function ownedSession(runtime: Runtime, req: IncomingMessage, sessionId: string) {
-  const session = runtime.sessions.require(sessionId);
+async function stateCall<K extends Exclude<keyof StateStore, "close">>(runtime: Runtime, op: K, ...args: Parameters<StateStore[K]>): Promise<ReturnType<StateStore[K]>> {
+  if (runtime.config.stateMode === "mysql") return await (await runtime.mysqlAsyncState()).call(op, ...args) as ReturnType<StateStore[K]>;
+  const operation = runtime.state[op] as (...args: Parameters<StateStore[K]>) => ReturnType<StateStore[K]>;
+  return operation.apply(runtime.state, args);
+}
+
+async function requireJob(runtime: Runtime, jobId: string): Promise<JobRecord> {
+  const job = await stateCall(runtime, "getJob", jobId);
+  if (!job) throw new RequestError("job_not_found", "没有这个任务", 404);
+  return job;
+}
+
+async function ownedSession(runtime: Runtime, req: IncomingMessage, sessionId: string): Promise<StoredSession> {
+  const session = await stateCall(runtime, "getSession", sessionId);
+  if (!session) throw new Error("session_not_found");
   if ((session.actor_id ?? "demo-analyst") !== actorOf(req)) throw new Error("session_not_found");
   return session;
 }
 
 function streamEvents(runtime: Runtime, jobId: string, url: URL, req: IncomingMessage, res: ServerResponse): void {
-  const job = runtime.jobs.require(jobId);
   let cursor = Number(url.searchParams.get("after") ?? 0);
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
@@ -209,8 +231,8 @@ function streamEvents(runtime: Runtime, jobId: string, url: URL, req: IncomingMe
       return false;
     }
   };
-  const pump = () => {
-    const current = runtime.jobs.require(jobId);
+  const pump = async () => {
+    const current = await requireJob(runtime, jobId);
     for (const event of current.events) {
       if (event.seq > cursor) {
         cursor = event.seq;
@@ -219,22 +241,23 @@ function streamEvents(runtime: Runtime, jobId: string, url: URL, req: IncomingMe
     }
     return current.status === "queued" || current.status === "running";
   };
-  if (!pump()) {
-    res.end();
-    return;
-  }
-  const timer = setInterval(() => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let closed = false;
+  const poll = async () => {
+    if (closed) return;
     try {
-      if (!pump()) {
-        clearInterval(timer);
+      if (!await pump()) {
         res.end();
+        return;
       }
     } catch {
-      clearInterval(timer);
       if (!res.writableEnded) res.end();
+      return;
     }
-  }, 150);
-  const close = () => clearInterval(timer);
+    if (!closed) timer = setTimeout(() => { void poll(); }, 150);
+  };
+  void poll();
+  const close = () => { closed = true; if (timer) clearTimeout(timer); };
   req.on("close", close);
   res.on("close", close);
 }
@@ -249,7 +272,9 @@ function publicJob(job: JobRecord) {
     turn: job.turn,
     events: job.events,
     version: job.version,
-    analysis: job.analysis,
+    // Historic records are not rewritten. Do not present an old candidate as
+    // a delivered answer when its task ultimately failed, timed out or cancelled.
+    analysis: ["failed", "timed_out", "cancelled"].includes(job.status) ? null : job.analysis,
     error: job.error,
     usage: job.usage ?? null,
     model_id: job.model_id ?? null,

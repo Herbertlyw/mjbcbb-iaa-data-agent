@@ -10,11 +10,15 @@ const pool = mysql.createPool({
   database: config.database,
   waitForConnections: true,
   connectionLimit: 8,
+  queueLimit: 64,
+  connectTimeout: 5000,
   multipleStatements: false,
   dateStrings: true,
 });
 
 const TERMINAL = "('completed','needs_clarification','partial','failed','cancelled','timed_out')";
+// SYSDATE is evaluated by MySQL at execution time, not supplied by the worker.
+const DB_NOW_MS = "CAST(UNIX_TIMESTAMP(SYSDATE(3)) * 1000 AS UNSIGNED)";
 
 const statements = `
   CREATE TABLE IF NOT EXISTS sessions (
@@ -62,6 +66,8 @@ const statements = `
     model_id VARCHAR(128) NULL,
     reasoning VARCHAR(16) NULL,
     revision_count INT NOT NULL DEFAULT 0,
+    tool_call_count INT NOT NULL DEFAULT 0,
+    tool_call_limit INT NULL,
     UNIQUE KEY uniq_idem (session_id, idempotency_key),
     KEY idx_claim (status, lease_until, created_at)
   ) ENGINE=InnoDB;
@@ -150,6 +156,13 @@ const ready = (async () => {
   for (const statement of statements.split(";").map((item) => item.trim()).filter(Boolean)) {
     await pool.query(statement);
   }
+  for (const [column, definition] of [["tool_call_count", "INT NOT NULL DEFAULT 0"], ["tool_call_limit", "INT NULL"]]) {
+    const [existing] = await pool.query("SHOW COLUMNS FROM jobs LIKE ?", [column]);
+    if (!existing.length) {
+      try { await pool.query(`ALTER TABLE jobs ADD COLUMN ${column} ${definition}`); }
+      catch (error) { if (error?.code !== "ER_DUP_FIELDNAME") throw error; }
+    }
+  }
 })();
 
 parentPort.on("message", (message) => {
@@ -180,10 +193,10 @@ async function dispatch(op, args) {
   if (op === "createSession") return createSession(args[0]);
   if (op === "getSession") return getSession(args[0]);
   if (op === "listSessions") return listSessions();
-  if (op === "saveSession") return saveSession(args[0]);
+  if (op === "saveSession") return saveSession(args[0], args[1]);
   if (op === "addMessage") return addMessage(args[0]);
   if (op === "listMessages") return listMessages(args[0]);
-  if (op === "saveResource") return saveResource(args[0]);
+  if (op === "saveResource") return saveResource(args[0], args[1]);
   if (op === "getResource") return getResource(args[0]);
   if (op === "countResources") return countResources();
   if (op === "createJob") return createJob(args[0]);
@@ -206,6 +219,7 @@ async function dispatch(op, args) {
   if (op === "listProviderSteps") return listProviderSteps(args[0]);
   if (op === "getTurnBudget") return getTurnBudget(args[0]);
   if (op === "reserveRevision") return reserveRevision(args[0], args[1], args[2]);
+  if (op === "reserveToolCall") return reserveToolCall(args[0], args[1], args[2]);
   if (op === "saveProviderPayload") return saveProviderPayload(args[0]);
   if (op === "listProviderPayloads") return listProviderPayloads(args[0], args[1]);
   if (op === "readProviderPayload") return readProviderPayload(args[0]);
@@ -245,14 +259,24 @@ async function listSessions() {
   return rows.map(sessionFromRow);
 }
 
-async function saveSession(session) {
-  await pool.query("UPDATE sessions SET title = ?, slots_json = ?, bindings_json = ? WHERE session_id = ?", [
-    session.title,
-    JSON.stringify(session.slots),
-    JSON.stringify(session.bindings),
-    session.session_id,
-  ]);
-  return null;
+async function assertExecutionLease(conn, sessionId, lease) {
+  const [rows] = await conn.query("SELECT lease_until FROM jobs WHERE job_id = ? AND session_id = ? AND lease_owner = ? AND fence = ? AND status = 'running' AND cancel_requested = 0 FOR UPDATE", [lease.jobId, sessionId, lease.owner, lease.fence]);
+  if (!rows[0] || !(await unexpired(conn, rows[0]))) throw new Error("execution_fence_rejected");
+}
+
+async function unexpired(conn, row) {
+  const [times] = await conn.query(`SELECT ${DB_NOW_MS} AS now_ms`);
+  return row.lease_until !== null && Number(row.lease_until) > Number(times[0].now_ms);
+}
+
+async function saveSession(session, lease) {
+  return transaction(async (conn) => {
+    if (lease) await assertExecutionLease(conn, session.session_id, lease);
+    await conn.query("UPDATE sessions SET title = ?, slots_json = ?, bindings_json = ? WHERE session_id = ?", [
+      session.title, JSON.stringify(session.slots), JSON.stringify(session.bindings), session.session_id,
+    ]);
+    return null;
+  });
 }
 
 async function addMessage(message) {
@@ -279,13 +303,15 @@ async function listMessages(sessionId) {
   }));
 }
 
-async function saveResource(resource) {
-  await pool.query("INSERT INTO resources (resource_id, session_id, body_json) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE body_json = VALUES(body_json)", [
-    resource.resource_id,
-    resource.session_id,
-    JSON.stringify(resource),
-  ]);
-  return null;
+async function saveResource(resource, lease) {
+  return transaction(async (conn) => {
+    if (lease) {
+      if (resource.job_id !== lease.jobId) throw new Error("execution_fence_rejected");
+      await assertExecutionLease(conn, resource.session_id, lease);
+    }
+    await conn.query("INSERT INTO resources (resource_id, session_id, body_json) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE body_json = VALUES(body_json)", [resource.resource_id, resource.session_id, JSON.stringify(resource)]);
+    return null;
+  });
 }
 
 async function getResource(resourceId) {
@@ -359,43 +385,42 @@ async function listJobs(sessionId) {
   return jobs;
 }
 
-async function claimNext(owner, now, leaseMs) {
+async function claimNext(owner, _now, leaseMs) {
   return transaction(async (conn) => {
     const [rows] = await conn.query(
       `SELECT job_id FROM jobs
-       WHERE status = 'queued' OR (status = 'running' AND lease_until IS NOT NULL AND lease_until < ?)
+       WHERE status = 'queued' OR (status = 'running' AND lease_until IS NOT NULL AND lease_until < ${DB_NOW_MS})
        ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`,
-      [now],
     );
     if (!rows[0]) return null;
-    return claimRow(conn, String(rows[0].job_id), owner, now, leaseMs);
+    return claimRow(conn, String(rows[0].job_id), owner, leaseMs);
   });
 }
 
-async function claimJob(jobId, owner, now, leaseMs) {
-  return transaction(async (conn) => claimRow(conn, jobId, owner, now, leaseMs));
+async function claimJob(jobId, owner, _now, leaseMs) {
+  return transaction(async (conn) => claimRow(conn, jobId, owner, leaseMs));
 }
 
-async function claimRow(conn, jobId, owner, now, leaseMs) {
+async function claimRow(conn, jobId, owner, leaseMs) {
   const [updated] = await conn.query(
     `UPDATE jobs
-     SET status = 'running', lease_owner = ?, lease_until = ?, fence = fence + 1, version = version + 1,
-         started_at = COALESCE(started_at, ?)
-     WHERE job_id = ? AND (status = 'queued' OR (status = 'running' AND lease_until IS NOT NULL AND lease_until < ?))`,
-    [owner, now + leaseMs, new Date(now).toISOString(), jobId, now],
+     SET status = 'running', lease_owner = ?, lease_until = ${DB_NOW_MS} + ?, fence = fence + 1, version = version + 1,
+         started_at = COALESCE(started_at, DATE_FORMAT(UTC_TIMESTAMP(3), '%Y-%m-%dT%H:%i:%s.%fZ'))
+     WHERE job_id = ? AND (status = 'queued' OR (status = 'running' AND lease_until IS NOT NULL AND lease_until < ${DB_NOW_MS}))`,
+    [owner, leaseMs, jobId],
   );
   if (updated.affectedRows !== 1) return null;
   const job = await getJobOn(conn, jobId);
   return { job, owner, fence: job.fence };
 }
 
-async function heartbeat(jobId, owner, fence, now, leaseMs) {
+async function heartbeat(jobId, owner, fence, _now, leaseMs) {
   const [updated] = await pool.query(
-    "UPDATE jobs SET lease_until = ? WHERE job_id = ? AND lease_owner = ? AND fence = ? AND status = 'running'",
-    [now + leaseMs, jobId, owner, fence],
+    `UPDATE jobs SET lease_until = ${DB_NOW_MS} + ? WHERE job_id = ? AND lease_owner = ? AND fence = ? AND status = 'running' AND lease_until > ${DB_NOW_MS}`,
+    [leaseMs, jobId, owner, fence],
   );
   const [rows] = await pool.query(
-    "SELECT cancel_requested FROM jobs WHERE job_id = ? AND lease_owner = ? AND fence = ? AND status = 'running'",
+    `SELECT cancel_requested FROM jobs WHERE job_id = ? AND lease_owner = ? AND fence = ? AND status = 'running' AND lease_until > ${DB_NOW_MS}`,
     [jobId, owner, fence],
   );
   return { ok: updated.affectedRows === 1 && rows[0] !== undefined, cancel_requested: rows[0]?.cancel_requested === 1 };
@@ -403,9 +428,9 @@ async function heartbeat(jobId, owner, fence, now, leaseMs) {
 
 async function appendEvent(jobId, owner, fence, type, payload) {
   return transaction(async (conn) => {
-    const [rows] = await conn.query("SELECT fence, lease_owner, status, next_seq FROM jobs WHERE job_id = ? FOR UPDATE", [jobId]);
+    const [rows] = await conn.query("SELECT fence, lease_owner, lease_until, status, next_seq FROM jobs WHERE job_id = ? FOR UPDATE", [jobId]);
     const row = rows[0];
-    if (!row || Number(row.fence) !== fence || row.lease_owner !== owner || isTerminal(String(row.status))) return null;
+    if (!row || Number(row.fence) !== fence || row.lease_owner !== owner || row.status !== "running" || !(await unexpired(conn, row))) return null;
     const event = await insertEvent(conn, jobId, Number(row.next_seq), type, payload);
     const [bumped] = await conn.query("UPDATE jobs SET next_seq = next_seq + 1 WHERE job_id = ? AND fence = ? AND lease_owner = ?", [jobId, fence, owner]);
     if (bumped.affectedRows !== 1) return null;
@@ -415,12 +440,35 @@ async function appendEvent(jobId, owner, fence, type, payload) {
 
 async function finish(jobId, owner, fence, status, analysis, error, usage) {
   return transaction(async (conn) => {
-    const [rows] = await conn.query("SELECT fence, lease_owner, status, next_seq, cancel_requested FROM jobs WHERE job_id = ? FOR UPDATE", [jobId]);
+    const [rows] = await conn.query("SELECT fence, lease_owner, lease_until, status, next_seq, cancel_requested FROM jobs WHERE job_id = ? FOR UPDATE", [jobId]);
     const row = rows[0];
-    if (!row || Number(row.fence) !== fence || row.lease_owner !== owner || row.status !== "running") return false;
-    const terminal = row.cancel_requested === 1 && status !== "timed_out" && status !== "failed" ? "cancelled" : status;
+    if (!row || Number(row.fence) !== fence || row.lease_owner !== owner || row.status !== "running" || !(await unexpired(conn, row))) return false;
+    let terminal = row.cancel_requested === 1 && status !== "timed_out" && status !== "failed" ? "cancelled" : status;
+    // A publisher also locks this row before advancing the pointer. Holding it
+    // until the job commit makes the check and delivery one ordered operation.
+    // Only server-eligible sources can contribute facts to the rendered answer.
+    if (analysis && terminal !== "cancelled" && terminal !== "failed" && terminal !== "timed_out") {
+      const eligible = (Array.isArray(analysis.sources) ? analysis.sources : []).filter((source) => source.evidence_eligible === true);
+      if (eligible.length) {
+        const [current] = await conn.query("SELECT b.result_json FROM freshness_pointer p JOIN freshness_batches b ON b.version = p.version AND b.state = 'published' WHERE p.singleton = 1 FOR UPDATE");
+        let publication = null;
+        try { publication = current[0] ? JSON.parse(String(current[0].result_json)) : null; } catch { /* fail closed */ }
+        const consistent = publication && eligible.every((source) =>
+          Array.isArray(source.tables) && source.tables.length > 0 &&
+          Array.isArray(source.freshness_receipts) && source.freshness_receipts.length === source.tables.length &&
+          source.tables.every((table) => source.freshness_receipts.some((receipt) =>
+            receipt.table === table && receipt.publication_id === publication.publication_id &&
+            Number(receipt.version) === Number(publication.version) && receipt.status === 'fresh' &&
+            publication.tables?.[table]?.status === 'fresh')));
+        if (!consistent) {
+          terminal = "failed";
+          analysis = null;
+          error = { code: "freshness_version_changed", message: "新鲜度在终态提交前变化，旧证据没有交付。" };
+        }
+      }
+    }
     const type = terminal === "cancelled" ? "job_cancelled" : terminal === "timed_out" ? "job_timed_out" : terminal === "failed" ? "job_failed" : "job_finished";
-    await insertEvent(conn, jobId, Number(row.next_seq), type, { status: terminal, analysis: terminal === "cancelled" ? null : analysis, error });
+    await insertEvent(conn, jobId, Number(row.next_seq), type, { status: terminal, error_code: error?.code ?? null });
     const [updated] = await conn.query(
       `UPDATE jobs
        SET status = ?, analysis_json = ?, error_json = ?, usage_json = ?, finished_at = ?, lease_owner = NULL, lease_until = NULL,
@@ -428,7 +476,7 @@ async function finish(jobId, owner, fence, status, analysis, error, usage) {
        WHERE job_id = ? AND fence = ? AND lease_owner = ? AND status = 'running'`,
       [
         terminal,
-        terminal === "cancelled" || !analysis ? null : JSON.stringify(analysis),
+        ["cancelled", "failed", "timed_out"].includes(terminal) || !analysis ? null : JSON.stringify(analysis),
         error ? JSON.stringify(error) : null,
         usage ? JSON.stringify(usage) : null,
         new Date().toISOString(),
@@ -503,16 +551,16 @@ function stepFromRow(row) {
     estimated_input: Number(row.estimated_input ?? 0),
     reserved_output: Number(row.reserved_output ?? 0),
     reserved_total: Number(row.reserved_total ?? 0),
-    estimate_source: "char_estimate",
+    estimate_source: row.estimate_source === "utf8_byte_estimate" ? "utf8_byte_estimate" : "char_estimate",
     settlement: String(row.settlement ?? "pending"),
   };
 }
 
 async function beginProviderStep(input) {
   return transaction(async (conn) => {
-    const [rows] = await conn.query("SELECT fence, lease_owner, status FROM jobs WHERE job_id = ? FOR UPDATE", [input.jobId]);
+    const [rows] = await conn.query("SELECT fence, lease_owner, lease_until, status, session_id FROM jobs WHERE job_id = ? FOR UPDATE", [input.jobId]);
     const row = rows[0];
-    if (!row || Number(row.fence) !== input.fence || row.lease_owner !== input.owner || row.status !== "running") {
+    if (!row || Number(row.fence) !== input.fence || row.lease_owner !== input.owner || row.status !== "running" || row.session_id !== input.sessionId || !(await unexpired(conn, row))) {
       return { ok: false, code: "provider_fence_rejected" };
     }
     const reserve = input.estimatedInput + input.reservedOutput;
@@ -543,8 +591,8 @@ async function beginProviderStep(input) {
       `INSERT INTO provider_steps (
         step_id, session_id, job_id, actor_id, fence, provider, model, status, usage_source, created_at,
         estimated_input, reserved_output, reserved_total, estimate_source, settlement
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched', 'unknown', ?, ?, ?, ?, 'char_estimate', 'pending')`,
-      [input.stepId, input.sessionId, input.jobId, input.actorId, input.fence, input.provider, input.model, new Date().toISOString(), input.estimatedInput, input.reservedOutput, reserve],
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched', 'unknown', ?, ?, ?, ?, ?, 'pending')`,
+      [input.stepId, input.sessionId, input.jobId, input.actorId, input.fence, input.provider, input.model, new Date().toISOString(), input.estimatedInput, input.reservedOutput, reserve, input.estimateSource],
     );
     await conn.query(
       "UPDATE turn_budgets SET reserved_tokens = reserved_tokens + ?, model_calls_reserved = model_calls_reserved + 1 WHERE job_id = ?",
@@ -556,12 +604,12 @@ async function beginProviderStep(input) {
 
 async function settleProviderStep(input) {
   return transaction(async (conn) => {
-    const [jobs] = await conn.query("SELECT fence, lease_owner, status FROM jobs WHERE job_id = ? FOR UPDATE", [input.jobId]);
+    const [jobs] = await conn.query("SELECT fence, lease_owner, lease_until, status FROM jobs WHERE job_id = ? FOR UPDATE", [input.jobId]);
     const [steps] = await conn.query("SELECT * FROM provider_steps WHERE step_id = ? FOR UPDATE", [input.stepId]);
     const job = jobs[0];
     const step = steps[0];
     if (!step) return { ok: false, code: "step_missing" };
-    if (!job || job.lease_owner !== input.owner || job.status !== "running" || Number(job.fence) !== input.fence) {
+    if (!job || job.lease_owner !== input.owner || job.status !== "running" || Number(job.fence) !== input.fence || !(await unexpired(conn, job))) {
       return { ok: false, code: "provider_fence_rejected" };
     }
     const settlement = String(step.settlement ?? "pending");
@@ -628,6 +676,8 @@ function nullable(value) {
 
 async function reserveRevision(jobId, owner, fence) {
   return transaction(async (conn) => {
+    const [jobs] = await conn.query("SELECT lease_until FROM jobs WHERE job_id = ? AND fence = ? AND lease_owner = ? AND status = 'running' FOR UPDATE", [jobId, fence, owner]);
+    if (!jobs[0] || !(await unexpired(conn, jobs[0]))) return { ok: false, count: 0 };
     const [updated] = await conn.query(
       `UPDATE jobs SET revision_count = revision_count + 1
        WHERE job_id = ? AND fence = ? AND lease_owner = ? AND status = 'running'`,
@@ -636,6 +686,16 @@ async function reserveRevision(jobId, owner, fence) {
     const [rows] = await conn.query("SELECT revision_count FROM jobs WHERE job_id = ?", [jobId]);
     const count = Number(rows[0]?.revision_count ?? 0);
     return updated.affectedRows === 1 ? { ok: true, count } : { ok: false, count };
+  });
+}
+
+async function reserveToolCall(sessionId, lease, maxCalls) {
+  return transaction(async (conn) => {
+    try { await assertExecutionLease(conn, sessionId, lease); } catch { return "lost"; }
+    await conn.query("UPDATE jobs SET tool_call_limit = COALESCE(tool_call_limit, ?) WHERE job_id = ?", [maxCalls, lease.jobId]);
+    const [updated] = await conn.query(`UPDATE jobs SET tool_call_count = tool_call_count + 1
+      WHERE job_id = ? AND tool_call_count < LEAST(tool_call_limit, ?)`, [lease.jobId, maxCalls]);
+    return updated.affectedRows === 1 ? "ok" : "budget_exhausted";
   });
 }
 
@@ -661,12 +721,14 @@ async function getTurnBudget(jobId) {
 }
 
 async function saveProviderPayload(input) {
-  await pool.query(
-    `INSERT INTO provider_payloads (payload_id, step_id, session_id, actor_id, job_id, kind, body, bytes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    [input.payloadId, input.stepId, input.sessionId, input.actorId, input.jobId, input.kind, input.body, Buffer.byteLength(input.body)],
-  );
-  return null;
+  return transaction(async (conn) => {
+    try { await assertExecutionLease(conn, input.sessionId, { jobId: input.jobId, owner: input.owner, fence: input.fence }); } catch { return false; }
+    const [rows] = await conn.query("SELECT step_id FROM provider_steps WHERE step_id = ? AND job_id = ? AND session_id = ? AND actor_id = ? AND fence = ? FOR UPDATE", [input.stepId, input.jobId, input.sessionId, input.actorId, input.fence]);
+    if (!rows[0]) return false;
+    await conn.query(`INSERT INTO provider_payloads (payload_id, step_id, session_id, actor_id, job_id, kind, body, bytes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [input.payloadId, input.stepId, input.sessionId, input.actorId, input.jobId, input.kind, input.body, Buffer.byteLength(input.body)]);
+    return true;
+  });
 }
 
 async function listProviderPayloads(jobId, actorId) {
@@ -708,9 +770,9 @@ async function listProviderSteps(jobId) {
 
 async function saveAgentSnapshot(input) {
   return transaction(async (conn) => {
-    const [rows] = await conn.query("SELECT fence, lease_owner, status FROM jobs WHERE job_id = ? FOR UPDATE", [input.jobId]);
+    const [rows] = await conn.query("SELECT fence, lease_owner, lease_until, status, session_id FROM jobs WHERE job_id = ? FOR UPDATE", [input.jobId]);
     const row = rows[0];
-    if (!row || Number(row.fence) !== input.fence || row.lease_owner !== input.owner || row.status !== "running") return false;
+    if (!row || Number(row.fence) !== input.fence || row.lease_owner !== input.owner || row.status !== "running" || row.session_id !== input.sessionId || !(await unexpired(conn, row))) return false;
     await conn.query(
       "INSERT INTO agent_snapshots (session_id, job_id, fence, kind, body_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
       [input.sessionId, input.jobId, input.fence, input.kind, JSON.stringify(input.body), new Date().toISOString()],
