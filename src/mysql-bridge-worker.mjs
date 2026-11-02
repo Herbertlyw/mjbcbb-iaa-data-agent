@@ -178,7 +178,7 @@ async function handle(message) {
   } catch (error) {
     message.port.postMessage({
       ok: false,
-      name: error instanceof Error ? error.name : "Error",
+      name: error instanceof Error && error.message === "execution_fence_rejected" ? "execution_fence_rejected" : error instanceof Error ? error.name : "Error",
       message: error instanceof Error ? error.message : "mysql error",
     });
   }
@@ -463,7 +463,7 @@ async function finish(jobId, owner, fence, status, analysis, error, usage) {
         if (!consistent) {
           terminal = "failed";
           analysis = null;
-          error = { code: "freshness_version_changed", message: "新鲜度在终态提交前变化，旧证据没有交付。" };
+          error = { code: "freshness_version_changed", message: "新鲜度版本已变化，或查询来源缺少有效的权威新鲜度回执，证据没有交付。" };
         }
       }
     }

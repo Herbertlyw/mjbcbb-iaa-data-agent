@@ -24,7 +24,13 @@ export class RedisJobQueue {
       maxRetriesPerRequest: 2,
       lazyConnect: true,
       enableReadyCheck: true,
+      enableOfflineQueue: false,
+      connectTimeout: 1500,
+      commandTimeout: 2000,
     });
+    // Error strings from clients can include network configuration. The
+    // worker/dispatcher emit a bounded generic diagnostic instead.
+    this.redis.on("error", () => undefined);
   }
 
   async connect(): Promise<void> {

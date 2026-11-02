@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import mysql from "mysql2/promise";
-import { analyst, openRuntime } from "./helpers.js";
+import { openRuntime } from "./helpers.js";
 import type { ProviderStepBegin } from "../src/state-store.js";
 
 test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围栏不会放宽额度", async () => {
@@ -29,9 +29,10 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
       redisPassword: password,
       startWorker: false,
     });
-    const session = analyst(runtime);
-    const job = runtime.jobs.submit(session.session_id, "预算争抢", "budget-key");
-    const claim = runtime.state.claimJob(job.job_id, "worker-a", Date.now(), 60_000);
+    const session = await runtime.sessions.createAsync("analyst");
+    const state = await runtime.mysqlAsyncState();
+    const job = await runtime.jobs.submitForSessionAsync(session.session_id, "预算争抢", "budget-key");
+    const claim = (await state.call("claimJob", job.job_id, "worker-a", Date.now(), 60_000));
     assert.ok(claim);
     const connection = { host: "127.0.0.1", port, user: "lumenfox_it", password, database: "lumenfox_it" };
     const input = (stepId: string): ProviderStepBegin => ({
@@ -62,12 +63,12 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
     assert.equal(wins.length, 1);
     assert.equal(losses.length, 1);
     assert.equal(losses[0]?.code, "budget_exhausted");
-    const budget = runtime.state.getTurnBudget(job.job_id);
+    const budget = (await state.call("getTurnBudget", job.job_id));
     assert.equal(budget?.reserved_tokens, 200);
     assert.equal(budget?.model_calls_reserved, 1);
     const winner = wins[0]?.code === "reserved" ? (raced[0]?.ok ? "step_a" : "step_b") : "step_a";
     const stepId = raced[0]?.ok ? "step_a" : "step_b";
-    const duplicate = runtime.state.settleProviderStep({
+    const duplicate = (await state.call("settleProviderStep", {
       stepId,
       jobId: job.job_id,
       owner: "worker-a",
@@ -78,9 +79,9 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
       usageSource: "simulated",
       durationMs: 5,
       errorCode: null,
-    });
+    }));
     assert.equal(duplicate.ok, true);
-    const again = runtime.state.settleProviderStep({
+    const again = (await state.call("settleProviderStep", {
       stepId,
       jobId: job.job_id,
       owner: "worker-a",
@@ -91,9 +92,9 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
       usageSource: "simulated",
       durationMs: 5,
       errorCode: null,
-    });
+    }));
     assert.equal(again.code, "idempotent");
-    const conflict = runtime.state.settleProviderStep({
+    const conflict = (await state.call("settleProviderStep", {
       stepId,
       jobId: job.job_id,
       owner: "worker-a",
@@ -104,15 +105,15 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
       usageSource: "simulated",
       durationMs: 5,
       errorCode: null,
-    });
+    }));
     assert.equal(conflict.code, "settlement_conflict");
-    const after = runtime.state.getTurnBudget(job.job_id);
+    const after = (await state.call("getTurnBudget", job.job_id));
     assert.equal(after?.settled_input, 21);
     assert.equal(after?.settled_output, 9);
     assert.equal(after?.reserved_tokens, 0);
-    const heldBegin = runtime.state.beginProviderStep(input("step_hold"));
+    const heldBegin = (await state.call("beginProviderStep", input("step_hold")));
     assert.equal(heldBegin.ok, true, heldBegin.code);
-    const missing = runtime.state.settleProviderStep({
+    const missing = (await state.call("settleProviderStep", {
       stepId: "step_hold",
       jobId: job.job_id,
       owner: "worker-a",
@@ -123,13 +124,13 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
       usageSource: "unknown",
       durationMs: 5,
       errorCode: null,
-    });
+    }));
     assert.equal(missing.code, "held");
-    const blocked = runtime.state.beginProviderStep(input("step_after_hold"));
+    const blocked = (await state.call("beginProviderStep", input("step_after_hold")));
     assert.equal(blocked.ok, false);
     assert.equal(blocked.code, "token_budget_unknown");
-    assert.equal(runtime.state.getTurnBudget(job.job_id)?.reserved_tokens, 200);
-    const oldFence = runtime.state.settleProviderStep({
+    assert.equal((await state.call("getTurnBudget", job.job_id))?.reserved_tokens, 200);
+    const oldFence = (await state.call("settleProviderStep", {
       stepId: "step_hold",
       jobId: job.job_id,
       owner: "worker-a",
@@ -140,10 +141,10 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
       usageSource: "simulated",
       durationMs: 1,
       errorCode: null,
-    });
+    }));
     assert.equal(oldFence.ok, false);
     assert.equal(oldFence.code, "provider_fence_rejected");
-    const step = runtime.state.listProviderSteps(job.job_id).find((item) => item.step_id === "step_hold");
+    const step = (await state.call("listProviderSteps", job.job_id)).find((item) => item.step_id === "step_hold");
     assert.equal(step?.settlement, "held_unknown");
     assert.equal(step?.input_tokens, null);
     assert.notEqual(winner, "");

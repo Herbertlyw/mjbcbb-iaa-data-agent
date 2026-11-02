@@ -65,6 +65,22 @@ export class SessionStore {
     return { ok: true, resource };
   }
 
+  async createAsync(role: string, title = "新会话", actorId = role === "viewer" ? "demo-viewer" : "demo-analyst"): Promise<SessionRecord> {
+    const session: StoredSession = { session_id: `ses_${randomUUID()}`, title, role, actor_id: actorId, created_at: new Date().toISOString(), slots: null, bindings: [] };
+    if (this.asyncState) await (await this.asyncState()).call("createSession", session);
+    else this.state.createSession(session);
+    return this.hydrate(session);
+  }
+
+  async listAsync(actorId?: string): Promise<SessionRecord[]> {
+    const sessions = this.asyncState ? await (await this.asyncState()).call("listSessions") : this.state.listSessions();
+    return sessions.filter((session) => !actorId || (session.actor_id ?? "demo-analyst") === actorId).map((session) => this.hydrate(session));
+  }
+
+  async resourceCountAsync(): Promise<number> {
+    return this.asyncState ? (await this.asyncState()).call("countResources") : this.state.countResources();
+  }
+
   create(role: string, title = "新会话", actorId = role === "viewer" ? "demo-viewer" : "demo-analyst"): SessionRecord {
     const session: StoredSession = {
       session_id: `ses_${randomUUID()}`,

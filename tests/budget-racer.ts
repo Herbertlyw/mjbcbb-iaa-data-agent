@@ -1,4 +1,4 @@
-import { MysqlStateStore } from "../src/mysql-state-store.js";
+import { AsyncMysqlStateStore } from "../src/async-mysql-state-store.js";
 
 const connection = JSON.parse(process.argv[2] ?? "{}") as {
   host: string;
@@ -8,9 +8,9 @@ const connection = JSON.parse(process.argv[2] ?? "{}") as {
   database: string;
 };
 const input = JSON.parse(process.argv[3] ?? "{}");
-const store = new MysqlStateStore(connection);
+const store = await AsyncMysqlStateStore.open(connection);
 try {
-  console.log(JSON.stringify(store.beginProviderStep(input)));
+  console.log(JSON.stringify(await store.call("beginProviderStep", input)));
 } finally {
-  store.close();
+  await store.close();
 }

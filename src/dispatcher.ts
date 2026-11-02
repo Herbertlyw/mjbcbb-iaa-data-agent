@@ -5,13 +5,14 @@ import { assertIsolatedMysql } from "./runtime.js";
 
 const config = loadConfig({ stateMode: "mysql", startWorker: false, publishFreshnessOnStart: false, reseedDatabase: false });
 assertIsolatedMysql(config);
-const state = await AsyncMysqlStateStore.open({
+const connection = {
   host: config.mysqlHost,
   port: config.mysqlPort,
   user: config.mysqlUser,
   password: config.mysqlPassword,
   database: config.mysqlDatabase,
-});
+};
+let state = await AsyncMysqlStateStore.open(connection);
 const queue = new RedisJobQueue({
   host: config.redisHost,
   port: config.redisPort,
@@ -26,6 +27,10 @@ console.log("Lumenfox dispatcher：从 MySQL outbox 投递到 Redis。投递成�
 try {
   while (running) {
     try {
+      if (!state.available) {
+        await state.close();
+        state = await AsyncMysqlStateStore.open(connection);
+      }
       const pending = await state.call("listPendingOutbox", 20);
       for (const item of pending) {
         try {

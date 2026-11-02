@@ -29,11 +29,11 @@ export class AsyncMysqlStateStore {
 
   get available(): boolean { return !this.closing && !this.failed; }
 
-  static async open(connection: MysqlConnection, timeoutMs = 20_000): Promise<AsyncMysqlStateStore> {
-    if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new Error("invalid_mysql_timeout");
+  static async open(connection: MysqlConnection, timeoutMs = 20_000, initializationTimeoutMs = timeoutMs): Promise<AsyncMysqlStateStore> {
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || !Number.isInteger(initializationTimeoutMs) || initializationTimeoutMs < 1) throw new Error("invalid_mysql_timeout");
     const state = new AsyncMysqlStateStore(connection, timeoutMs);
     try {
-      await state.request("ping", []);
+      await state.request("ping", [], initializationTimeoutMs);
       return state;
     } catch (error) {
       await state.close();
@@ -47,8 +47,10 @@ export class AsyncMysqlStateStore {
     return this.request(op, args);
   }
 
-  private request<T>(op: string, args: unknown[]): Promise<T> {
+  private request<T>(op: string, args: unknown[], timeoutMs = this.timeoutMs): Promise<T> {
     if (this.closing || this.failed) return Promise.reject(new Error("mysql_state_closed"));
+    // Fail before dispatch rather than allowing an unbounded worker/pool queue.
+    if (this.pending.size >= 64) return Promise.reject(new Error("mysql_state_overloaded"));
     const channel = new MessageChannel();
     return new Promise<T>((resolve, reject) => {
       let settled = false;
@@ -61,13 +63,17 @@ export class AsyncMysqlStateStore {
         if (error) reject(error); else resolve(value as T);
       };
       const item: Pending = { reject: (error) => finish(error) };
-      const timer = setTimeout(() => finish(new Error("mysql_state_outcome_unknown")), this.timeoutMs);
+      const timer = setTimeout(() => {
+        // The transaction might still commit. Poison this bridge instance and
+        // fail all pending callers; do not dispatch further work to it.
+        this.failPending("mysql_state_outcome_unknown");
+      }, timeoutMs);
       this.pending.add(item);
       channel.port1.once("message", (body: { ok: true; result: T } | { ok: false; name: string }) => {
         if (body.ok) finish(undefined, body.result);
         else {
           // Do not expose database messages, which can contain query data.
-          const error = new Error("mysql_state_operation_failed");
+          const error = new Error(body.name === "execution_fence_rejected" ? body.name : "mysql_state_operation_failed");
           error.name = body.name;
           finish(error);
         }

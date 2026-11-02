@@ -92,8 +92,11 @@ export class JobService {
     return this.owner;
   }
 
-  runClaimed(claim: { job: JobRecord; fence: number }): Promise<void> {
-    return this.execute(claim.job, claim.fence);
+  async runClaimed(claim: { job: JobRecord; fence: number }): Promise<void> {
+    try { await this.execute(claim.job, claim.fence); }
+    finally {
+      if (this.boundFences.get(claim.job.job_id) === claim.fence) this.boundFences.delete(claim.job.job_id);
+    }
   }
 
   async abandon(): Promise<void> {
@@ -115,6 +118,16 @@ export class JobService {
     const input = this.prepareSubmission(session, text, idempotencyKey, requested);
     try {
       const stored = await state.call("createJob", input);
+      this.wake();
+      return stored;
+    } catch (error) { throw submissionError(error); }
+  }
+
+  async submitForSessionAsync(sessionId: string, text: string, idempotencyKey: string, requested?: { modelId?: string; reasoning?: string }): Promise<JobRecord> {
+    const session = await this.host.sessions.requireAsync(sessionId);
+    const input = this.prepareSubmission(session, text, idempotencyKey, requested);
+    try {
+      const stored = await this.stateCall("createJob", input);
       this.wake();
       return stored;
     } catch (error) { throw submissionError(error); }
@@ -168,9 +181,27 @@ export class JobService {
   cancel(jobId: string): JobRecord {
     const job = this.host.state.requestCancel(jobId);
     this.localAgents.get(jobId)?.abort();
-    this.publish(jobId);
+    const event = job.events.at(-1);
+    if (event) this.publishEvent(jobId, event);
     return job;
   }
+
+  async cancelAsync(jobId: string): Promise<JobRecord> {
+    const job = await this.stateCall("requestCancel", jobId);
+    this.localAgents.get(jobId)?.abort();
+    const event = job.events.at(-1);
+    if (event) this.publishEvent(jobId, event);
+    return job;
+  }
+
+  async requireAsync(jobId: string): Promise<JobRecord> {
+    const job = await this.stateCall("getJob", jobId);
+    if (!job) throw new RequestError("job_not_found", "没有这个任务", 404);
+    return job;
+  }
+
+  async listAsync(sessionId: string): Promise<JobRecord[]> { return this.stateCall("listJobs", sessionId); }
+  async expireLeaseAsync(jobId: string): Promise<void> { await this.stateCall("expireLease", jobId); }
 
   abortLocal(jobId: string): void { this.localAgents.get(jobId)?.abort(); }
 
@@ -198,6 +229,15 @@ export class JobService {
 
   subscribe(jobId: string, listener: (event: { seq: number; type: string }) => void): () => void {
     this.require(jobId);
+    return this.registerSubscriber(jobId, listener);
+  }
+
+  async subscribeAsync(jobId: string, listener: (event: { seq: number; type: string }) => void): Promise<() => void> {
+    await this.requireAsync(jobId);
+    return this.registerSubscriber(jobId, listener);
+  }
+
+  private registerSubscriber(jobId: string, listener: (event: { seq: number; type: string }) => void): () => void {
     let set = this.subscribers.get(jobId);
     if (!set) {
       set = new Set();
@@ -209,15 +249,16 @@ export class JobService {
 
   private async loop(): Promise<void> {
     while (this.running) {
-      const claim = await this.stateCall("claimNext", this.owner, Date.now(), this.host.config.leaseMs);
-      if (!claim) {
-        if (this.running) await this.waitForWork();
-        continue;
-      }
       try {
-        await this.execute(claim.job, claim.fence);
+        const claim = await this.stateCall("claimNext", this.owner, Date.now(), this.host.config.leaseMs);
+        if (!claim) {
+          if (this.running) await this.waitForWork();
+          continue;
+        }
+        await this.runClaimed(claim);
       } catch {
-        console.error("worker failed; execution details omitted");
+        console.error("worker state unavailable; execution details omitted");
+        if (this.running) await this.waitForWork();
       }
     }
   }
@@ -227,8 +268,7 @@ export class JobService {
     this.boundFences.set(jobId, fence);
     const fresh = await this.stateCall("getJob", jobId);
     if (fresh?.cancel_requested) {
-      await this.stateCall("finish", jobId, this.owner, fence, "cancelled", null, null);
-      this.publish(jobId);
+      if (await this.stateCall("finish", jobId, this.owner, fence, "cancelled", null, null)) await this.publish(jobId);
       return;
     }
     let lost = false;
@@ -236,18 +276,19 @@ export class JobService {
       lost = true;
       this.localAgents.get(jobId)?.abort();
     };
-    if (!await this.stateCall("appendEvent", jobId, this.owner, fence, "job_started", { status: "running", fence, owner: this.owner })) {
-      return;
-    }
-    if (!await this.stateCall("appendEvent", jobId, this.owner, fence, "turn_resolved", { kind: claimed.turn.kind })) return;
-    this.publish(jobId);
+    const started = await this.stateCall("appendEvent", jobId, this.owner, fence, "job_started", { status: "running", fence, owner: this.owner });
+    if (!started) return;
+    this.publishEvent(jobId, started);
+    const turnResolved = await this.stateCall("appendEvent", jobId, this.owner, fence, "turn_resolved", { kind: claimed.turn.kind });
+    if (!turnResolved) return;
+    this.publishEvent(jobId, turnResolved);
     // started_at survives lease takeover; recovery does not receive a fresh wall-clock budget.
     const startedAt = claimed.started_at ? Date.parse(claimed.started_at) : Date.now();
     const remainingMs = this.host.config.jobTimeoutMs - Math.max(0, Date.now() - startedAt);
     if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
-      await this.stateCall("finish", jobId, this.owner, fence, "timed_out", null, { code: "job_timed_out", message: "任务的墙钟预算已耗尽，恢复后不会重新开始计时。" });
+      const finished = await this.stateCall("finish", jobId, this.owner, fence, "timed_out", null, { code: "job_timed_out", message: "任务的墙钟预算已耗尽，恢复后不会重新开始计时。" });
       this.boundFences.delete(jobId);
-      this.publish(jobId);
+      if (finished) await this.publish(jobId);
       return;
     }
     const session = await this.host.sessions.requireAsync(claimed.session_id);
@@ -444,8 +485,7 @@ export class JobService {
       status = analysis.status;
     }
     const steps = this.host.config.piProvider === "openai-compatible" ? await this.stateCall("listProviderSteps", jobId) : [];
-    await this.stateCall("finish", jobId, this.owner, fence, status, analysis, error, measuredUsage(this.host.config.modelMode, this.host.config.piProvider, modelCalls, toolCalls, steps));
-    this.publish(jobId);
+    if (await this.stateCall("finish", jobId, this.owner, fence, status, analysis, error, measuredUsage(this.host.config.modelMode, this.host.config.piProvider, modelCalls, toolCalls, steps))) await this.publish(jobId);
   }
 
   private async runPiSession(input: {
@@ -672,7 +712,7 @@ export class JobService {
       branch_entry_ids: session.sessionManager.getBranch().map((entry) => entry.id),
     });
     if (!contextEvent) { markLost(); return "lost"; }
-    this.publish(input.jobId);
+    await this.publish(input.jobId);
     if (decision.action === "reject") {
       fail({ code: decision.code, message: decision.message });
       return lost ? "lost" : "ok";
@@ -720,16 +760,19 @@ export class JobService {
     return lost ? "lost" : "ok";
   }
 
-  private publish(jobId: string): void {
+  private async publish(jobId: string): Promise<void> {
     if (!this.subscribers.get(jobId)?.size) return;
-    const job = this.host.state.getJob(jobId);
+    const job = await this.stateCall("getJob", jobId);
     const latest = job?.events.at(-1);
     if (!latest) return;
     this.publishEvent(jobId, latest);
   }
 
   private publishEvent(jobId: string, event: { seq: number; type: string }): void {
-    for (const listener of this.subscribers.get(jobId) ?? []) listener(event);
+    for (const listener of this.subscribers.get(jobId) ?? []) {
+      try { listener(event); }
+      catch { console.error("任务事件订阅回调失败，未输出事件内容。"); }
+    }
   }
 
   private waitForWork(): Promise<void> {
