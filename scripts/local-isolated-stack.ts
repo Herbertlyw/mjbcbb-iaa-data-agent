@@ -7,15 +7,26 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import mysql from "mysql2/promise";
 import { clickHouseCommand, clickHouseInsert, clickHouseQuery, createClickHouseClient } from "../src/clickhouse-client.js";
+import { currentCalendarDate } from "../src/config.js";
 import { freshnessManifest, probeClickHouseFreshness } from "../src/freshness.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import { MysqlFreshnessStore } from "../src/mysql-freshness.js";
-import { createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
+import { syntheticDayShift } from "../src/synthetic-clock.js";
+import { createTableSql, rollingWarehouse, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
 import { startFakeOpenAI } from "../tests/openai-fake-server.js";
 
 // A disposable integration stack. Docker only publishes random loopback ports;
 // all names, credentials and temporary files belong to this invocation.
 const root = fileURLToPath(new URL("..", import.meta.url));
+const args = process.argv.slice(2);
+const rolling = args.includes("--rolling");
+const dates = args.filter((arg) => arg.startsWith("--today="));
+if (args.some((arg) => arg !== "--rolling" && !arg.startsWith("--today=")) || dates.length > 1 || args.filter((arg) => arg === "--rolling").length > 1 || (dates.length && !rolling)) throw new Error("用法：npm run demo:stack -- [--rolling [--today=YYYY-MM-DD]]");
+const testToday = dates[0]?.slice("--today=".length);
+if (dates.length && !testToday) throw new Error("测试日期不能为空");
+const fixtureToday = rolling ? (testToday || currentCalendarDate({ simulatedToday: "" }, "America/Los_Angeles")) : "2026-10-29";
+const dateShift = syntheticDayShift(fixtureToday);
+const configuredToday = rolling ? (testToday ?? "") : fixtureToday;
 const id = randomUUID();
 const password = randomBytes(18).toString("hex");
 const readerPassword = randomBytes(18).toString("hex");
@@ -110,31 +121,31 @@ try {
     const connection = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password, database: "lumenfox_it", connectTimeout: 1000 });
     await connection.end(); return true;
   }, "MySQL");
-  console.log("装载固定日期的合成样本并发布新鲜度…");
+  console.log(`装载${rolling ? "滚动" : "固定"}合成样本（业务日 ${fixtureToday}）并发布新鲜度…`);
   const base = { url, username: "default", password, maxRowsToRead: 5_000_000, timeoutSeconds: 30 };
   const bootstrap = createClickHouseClient({ ...base, database: "default" }, false);
   try { await clickHouseCommand(bootstrap, "CREATE DATABASE IF NOT EXISTS harborlight"); } finally { await bootstrap.close(); }
   const admin = createClickHouseClient({ ...base, database: "harborlight" }, false);
   try {
     for (const table of WAREHOUSE_TABLES) await clickHouseCommand(admin, createTableSql(table));
-    const data = smallWarehouse();
+    const data = rolling ? rollingWarehouse({ simulatedToday: fixtureToday }) : smallWarehouse();
     const tables = { dim_fox_title: data.titles, dim_fox_channel: data.channels, fact_fox_daily_install: data.installs, fact_fox_daily_active: data.active, fact_fox_daily_payment: data.payments, fact_fox_ad_receipt: data.revenue, fact_fox_daily_spend: data.spend, fact_fox_retention_cohort: data.retention, fact_fox_cohort_payback: data.cohortPayback, fact_fox_experiment_arm: data.arms, fact_fox_experiment_metric: data.experimentMetrics };
     for (const [table, rows] of Object.entries(tables)) await clickHouseInsert<unknown>(admin, table, rows);
     await clickHouseCommand(admin, `CREATE USER fox_reader IDENTIFIED BY '${readerPassword}'`);
     await clickHouseCommand(admin, "GRANT SELECT ON harborlight.* TO fox_reader");
   } finally { await admin.close(); }
   const knowledgeDir = path.join(root, "knowledge", "harborlight");
-  const targetsPath = path.join(knowledgeDir, "freshness-targets.json");
+  const targetsPath = path.join(knowledgeDir, rolling ? "freshness-targets-rolling.example.json" : "freshness-targets.json");
   const reader = createClickHouseClient({ ...base, username: "fox_reader", password: readerPassword, database: "harborlight" }, true);
   const freshness = await MysqlFreshnessStore.open({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password, database: "lumenfox_it" });
   try {
-    const batch = await freshness.begin(freshnessManifest(loadKnowledge(knowledgeDir), targetsPath, { simulatedToday: "2026-10-29" }));
-    const observed = await probeClickHouseFreshness({ targetsPath, simulatedToday: "2026-10-29", query: (sql) => clickHouseQuery(reader, sql) as Promise<Array<{ event_date: string }>> });
+    const batch = await freshness.begin(freshnessManifest(loadKnowledge(knowledgeDir), targetsPath, { simulatedToday: fixtureToday }));
+    const observed = await probeClickHouseFreshness({ targetsPath, simulatedToday: fixtureToday, query: (sql) => clickHouseQuery(reader, sql) as Promise<Array<{ event_date: string }>> });
     if (await freshness.publish(batch.version, observed) !== "published") throw new Error("新鲜度发布未完成");
   } finally { await freshness.close(); await reader.close(); }
-  fake = await startFakeOpenAI(token, { recordObservations: false });
+  fake = await startFakeOpenAI(token, { recordObservations: false, syntheticDateShiftDays: dateShift });
   const env = {
-    PATH: process.env.PATH ?? "", HOST: "127.0.0.1", PORT: String(apiPort), SIMULATED_TODAY: "2026-10-29", STATE_MODE: "mysql", BUSINESS_ENGINE: "clickhouse", KNOWLEDGE_DIR: knowledgeDir,
+    PATH: process.env.PATH ?? "", HOST: "127.0.0.1", PORT: String(apiPort), SIMULATED_TODAY: configuredToday, DEMO_FIXTURE_TODAY: fixtureToday, STATE_MODE: "mysql", BUSINESS_ENGINE: "clickhouse", KNOWLEDGE_DIR: knowledgeDir, FRESHNESS_TARGETS_PATH: targetsPath,
     CLICKHOUSE_URL: url, CLICKHOUSE_USER: "fox_reader", CLICKHOUSE_PASSWORD: readerPassword, CLICKHOUSE_DATABASE: "harborlight",
     FRESHNESS_PATH: path.join(dir, "freshness.json"), DATABASE_PATH: path.join(dir, "unused.sqlite"), RESEED_DATABASE: "false", PUBLISH_FRESHNESS_ON_START: "false",
     MYSQL_HOST: "127.0.0.1", MYSQL_PORT: String(mysqlPort), MYSQL_USER: "lumenfox_it", MYSQL_PASSWORD: password, MYSQL_DATABASE: "lumenfox_it",
@@ -145,7 +156,8 @@ try {
   launch("src/api.ts", env); launch("src/dispatcher.ts", env); launch("src/worker.ts", env);
   await waitUntil(async () => (await fetch(`http://127.0.0.1:${apiPort}/api/health`, { signal: AbortSignal.timeout(1000) })).ok, "API");
   console.log(`\n本机演示：http://127.0.0.1:${apiPort}`);
-  console.log("固定日期的合成数据；Pi 连接脚本化的本机假服务，不是真实模型。按 Ctrl+C 停止并清理本轮资源。");
+  console.log(`${rolling ? "滚动" : "固定日期"}合成数据；Pi 连接脚本化的本机假服务，不是真实模型。按 Ctrl+C 停止并清理本轮资源。`);
+  if (rolling && !testToday) console.log("跨业务日后旧 freshness 不能继续使用；请停止并重新启动以生成新样本和发布。 ");
   await stopped;
 } catch (error) {
   if (!stopping) { console.error(error instanceof Error ? error.message : "隔离栈启动失败"); process.exitCode = 1; }

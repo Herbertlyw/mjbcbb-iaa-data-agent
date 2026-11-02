@@ -37,6 +37,7 @@ export interface AppConfig {
   jobTimeoutMs: number;
   toolDelayMs: number;
   simulatedToday: string;
+  demoFixtureToday: string;
   defaultRole: string;
   startWorker: boolean;
   stateMode: "sqlite" | "mysql";
@@ -146,6 +147,8 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     // Empty means real time in the contract/knowledge timezone. Tests and
     // explicitly simulated demos can inject a fixed calendar date.
     simulatedToday: process.env.SIMULATED_TODAY || "",
+    // Applies only to prewritten examples for the explicitly synthetic stack.
+    demoFixtureToday: process.env.DEMO_FIXTURE_TODAY || "",
     defaultRole: process.env.DEFAULT_ROLE || "analyst",
     startWorker: true,
   };
@@ -155,6 +158,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   }
   if (merged.host !== "127.0.0.1") throw new Error("本地 mock 身份只允许监听 127.0.0.1。");
   if (merged.simulatedToday && !isCalendarDate(merged.simulatedToday)) throw new Error("SIMULATED_TODAY 必须是真实的 YYYY-MM-DD 日历日期。");
+  if (merged.demoFixtureToday && (!isCalendarDate(merged.demoFixtureToday) || merged.demoFixtureToday < "1971-01-01" || merged.demoFixtureToday > "2148-12-31")) throw new Error("DEMO_FIXTURE_TODAY 必须是支持范围内的真实日历日期。");
   validateModelProvider(merged);
   return merged;
 }

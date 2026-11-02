@@ -1,3 +1,5 @@
+import { shiftSyntheticDates, syntheticDayShift } from "./synthetic-clock.js";
+
 export const DEMO_QUESTIONS = [
   {
     id: "weekly",
@@ -46,10 +48,16 @@ const HARBORLIGHT_QUESTIONS = [
   { id: "japan", label: "追问日本", text: "那日本呢？" },
   { id: "shorter", label: "更改日期", text: "日期改成 2026-10-06 到 2026-10-08。" },
   { id: "vague", label: "含糊问题", text: "只说看看收入" },
+  { id: "title-join", label: "产品关联", text: "合成产品维表关联：统计纸灯日本 iOS 雾帆 2026-10-06 到 2026-10-12 新增。" },
+  { id: "channel-join", label: "渠道关联", text: "合成渠道维表关联：统计纸灯日本 iOS 雾帆 2026-10-06 到 2026-10-12 新增。" },
+  { id: "ratio", label: "收入／成本", text: "合成收入成本比：2026-10-08 美国 iOS 雾帆的收入除以成本。" },
+  { id: "grouped-ratio", label: "多渠道比率", text: "合成多渠道收入成本比：按国家和渠道对齐 2026-10-08 收入与成本。" },
+  { id: "alignment", label: "跨期分组变换", text: "合成分组对齐：按国家对照 2026-10-06 与 2026-10-08 的新增，并筛选、排序及求和下降组。" },
 ] as const;
 
-export function demoForScenario(harborlight: boolean) {
+export function demoForScenario(harborlight: boolean, fixtureToday?: string) {
+  const days = fixtureToday ? syntheticDayShift(fixtureToday) : 0;
   return harborlight
-    ? { scenario: "Harborlight", placeholder: "问一个关于纸灯或玻璃鲦的问题", questions: HARBORLIGHT_QUESTIONS }
+    ? { scenario: "Harborlight", placeholder: "问一个关于纸灯或玻璃鲦的问题", questions: HARBORLIGHT_QUESTIONS.map((question) => ({ ...question, text: shiftSyntheticDates(question.text, days) })) }
     : { scenario: "Lumenfox", placeholder: "问一个关于 Starlane Drift 的问题", questions: DEMO_QUESTIONS };
 }

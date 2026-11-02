@@ -72,7 +72,7 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
       return;
     }
     if (method === "GET" && url.pathname === "/api/demo") {
-      send(res, 200, { simulated: true, ...demoForScenario(runtime.knowledge.contract_by_table.has("fact_fox_daily_install")) });
+      send(res, 200, { simulated: true, ...demoForScenario(runtime.knowledge.contract_by_table.has("fact_fox_daily_install"), runtime.config.demoFixtureToday || undefined) });
       return;
     }
     if (method === "GET" && url.pathname === "/api/sessions") {
