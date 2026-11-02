@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import mysql, { type Pool, type ResultSetHeader, type RowDataPacket } from "mysql2/promise";
-import type { FreshnessPublication } from "./freshness.js";
+import { dimensionSnapshotStatusValid, type FreshnessPublication } from "./freshness.js";
 import type { MysqlConnection } from "./mysql-state-store.js";
 
 export interface FreshnessManifest {
@@ -8,6 +8,7 @@ export interface FreshnessManifest {
   target_hash: string;
   contract_hashes: Record<string, string>;
   target_tables: string[];
+  dimension_targets?: Record<string, { key_columns: string[]; snapshot_columns: string[] }>;
 }
 
 export interface MysqlFreshnessPublication extends FreshnessPublication {
@@ -49,7 +50,7 @@ export class MysqlFreshnessStore {
   }
 
   async begin(manifest: FreshnessManifest): Promise<{ version: number; publication_id: string }> {
-    if (!manifest.registry_revision || !/^[a-f0-9]{64}$/u.test(manifest.target_hash) || !manifest.target_tables.length || new Set(manifest.target_tables).size !== manifest.target_tables.length || manifest.target_tables.some((table) => !/^[a-z_][a-z0-9_]*$/u.test(table)) || Object.values(manifest.contract_hashes).some((hash) => !/^[a-f0-9]{64}$/u.test(hash))) {
+    if (!manifest.registry_revision || !/^[a-f0-9]{64}$/u.test(manifest.target_hash) || !manifest.target_tables.length || new Set(manifest.target_tables).size !== manifest.target_tables.length || manifest.target_tables.some((table) => !/^[a-z_][a-z0-9_]*$/u.test(table)) || Object.values(manifest.contract_hashes).some((hash) => !/^[a-f0-9]{64}$/u.test(hash)) || Object.keys(manifest.dimension_targets ?? {}).some((table) => !manifest.target_tables.includes(table) || !manifest.contract_hashes[table])) {
       throw new Error("invalid_freshness_manifest");
     }
     const id = `fp_${randomUUID()}`;
@@ -72,6 +73,7 @@ export class MysqlFreshnessStore {
       const manifest = JSON.parse(String(batch.manifest_json)) as FreshnessManifest;
       if (JSON.stringify(Object.keys(result.tables).sort()) !== JSON.stringify([...manifest.target_tables].sort())) throw new Error("freshness_batch_incomplete");
       if (Object.values(result.tables).some((table) => !["fresh", "stale", "missing", "probe_failed"].includes(table.status))) throw new Error("freshness_status_invalid");
+      if (Object.entries(manifest.dimension_targets ?? {}).some(([table, target]) => !dimensionSnapshotStatusValid(result.tables[table], table, target))) throw new Error("freshness_dimension_snapshot_invalid");
       const [pointers] = await conn.query<RowDataPacket[]>("SELECT version FROM freshness_pointer WHERE singleton = 1 FOR UPDATE");
       const current = Number(pointers[0]?.version ?? 0);
       if (current >= version) {

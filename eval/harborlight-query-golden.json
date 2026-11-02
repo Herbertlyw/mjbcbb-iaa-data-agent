@@ -1,0 +1,13 @@
+{
+  "simulated": true,
+  "note": "手工按小型合成行计算的查询期望；不使用代理计算生成答案。",
+  "cases": [
+    { "id": "paper-japan-week", "table": "fact_fox_daily_install", "metric": "new_users", "title": "paper_lantern", "country": "JP", "channel": "mist_ads", "start": "2026-10-06", "end": "2026-10-12", "expected": "70", "status": "completed", "reason": "七日各 10，合计 70。" },
+    { "id": "paper-japan-three-days", "table": "fact_fox_daily_install", "metric": "new_users", "title": "paper_lantern", "country": "JP", "channel": "mist_ads", "start": "2026-10-06", "end": "2026-10-08", "expected": "30", "status": "completed", "reason": "三日各 10，合计 30。" },
+    { "id": "glass-germany-week", "table": "fact_fox_daily_install", "metric": "new_users", "title": "glass_minnow", "country": "DE", "channel": "mist_ads", "start": "2026-10-06", "end": "2026-10-12", "expected": "48", "status": "completed", "reason": "六日各 8，一日为真实零，合计 48。" },
+    { "id": "glass-germany-short", "table": "fact_fox_daily_install", "metric": "new_users", "title": "glass_minnow", "country": "DE", "channel": "mist_ads", "start": "2026-10-06", "end": "2026-10-08", "expected": "16", "status": "completed", "reason": "8 + 0 + 8 = 16。" },
+    { "id": "paper-us-previous", "table": "fact_fox_daily_install", "metric": "new_users", "title": "paper_lantern", "country": "US", "channel": "mist_ads", "start": "2026-09-29", "end": "2026-10-05", "expected": "140", "status": "completed", "reason": "七日各 20，合计 140。" },
+    { "id": "paper-us-missing", "table": "fact_fox_daily_install", "metric": "new_users", "title": "paper_lantern", "country": "US", "channel": "mist_ads", "start": "2026-10-06", "end": "2026-10-12", "expected": "670", "status": "partial", "reason": "100 + 0 + 120 + 140 + 150 + 160 = 670，另有一天 NULL。" },
+    { "id": "paper-japan-active", "table": "fact_fox_daily_active", "metric": "active_users", "title": "paper_lantern", "country": "JP", "channel": "mist_ads", "start": "2026-10-06", "end": "2026-10-12", "expected": "5090", "status": "completed", "reason": "六日各 15，最后一日 5000，合计 5090。" }
+  ]
+}

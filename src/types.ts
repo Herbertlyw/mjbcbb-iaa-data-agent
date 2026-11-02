@@ -192,6 +192,8 @@ export interface CoverageReport {
   actual_dates: string[];
   unknown_prediction_dates: string[];
   groups: CoverageGroup[];
+  /** Digest of the bounded coverage observation, not a database snapshot. */
+  observation_hash?: string;
   per_table?: CoverageReport[];
 }
 
@@ -258,7 +260,7 @@ export interface CalculationResource {
   notes: string[];
 }
 
-export interface ArithmeticRef { resource_id: string; cell: string; group?: Record<string, string> }
+export interface ArithmeticRef { resource_id: string; cell: string; group?: Record<string, string>; execution_id?: string; row?: number; aggregate?: "sum" }
 export interface ArithmeticResource {
   resource_id: string;
   session_id: string;
@@ -306,6 +308,7 @@ export type SessionResource = QueryResource | CalculationResource | ArithmeticRe
 export interface AnalysisSource {
   resource_id: string;
   execution_id?: string;
+  observed_at?: string;
   data_capture_hash?: string;
   sql: string;
   tables: string[];

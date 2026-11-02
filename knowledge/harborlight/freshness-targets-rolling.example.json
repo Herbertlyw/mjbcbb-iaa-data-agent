@@ -9,6 +9,20 @@
   "note": "合成滚动周期示例：使用表契约时区；示例数据固定在 2026 年 10 月，测试可注入日期。没有覆盖当前周期时必须标为不新鲜。",
   "targets": [
     {
+      "table": "dim_fox_title",
+      "engine": "clickhouse-local",
+      "kind": "dimension_snapshot",
+      "key_columns": ["title_id"],
+      "snapshot_columns": ["title_id", "title_name", "genre", "launched_on"]
+    },
+    {
+      "table": "dim_fox_channel",
+      "engine": "clickhouse-local",
+      "kind": "dimension_snapshot",
+      "key_columns": ["channel_id"],
+      "snapshot_columns": ["channel_id", "channel_name", "channel_kind"]
+    },
+    {
       "table": "fact_fox_daily_install",
       "engine": "clickhouse-local",
       "date_column": "event_date",

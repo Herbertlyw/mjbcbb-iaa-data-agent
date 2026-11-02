@@ -409,13 +409,16 @@ export function emitHarborlightKnowledge(root: string): void {
     valid_until: "2027-04-01",
     unimplemented_engines: ["maxcompute", "mysql-business"],
     note: "只读探测本地 ClickHouse 的声明周期。MAX(date) 和连接成功都不是完整。",
-    targets: WAREHOUSE_TABLES.filter((table) => table.date_column).map((table) => ({
+    targets: [...WAREHOUSE_TABLES.filter((table) => table.date_column).map((table) => ({
       table: table.table,
       engine: "clickhouse-local",
       date_column: table.date_column,
       expected_start: table.table === "fact_fox_retention_cohort" || table.table === "fact_fox_cohort_payback" || table.table === "fact_fox_experiment_arm" ? "2026-10-06" : "2026-10-06",
       expected_end: table.table === "fact_fox_retention_cohort" || table.table === "fact_fox_cohort_payback" || table.table === "fact_fox_experiment_arm" ? "2026-10-06" : "2026-10-12",
     })),
+      { table: "dim_fox_title", engine: "clickhouse-local", kind: "dimension_snapshot", key_columns: ["title_id"], snapshot_columns: ["title_id", "title_name", "genre", "launched_on"] },
+      { table: "dim_fox_channel", engine: "clickhouse-local", kind: "dimension_snapshot", key_columns: ["channel_id"], snapshot_columns: ["channel_id", "channel_name", "channel_kind"] },
+    ],
   }, null, 2));
   writeFileSync(path.join(root, "semantics.json"), JSON.stringify({
     simulated: true,

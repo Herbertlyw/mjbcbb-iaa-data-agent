@@ -11,7 +11,7 @@ export interface ResultColumn {
 export interface ResultTable { columns: ResultColumn[]; rows: Array<Record<string, ResultValue>> }
 export type ComparisonOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 export type TransformStep =
-  | { op: "filter"; column: string; comparison: ComparisonOp; value: string | boolean | null }
+  | ({ op: "filter"; column: string } & ({ comparison: ComparisonOp; value: string | boolean | null; other_column?: never } | { comparison: ComparisonOp; other_column: string; value?: never } | { comparison: "is_null" | "is_not_null"; value?: never; other_column?: never }))
   | { op: "compare"; left: string; right: string; comparison: ComparisonOp; as: string }
   | { op: "sort"; keys: Array<{ column: string; direction: "asc" | "desc"; nulls: "first" | "last" }> }
   | { op: "group"; by: string[]; aggregates: Array<{ op: "count_all" | "count" | "sum" | "min" | "max"; column?: string; as: string }> };
@@ -28,8 +28,19 @@ export function transformResult(input: ResultTable, steps: TransformStep[]): Res
     const column = (name: string) => table.columns.find((c) => c.name === name);
     if (step.op === "filter") {
       const field = column(step.column);
-      if (!field || !comparisons.has(step.comparison) || !validValue(step.value, field)) return null;
-      table.rows = table.rows.filter((row) => compare(row[field.name]!, step.value, field, step.comparison) === true);
+      if (!field) return null;
+      if (step.comparison === "is_null" || step.comparison === "is_not_null") {
+        if (Object.hasOwn(step, "value") || Object.hasOwn(step, "other_column")) return null;
+        table.rows = table.rows.filter((row) => step.comparison === "is_null" ? row[field.name] === null : row[field.name] !== null);
+      } else {
+        if (!comparisons.has(step.comparison)) return null;
+        const hasValue = Object.hasOwn(step, "value"), hasColumn = Object.hasOwn(step, "other_column");
+        if (hasValue === hasColumn) return null;
+        const other = hasColumn ? column(step.other_column!) : undefined;
+        if (hasColumn ? !other || other.type !== field.type || other.unit !== field.unit : !validValue(step.value, field)) return null;
+        const comparison = step.comparison as ComparisonOp;
+        table.rows = table.rows.filter((row) => compare(row[field.name]!, other ? row[other.name]! : step.value!, field, comparison) === true);
+      }
     } else if (step.op === "compare") {
       const left = column(step.left); const right = column(step.right);
       if (!left || !right || !validName(step.as, table.columns) || !comparisons.has(step.comparison) || left.type !== right.type || left.unit !== right.unit) return null;
@@ -62,7 +73,11 @@ export function transformResult(input: ResultTable, steps: TransformStep[]): Res
       }
       const groups = new Map<string, Array<Record<string, ResultValue>>>();
       for (const row of table.rows) {
-        const key = JSON.stringify(step.by.map((name) => row[name]));
+        // Numeric keys compare by value, so 1.0 and 1.00 are the same group.
+        const key = JSON.stringify(step.by.map((name) => {
+          const value = row[name]; const field = column(name)!;
+          return value !== null && field.type === "decimal" ? normalizedDecimal(value as string) : value;
+        }));
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key)!.push(row);
       }
@@ -100,7 +115,7 @@ function validTable(table: ResultTable): boolean {
   if (!table || !Array.isArray(table.columns) || !table.columns.length || table.columns.length > 40 || !Array.isArray(table.rows) || table.rows.length > 200) return false;
   const names: ResultColumn[] = [];
   for (const field of table.columns) {
-    if (!field || !validName(field.name, names) || !["text", "decimal", "boolean"].includes(field.type) || typeof field.label !== "string" || typeof field.unit !== "string" || (field.type === "decimal" && (!Number.isInteger(field.scale) || field.scale! < 0 || field.scale! > 38))) return false;
+    if (!field || !validName(field.name, names) || !["text", "decimal", "boolean"].includes(field.type) || typeof field.label !== "string" || typeof field.unit !== "string" || (field.type === "decimal" && (!Number.isInteger(field.scale) || field.scale! < 0 || field.scale! > 76))) return false;
     names.push(field);
   }
   return table.rows.every((row) => row && typeof row === "object" && Object.keys(row).length === names.length && names.every((field) => Object.hasOwn(row, field.name) && validValue(row[field.name], field))) && Buffer.byteLength(JSON.stringify(table)) <= 200_000;
@@ -112,10 +127,26 @@ function validValue(value: unknown, field: ResultColumn): value is ResultValue {
   return field.type === "text" || decimal(value) !== null;
 }
 function decimal(value: string): { n: bigint; scale: number } | null {
-  const m = /^(-?)(\d+)(?:\.(\d+))?$/u.exec(value);
-  if (!m || m[2]!.length + (m[3]?.length ?? 0) > 76 || (m[3]?.length ?? 0) > 38) return null;
-  const n = BigInt(m[2]! + (m[3] ?? ""));
-  return { n: m[1] ? -n : n, scale: m[3]?.length ?? 0 };
+  // Preserve the source wire decimal; Float values have already been rounded
+  // by their database type and must not be labelled as exact currency.
+  const m = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d{1,3}))?$/u.exec(value);
+  if (!m || (!m[2] && !m[3]) || value.length > 84) return null;
+  const digits = `${m[2] || "0"}${m[3] || ""}`.replace(/^0+/u, "") || "0";
+  const exponent = Number(m[4] || 0);
+  if (digits.length > 76 || Math.abs(exponent) > 76) return null;
+  let n = BigInt(digits) * (m[1] === "-" ? -1n : 1n);
+  let scale = (m[3]?.length ?? 0) - exponent;
+  if (scale < 0) { n *= 10n ** BigInt(-scale); scale = 0; }
+  while (scale > 0 && n % 10n === 0n) { n /= 10n; scale -= 1; }
+  if (scale > 76 || (n < 0n ? -n : n).toString().length > 76) return null;
+  return { n, scale };
+}
+
+function normalizedDecimal(value: string): string {
+  const parsed = decimal(value)!;
+  const sign = parsed.n < 0n ? "-" : "";
+  const digits = (parsed.n < 0n ? -parsed.n : parsed.n).toString().padStart(parsed.scale + 1, "0");
+  return parsed.scale ? `${sign}${digits.slice(0, -parsed.scale)}.${digits.slice(-parsed.scale)}` : `${sign}${digits}`;
 }
 function order(a: Exclude<ResultValue, null>, b: Exclude<ResultValue, null>, field: ResultColumn): number {
   if (field.type === "decimal") {

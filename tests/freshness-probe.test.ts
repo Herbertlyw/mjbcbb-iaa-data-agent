@@ -6,7 +6,7 @@ import test from "node:test";
 import { writeFileSync } from "node:fs";
 import { repoRoot } from "../src/config.js";
 import { openSimulatedDatabase } from "../src/database.js";
-import { freshnessManifest, freshnessPeriodKey, probeAndPublish, probeClickHouseFreshness, probeSqliteFreshness, readPublication } from "../src/freshness.js";
+import { dimensionSnapshotMatches, freshnessManifest, freshnessPeriodKey, matchesFreshnessManifest, probeAndPublish, probeClickHouseFreshness, probeSqliteFreshness, readPublication } from "../src/freshness.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import { createRuntime } from "../src/runtime.js";
 
@@ -93,5 +93,55 @@ test("滚动周期按契约时区和延迟计算，跨午夜后旧发布不能�
     definition.targets[0]!.period.timezone = "Asia/Shanghai";
     writeFileSync(targetsPath, JSON.stringify(definition));
     assert.throws(() => freshnessManifest(knowledge, targetsPath, before), /freshness_period_contract_mismatch/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("无业务日期的维表发布键值摘要；重复键、读取失败和标签变化不会冒充已发布观察", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "dataagent-dimension-probe-"));
+  const targetsPath = path.join(dir, "targets.json");
+  const knowledge = loadKnowledge(path.join(repoRoot(), "knowledge", "harborlight"));
+  const target = { table: "dim_fox_title", engine: "clickhouse-local", kind: "dimension_snapshot", key_columns: ["title_id"], snapshot_columns: ["title_id", "title_name", "genre", "launched_on"] };
+  try {
+    writeFileSync(targetsPath, JSON.stringify({ source: "synthetic", engine: "clickhouse-local", valid_until: "2027-04-01", targets: [target] }));
+    const manifest = freshnessManifest(knowledge, targetsPath, { simulatedToday: "2026-10-29" });
+    assert.deepEqual(manifest.target_tables, ["dim_fox_title"]);
+    assert.ok(manifest.contract_hashes.dim_fox_title);
+    assert.deepEqual(manifest.dimension_targets?.dim_fox_title?.key_columns, ["title_id"]);
+    const revised = { ...knowledge, contract_by_table: new Map(knowledge.contract_by_table) };
+    const asset = revised.contract_by_table.get("dim_fox_title");
+    assert.ok(asset);
+    revised.contract_by_table.set("dim_fox_title", { ...asset, content_hash: "a".repeat(64) });
+    assert.equal(matchesFreshnessManifest(manifest, freshnessManifest(revised, targetsPath)), false, "契约内容变化不能沿用旧观察");
+    const synthetic = [
+      ["paper_lantern", "纸灯", "adventure", "2026-01-01"],
+      ["glass_minnow", "玻璃鲦", "puzzle", "2026-01-02"],
+    ];
+    const probe = async (rows: string[][]) => probeClickHouseFreshness({ targetsPath, query: async (sql) => {
+      assert.match(sql, /FROM dim_fox_title ORDER BY title_id LIMIT 1001/u);
+      return rows.map((row) => ({ event_date: JSON.stringify(row) }));
+    } });
+    const observation = await probe(synthetic);
+    const title = observation.tables.dim_fox_title;
+    assert.equal(title?.status, "fresh");
+    assert.ok(title && "kind" in title && title.kind === "dimension_snapshot");
+    assert.ok(dimensionSnapshotMatches(title, "dim_fox_title", { title_id: "paper_lantern" }, "title_name", "纸灯"));
+    assert.equal(dimensionSnapshotMatches(title, "dim_fox_title", { title_id: "paper_lantern" }, "title_name", "另一个合成标签"), false);
+    assert.equal(dimensionSnapshotMatches(title, "dim_fox_title", { title_id: "not_published" }, "title_name", "纸灯"), false);
+    assert.equal(dimensionSnapshotMatches(title, "dim_fox_title", { title_id: "paper_lantern" }, "unknown_column", "纸灯"), false);
+    assert.equal(JSON.stringify(title).includes("paper_lantern"), false, "发布只保存观察摘要，不保存维表明文");
+    if (title && "snapshot_cell_hashes" in title) {
+      const tampered = { ...title, snapshot_cell_hashes: [...title.snapshot_cell_hashes].reverse() };
+      assert.equal(dimensionSnapshotMatches(tampered, "dim_fox_title", { title_id: "paper_lantern" }, "title_name", "纸灯"), false);
+    }
+    assert.equal((await probe([...synthetic, ["paper_lantern", "另一个标签", "adventure", "2026-01-01"]])).tables.dim_fox_title?.status, "probe_failed");
+    assert.equal((await probe([])).tables.dim_fox_title?.status, "missing");
+    assert.equal((await probe(Array.from({ length: 1001 }, (_, index) => [`id_${index}`, "标签", "genre", "2026-01-01"]))).tables.dim_fox_title?.status, "probe_failed");
+    assert.equal((await probe([["paper_lantern", "x".repeat(4097), "genre", "2026-01-01"]])).tables.dim_fox_title?.status, "probe_failed");
+    const failed = await probeClickHouseFreshness({ targetsPath, query: async () => { throw new Error("synthetic_private_error_marker"); } });
+    assert.equal(failed.tables.dim_fox_title?.status, "probe_failed");
+    assert.equal(JSON.stringify(failed).includes("synthetic_private_error_marker"), false);
+    const unsafe = { ...target, snapshot_columns: ["title_id", "not_a_contract_column"] };
+    writeFileSync(targetsPath, JSON.stringify({ source: "synthetic", engine: "clickhouse-local", valid_until: "2027-04-01", targets: [unsafe] }));
+    assert.throws(() => freshnessManifest(knowledge, targetsPath), /freshness_dimension_contract_mismatch/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

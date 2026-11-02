@@ -34,9 +34,16 @@ export interface VerifiedJoinValue {
   range: JoinEvidencePlan["range"];
 }
 
+export interface JoinDimensionObservation {
+  keys: Record<string, string>;
+  column: string;
+  value: string;
+}
+
 const IDENT = /^[a-z_][a-z0-9_]*$/u;
 const LITERAL = /^[\p{L}\p{N}_ .-]{1,100}$/u;
 const PROOF = "__da_join_proof";
+const DIMENSION_COUNT = "__da_dimension_key_count";
 const object = (item: unknown): Record<string, unknown> | null => item && typeof item === "object" && !Array.isArray(item) ? item as Record<string, unknown> : null;
 const quote = (value: string) => `'${value}'`;
 
@@ -85,11 +92,7 @@ export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: 
         else if (op === "<=" && !end) end = value.value;
         else return false;
       } else {
-        // A WHERE predicate on the dimension can hide another physical row
-        // with the same join key and a different label before it reaches the
-        // proof tuples. Until the full unfiltered dimension key is captured,
-        // don't claim uniqueness for such a query.
-        if (op !== "=" || col.table === "dimension" || !series.dimensions.includes(col.column)) return false;
+        if (op !== "=" || (col.table === "fact" && !series.dimensions.includes(col.column))) return false;
         const filters = col.table === "fact" ? factFilters : dimensionFilters;
         if (Object.hasOwn(filters, col.column)) return false;
         filters[col.column] = value.value;
@@ -133,12 +136,23 @@ export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: 
     for (const group of groups) fields.set(`${group.table}.${group.column}`, { table: group.table, column: group.column });
     for (const name of Object.keys(dimensionFilters)) fields.set(`dimension.${name}`, { table: "dimension", column: name });
     const proofFields = [...fields.values()]; const metricFields = [...new Set(metrics.map((metric) => metric.column))];
+    const filteredDimension = Object.keys(dimensionFilters).length > 0;
+    if (filteredDimension && dimColumns.has(DIMENSION_COUNT)) return null;
     // Keep physical types inside the tuple so the response metadata can be
     // checked against contracts for the actual execution, not just an earlier
     // DESCRIBE that may race a schema change.
     const proof = [`${fa}.${series.date_column}`, ...metricFields.map((name) => `${fa}.${name}`), ...proofFields.map((col) => `${col.table === "fact" ? fa : da}.${col.column}`)];
+    // A WHERE predicate on the joined dimension would otherwise hide a second
+    // physical row having the same key but a different label. Count each key's
+    // unfiltered rows inside the dimension subquery before the outer WHERE.
+    // A window preserves every row, so even when proof fails the returned
+    // query rows retain the original JOIN's multiplicity and SQL semantics.
+    if (filteredDimension) proof.push(`${da}.${DIMENSION_COUNT}`);
     selections.push(`groupArray(367)(tuple(${proof.join(", ")})) AS ${PROOF}`);
     const on = relation.keys.map((key) => `${fa}.${key} = ${da}.${key}`).join(" AND ");
+    const dimensionFrom = filteredDimension
+      ? `(SELECT ${[...relation.keys, ...proofFields.filter((field) => field.table === "dimension" && !relation.keys.includes(field.column)).map((field) => field.column), `count() OVER (PARTITION BY ${relation.keys.join(", ")}) AS ${DIMENSION_COUNT}`].join(", ")} FROM ${dimension.table})`
+      : dimension.table;
     const groupSql = groupFields.length ? ` GROUP BY ${groupFields.map((col) => `${col!.table === "fact" ? fa : da}.${col!.column}`).join(", ")}` : "";
     let orderSql = "";
     if (ast.orderby) {
@@ -153,7 +167,7 @@ export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: 
       }
       orderSql = ` ORDER BY ${order.join(", ")}`;
     }
-    return { originalSql: parsed.sql, executionSql: `SELECT ${selections.join(", ")} FROM ${fact.table} AS ${fa} INNER JOIN ${dimension.table} AS ${da} ON ${on} WHERE ${conditions.join(" AND ")}${groupSql}${orderSql}`, fact: fact.table, dimension: dimension.table, joinKeys: [...relation.keys], range: { start, end, timezone: fact.timezone }, factFilters, dimensionFilters, groups, metrics, proofFields, expectedDates: dates };
+    return { originalSql: parsed.sql, executionSql: `SELECT ${selections.join(", ")} FROM ${fact.table} AS ${fa} INNER JOIN ${dimensionFrom} AS ${da} ON ${on} WHERE ${conditions.join(" AND ")}${groupSql}${orderSql}`, fact: fact.table, dimension: dimension.table, joinKeys: [...relation.keys], range: { start, end, timezone: fact.timezone }, factFilters, dimensionFilters, groups, metrics, proofFields, expectedDates: dates };
   } catch { return null; }
 }
 
@@ -180,6 +194,7 @@ export function verifyJoinExecutionSchema(plan: JoinEvidencePlan, fact: DataCont
   const metricFields = [...new Set(plan.metrics.map((item) => item.column))];
   const expected = [lookup(fact, fact.series.date_column), ...metricFields.map((name) => lookup(fact, name)), ...plan.proofFields.map((item) => lookup(item.table === "fact" ? fact : dimension, item.column))];
   if (expected.some((item) => !item) || !resultTypes[PROOF]) return false;
+  if (Object.keys(plan.dimensionFilters).length) expected.push("UInt64");
   const normalize = (value: string) => value.replace(/\s/gu, "").toLowerCase().replace(/lowcardinality\(([^()]*)\)/gu, "$1");
   return normalize(resultTypes[PROOF]!) === normalize(`Array(Tuple(${expected.join(",")}))`);
 }
@@ -210,7 +225,9 @@ export function verifyJoinEvidence(plan: JoinEvidencePlan, rows: Array<Record<st
     const key = JSON.stringify(group); if (seen.has(key)) return null; seen.add(key);
     const dates = new Set<string>(); const sums = new Map(metrics.map((metric) => [metric, 0n]));
     for (const tuple of tuples) {
-      if (!Array.isArray(tuple) || tuple.length !== 1 + metrics.length + plan.proofFields.length || typeof tuple[0] !== "string" || !plan.expectedDates.includes(tuple[0]) || dates.has(tuple[0])) return null;
+      const filteredDimension = Object.keys(plan.dimensionFilters).length > 0;
+      if (!Array.isArray(tuple) || tuple.length !== 1 + metrics.length + plan.proofFields.length + Number(filteredDimension) || typeof tuple[0] !== "string" || !plan.expectedDates.includes(tuple[0]) || dates.has(tuple[0])) return null;
+      if (filteredDimension && tuple.at(-1) !== 1 && tuple.at(-1) !== "1") return null;
       dates.add(tuple[0]);
       for (const [index, metric] of metrics.entries()) {
         const value = tuple[1 + index];
@@ -242,4 +259,26 @@ export function verifyJoinEvidence(plan: JoinEvidencePlan, rows: Array<Record<st
     }
   }
   return verified;
+}
+
+/** Extract the dimension values actually captured by a valid proof, for
+ * comparison with the authority's published dimension snapshot. This helper
+ * does not itself grant access or declare those values fresh. */
+export function joinDimensionObservations(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>): JoinDimensionObservation[] | null {
+  if (!verifyJoinEvidence(plan, rows)) return null;
+  const metricCount = new Set(plan.metrics.map((metric) => metric.column)).size;
+  const dimensionFields = plan.proofFields.flatMap((field, index) => field.table === "dimension" ? [{ column: field.column, index }] : []);
+  const keyFields = plan.joinKeys.map((key) => dimensionFields.find((field) => field.column === key));
+  if (keyFields.some((field) => !field)) return null;
+  const unique = new Map<string, JoinDimensionObservation>();
+  for (const row of rows) for (const tuple of row[PROOF] as unknown[][]) {
+    const keys = Object.fromEntries(keyFields.map((field) => [field!.column, tuple[1 + metricCount + field!.index] as string]));
+    for (const field of dimensionFields) {
+      const value = tuple[1 + metricCount + field.index];
+      if (typeof value !== "string") return null;
+      const observation = { keys, column: field.column, value };
+      unique.set(JSON.stringify([plan.joinKeys.map((key) => keys[key]), field.column, value]), observation);
+    }
+  }
+  return [...unique.values()];
 }

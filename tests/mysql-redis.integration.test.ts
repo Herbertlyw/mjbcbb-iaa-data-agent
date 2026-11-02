@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -14,7 +14,8 @@ import { AsyncMysqlStateStore } from "../src/async-mysql-state-store.js";
 import { MysqlFreshnessStore } from "../src/mysql-freshness.js";
 import { RedisJobQueue } from "../src/redis-queue.js";
 import { createRuntime } from "../src/runtime.js";
-import { freshnessManifest, probeSqliteFreshness } from "../src/freshness.js";
+import { dimensionSnapshotMatches, freshnessManifest, probeClickHouseFreshness, probeSqliteFreshness } from "../src/freshness.js";
+import { loadKnowledge } from "../src/knowledge.js";
 import { bindTables } from "./helpers.js";
 import type { AnalysisRecord } from "../src/types.js";
 import { stopProcess } from "./process-control.js";
@@ -130,6 +131,30 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
           }
         } finally { await timeoutFreshnessCleanup?.close(); }
       }
+      // Dimension freshness is an immutable MySQL publication of a bounded
+      // observation, not a fabricated business date or a claim that all
+      // ClickHouse queries share one physical snapshot.
+      const dimensionTargetsPath = path.join(dir, "dimension-targets.json");
+      writeFileSync(dimensionTargetsPath, JSON.stringify({ source: "synthetic", engine: "clickhouse-local", valid_until: "2027-04-01", targets: [{ table: "dim_fox_title", engine: "clickhouse-local", kind: "dimension_snapshot", key_columns: ["title_id"], snapshot_columns: ["title_id", "title_name"] }] }));
+      const dimensionManifest = freshnessManifest(loadKnowledge(path.join(root, "knowledge", "harborlight")), dimensionTargetsPath);
+      const dimensionRows = [["paper_lantern", "纸灯"], ["glass_minnow", "玻璃鲦"]];
+      const observeDimension = (rows: string[][]) => probeClickHouseFreshness({ targetsPath: dimensionTargetsPath, query: async () => rows.map((row) => ({ event_date: JSON.stringify(row) })) });
+      const dimensionObservation = await observeDimension(dimensionRows);
+      const dimensionBatch = await freshnessA.begin(dimensionManifest);
+      await assert.rejects(() => freshnessA.publish(dimensionBatch.version, { ...dimensionObservation, tables: {} }), /freshness_batch_incomplete/);
+      await assert.rejects(() => freshnessA.publish(dimensionBatch.version, { ...dimensionObservation, tables: { dim_fox_title: { status: "fresh", as_of: null } } }), /freshness_dimension_snapshot_invalid/);
+      assert.equal(await freshnessA.publish(dimensionBatch.version, dimensionObservation), "published");
+      const dimensionCurrent = await freshnessB.current();
+      assert.equal(dimensionCurrent?.version, dimensionBatch.version);
+      assert.ok(dimensionSnapshotMatches(dimensionCurrent?.tables.dim_fox_title, "dim_fox_title", { title_id: "paper_lantern" }, "title_name", "纸灯"));
+      assert.equal(dimensionSnapshotMatches(dimensionCurrent?.tables.dim_fox_title, "dim_fox_title", { title_id: "paper_lantern" }, "title_name", "另一个合成标签"), false);
+      const duplicateObservation = await observeDimension([...dimensionRows, ["paper_lantern", "重复标签"]]);
+      assert.equal(duplicateObservation.tables.dim_fox_title?.status, "probe_failed");
+      const failedDimensionBatch = await freshnessB.begin(dimensionManifest);
+      assert.equal(await freshnessB.publish(failedDimensionBatch.version, duplicateObservation), "published");
+      assert.equal((await freshnessA.current())?.tables.dim_fox_title?.status, "probe_failed");
+      assert.equal((await freshnessA.get(dimensionBatch.version))?.tables.dim_fox_title?.status, "fresh", "旧成功版本保留审计，不能替代最新失败版本");
+
       const actualManifest = freshnessManifest(seeded.knowledge, seeded.config.freshnessTargetsPath);
       const probeObservation = () => probeSqliteFreshness({ databasePath, targetsPath: seeded.config.freshnessTargetsPath });
       const checkRuntime = createRuntime({ stateMode: "mysql", mysqlHost: "127.0.0.1", mysqlPort, mysqlUser: user, mysqlPassword: password, mysqlDatabase: database, redisHost: "127.0.0.1", redisPort, databasePath, freshnessPath, reseedDatabase: false, publishFreshnessOnStart: false, startWorker: false, ephemeralDir: undefined, queryLatencyMs: 1000 });

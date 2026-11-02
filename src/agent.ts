@@ -206,8 +206,8 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
         )),
         arithmetic: Type.Optional(Type.Object({
           op: Type.Union([Type.Literal("add"), Type.Literal("subtract"), Type.Literal("multiply"), Type.Literal("divide")]),
-          left: Type.Object({ resource_id: Type.String(), cell: Type.String(), group: Type.Optional(Type.Record(Type.String(), Type.String())) }),
-          right: Type.Object({ resource_id: Type.String(), cell: Type.String(), group: Type.Optional(Type.Record(Type.String(), Type.String())) }),
+          left: Type.Object({ resource_id: Type.String(), cell: Type.String(), group: Type.Optional(Type.Record(Type.String(), Type.String())), execution_id: Type.Optional(Type.String()), row: Type.Optional(Type.Integer({ minimum: 0 })), aggregate: Type.Optional(Type.Literal("sum")) }),
+          right: Type.Object({ resource_id: Type.String(), cell: Type.String(), group: Type.Optional(Type.Record(Type.String(), Type.String())), execution_id: Type.Optional(Type.String()), row: Type.Optional(Type.Integer({ minimum: 0 })), aggregate: Type.Optional(Type.Literal("sum")) }),
         })),
         align: Type.Optional(Type.Object({
           op: Type.Union([Type.Literal("add"), Type.Literal("subtract"), Type.Literal("multiply"), Type.Literal("divide")]),
@@ -218,7 +218,7 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
         transform: Type.Optional(Type.Object({
           resource_id: Type.String(),
           steps: Type.Array(Type.Union([
-            Type.Object({ op: Type.Literal("filter"), column: Type.String(), comparison: Type.Union([Type.Literal("eq"), Type.Literal("ne"), Type.Literal("lt"), Type.Literal("le"), Type.Literal("gt"), Type.Literal("ge")]), value: Type.Union([Type.String(), Type.Boolean(), Type.Null()]) }),
+            Type.Object({ op: Type.Literal("filter"), column: Type.String(), comparison: Type.Union([Type.Literal("eq"), Type.Literal("ne"), Type.Literal("lt"), Type.Literal("le"), Type.Literal("gt"), Type.Literal("ge"), Type.Literal("is_null"), Type.Literal("is_not_null")]), value: Type.Optional(Type.Union([Type.String(), Type.Boolean(), Type.Null()])), other_column: Type.Optional(Type.String()) }),
             Type.Object({ op: Type.Literal("compare"), left: Type.String(), right: Type.String(), comparison: Type.Union([Type.Literal("eq"), Type.Literal("ne"), Type.Literal("lt"), Type.Literal("le"), Type.Literal("gt"), Type.Literal("ge")]), as: Type.String() }),
             Type.Object({ op: Type.Literal("sort"), keys: Type.Array(Type.Object({ column: Type.String(), direction: Type.Union([Type.Literal("asc"), Type.Literal("desc")]), nulls: Type.Union([Type.Literal("first"), Type.Literal("last")]) }), { minItems: 1, maxItems: 8 }) }),
             Type.Object({ op: Type.Literal("group"), by: Type.Array(Type.String(), { maxItems: 8 }), aggregates: Type.Array(Type.Object({ op: Type.Union([Type.Literal("count_all"), Type.Literal("count"), Type.Literal("sum"), Type.Literal("min"), Type.Literal("max")]), column: Type.Optional(Type.String()), as: Type.String() }), { minItems: 1, maxItems: 20 }) }),

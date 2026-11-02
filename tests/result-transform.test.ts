@@ -49,6 +49,17 @@ test("比较遇 NULL 为未知，过滤仅保留 true，NULL 顺序可指定", (
   assert.deepEqual(empty?.rows.map((row) => ({ ...row })), [{ sum: null, n: "0" }]);
 });
 
+test("参考计算模块：NULL 谓词、列比较筛选和等值十进制分组", () => {
+  const missing = transformResult(fixture, [{ op: "filter", column: "amount", comparison: "is_null" }]);
+  assert.deepEqual(missing?.rows.map((row) => row.country), ["US", "JP"]);
+  const present = transformResult(fixture, [{ op: "filter", column: "amount", comparison: "is_not_null" }, { op: "filter", column: "amount", comparison: "gt", other_column: "cost" }]);
+  assert.deepEqual(present?.rows.map((row) => row.country), ["US"]);
+  assert.equal(transformResult(fixture, [{ op: "filter", column: "amount", comparison: "gt", other_column: "country" }]), null);
+  const numericKeys: ResultTable = { columns: [{ name: "key", type: "decimal", unit: "人", label: "数字", scale: 2 }], rows: [{ key: "1.0" }, { key: "1.00" }, { key: "1e0" }, { key: null }] };
+  const groups = transformResult(numericKeys, [{ op: "group", by: ["key"], aggregates: [{ op: "count_all", as: "n" }] }]);
+  assert.deepEqual(groups?.rows.map((row) => ({ ...row })), [{ key: "1", n: "3" }, { key: null, n: "1" }]);
+});
+
 test("无效列、单位、原型键和非精确数值都失败关闭", () => {
   assert.equal(transformResult(fixture, [{ op: "compare", left: "amount", right: "country", comparison: "eq", as: "wrong" }]), null);
   assert.equal(transformResult(fixture, [{ op: "compare", left: "amount", right: "cost", comparison: "eq", as: "__proto__" }]), null);

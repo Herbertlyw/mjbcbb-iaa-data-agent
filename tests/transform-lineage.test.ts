@@ -6,6 +6,30 @@ import path from "node:path";
 import { analyst, bindTables, withRuntime } from "./helpers.js";
 import type { TransformResource } from "../src/types.js";
 
+test("完整明细按受契约约束的字段分组并能复核交付，其他任务不得引用", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_raw_transform");
+    const query = await runtime.tools.query(session.session_id, { sql: "SELECT event_date, country_code, new_users FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads'" });
+    assert.equal(query.ok, true, JSON.stringify(query));
+    if (!query.ok) return;
+    const transformed = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(query.resource_id), steps: [
+      { op: "group", by: ["country_code"], aggregates: [{ op: "sum", column: "new_users", as: "users" }] },
+      { op: "sort", keys: [{ column: "country_code", direction: "asc", nulls: "last" }] },
+    ] } });
+    assert.equal(transformed.ok, true, JSON.stringify(transformed));
+    if (!transformed.ok) return;
+    assert.deepEqual((transformed.result as { rows: object[] }).rows.map((row) => ({ ...row })), [{ country_code: "JP", users: "10" }, { country_code: "US", users: "120" }]);
+    const delivered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(query.resource_id), String(transformed.resource_id)] });
+    assert.equal(delivered.ok, true, JSON.stringify(delivered));
+    if (delivered.ok) { assert.equal(delivered.status, "completed"); assert.match(String(delivered.answer), /daily_installs\.new_users（实际观察） 的合计=10/); }
+    runtime.sessions.setActiveJob(session.session_id, "job_raw_other");
+    const foreign = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(query.resource_id), steps: [{ op: "group", by: [], aggregates: [{ op: "count_all", as: "n" }] }] } });
+    assert.equal(foreign.ok, false);
+  });
+});
+
 test("同任务完整聚合可链式变换并在交付前重新验证全部来源", async () => {
   await withRuntime({}, async (runtime) => {
     const session = analyst(runtime);

@@ -8,10 +8,10 @@ import { compareDecimalAggregates, type AggregateComparison } from "./aggregate-
 import { computeArithmetic, fromAggregate, sumDecimalStrings, type ArithmeticOp, type ArithmeticValue } from "./exact-arithmetic.js";
 import { verifyDecimalCell, type VerifiedDecimalCell } from "./decimal-cell-evidence.js";
 import { verifyDatabaseAggregates, type VerifiedAggregate } from "./aggregate-evidence.js";
-import { prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema, type JoinEvidencePlan, type VerifiedJoinValue } from "./join-evidence.js";
+import { joinDimensionObservations, prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema, type JoinEvidencePlan, type VerifiedJoinValue } from "./join-evidence.js";
 import { transformResult, type ResultColumn, type ResultTable, type ResultValue, type TransformStep } from "./result-transform.js";
 import { alignAggregates, type AlignedRow, type AlignmentSpec } from "./result-alignment.js";
-import { freshnessManifest, freshnessPeriodKey, matchesFreshnessManifest, readPublication, type FreshnessPublication } from "./freshness.js";
+import { dimensionSnapshotMatches, freshnessManifest, freshnessPeriodKey, matchesFreshnessManifest, readPublication, type FreshnessPublication } from "./freshness.js";
 import type { MysqlFreshnessStore } from "./mysql-freshness.js";
 import { canQueryTable, canRead, contractValidity, tableGrain } from "./knowledge.js";
 import { newId, type SessionRecord, type SessionStore } from "./session.js";
@@ -348,11 +348,14 @@ export class ToolService {
     const freshnessReceipts: FreshnessReceipt[] = [];
     for (const table of guarded.tables) {
       const contract = this.ctx.knowledge.contract_by_table.get(table)?.contract;
-      if (!contract?.series && contract?.must_filter.length === 0) continue;
       const tableState = published.tables[table];
+      // Legacy SQLite examples may query a dimension for diagnostics, but a
+      // JOIN cannot later become verified without its authority receipt.
+      if (!contract?.series && contract?.must_filter.length === 0 && !tableState && this.ctx.config.stateMode !== "mysql") continue;
       if (!tableState) return fail("freshness_table_missing", `${table} 不在已发布新鲜度里。`);
       if (tableState.status === "probe_failed") return fail("freshness_probe_failed", `${table} 的离线探测失败，不能当成可查询事实。`);
       if (tableState.status !== "fresh") return fail("freshness_not_fresh", `${table} 的已发布状态是 ${tableState.status}。`);
+      if (!contract?.series && contract?.must_filter.length === 0 && (!("kind" in tableState) || tableState.kind !== "dimension_snapshot")) return fail("dimension_snapshot_missing", `${table} 缺少有效的维表发布快照。`);
       freshnessReceipts.push({
         publication_id: published.publication_id,
         version: published.version,
@@ -378,6 +381,9 @@ export class ToolService {
           const cleanRows = captured.map(({ __da_join_proof: _proof, ...row }) => row);
           const { __da_join_proof: _proofType, ...cleanTypes } = types;
           if (!bounded.truncated && verifyJoinExecutionSchema(joinPlan, joinFact, joinDimension, types) && verifyJoinEvidence(joinPlan, captured) && Buffer.byteLength(JSON.stringify({ captured, cleanRows, types })) <= this.ctx.config.maxResultBytes) {
+            const observations = joinDimensionObservations(joinPlan, captured);
+            const dimensionState = published.tables[joinDimension.table];
+            if (!observations || observations.some((item) => !dimensionSnapshotMatches(dimensionState, joinDimension.table, item.keys, item.column, item.value))) return fail("dimension_snapshot_mismatch", "本次关联捕获的维表值不符合当前权威发布，未保存可交付结果。");
             joinProof = { rows: captured, column_types: types, capture_hash: joinCaptureHash(guarded.sql, bounded.query_id, captured, types) };
           }
           bounded.rows = cleanRows;
@@ -434,7 +440,8 @@ export class ToolService {
       ...(session.active_job_id ? { job_id: session.active_job_id } : {}),
       engine: this.ctx.businessEngine === "clickhouse" ? "clickhouse-local" : "sqlite-local",
       elapsed_ms: elapsedMs,
-      ...(bounded ? { execution_id: bounded.query_id, column_types: bounded.column_types } : {}),
+      execution_id: bounded?.query_id ?? newId("exec"),
+      ...(bounded ? { column_types: bounded.column_types } : {}),
       ...(this.ctx.businessEngine === "clickhouse" ? { scan_limit: this.configuredScanLimit } : {}),
       ...(Object.keys(decimalTypes).length ? { decimal_types: decimalTypes } : {}),
       simulated: true,
@@ -608,7 +615,7 @@ export class ToolService {
     if (!fresh.ok) return fresh;
     if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
     const inputTable = await this.resolveTransform(session, jobId, input.resource_id, fresh.publication, new Set());
-    if (!inputTable) return fail("transform_lineage_unsupported", "输入必须为当前任务完整、可验证的聚合资源或变换资源。");
+    if (!inputTable) return fail("transform_lineage_unsupported", "输入必须为当前任务完整、可验证的查询或变换资源。");
     const result = transformResult(inputTable.table, input.steps);
     if (!result) return fail("invalid_transform", "变换参数、类型、单位或资源边界不受支持。");
     const resource: TransformResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "transform", created_at: new Date().toISOString(), source_resource_id: input.resource_id, steps: input.steps, input_hashes: inputTable.hashes, result, input_truncated: false, complete_population: true };
@@ -651,7 +658,7 @@ export class ToolService {
     return { rows, hashes, leaves: [...new Set(inputs.map(({ source }) => source.resource_id))] };
   }
 
-  private async resolveTransform(session: SessionRecord, jobId: string, resourceId: string, publication: FreshnessPublication, path: Set<string>): Promise<{ table: ResultTable; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
+  private async resolveTransform(session: SessionRecord, jobId: string, resourceId: string, publication: FreshnessPublication, path: Set<string>): Promise<{ table: ResultTable; hashes: Record<string, string>; leaves: string[]; partial: boolean; partial_reason?: "alignment_incomplete" | "transform_coverage_incomplete" } | null> {
     if (typeof resourceId !== "string" || path.has(resourceId) || path.size >= 8) return null;
     const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, resourceId);
     if (!found.ok || found.resource.job_id !== jobId) return null;
@@ -660,14 +667,36 @@ export class ToolService {
     if (resource.kind === "query_result") {
       const contract = this.arithmeticContract(session, resource, publication);
       const aggregates = contract && verifyDatabaseAggregates(resource, contract);
-      const table = aggregates && aggregateTable(aggregates);
-      return table ? { table, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial: false } : null;
+      let table = aggregates && aggregateTable(aggregates);
+      if (!table && contract) {
+        // Read the stored result through the same bounded, hash-bound pages
+        // exposed to agents. A mutation between pages invalidates the input.
+        const rows: Array<Record<string, unknown>> = [];
+        let offset = 0;
+        do {
+          const page = await this.readSessionResource(session.session_id, { resource_id: resourceId, row_offset: offset, row_limit: 100, expected_resource_hash: ownHash });
+          if (!page.ok || page.resource_hash !== ownHash || page.resource_truncated || !page.resource || typeof page.resource !== "object") return null;
+          const result = page.resource as QueryResource;
+          if (result.job_id !== jobId || !Array.isArray(result.rows) || result.rows.length > 100) return null;
+          rows.push(...result.rows);
+          if (rows.length > 200) return null;
+          const next = page.next_row_offset;
+          if (!page.has_more) break;
+          if (!Number.isInteger(next) || (next as number) !== offset + result.rows.length || !result.rows.length) return null;
+          offset = next as number;
+        } while (true);
+        if (rows.length !== resource.returned_rows || rows.length !== resource.total_rows || resource.total_rows_exact !== true) return null;
+        table = rawResultTable({ ...resource, rows }, contract);
+      }
+      const partial = coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length > 0;
+      return table ? { table, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial, ...(partial ? { partial_reason: "transform_coverage_incomplete" as const } : {}) } : null;
     }
     if (resource.kind === "alignment") {
       const checked = await this.resolveAlignment(session, jobId, resource.spec, publication);
       if (!checked || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) return null;
       const table = alignmentTable(resource.spec, checked.rows);
-      return table ? { table, hashes: { ...checked.hashes, [resource.resource_id]: ownHash }, leaves: checked.leaves, partial: checked.rows.some((row) => row.status !== "matched") } : null;
+      const partial = checked.rows.some((row) => row.status !== "matched");
+      return table ? { table, hashes: { ...checked.hashes, [resource.resource_id]: ownHash }, leaves: checked.leaves, partial, ...(partial ? { partial_reason: "alignment_incomplete" as const } : {}) } : null;
     }
     if (resource.kind !== "transform") return null;
     const next = new Set(path); next.add(resourceId);
@@ -675,7 +704,7 @@ export class ToolService {
     if (!source || stableHashes(source.hashes) !== stableHashes(resource.input_hashes)) return null;
     const table = transformResult(source.table, resource.steps);
     if (!table || JSON.stringify(table) !== JSON.stringify(resource.result)) return null;
-    return { table, hashes: { ...source.hashes, [resource.resource_id]: ownHash }, leaves: source.leaves, partial: source.partial };
+    return { table, hashes: { ...source.hashes, [resource.resource_id]: ownHash }, leaves: source.leaves, partial: source.partial, ...(source.partial_reason ? { partial_reason: source.partial_reason } : {}) };
   }
 
   private async resolveArithmetic(session: SessionRecord, jobId: string, ref: ArithmeticRef, publication: FreshnessPublication, path: Set<string>): Promise<{ value: ArithmeticValue; hashes: Record<string, string>; leaves: string[] } | null> {
@@ -688,11 +717,46 @@ export class ToolService {
     if (resource.kind === "query_result") {
       const contract = this.arithmeticContract(session, resource, publication);
       if (!contract) return null;
+      if (ref.row !== undefined || ref.aggregate !== undefined || ref.execution_id !== undefined) {
+        if (ref.group || !ref.execution_id || ref.execution_id !== resource.execution_id || (ref.row === undefined) === (ref.aggregate === undefined) || (ref.row !== undefined && (!Number.isSafeInteger(ref.row) || ref.row < 0)) || (ref.aggregate !== undefined && ref.aggregate !== "sum") || coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length) return null;
+        const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, new Set());
+        const table = checked?.table; const column = table?.columns.find((candidate) => candidate.name === ref.cell);
+        const shape = verifyCell(resource, contract, { op: "count_rows", as: "shape" }, resource.rows.length);
+        const projections = parseReadonlySql(resource.sql).ast.columns;
+        const projection = Array.isArray(projections) ? projections.find((item) => item && typeof item === "object" && ((item as { as?: string | null; expr?: { column?: string } }).as ?? (item as { expr?: { column?: string } }).expr?.column) === ref.cell) as { expr?: { type?: string; column?: string } } | undefined : undefined;
+        const field = projection?.expr?.type === "column_ref" ? projection.expr.column : undefined;
+        if (!checked || !table || !column || column.type !== "decimal" || !shape || !field || !contract.series?.metrics.includes(field) || !contract.columns.find((candidate) => candidate.name === field)?.unit || !rawResultTable(resource, contract)) return null;
+        const filters = { ...shape.filters }; let start = resource.time_range.start; let end = resource.time_range.end;
+        let value: string | null;
+        if (ref.row !== undefined) {
+          const row = table.rows[ref.row];
+          if (!row || typeof row[ref.cell] !== "string") return null;
+          value = row[ref.cell] as string;
+          const outputs = new Map<string, string>();
+          for (const item of projections as Array<{ as?: string | null; expr?: { type?: string; column?: string } }>) if (item.expr?.type === "column_ref" && item.expr.column) outputs.set(item.expr.column, item.as ?? item.expr.column);
+          for (const dimension of contract.series.dimensions) {
+            if (Object.hasOwn(filters, dimension)) continue;
+            const output = outputs.get(dimension); const selected = output && row[output];
+            if (typeof selected !== "string") return null;
+            filters[dimension] = selected;
+          }
+          const dateOutput = outputs.get(contract.series.date_column); const dateValue = dateOutput && row[dateOutput];
+          if (typeof dateValue === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(dateValue) && dateValue >= start && dateValue <= end) start = end = dateValue;
+          else if (start !== end) return null;
+        } else {
+          if (table.rows.some((row) => typeof row[ref.cell] !== "string")) return null;
+          value = sumDecimalStrings(table.rows.map((row) => row[ref.cell]), column.scale!);
+          if (value === null) return null;
+        }
+        const exact: ArithmeticValue = { value, scale: column.scale!, unit: column.unit, basis: { table: contract.table, column: field, operation: ref.row === undefined ? "sum" : "value", unit: column.unit, prediction: "actual_observed_only", timezone: resource.time_range.timezone }, scopes: [{ filters, start, end }] };
+        return { value: exact, hashes: checked.hashes, leaves: checked.leaves };
+      }
       const canonical = (group: Record<string, string>) => JSON.stringify(Object.entries(group).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
       const matching = verifyDatabaseAggregates(resource, contract)?.filter((item) => item.output_column === ref.cell && canonical(item.group) === canonical(ref.group ?? {})) ?? [];
       if (matching.length !== 1) return null;
       return { value: fromAggregate(matching[0]!), hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id] };
     }
+    if (ref.execution_id !== undefined || ref.row !== undefined || ref.aggregate !== undefined) return null;
     if (resource.kind === "calculation") {
       if (ref.group || !resource.operations || !Object.hasOwn(resource.operations, ref.cell)) return null;
       const foundSource = await this.ctx.sessions.lookupResourceAsync(session.session_id, resource.source_resource_id);
@@ -824,6 +888,7 @@ export class ToolService {
           simulated: true,
           engine: found.resource.engine,
           ...(found.resource.execution_id ? { execution_id: found.resource.execution_id } : {}),
+          observed_at: found.resource.created_at,
           ...((found.resource as JoinQueryResource).join_proof ? { data_capture_hash: (found.resource as JoinQueryResource).join_proof!.capture_hash } : {}),
           rows: found.resource.rows,
           coverage: found.resource.coverage ?? unknownCoverage("资源没有覆盖回执，覆盖情况未知。"),
@@ -900,10 +965,7 @@ export class ToolService {
       source.evidence_eligible = Boolean(currentContract && currentFresh && (shape || databaseAggregates) && !source.truncated && source.complete_population);
       if (source.evidence_eligible) {
         eligible.add(source.resource_id);
-        if (source.engine === "clickhouse-local") {
-          reasons.push("clickhouse_snapshot_unproven");
-          if (status === "completed") status = "partial";
-        }
+        if (source.engine === "clickhouse-local") reasons.push("clickhouse_observation_nonatomic");
         if (databaseAggregates) aggregates.push(...databaseAggregates);
         // SQL aliases are model-controlled and can look like another metric or
         // unit. The verified statements use contract names; do not present the
@@ -931,6 +993,23 @@ export class ToolService {
         if (status === "completed") status = "partial";
         reasons.push("completeness_gap");
       }
+    }
+    // A shared publication is not a ClickHouse snapshot. Detect observed
+    // contradictions for the same table and coverage population rather than
+    // either asserting atomicity or downgrading every ordinary observation.
+    const observed = new Map<string, string>();
+    for (const source of sources) {
+      if (!source.evidence_eligible || source.engine !== "clickhouse-local" || source.tables.length !== 1 || !source.coverage.observation_hash) continue;
+      const contract = this.ctx.knowledge.contract_by_table.get(source.tables[0]!)?.contract;
+      const filters = contract && provenCoverageFilters(source.sql, contract, source.time_range);
+      if (!filters) continue;
+      const key = JSON.stringify([source.tables[0], source.time_range, Object.entries(filters).sort(([a], [b]) => a.localeCompare(b))]);
+      const previous = observed.get(key);
+      if (previous && previous !== source.coverage.observation_hash) {
+        reasons.push("coverage_observations_conflict");
+        if (status === "completed") status = "partial";
+      }
+      observed.set(key, source.coverage.observation_hash);
     }
     const verified: VerifiedCell[] = [];
     const verifiedDecimal: VerifiedDecimalCell[] = [];
@@ -966,8 +1045,7 @@ export class ToolService {
     const aggregateComparisons: AggregateComparison[] = [];
     const noteUnprovenSnapshot = (ids: string[]) => {
       if (ids.some((id) => sources.some((source) => source.resource_id === id && source.engine === "clickhouse-local"))) {
-        reasons.push("clickhouse_snapshot_unproven");
-        if (status === "completed") status = "partial";
+        reasons.push("clickhouse_observation_nonatomic");
       }
     };
     for (const request of (input.comparisons ?? []).slice(0, 20)) {
@@ -1019,7 +1097,7 @@ export class ToolService {
         if (status === "completed") status = "partial";
         continue;
       }
-      if (checked.partial) { reasons.push("alignment_incomplete"); if (status === "completed") status = "partial"; }
+      if (checked.partial) { reasons.push(checked.partial_reason ?? "transform_coverage_incomplete"); if (status === "completed") status = "partial"; }
       noteUnprovenSnapshot(checked.leaves);
       transformResults.push({ resource_id: resource.resource_id, source_resource_id: resource.source_resource_id, steps: resource.steps, result: checked.table });
       transformLines.push(...renderTransform(resource, source.table, checked.table));
@@ -1056,7 +1134,9 @@ export class ToolService {
     if (reasons.includes("transform_lineage_unsupported")) limitations.push("部分结果变换的递归来源、资源哈希、授权或新鲜度无法证明，没有展示结果。");
     if (reasons.includes("alignment_lineage_unsupported")) limitations.push("部分分组对齐的完整来源、范围或口径无法证明，没有展示结果。");
     if (reasons.includes("alignment_incomplete")) limitations.push("对齐来源存在未出现的分组或零分母；变换未把未知结果当作零。");
-    if (reasons.includes("clickhouse_snapshot_unproven")) limitations.push("ClickHouse 查询和覆盖统计是多次读取，可能发生数据变化；未证明共同数据版本，计算仅基于各次已捕获结果。");
+    if (reasons.includes("transform_coverage_incomplete")) limitations.push("变换输入存在未覆盖日期、NULL 或无法确认的预测状态；聚合忽略 NULL，不代表完整总体。");
+    if (reasons.includes("clickhouse_observation_nonatomic")) limitations.push("ClickHouse 查询和覆盖统计是独立读取；结果代表各次观测，不宣称跨查询原子快照或共同数据版本。");
+    if (reasons.includes("coverage_observations_conflict")) limitations.push("相同范围的覆盖观测内容发生变化；跨次比较可能不一致，只能部分交付。");
     if (reasons.includes("alias_preview_hidden")) limitations.push("含模型自选列别名的结果预览已隐藏；正式数值按契约字段及单位展示。");
     if (reasons.includes("floating_point_approximate")) limitations.push("浮点字段及其派生值仅是近似数，尚未实现可验证的精确十进制金额计算。");
     if (reasons.includes("coverage_unknown")) limitations.push("预期覆盖范围无法确定，覆盖情况未知。");
@@ -1070,7 +1150,8 @@ export class ToolService {
     limitations.push("数据来自本地合成库，不是生产数据。");
     const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...verifiedDecimal.map(renderDecimalCell), ...comparisons.map(renderComparison), ...aggregates.map(renderAggregate), ...aggregateComparisons.map(renderAggregateComparison), ...arithmeticResults.map(renderArithmetic), ...transformLines];
     derivedLines.push(...alignmentLines);
-    if (reasons.includes("clickhouse_snapshot_unproven")) derivedLines.push("这些结果和计算基于 ClickHouse 的已捕获数据；查询和覆盖统计并非同一原子快照，未证明共同数据版本。");
+    if (reasons.includes("clickhouse_observation_nonatomic")) derivedLines.push("结果基于各次 ClickHouse 观测；查询和覆盖统计不是同一原子快照，未证明共同数据版本。");
+    if (reasons.includes("coverage_observations_conflict")) derivedLines.push("相同范围的覆盖观测内容发生变化，跨次计算结果不能作为一致数据集的完整结论。");
     derivedLines.push(...joinLines);
     let answer = renderAnswer(status, verified, sources, input.clarification_question, derivedLines);
     const draftNumbers = input.draft_answer.match(/\d+(?:\.\d+)?/g) ?? [];
@@ -1173,7 +1254,11 @@ export class ToolService {
       if (needed.some((column) => !permitted.has(column))) return { table, report: unknownCoverage("覆盖统计需要未授权字段，未读取这些字段。") };
       const rows = await this.seriesRows(contract, applicable, timeRange, signal);
       if (!rows) return { table, report: unknownCoverage("覆盖查询超过保存预算，未把预览当作完整覆盖。") };
-      return { table, report: assessCoverage(contract, applicable, timeRange, rows) };
+      // Only a comparison of observed content, not a claim of an immutable
+      // ClickHouse version. Sorting makes database row order irrelevant.
+      const canonical = rows.map((row) => JSON.stringify(Object.entries(row).sort(([a], [b]) => a.localeCompare(b)))).sort();
+      const observation_hash = createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+      return { table, report: { ...assessCoverage(contract, applicable, timeRange, rows), observation_hash } };
     }));
     return combineCoverage(parts);
   }
@@ -1304,14 +1389,16 @@ function verifyJoinResource(resource: JoinQueryResource, session: SessionRecord,
   const dimension = assets.find((asset) => asset?.contract && !asset.contract.series)?.contract;
   if (!fact || !dimension) return null;
   const receipts = resource.freshness_receipts;
-  if (receipts.length !== 1 || receipts[0]?.table !== fact.table || receipts[0].status !== "fresh" || receipts[0].publication_id !== publication.publication_id || receipts[0].version !== publication.version || publication.tables[fact.table]?.status !== "fresh") return null;
+  if (receipts.length !== 2 || resource.tables.some((table) => !receipts.some((receipt) => receipt.table === table && receipt.status === "fresh" && receipt.publication_id === publication.publication_id && receipt.version === publication.version && publication.tables[table]?.status === "fresh"))) return null;
   const plan = prepareJoinEvidence(resource.sql, fact, dimension, knowledge.joins);
   if (!plan || plan.range.start !== resource.time_range.start || plan.range.end !== resource.time_range.end || plan.range.timezone !== resource.time_range.timezone || !verifyJoinExecutionSchema(plan, fact, dimension, resource.join_proof.column_types)) return null;
   if (resource.join_proof.capture_hash !== joinCaptureHash(resource.sql, resource.execution_id, resource.join_proof.rows, resource.join_proof.column_types)) return null;
   const visible = resource.join_proof.rows.map(({ __da_join_proof: _proof, ...row }) => row);
   if (JSON.stringify(visible) !== JSON.stringify(resource.rows)) return null;
   const values = verifyJoinEvidence(plan, resource.join_proof.rows);
-  return values ? { plan, values } : null;
+  const observations = values && joinDimensionObservations(plan, resource.join_proof.rows);
+  if (!values || !observations || observations.some((item) => !dimensionSnapshotMatches(publication.tables[dimension.table], dimension.table, item.keys, item.column, item.value))) return null;
+  return { plan, values };
 }
 
 function joinCaptureHash(sql: string, executionId: string, rows: Array<Record<string, unknown>>, columnTypes: Record<string, string>): string {
@@ -1361,6 +1448,58 @@ function stableHashes(value: Record<string, string>): string {
 
 /** Reconstruct rows solely from verified aggregate outputs and contract labels,
  * never from model-chosen aliases as semantic descriptions. */
+/** Convert only a complete direct projection of an observed-only contract.
+ * SQL admission alone is insufficient evidence of column lineage or exactness. */
+function rawResultTable(source: QueryResource, contract: DataContract): ResultTable | null {
+  if (!contract.series || contract.series.prediction_mode !== "observed_only" || contract.series.predicted_column || source.truncated || source.sql_limited || !source.complete_population || source.total_rows_exact !== true || source.rows.length > 200 || source.rows.length !== source.returned_rows || source.rows.length !== source.total_rows || (source.engine === "clickhouse-local" && !source.execution_id)) return null;
+  if (!verifyCell(source, contract, { op: "count_rows", as: "shape" }, source.rows.length)) return null;
+  const projections = parseReadonlySql(source.sql).ast.columns;
+  if (!Array.isArray(projections) || projections.length !== source.columns.length || projections.length > 40) return null;
+  const fields: Array<{ column: ResultColumn; field: string; declared: DataContract["columns"][number]; kind: "integer" | "decimal" | "text" }> = [];
+  for (const projection of projections) {
+    if (!projection || typeof projection !== "object") return null;
+    const item = projection as { as?: string | null; expr?: { type?: string; column?: string } };
+    const field = item.expr?.column, name = item.as ?? field;
+    if (item.expr?.type !== "column_ref" || !field || !name || !source.columns.includes(name) || !/^[a-z_][a-z0-9_]{0,63}$/u.test(name) || ["__proto__", "constructor", "prototype"].includes(name)) return null;
+    const declared = contract.columns.find((candidate) => candidate.name === field);
+    if (!declared || contract.sensitive_columns.includes(field)) return null;
+    const type = declared.type.replace(/\s/gu, "").toLowerCase();
+    const decimal = /^(?:nullable\()?decimal\((\d+),(\d+)\)\)?$/u.exec(type);
+    const integer = /^(?:nullable\()?(?:u?int\d*|integer)\)?$/u.test(type);
+    const text = /^(?:nullable\()?(?:lowcardinality\()?string\)?\)?$/u.test(type) || /^(?:nullable\()?date\)?$/u.test(type);
+    if (!decimal && !integer && !text) return null;
+    const kind = decimal ? "decimal" : integer ? "integer" : "text";
+    const isMetric = contract.series.metrics.includes(field);
+    if (isMetric && (!declared.unit || kind === "text")) return null;
+    if (decimal && (Number(decimal[1]) > 28 || Number(decimal[2]) > 28 || source.engine !== "clickhouse-local" || source.decimal_types?.[`${contract.table}.${field}`]?.replace(/\s/gu, "").toLowerCase() !== type || source.column_types?.[name]?.replace(/\s/gu, "").toLowerCase() !== type)) return null;
+    if (source.engine === "clickhouse-local" && integer && source.column_types?.[name]?.replace(/\s/gu, "").toLowerCase() !== type) return null;
+    const column: ResultColumn = { name, type: kind === "text" ? "text" : "decimal", unit: isMetric ? declared.unit! : `维度 ${contract.table}.${field}`, label: `${contract.table}.${field}${isMetric ? "（实际观察）" : ""}`, ...(kind === "text" ? {} : { scale: decimal ? Number(decimal[2]) : 0 }) };
+    fields.push({ column, field, declared, kind });
+  }
+  const rows: Array<Record<string, ResultValue>> = [];
+  for (const row of source.rows) {
+    if (Object.keys(row).length !== fields.length || fields.some(({ column }) => !Object.hasOwn(row, column.name))) return null;
+    const result: Record<string, ResultValue> = Object.create(null) as Record<string, ResultValue>;
+    for (const { column, declared, kind } of fields) {
+      const value = row[column.name];
+      if (value === null) { if (!declared.nullable && !declared.type.toLowerCase().startsWith("nullable(")) return null; result[column.name] = null; continue; }
+      if (kind === "text") { if (typeof value !== "string" || value.length > 256) return null; result[column.name] = value; continue; }
+      if (kind === "integer") {
+        if (typeof value === "number" && Number.isSafeInteger(value)) result[column.name] = String(value);
+        else if (typeof value === "string" && /^-?\d{1,76}$/u.test(value)) result[column.name] = value;
+        else return null;
+      } else {
+        const exact = sumDecimalStrings([value], column.scale!);
+        if (exact === null) return null;
+        result[column.name] = exact;
+      }
+    }
+    rows.push(result);
+  }
+  const result = { columns: fields.map(({ column }) => column), rows };
+  return Buffer.byteLength(JSON.stringify(result)) <= 200_000 ? result : null;
+}
+
 function aggregateTable(items: VerifiedAggregate[]): ResultTable | null {
   if (!items.length) return null;
   const first = items[0]!;
@@ -1418,7 +1557,7 @@ function renderTransform(resource: TransformResource, input: ResultTable, result
   let current = input;
   const label = (name: string) => current.columns.find((column) => column.name === name)?.label ?? "未知字段";
   for (const step of resource.steps) {
-    if (step.op === "filter") descriptions.push(`筛选 ${label(step.column)} ${step.comparison} ${JSON.stringify(step.value)}`);
+    if (step.op === "filter") descriptions.push(`筛选 ${label(step.column)} ${step.comparison}${"other_column" in step && step.other_column ? ` ${label(step.other_column)}` : "value" in step ? ` ${JSON.stringify(step.value)}` : ""}`);
     else if (step.op === "compare") descriptions.push(`比较 ${label(step.left)} ${step.comparison} ${label(step.right)}`);
     else if (step.op === "sort") descriptions.push(`排序 ${step.keys.map((key) => `${label(key.column)} ${key.direction}（NULL ${key.nulls}）`).join("、")}`);
     else descriptions.push(`按 ${step.by.map(label).join("、") || "全部结果"} 分组；${step.aggregates.map((item) => item.op === "count_all" ? "输入结果行数" : `${label(item.column!)} ${item.op}`).join("、")}`);

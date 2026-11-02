@@ -17,6 +17,36 @@ test("定点除法 18 位、半数远离零以及大数不经过浮点", () => {
   assert.equal(computeArithmetic("divide", revenue, otherCountry, true), null, "不同指标必须使用相同范围");
 });
 
+test("引用明细行和整列时绑定执行号、范围及当前任务", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_raw_arithmetic");
+    const query = await runtime.tools.query(session.session_id, { sql: "SELECT event_date, country_code, new_users FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads'" });
+    assert.equal(query.ok, true, JSON.stringify(query)); if (!query.ok) return;
+    const rows = query.rows as Array<{ country_code: string }>;
+    const ref = { resource_id: String(query.resource_id), execution_id: String(query.execution_id), cell: "new_users" };
+    const jp = { ...ref, row: rows.findIndex((row) => row.country_code === "JP") };
+    const us = { ...ref, row: rows.findIndex((row) => row.country_code === "US") };
+    const add = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: jp, right: us } });
+    assert.equal(add.ok, true, JSON.stringify(add)); if (add.ok) assert.equal((add.result as { value: string }).value, "130");
+    const sum = { ...ref, aggregate: "sum" as const };
+    const doubled = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: sum, right: sum } });
+    assert.equal(doubled.ok, true, JSON.stringify(doubled)); if (doubled.ok) assert.equal((doubled.result as { value: string }).value, "260");
+    const wrong = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: { ...jp, execution_id: "wrong" }, right: us } });
+    assert.equal(wrong.ok, false);
+    const missing = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: { ...jp, row: 999 }, right: us } });
+    assert.equal(missing.ok, false);
+    if (add.ok) {
+      const delivered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [ref.resource_id, String(add.resource_id)] });
+      assert.equal(delivered.ok, true, JSON.stringify(delivered));
+      if (delivered.ok) { assert.equal(delivered.status, "completed"); assert.match(String(delivered.answer), /130 人/); }
+    }
+    runtime.sessions.setActiveJob(session.session_id, "job_raw_other");
+    const foreign = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: jp, right: us } });
+    assert.equal(foreign.ok, false);
+  });
+});
+
 test("同任务聚合的四则运算可递归复核，零分母、篡改和跨任务失败关闭", async () => {
   await withRuntime({}, async (runtime) => {
     const session = analyst(runtime);

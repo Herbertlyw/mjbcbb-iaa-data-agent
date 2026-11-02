@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { promisify } from "node:util";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { clickHouseColumnTypes, clickHouseCommand, clickHouseInsert, clickHouseQuery, clickHouseQueryBounded, createClickHouseClient } from "../src/clickhouse-client.js";
-import { prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema, verifyJoinPhysicalSchema } from "../src/join-evidence.js";
+import { joinDimensionObservations, prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema, verifyJoinPhysicalSchema } from "../src/join-evidence.js";
 import { probeClickHouseAndPublish } from "../src/freshness.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import { createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
@@ -31,7 +32,9 @@ test("JOIN 证明规划只接受可核对完整粒度和登记键的 SQL", () =>
   assert.equal(prepareJoinEvidence(titleSql.replace("SUM(f.new_users)", "SUM(f.device_token)"), fact, title, knowledge.joins), null);
   assert.equal(prepareJoinEvidence(`${titleSql} LIMIT 1`, fact, title, knowledge.joins), null);
   assert.equal(prepareJoinEvidence(titleSql.replace("f.country_code = 'JP'", "(f.country_code = 'JP' OR f.country_code = 'US')"), fact, title, knowledge.joins), null);
-  assert.equal(prepareJoinEvidence(titleSql.replace(" GROUP BY", " AND d.title_name = '纸灯' GROUP BY"), fact, title, knowledge.joins), null);
+  const filteredTitle = prepareJoinEvidence(titleSql.replace(" GROUP BY", " AND d.title_name = '纸灯' GROUP BY"), fact, title, knowledge.joins);
+  assert.ok(filteredTitle);
+  assert.match(filteredTitle.executionSql, /count\(\) OVER \(PARTITION BY title_id\) AS __da_dimension_key_count/u);
   assert.equal(prepareJoinEvidence(titleSql.replace("d.title_name AS label, SUM", "d.title_name AS label, d.title_name AS other_label, SUM").replace("GROUP BY d.title_name", "GROUP BY d.title_name, f.country_code"), fact, title, knowledge.joins), null);
   // None of these auto-captured proof fields is projected by the SQL. A
   // sensitive flag still prohibits the read, including dimension JOIN keys.
@@ -102,6 +105,27 @@ test("隔离 ClickHouse 在同次 JOIN 读取中证明产品和渠道分组，�
       const grouped = await clickHouseQueryBounded(reader, groupedPlan.executionSql, 100, 200_000);
       const groupedEvidence = verifyJoinEvidence(groupedPlan, grouped.rows); assert.ok(groupedEvidence);
       assert.deepEqual(groupedEvidence.map((item) => [item.group["fact_fox_daily_install.channel_id"], item.group["dim_fox_channel.channel_name"], item.value]), [["mist_ads", "雾帆", "70"], ["pebble_net", "卵石", "14"]]);
+      const filteredTitleSql = titleSql.replace(" GROUP BY", " AND d.title_name = '纸灯' GROUP BY");
+      const filteredTitle = prepareJoinEvidence(filteredTitleSql, fact, title, knowledge.joins); assert.ok(filteredTitle);
+      const filteredTitleResult = await clickHouseQueryBounded(reader, filteredTitle.executionSql, 100, 200_000);
+      assert.equal(verifyJoinExecutionSchema(filteredTitle, fact, title, filteredTitleResult.column_types), true);
+      assert.equal(verifyJoinExecutionSchema(filteredTitle, fact, title, { ...filteredTitleResult.column_types, __da_join_proof: filteredTitleResult.column_types.__da_join_proof!.replace("UInt64", "UInt32") }), false);
+      assert.equal(verifyJoinEvidence(filteredTitle, filteredTitleResult.rows)?.[0]?.value, "70");
+      const falseCount = structuredClone(filteredTitleResult.rows); (falseCount[0]!.__da_join_proof as unknown[][])[0]!.splice(-1, 1, "2");
+      assert.equal(verifyJoinEvidence(filteredTitle, falseCount), null);
+      const missingCount = structuredClone(filteredTitleResult.rows); (missingCount[0]!.__da_join_proof as unknown[][])[0]!.pop();
+      assert.equal(verifyJoinEvidence(filteredTitle, missingCount), null);
+      assert.deepEqual(joinDimensionObservations(filteredTitle, filteredTitleResult.rows), [
+        { keys: { title_id: "paper_lantern" }, column: "title_id", value: "paper_lantern" },
+        { keys: { title_id: "paper_lantern" }, column: "title_name", value: "纸灯" },
+      ]);
+      const filteredChannelSql = channelSql.replace(" GROUP BY", " AND d.channel_name = '雾帆' GROUP BY");
+      const filteredChannel = prepareJoinEvidence(filteredChannelSql, fact, channel, knowledge.joins); assert.ok(filteredChannel);
+      const filteredChannelResult = await clickHouseQueryBounded(reader, filteredChannel.executionSql, 100, 200_000);
+      assert.equal(verifyJoinExecutionSchema(filteredChannel, fact, channel, filteredChannelResult.column_types), true);
+      assert.equal(verifyJoinEvidence(filteredChannel, filteredChannelResult.rows)?.[0]?.value, "7");
+      const absent = prepareJoinEvidence(titleSql.replace(" GROUP BY", " AND d.title_name = '不存在' GROUP BY"), fact, title, knowledge.joins); assert.ok(absent);
+      assert.equal(verifyJoinEvidence(absent, (await clickHouseQueryBounded(reader, absent.executionSql, 100, 200_000)).rows), null);
       await withRuntime({ knowledgeDir: path.join(root, "knowledge", "harborlight"), businessEngine: "clickhouse", clickhouseUrl: url, clickhouseUser: "synthetic_join_reader", clickhousePassword: readerPassword, clickhouseDatabase: "default", publishFreshnessOnStart: false, startWorker: false }, async (runtime) => {
         await probeClickHouseAndPublish({ targetsPath: runtime.config.freshnessTargetsPath, destinationPath: runtime.config.freshnessPath, query: (sql) => clickHouseQuery(reader, sql) as Promise<Array<{ event_date: string }>> });
         const session = analyst(runtime);
@@ -124,6 +148,37 @@ test("隔离 ClickHouse 在同次 JOIN 读取中证明产品和渠道分组，�
         const groupedAnswer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(groupedQuery.resource_id)] });
         assert.equal(groupedAnswer.ok, true, JSON.stringify(groupedAnswer));
         if (groupedAnswer.ok) { assert.equal(groupedAnswer.status, "completed"); assert.match(String(groupedAnswer.answer), /求和 70/); assert.match(String(groupedAnswer.answer), /求和 14/); }
+        const filteredQuery = await runtime.tools.query(session.session_id, { sql: filteredTitleSql });
+        assert.equal(filteredQuery.ok, true, JSON.stringify(filteredQuery));
+        if (filteredQuery.ok) {
+          const filteredAnswer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(filteredQuery.resource_id)] });
+          assert.equal(filteredAnswer.ok, true, JSON.stringify(filteredAnswer));
+          if (filteredAnswer.ok) { assert.equal(filteredAnswer.status, "completed"); assert.match(String(filteredAnswer.answer), /已核验 JOIN 求和 70/); assert.match(String(filteredAnswer.answer), /dim_fox_title\.title_name=纸灯/); }
+        }
+        // The private, temporary publication can be modified by this test;
+        // a missing dimension receipt must never become a verified JOIN.
+        const publishedText = readFileSync(runtime.config.freshnessPath, "utf8");
+        try {
+          const withoutDimension = JSON.parse(publishedText) as { tables: Record<string, unknown> };
+          delete withoutDimension.tables[title.table];
+          writeFileSync(runtime.config.freshnessPath, JSON.stringify(withoutDimension));
+          const missingSnapshot = await runtime.tools.query(session.session_id, { sql: titleSql });
+          assert.equal(missingSnapshot.ok, false);
+          if (!missingSnapshot.ok) assert.equal(missingSnapshot.code, "dimension_snapshot_mismatch");
+          const missingDelivery = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(queried.resource_id)] });
+          assert.equal(missingDelivery.ok, true);
+          if (missingDelivery.ok) { assert.notEqual(missingDelivery.status, "completed"); assert.doesNotMatch(String(missingDelivery.answer), /已核验 JOIN 求和 70/); }
+        } finally { writeFileSync(runtime.config.freshnessPath, publishedText); }
+        // A live dimension label changed after publication cannot inherit the
+        // previously published label's authority just because the key exists.
+        await clickHouseCommand(client, "ALTER TABLE dim_fox_title UPDATE title_name = '合成改名' WHERE title_id = 'paper_lantern' SETTINGS mutations_sync = 2");
+        try {
+          const beforeMismatch = runtime.sessions.resourceCount();
+          const changedLabel = await runtime.tools.query(session.session_id, { sql: titleSql });
+          assert.equal(changedLabel.ok, false);
+          if (!changedLabel.ok) assert.equal(changedLabel.code, "dimension_snapshot_mismatch");
+          assert.equal(runtime.sessions.resourceCount(), beforeMismatch);
+        } finally { await clickHouseCommand(client, "ALTER TABLE dim_fox_title UPDATE title_name = '纸灯' WHERE title_id = 'paper_lantern' SETTINGS mutations_sync = 2"); }
         runtime.sessions.setActiveJob(session.session_id, "job_other");
         const foreign = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(queried.resource_id)] });
         assert.ok(!foreign.ok || foreign.status !== "completed");
@@ -160,14 +215,25 @@ test("隔离 ClickHouse 在同次 JOIN 读取中证明产品和渠道分组，�
       // A duplicated key with a different label creates two apparently
       // complete output groups. Their fact grains must still collide globally.
       await clickHouseInsert(client, title.table, [{ ...data.titles[0]!, title_name: "纸灯重复标签" }]);
+      const hiddenDuplicate = await clickHouseQueryBounded(reader, filteredTitle.executionSql, 100, 200_000);
+      assert.equal(verifyJoinEvidence(filteredTitle, hiddenDuplicate.rows), null, "标签过滤不能隐藏同键另一标签");
+      assert.equal(joinDimensionObservations(filteredTitle, hiddenDuplicate.rows), null);
+      const hiddenOriginal = await clickHouseQueryBounded(reader, filteredTitleSql, 100, 200_000);
+      assert.deepEqual(hiddenDuplicate.rows.map(({ __da_join_proof: _proof, ...row }) => row), hiddenOriginal.rows, "证明 SQL 不改变原 JOIN 结果");
       const differentLabel = await clickHouseQueryBounded(reader, titlePlan.executionSql, 100, 200_000);
       assert.equal(differentLabel.rows.length, 2);
       assert.ok(differentLabel.rows.every((row) => (row.__da_join_proof as unknown[][]).length === 7));
       assert.equal(verifyJoinEvidence(titlePlan, differentLabel.rows), null);
       await clickHouseInsert(client, title.table, [data.titles[0]!]);
+      const sameLabelDuplicate = await clickHouseQueryBounded(reader, filteredTitle.executionSql, 100, 200_000);
+      assert.equal(verifyJoinEvidence(filteredTitle, sameLabelDuplicate.rows), null, "同标签重复键也不能通过");
+      const sameLabelOriginal = await clickHouseQueryBounded(reader, filteredTitleSql, 100, 200_000);
+      assert.deepEqual(sameLabelDuplicate.rows.map(({ __da_join_proof: _proof, ...row }) => row), sameLabelOriginal.rows, "重复键的原 SQL 结果也保持一致");
       const duplicate = await clickHouseQueryBounded(reader, titlePlan.executionSql, 100, 200_000);
       assert.equal(verifyJoinEvidence(titlePlan, duplicate.rows), null);
       await clickHouseInsert(client, channel.table, [data.channels[0]!]);
+      const filteredDuplicateChannel = await clickHouseQueryBounded(reader, filteredChannel.executionSql, 100, 200_000);
+      assert.equal(verifyJoinEvidence(filteredChannel, filteredDuplicateChannel.rows), null);
       const duplicateChannel = await clickHouseQueryBounded(reader, channelPlan.executionSql, 100, 200_000);
       assert.equal(verifyJoinEvidence(channelPlan, duplicateChannel.rows), null);
       const pebbleSql = channelSql.replace("'mist_ads'", "'pebble_net'");

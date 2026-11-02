@@ -1,4 +1,5 @@
 import { createServer, type ServerResponse } from "node:http";
+import { shiftSyntheticDates } from "../src/synthetic-clock.js";
 
 export interface ProtocolObservation {
   script: string;
@@ -13,7 +14,9 @@ export interface ProtocolObservation {
   currentTurnRoles: string[];
 }
 
-export async function startFakeOpenAI(token: string, options: { recordObservations?: boolean } = {}): Promise<{ url: string; observations: ProtocolObservation[]; close: () => Promise<void> }> {
+export async function startFakeOpenAI(token: string, options: { recordObservations?: boolean; syntheticDateShiftDays?: number } = {}): Promise<{ url: string; observations: ProtocolObservation[]; close: () => Promise<void> }> {
+  const dateShift = options.syntheticDateShiftDays ?? 0;
+  if (!Number.isSafeInteger(dateShift) || Math.abs(dateShift) > 70_000) throw new Error("invalid_synthetic_clock");
   const observations: ProtocolObservation[] = [];
   const server = createServer((request, response) => {
     const chunks: Buffer[] = [];
@@ -79,13 +82,16 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
         writeTextStream(response, true);
         return;
       }
-      const call = script === "bad-args" ? badCall(body) : happyCall(messages);
+      // Only the explicitly scripted fake maps its fixture dates. The actual
+      // Pi session and persisted user message always keep the original text.
+      const fixtureMessages = dateShift ? JSON.parse(shiftSyntheticDates(JSON.stringify(messages), -dateShift)) as ProtocolMessage[] : messages;
+      const call = script === "bad-args" ? badCall(body) : happyCall(fixtureMessages);
       if (!call) {
         writeTextStream(response, true);
         return;
       }
       const turnNumber = messages.filter((message) => message.role === "user").length;
-      writeToolStream(response, { ...call, id: `${call.id}_turn${turnNumber}` }, true);
+      writeToolStream(response, { ...call, id: `${call.id}_turn${turnNumber}`, arguments: shiftSyntheticDates(call.arguments, dateShift) }, true);
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -121,6 +127,7 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成多渠道收入成本比")) return scripted(turn, groupedRatioSteps);
   if (latest.includes("合成分组对齐")) return scripted(turn, alignmentSteps);
   if (latest.includes("合成产品维表关联")) return scripted(turn, validJoinSteps);
+  if (latest.includes("合成渠道维表关联")) return scripted(turn, validChannelJoinSteps);
   if (latest.includes("合成精确金额")) return scripted(turn, decimalSteps);
   if (latest.includes("玻璃鲦") && latest.includes("德国")) return scripted(turn, glassSteps);
   if (latest.includes("只说看看收入") || (latest.includes("日本") && !hasBase && !latest.includes("纸灯"))) return scripted(turn, clarifySteps);
@@ -179,8 +186,17 @@ function validJoinSteps(ids: string[]) {
   return [
     { id: "join_fact", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
     { id: "join_dim", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.dim_fox_title" }) },
-    { id: "join_query", name: "query", arguments: JSON.stringify({ sql: "SELECT d.title_name AS label, SUM(f.new_users) AS total FROM fact_fox_daily_install f JOIN dim_fox_title d ON f.title_id = d.title_id WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-12' AND f.title_id = 'paper_lantern' AND f.platform = 'ios' AND f.country_code = 'JP' AND f.channel_id = 'mist_ads' GROUP BY d.title_name ORDER BY d.title_name" }) },
+    { id: "join_query", name: "query", arguments: JSON.stringify({ sql: "SELECT d.title_name AS label, SUM(f.new_users) AS total FROM fact_fox_daily_install f JOIN dim_fox_title d ON f.title_id = d.title_id WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-12' AND f.title_id = 'paper_lantern' AND f.platform = 'ios' AND f.country_code = 'JP' AND f.channel_id = 'mist_ads' AND d.title_name = '纸灯' GROUP BY d.title_name ORDER BY d.title_name" }) },
     { id: "join_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+function validChannelJoinSteps(ids: string[]) {
+  return [
+    { id: "join_channel_fact", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "join_channel_dim", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.dim_fox_channel" }) },
+    { id: "join_channel_query", name: "query", arguments: JSON.stringify({ sql: "SELECT d.channel_name AS label, SUM(f.new_users) AS total FROM fact_fox_daily_install f JOIN dim_fox_channel d ON f.channel_id = d.channel_id WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-12' AND f.title_id = 'paper_lantern' AND f.platform = 'ios' AND f.country_code = 'JP' AND f.channel_id = 'mist_ads' AND d.channel_name = '雾帆' GROUP BY d.channel_name ORDER BY d.channel_name" }) },
+    { id: "join_channel_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
   ];
 }
 

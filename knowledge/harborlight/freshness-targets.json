@@ -9,6 +9,20 @@
   "note": "只读探测本地 ClickHouse 的声明周期。MAX(date) 和连接成功都不是完整。",
   "targets": [
     {
+      "table": "dim_fox_title",
+      "engine": "clickhouse-local",
+      "kind": "dimension_snapshot",
+      "key_columns": ["title_id"],
+      "snapshot_columns": ["title_id", "title_name", "genre", "launched_on"]
+    },
+    {
+      "table": "dim_fox_channel",
+      "engine": "clickhouse-local",
+      "kind": "dimension_snapshot",
+      "key_columns": ["channel_id"],
+      "snapshot_columns": ["channel_id", "channel_name", "channel_kind"]
+    },
+    {
       "table": "fact_fox_daily_install",
       "engine": "clickhouse-local",
       "date_column": "event_date",
