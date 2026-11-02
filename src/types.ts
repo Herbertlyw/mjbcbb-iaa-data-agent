@@ -212,6 +212,7 @@ export interface QueryResource {
   engine: "sqlite-local" | "clickhouse-local";
   simulated: true;
   elapsed_ms?: number;
+  scan_limit?: number;
   sql: string;
   tables: string[];
   contract_revisions: Record<string, string>;
@@ -293,6 +294,7 @@ export interface AnalysisRecord {
     complete_population: boolean;
   }>;
   comparisons?: import("./evidence-comparison.js").VerifiedComparison[];
+  aggregates?: import("./aggregate-evidence.js").VerifiedAggregate[];
   model_suggested_status: string;
   model_draft: string;
   server_reasons: string[];

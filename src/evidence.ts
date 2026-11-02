@@ -13,6 +13,7 @@ export interface VerifiedCell {
   precision: "exact_integer" | "floating_point_approximate";
   table: string;
   column: string | null;
+  outputColumn: string | null;
   description: string;
   unit: string;
   operation: CellOperation["op"];
@@ -24,25 +25,31 @@ export interface VerifiedCell {
   excludedNulls: number;
 }
 
-/** Only raw projections from one contracted table and conjunctive, literal filters
+/** Only direct projections from one contracted table and conjunctive, literal filters
  * are currently eligible for authoritative calculation statements. This is
  * independent of SQL admission: admitted SQL can still have unknown lineage. */
 export function verifyCell(source: QueryResource, contract: DataContract, operation: CellOperation, storedValue: number): VerifiedCell | null {
   if (source.truncated || !source.complete_population || source.tables.length !== 1 || source.tables[0] !== contract.table || !contract.series) return null;
   let ast: Record<string, unknown>;
   try { ast = parseReadonlySql(source.sql).ast; } catch { return null; }
-  if (ast.with || ast.distinct || ast.groupby || ast.having || ast.orderby || ast.limit || ast._next || ast.options) return null;
+  if (ast.with || ast.distinct || ast.groupby || ast.having || ast.limit || ast._next || ast.options) return null;
   const from = Array.isArray(ast.from) ? ast.from : [];
   if (from.length !== 1) return null;
   const relation = record(from[0]);
   if (!relation || relation.table !== contract.table || relation.db || relation.join || relation.expr) return null;
   const qualifier = typeof relation.as === "string" ? relation.as : contract.table;
   const projections = Array.isArray(ast.columns) ? ast.columns : [];
-  const names = new Set<string>();
+  const projectedToField = new Map<string, string>();
+  const fieldToProjected = new Map<string, string>();
+  const contractNames = new Set(contract.columns.map((column) => column.name));
   for (const projection of projections) {
     const item = record(projection); const expr = record(item?.expr);
-    if (!item || item.as || !expr || expr.type !== "column_ref" || typeof expr.column !== "string" || (expr.table && expr.table !== qualifier)) return null;
-    names.add(expr.column);
+    if (!item || !expr || expr.type !== "column_ref" || typeof expr.column !== "string" || (expr.table && expr.table !== qualifier)) return null;
+    const field = expr.column;
+    const output = item.as === null || item.as === undefined ? field : item.as;
+    if (typeof output !== "string" || !/^[a-z_][a-z0-9_]*$/u.test(output) || !contractNames.has(field) || projectedToField.has(output) || fieldToProjected.has(field) || (output !== field && contractNames.has(output))) return null;
+    projectedToField.set(output, field);
+    fieldToProjected.set(field, output);
   }
   const dateColumn = contract.series.date_column;
   const dimensions = new Set([...contract.series.dimensions, ...(contract.grain ?? []).filter((x) => x !== dateColumn && !contract.series!.metrics.includes(x))]);
@@ -68,27 +75,30 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
   }
   if (!visit(ast.where) || !start || !end || start !== source.time_range.start || end !== source.time_range.end) return null;
   for (const [key, value] of Object.entries(filters)) {
-    if (names.has(key) && source.rows.some((row) => String(row[key]) !== value)) return null;
+    const output = fieldToProjected.get(key);
+    if (output && source.rows.some((row) => String(row[output]) !== value)) return null;
   }
   const op = operation.op;
   if (!["sum", "count_null", "count_zero", "count_rows"].includes(op)) return null;
-  const column = op === "count_rows" ? null : operation.column ?? "";
+  const outputColumn = op === "count_rows" ? null : operation.column ?? "";
+  const column = outputColumn ? projectedToField.get(outputColumn) ?? "" : null;
   const declared = column ? contract.columns.find((item) => item.name === column) : undefined;
-  if (column && (!names.has(column) || !contract.series.metrics.includes(column) || !declared)) return null;
-  if (column && source.rows.some((row) => !Object.hasOwn(row, column))) return null;
+  if (op !== "count_rows" && (!column || !outputColumn || !contract.series.metrics.includes(column) || !declared)) return null;
+  if (outputColumn && source.rows.some((row) => !Object.hasOwn(row, outputColumn))) return null;
   const predColumn = contract.series.predicted_column;
   if (predColumn && contract.series.prediction_mode || !predColumn && contract.series.prediction_values) return null;
   let rows = source.rows;
   let prediction = "契约未声明预测标记，实际/预测状态未验证";
   if (predColumn) {
     const mapping = contract.series.prediction_values;
+    const predOutput = fieldToProjected.get(predColumn);
     if (!mapping || !Number.isFinite(mapping.actual) || !Number.isFinite(mapping.predicted) || mapping.actual === mapping.predicted) return null;
-    if (!names.has(predColumn) || rows.some((row) => !Object.hasOwn(row, predColumn) || (typeof row[predColumn] !== "number" && (typeof row[predColumn] !== "string" || !/^-?\d+(?:\.\d+)?$/u.test(row[predColumn] as string))) || ![mapping.actual, mapping.predicted].includes(Number(row[predColumn])))) return null;
+    if (!predOutput || rows.some((row) => !Object.hasOwn(row, predOutput) || (typeof row[predOutput] !== "number" && (typeof row[predOutput] !== "string" || !/^-?\d+(?:\.\d+)?$/u.test(row[predOutput] as string))) || ![mapping.actual, mapping.predicted].includes(Number(row[predOutput])))) return null;
     const wanted = operation.predicted ?? "any";
-    if (wanted === "actual_only") { rows = rows.filter((row) => Number(row[predColumn]) === mapping.actual); prediction = `实际（${predColumn}=${mapping.actual}）`; }
-    else if (wanted === "predicted_only") { rows = rows.filter((row) => Number(row[predColumn]) === mapping.predicted); prediction = `预测（${predColumn}=${mapping.predicted}）`; }
+    if (wanted === "actual_only") { rows = rows.filter((row) => Number(row[predOutput]) === mapping.actual); prediction = `实际（${predColumn}=${mapping.actual}）`; }
+    else if (wanted === "predicted_only") { rows = rows.filter((row) => Number(row[predOutput]) === mapping.predicted); prediction = `预测（${predColumn}=${mapping.predicted}）`; }
     else {
-      const flags = new Set(rows.map((row) => Number(row[predColumn])));
+      const flags = new Set(rows.map((row) => Number(row[predOutput])));
       if (flags.size > 1 && op !== "count_rows") return null;
       prediction = flags.size > 1 ? "包含实际和预测（未分开）" : flags.has(mapping.predicted) ? `预测（${predColumn}=${mapping.predicted}）` : flags.has(mapping.actual) ? `实际（${predColumn}=${mapping.actual}）` : "无符合预测筛选的行";
     }
@@ -102,7 +112,7 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
   let excludedNulls = 0;
   if (op === "count_rows") actual = rows.length;
   else {
-    const values = rows.map((row) => row[column!]);
+    const values = rows.map((row) => row[outputColumn!]);
     excludedNulls = values.filter((value) => value === null).length;
     if (values.some((value) => value !== null && (typeof value !== "number" || !Number.isFinite(value)))) return null;
     if (op === "count_null") actual = excludedNulls;
@@ -125,7 +135,7 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
   }
   if (!Number.isFinite(storedValue) || Math.abs(actual - storedValue) > 1e-9) return null;
   return {
-    value: actual, precision, table: contract.table, column, description: declared?.description ?? "查询结果行数",
+    value: actual, precision, table: contract.table, column, outputColumn, description: declared?.description ?? "查询结果行数",
     unit: op === "sum" ? (declared?.unit || "契约未声明") : "行",
     operation: op, prediction, predictionFilter: operation.predicted ?? "any", filters, range: source.time_range, sourceResourceId: source.resource_id, excludedNulls,
   };

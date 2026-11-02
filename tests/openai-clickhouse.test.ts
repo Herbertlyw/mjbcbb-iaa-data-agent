@@ -68,6 +68,21 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     await waitMysql(mysqlPort, statePassword);
     const freshness = await MysqlFreshnessStore.open({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password: statePassword, database: "lumenfox_it" });
     try {
+      const rollingPath = path.join(knowledgeDir, "freshness-targets-rolling.example.json");
+      const rollingKnowledge = loadKnowledge(knowledgeDir);
+      const firstDay = { simulatedToday: "2026-10-29" };
+      const nextDay = { simulatedToday: "2026-10-30" };
+      const rollingManifest = freshnessManifest(rollingKnowledge, rollingPath, firstDay);
+      const rollingBatch = await freshness.begin(rollingManifest);
+      const rollingObserved = await probeClickHouseFreshness({ targetsPath: rollingPath, ...firstDay, query: (sql) => clickHouseQuery(reader, sql) as Promise<Array<{ event_date: string }>> });
+      assert.equal(rollingObserved.tables.fact_fox_daily_install?.status, "fresh");
+      assert.equal(rollingObserved.valid_until, "2026-10-29");
+      assert.equal(await freshness.publish(rollingBatch.version, rollingObserved), "published");
+      assert.equal((await freshness.current())?.version, rollingBatch.version);
+      assert.notEqual(rollingManifest.target_hash, freshnessManifest(rollingKnowledge, rollingPath, nextDay).target_hash);
+      const nextObserved = await probeClickHouseFreshness({ targetsPath: rollingPath, ...nextDay, query: (sql) => clickHouseQuery(reader, sql) as Promise<Array<{ event_date: string }>> });
+      assert.equal(nextObserved.tables.fact_fox_daily_install?.status, "stale");
+      assert.equal((await freshness.get(rollingBatch.version))?.tables.fact_fox_daily_install?.status, "fresh", "旧版本仅供审计");
       const targetsPath = path.join(knowledgeDir, "freshness-targets.json");
       const batch = await freshness.begin(freshnessManifest(loadKnowledge(knowledgeDir), targetsPath));
       const observed = await probeClickHouseFreshness({ targetsPath, query: (sql) => clickHouseQuery(reader, sql) as Promise<Array<{ event_date: string }>> });

@@ -10,7 +10,9 @@ export function provenCoverageFilters(sql: string, contract: DataContract, timeR
   if (!series) return null;
   let ast: Record<string, unknown>;
   try { ast = parseReadonlySql(sql).ast; } catch { return null; }
-  if (ast.with || ast._next || ast.limit || ast.having || ast.groupby || ast.distinct || ast.options) return null;
+  // Coverage describes the input population before grouping; HAVING, LIMIT,
+  // unions and nested inputs remain unknown because they change that scope.
+  if (ast.with || ast._next || ast.limit || ast.having || ast.distinct || ast.options) return null;
   const from = Array.isArray(ast.from) ? ast.from : [];
   const relation = object(from[0]);
   if (from.length !== 1 || !relation || relation.table !== contract.table || relation.db || relation.expr || relation.join) return null;

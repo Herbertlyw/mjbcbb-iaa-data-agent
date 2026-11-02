@@ -1,7 +1,7 @@
 import { rmSync } from "node:fs";
 import { loadConfig, type AppConfig } from "./config.js";
 import { assertLocalClickHouse, createClickHouseClient } from "./clickhouse-client.js";
-import { freshnessManifest, matchesFreshnessManifest, probeAndPublish, readPublication } from "./freshness.js";
+import { freshnessManifest, freshnessPeriodKey, matchesFreshnessManifest, probeAndPublish, readPublication } from "./freshness.js";
 import { openSimulatedDatabase } from "./database.js";
 import { JobService } from "./jobs.js";
 import { loadKnowledge } from "./knowledge.js";
@@ -90,13 +90,22 @@ export class Runtime {
   }
 
   async freshnessHealth(): Promise<{ source: string; status: string }> {
-    if (this.config.stateMode !== "mysql") return { source: "sqlite-demo-file", status: readPublication(this.config.freshnessPath) ? "published" : "not_published" };
+    if (this.config.stateMode !== "mysql") {
+      const publication = readPublication(this.config.freshnessPath);
+      if (!publication) return { source: "sqlite-demo-file", status: "not_published" };
+      try {
+        const clock = { now: new Date(), simulatedToday: this.config.simulatedToday };
+        const period = freshnessPeriodKey(this.config.freshnessTargetsPath, clock);
+        if (period) freshnessManifest(this.knowledge, this.config.freshnessTargetsPath, clock);
+        return { source: "sqlite-demo-file", status: period && period !== publication.period_key ? "manifest_changed" : "published" };
+      } catch { return { source: "sqlite-demo-file", status: "unavailable" }; }
+    }
     try {
       const store = await this.getMysqlFreshness();
       if (!store) return { source: "mysql", status: "unavailable" };
       const publication = await store.current();
       if (!publication) return { source: "mysql", status: "not_published" };
-      return { source: "mysql", status: matchesFreshnessManifest(publication.manifest, freshnessManifest(this.knowledge, this.config.freshnessTargetsPath)) ? "published" : "manifest_changed" };
+      return { source: "mysql", status: matchesFreshnessManifest(publication.manifest, freshnessManifest(this.knowledge, this.config.freshnessTargetsPath, { simulatedToday: this.config.simulatedToday })) ? "published" : "manifest_changed" };
     } catch { return { source: "mysql", status: "unavailable" }; }
   }
 }
@@ -112,7 +121,7 @@ export function createRuntime(overrides: Partial<AppConfig> = {}): Runtime {
     ? openSimulatedDatabase(config.databasePath, "SELECT 1")
     : openSimulatedDatabase(config.databasePath, knowledge.seed_sql, { reseed: config.reseedDatabase });
   if (config.publishFreshnessOnStart && config.businessEngine === "sqlite" && config.stateMode === "sqlite") {
-    probeAndPublish({ databasePath: config.databasePath, targetsPath: config.freshnessTargetsPath, destinationPath: config.freshnessPath });
+    probeAndPublish({ databasePath: config.databasePath, targetsPath: config.freshnessTargetsPath, destinationPath: config.freshnessPath, simulatedToday: config.simulatedToday });
   }
   const state = config.stateMode === "mysql"
     ? new MysqlStateStore({

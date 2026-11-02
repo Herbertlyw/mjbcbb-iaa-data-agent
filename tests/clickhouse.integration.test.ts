@@ -245,6 +245,23 @@ async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, 
   runtime.sessions.setActiveJob(session.session_id, "job_evidence_lineage");
   const time = "event_date >= '2026-10-06' AND event_date <= '2026-10-12'";
   const common = "title_id = 'paper_lantern' AND platform = 'ios'";
+  const aggregateQuery = await runtime.tools.query(session.session_id, { sql: `SELECT country_code, SUM(new_users) AS total, COUNT(new_users) AS n FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND ${common} AND channel_id = 'mist_ads' GROUP BY country_code ORDER BY country_code` });
+  assert.equal(aggregateQuery.ok, true, JSON.stringify(aggregateQuery));
+  if (!aggregateQuery.ok) throw new Error("aggregate query rejected");
+  const aggregateResult = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(aggregateQuery.resource_id)] });
+  assert.equal(aggregateResult.ok, true, JSON.stringify(aggregateResult));
+  if (!aggregateResult.ok) throw new Error("aggregate analysis rejected");
+  assert.equal(aggregateResult.status, "completed", JSON.stringify(aggregateResult));
+  const aggregateCells = aggregateResult.aggregates as Array<{ operation: string; value: string; group: Record<string, string> }>;
+  assert.deepEqual(aggregateCells.map((a) => [a.group.country_code, a.operation, a.value]), [["JP", "sum", "10"], ["JP", "count_nonnull", "1"], ["US", "sum", "100"], ["US", "count_nonnull", "1"]]);
+  const channels = await runtime.tools.query(session.session_id, { sql: `SELECT channel_id, SUM(new_users) AS total FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND ${common} AND country_code = 'US' GROUP BY channel_id ORDER BY channel_id` });
+  assert.equal(channels.ok, true, JSON.stringify(channels));
+  if (!channels.ok) throw new Error("channel query rejected");
+  const channelResult = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(channels.resource_id)] });
+  assert.equal(channelResult.ok, true, JSON.stringify(channelResult));
+  if (!channelResult.ok) throw new Error("channel analysis rejected");
+  assert.equal(channelResult.status, "completed", JSON.stringify(channelResult));
+  assert.deepEqual((channelResult.aggregates as Array<{ value: string; group: Record<string, string> }>).map((a) => [a.group.channel_id, a.value]), [["mist_ads", "100"], ["pebble_net", "5"]]);
   async function calculate(sql: string, column: string, predicted: "any" | "actual_only" | "predicted_only" = "any") {
     const query = await runtime.tools.query(session.session_id, { sql });
     assert.equal(query.ok, true, JSON.stringify(query));
@@ -295,7 +312,11 @@ async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, 
     if (!calc.ok) continue;
     const result = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(unsupported.resource_id), String(calc.resource_id)] });
     assert.equal(result.ok, true);
-    if (result.ok) { assert.notEqual(result.status, "completed"); assert.doesNotMatch(String(result.answer), /合计 70/); }
+    if (result.ok) {
+      // A SQL alias is allowed, but it cannot relabel installs as revenue.
+      assert.match(String(result.answer), /fact_fox_daily_install\.new_users/);
+      assert.doesNotMatch(String(result.answer), /revenue_usd|USD/);
+    }
   }
   const zeroNullQuery = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE ${time} AND ${common} AND country_code = 'US' AND channel_id = 'mist_ads'` });
   assert.equal(zeroNullQuery.ok, true);

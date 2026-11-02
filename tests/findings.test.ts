@@ -201,3 +201,70 @@ test("浮点金额不冒充精确十进制结论", async () => {
     assert.ok((result.server_reasons as string[]).includes("floating_point_approximate"));
   });
 });
+
+test("直接列别名与排序保留契约血缘，遮蔽维度和 LIMIT 不能冒充完整结论", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_alias_fixture");
+    const where = "event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'";
+    async function analyze(sql: string, column: string) {
+      const query = await runtime.tools.query(session.session_id, { sql });
+      assert.equal(query.ok, true, JSON.stringify(query));
+      if (!query.ok) throw new Error("synthetic query failed");
+      const calculation = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(query.resource_id), operations: [{ op: "sum", column, as: "metric" }] });
+      assert.equal(calculation.ok, true);
+      if (!calculation.ok) throw new Error("synthetic calculation failed");
+      return runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(query.resource_id), String(calculation.resource_id)] });
+    }
+    const valid = await analyze(`SELECT event_date AS day, new_users AS amount FROM daily_installs WHERE ${where} ORDER BY event_date`, "amount");
+    assert.equal(valid.ok, true);
+    if (valid.ok) {
+      assert.match(String(valid.answer), /daily_installs\.new_users/);
+      assert.match(String(valid.answer), /120；单位 人/);
+      assert.match(String(valid.answer), /country_code=US/);
+    }
+    const shadow = await analyze(`SELECT event_date, new_users AS country_code FROM daily_installs WHERE ${where}`, "country_code");
+    assert.equal(shadow.ok, true);
+    if (shadow.ok) { assert.doesNotMatch(String(shadow.answer), /120/); assert.notEqual(shadow.status, "completed"); }
+    const limited = await analyze(`SELECT event_date, new_users AS amount FROM daily_installs WHERE ${where} LIMIT 1`, "amount");
+    assert.equal(limited.ok, true);
+    if (limited.ok) { assert.doesNotMatch(String(limited.answer), /120/); assert.notEqual(limited.status, "completed"); }
+  });
+});
+
+test("数据库分组聚合只交付完整覆盖且契约可证明的整数结果", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_sql_aggregate");
+    const base = "product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads'";
+    async function analyze(sql: string) {
+      const query = await runtime.tools.query(session.session_id, { sql });
+      assert.equal(query.ok, true, JSON.stringify(query));
+      if (!query.ok) throw new Error("synthetic query failed");
+      const answer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(query.resource_id)] });
+      assert.equal(answer.ok, true, JSON.stringify(answer));
+      if (!answer.ok) throw new Error("synthetic analysis failed");
+      return answer;
+    }
+    const day = "event_date >= '2026-10-06' AND event_date <= '2026-10-06'";
+    const result = await analyze(`SELECT country_code, SUM(new_users) AS total, COUNT(new_users) AS n FROM daily_installs WHERE ${day} AND ${base} GROUP BY country_code ORDER BY country_code`);
+    assert.equal(result.status, "completed", JSON.stringify(result));
+    const aggregates = result.aggregates as Array<{ operation: string; value: string; group: Record<string, string>; unit: string }>;
+    assert.deepEqual(aggregates.map((a) => [a.group.country_code, a.operation, a.value, a.unit]), [["JP", "sum", "10", "人"], ["JP", "count_nonnull", "1", "行"], ["US", "sum", "120", "人"], ["US", "count_nonnull", "1", "行"]]);
+    assert.match(String(result.answer), /country_code=US/);
+    assert.deepEqual((result.sources as Array<{ rows: unknown[] }>)[0]?.rows, []);
+    assert.match((result.limitations as string[]).join(" "), /未出现的组合没有补零/);
+    for (const sql of [
+      `SELECT SUM(new_users) AS country_code FROM daily_installs WHERE ${day} AND ${base} AND country_code = 'US'`,
+      `SELECT SUM(new_users + 1) AS total FROM daily_installs WHERE ${day} AND ${base} AND country_code = 'US'`,
+      `SELECT SUM(new_users) AS total FROM daily_installs WHERE ${day} AND ${base} AND country_code = 'US' LIMIT 1`,
+      `SELECT SUM(new_users) AS total FROM daily_installs WHERE event_date >= '2026-10-09' AND event_date <= '2026-10-09' AND ${base} AND country_code = 'US'`,
+    ]) {
+      const rejected = await analyze(sql);
+      assert.notEqual(rejected.status, "completed", sql);
+      assert.deepEqual(rejected.aggregates, [], sql);
+    }
+  });
+});

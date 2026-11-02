@@ -20,11 +20,12 @@ export function compareVerifiedIntegers(
   const column = contract.columns.find((item) => item.name === a.column);
   if (!column || !/^(?:nullable\()?\s*(?:u?int\d*|integer)\s*\)?$/iu.test(column.type)) return null;
   if (!Number.isSafeInteger(a.value) || !Number.isSafeInteger(b.value) || !Number.isSafeInteger(a.value - b.value)) return null;
-  for (const source of [leftSource, rightSource]) {
+  for (const [source, cell] of [[leftSource, a], [rightSource, b]] as const) {
+    if (!cell.outputColumn) return null;
     if (source.truncated || !source.complete_population || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length) return null;
     let magnitude = 0n;
     for (const row of source.rows) {
-      const value = row[a.column];
+      const value = row[cell.outputColumn];
       if (!Number.isSafeInteger(value)) return null;
       const n = BigInt(value as number);
       magnitude += n < 0n ? -n : n;

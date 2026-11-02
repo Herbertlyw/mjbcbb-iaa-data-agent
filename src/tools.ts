@@ -4,7 +4,8 @@ import { assessCoverage, combineCoverage, coverageHasGap, provenCoverageFilters,
 import { plainRows } from "./database.js";
 import { verifyCell, type CellOperation, type VerifiedCell } from "./evidence.js";
 import { compareVerifiedIntegers, type VerifiedComparison } from "./evidence-comparison.js";
-import { freshnessManifest, matchesFreshnessManifest, readPublication, type FreshnessPublication } from "./freshness.js";
+import { verifyDatabaseAggregates, type VerifiedAggregate } from "./aggregate-evidence.js";
+import { freshnessManifest, freshnessPeriodKey, matchesFreshnessManifest, readPublication, type FreshnessPublication } from "./freshness.js";
 import type { MysqlFreshnessStore } from "./mysql-freshness.js";
 import { canQueryTable, canRead, contractValidity, tableGrain } from "./knowledge.js";
 import { newId, type SessionStore } from "./session.js";
@@ -39,8 +40,9 @@ type ToolResult = ToolFailure | { ok: true; [key: string]: unknown };
 
 export class ToolService {
   private readonly assetBytesRead = new Map<string, number>();
+  private readonly configuredScanLimit: number;
 
-  constructor(private readonly ctx: ToolContext) {}
+  constructor(private readonly ctx: ToolContext) { this.configuredScanLimit = ctx.config.clickhouseMaxRowsToRead; }
 
   reserveToolCall(sessionId: string): "ok" | "budget_exhausted" | "lost" {
     return this.ctx.sessions.reserveToolCall(sessionId, this.ctx.config.maxToolCalls);
@@ -344,6 +346,7 @@ export class ToolService {
       ...(session.active_job_id ? { job_id: session.active_job_id } : {}),
       engine: this.ctx.businessEngine === "clickhouse" ? "clickhouse-local" : "sqlite-local",
       elapsed_ms: elapsedMs,
+      ...(this.ctx.businessEngine === "clickhouse" ? { scan_limit: this.configuredScanLimit } : {}),
       simulated: true,
       sql: guarded.sql,
       tables: guarded.tables,
@@ -573,6 +576,7 @@ export class ToolService {
     if (!deliveredFreshness.ok) return deliveredFreshness;
     const liveFreshness = deliveredFreshness.publication;
     const eligible = new Set<string>();
+    const aggregates: VerifiedAggregate[] = [];
     for (const source of sources) {
       const original = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === source.resource_id);
       const asset = original && original.tables.length === 1 ? this.ctx.knowledge.contract_by_table.get(original.tables[0] ?? "") : undefined;
@@ -580,13 +584,25 @@ export class ToolService {
       const currentContract = Boolean(original && asset && contract && original.registry_revision === this.ctx.knowledge.registry_revision && original.contract_revisions[contract.table] === contract.revision && original.asset_hashes[asset.asset_id] === asset.content_hash && canQueryTable(this.ctx.knowledge, session.role, contract.table) && !contractValidity(contract, currentCalendarDate(this.ctx.config, contract.timezone)));
       const currentFresh = Boolean(liveFreshness && liveFreshness.valid_until >= currentCalendarDate(this.ctx.config, this.ctx.knowledge.timezone) && source.freshness_receipts.length === source.tables.length && source.tables.every((table) => source.freshness_receipts.some((receipt) => receipt.table === table)) && source.freshness_receipts.every((receipt) => receipt.publication_id === liveFreshness.publication_id && receipt.version === liveFreshness.version && liveFreshness.tables[receipt.table]?.status === "fresh"));
       const shape = original && contract && verifyCell(original, contract, { op: "count_rows", as: "internal" }, original.rows.length);
-      source.evidence_eligible = Boolean(currentContract && currentFresh && shape && !source.truncated && source.complete_population);
-      if (source.evidence_eligible) eligible.add(source.resource_id);
+      const databaseAggregates = original && contract && verifyDatabaseAggregates(original, contract);
+      source.evidence_eligible = Boolean(currentContract && currentFresh && (shape || databaseAggregates) && !source.truncated && source.complete_population);
+      if (source.evidence_eligible) {
+        eligible.add(source.resource_id);
+        if (databaseAggregates) aggregates.push(...databaseAggregates);
+        // SQL aliases are model-controlled and can look like another metric or
+        // unit. The verified statements use contract names; do not present the
+        // raw alias-labelled preview as verified evidence in the answer.
+        const columns = parseReadonlySql(original!.sql).ast.columns;
+        if (Array.isArray(columns) && columns.some((item) => item && typeof item === "object" && "as" in item && item.as)) {
+          source.rows = [];
+          reasons.push("alias_preview_hidden");
+        }
+      }
       else {
         if (!currentFresh) reasons.push("freshness_version_changed");
         if (!currentContract) reasons.push("contract_or_authorization_changed");
         if (source.truncated || !source.complete_population) reasons.push("truncated_result_is_not_population");
-        if (!shape && currentContract) reasons.push("query_lineage_unsupported");
+        if (!shape && !databaseAggregates && currentContract) reasons.push("query_lineage_unsupported");
         source.rows = [];
         source.coverage = unknownCoverage("该查询结果不满足当前证据条件，覆盖回执不作为事实展示。");
         if (status === "completed") status = "partial";
@@ -655,6 +671,7 @@ export class ToolService {
     if (input.findings?.length || input.limitations?.length) limitations.push("模型提供的标签、分组、单位、状态和自由文字未作为事实采用；数值与范围由服务端元数据生成。");
     if (reasons.includes("calculation_lineage_unsupported") || reasons.includes("query_lineage_unsupported")) limitations.push("部分表达式或计算缺少可证明的血缘，没有作为已验证数值展示。");
     if (reasons.includes("comparison_unverifiable")) limitations.push("部分比较的范围、覆盖、单位、预测状态或整数精度无法证明，没有展示比较结果。");
+    if (reasons.includes("alias_preview_hidden")) limitations.push("含模型自选列别名的结果预览已隐藏；正式数值按契约字段及单位展示。");
     if (reasons.includes("floating_point_approximate")) limitations.push("浮点字段及其派生值仅是近似数，尚未实现可验证的精确十进制金额计算。");
     if (reasons.includes("coverage_unknown")) limitations.push("预期覆盖范围无法确定，覆盖情况未知。");
     if (reasons.includes("freshness_version_changed")) limitations.push("新鲜度发布版本已变化或失效，受影响的数值没有作为已验证事实展示。");
@@ -662,8 +679,9 @@ export class ToolService {
     if (reasons.includes("missing_values_disclosed")) limitations.push("NULL 是缺失，没有当作零。");
     if (reasons.includes("true_zeros_disclosed")) limitations.push("结果包含数值为零的行；预测状态按契约单独标示。");
     if (reasons.includes("predicted_values_disclosed")) limitations.push("预测值和实际值分开列出。");
+    if (aggregates.some((item) => Object.keys(item.group).length)) limitations.push("分组只展示查询中出现的取值，未出现的组合没有补零。");
     limitations.push("数据来自本地合成库，不是生产数据。");
-    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...comparisons.map(renderComparison)];
+    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...comparisons.map(renderComparison), ...aggregates.map(renderAggregate)];
     let answer = renderAnswer(status, verified, sources, input.clarification_question, derivedLines);
     const draftNumbers = input.draft_answer.match(/\d+(?:\.\d+)?/g) ?? [];
     if (draftNumbers.some((item) => !answer.includes(item))) {
@@ -683,6 +701,7 @@ export class ToolService {
       sources,
       calculations,
       comparisons,
+      aggregates,
       model_suggested_status: input.suggested_status,
       model_draft: input.draft_answer,
       server_reasons: unique(reasons),
@@ -821,13 +840,22 @@ export class ToolService {
   }
 
   private async currentFreshness(): Promise<{ ok: true; publication: FreshnessPublication | null } | ToolFailure> {
-    if (this.ctx.config.stateMode !== "mysql") return { ok: true, publication: readPublication(this.ctx.config.freshnessPath) };
+    if (this.ctx.config.stateMode !== "mysql") {
+      const publication = readPublication(this.ctx.config.freshnessPath);
+      try {
+        const clock = { now: new Date(), simulatedToday: this.ctx.config.simulatedToday };
+        const period = freshnessPeriodKey(this.ctx.config.freshnessTargetsPath, clock);
+        if (period) freshnessManifest(this.ctx.knowledge, this.ctx.config.freshnessTargetsPath, clock);
+        if (publication && period && publication.period_key !== period) return fail("freshness_manifest_changed", "本机演示的新鲜度周期已变化，需要重新探测。");
+        return { ok: true, publication };
+      } catch { return fail("freshness_authority_unavailable", "本机演示的新鲜度周期配置无效。"); }
+    }
     try {
       const store = await this.ctx.mysqlFreshness?.();
       if (!store) return fail("freshness_authority_unavailable", "MySQL 新鲜度权威状态不可用，不能回退本机文件。");
       const current = await store.current();
       if (!current) return { ok: true, publication: null };
-      if (!matchesFreshnessManifest(current.manifest, freshnessManifest(this.ctx.knowledge, this.ctx.config.freshnessTargetsPath))) return fail("freshness_manifest_changed", "已发布新鲜度与当前契约或探测目标不一致，需要重新探测。");
+      if (!matchesFreshnessManifest(current.manifest, freshnessManifest(this.ctx.knowledge, this.ctx.config.freshnessTargetsPath, { simulatedToday: this.ctx.config.simulatedToday }))) return fail("freshness_manifest_changed", "已发布新鲜度与当前契约、探测目标或业务周期不一致，需要重新探测。");
       return { ok: true, publication: current };
     } catch {
       // Never fall back to the local file when the authoritative database fails.
@@ -874,6 +902,12 @@ function renderComparison(comparison: VerifiedComparison): string {
   const { left, right, difference, change_percent } = comparison;
   const scope = (cell: VerifiedCell) => `${Object.entries(cell.filters).map(([key, value]) => `${key}=${value}`).join("，")}；${cell.range.start} 到 ${cell.range.end}（${cell.range.timezone}）；来源 ${cell.sourceResourceId}`;
   return `${left.source.table}.${left.source.column} 比较：${left.source.value}（${scope(left.source)}）减 ${right.source.value}（${scope(right.source)}）= ${difference} ${left.source.unit}；${change_percent === null ? "基准为零，变化率不可计算" : `相对基准变化 ${change_percent}%（四舍五入到小数点后两位）`}；${left.source.prediction}。`;
+}
+
+function renderAggregate(item: VerifiedAggregate): string {
+  const filters = Object.entries(item.filters).map(([key, value]) => `${key}=${value}`).join("，") || "无";
+  const group = Object.entries(item.group).map(([key, value]) => `${key}=${value}`).join("，");
+  return `${item.table}.${item.column}（${item.description}）：数据库${item.operation === "sum" ? "求和" : "非 NULL 计数"} ${item.value}；单位 ${item.unit}；实际（契约声明仅观察值）；筛选 ${filters}${group ? `；分组 ${group}` : ""}；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${item.source_resource_id}。`;
 }
 
 function computeCell(source: QueryResource, operation: CellOperation, notes: string[]): number {
@@ -928,7 +962,7 @@ function renderAnswer(
     if (source.evidence_eligible) appendCoverage(lines, source);
     else lines.push(`${source.tables.join(",")} 的证据当前不可验证，未展示其数值。`);
   }
-  if (!cells.length && sources.length) lines.push("没有可证明血缘的计算数值。");
+  if (!cells.length && !derivedLines.length && sources.length) lines.push("没有可证明血缘的计算数值。");
   return lines.join("\n");
 }
 
@@ -952,8 +986,8 @@ function renderDerivedAndGroups(cells: VerifiedCell[], resources: SessionResourc
     }
     // Group only already-authorized raw rows on a declared and selected dimension.
     for (const cell of related) {
-      const calc = resources.find((item): item is CalculationResource => item.kind === "calculation" && item.source_resource_id === id && Object.values(item.operations ?? {}).some((op) => op.op === "sum" && op.column === cell.column && (op.predicted ?? "any") === cell.predictionFilter));
-      const op = calc && Object.values(calc.operations ?? {}).find((item) => item.op === "sum" && item.column === cell.column && (item.predicted ?? "any") === cell.predictionFilter);
+      const calc = resources.find((item): item is CalculationResource => item.kind === "calculation" && item.source_resource_id === id && Object.values(item.operations ?? {}).some((op) => op.op === "sum" && op.column === cell.outputColumn && (op.predicted ?? "any") === cell.predictionFilter));
+      const op = calc && Object.values(calc.operations ?? {}).find((item) => item.op === "sum" && item.column === cell.outputColumn && (item.predicted ?? "any") === cell.predictionFilter);
       if (!op || !cell.column) continue;
       for (const dimension of contract.series.dimensions) {
         if (Object.hasOwn(cell.filters, dimension) || !source.columns.includes(dimension)) continue;
@@ -966,7 +1000,7 @@ function renderDerivedAndGroups(cells: VerifiedCell[], resources: SessionResourc
           const mapping = contract.series.prediction_values;
           const flag = contract.series.predicted_column;
           const selected = flag && mapping && op.predicted === "actual_only" ? subset.filter((row) => Number(row[flag]) === mapping.actual) : flag && mapping && op.predicted === "predicted_only" ? subset.filter((row) => Number(row[flag]) === mapping.predicted) : subset;
-          const numbers = selected.map((row) => row[cell.column!]).filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+          const numbers = selected.map((row) => row[cell.outputColumn!]).filter((value): value is number => typeof value === "number" && Number.isFinite(value));
           if (!numbers.length) continue;
           const total = numbers.reduce((a, b) => a + b, 0);
           if (!verifyCell({ ...source, rows: subset }, contract, op, total)) continue;

@@ -31,6 +31,7 @@ export function createClickHouseClient(config: ClickHouseConfig, readonly: boole
       readonly: readonly ? "1" : "0",
       max_execution_time: Math.max(config.timeoutSeconds, 1),
       max_rows_to_read: String(config.maxRowsToRead),
+      read_overflow_mode: "throw",
     },
   });
 }
