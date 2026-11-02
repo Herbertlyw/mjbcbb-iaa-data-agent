@@ -15,7 +15,7 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
   const password = randomBytes(12).toString("hex");
   const name = `lumenfox-budget-${randomUUID()}`;
   const dir = mkdtempSync(path.join(tmpdir(), "lumenfox-budget-"));
-  await docker(["run", "--pull=never", "-d", "--name", name, "-p", `127.0.0.1:${port}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${password}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${password}`, "mysql:8.0.32"]);
+  await docker(["run", "--pull=never", "-d", "--name", name, "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", `127.0.0.1:${port}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${password}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${password}`, "mysql:8.0.32"]);
   try {
     await waitMysql(port, password);
     const runtime = openRuntime(dir, {
