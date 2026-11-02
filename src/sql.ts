@@ -23,6 +23,10 @@ const WRITE_TYPES = new Set([
 
 const ALLOWED_FUNCTIONS = new Set(["sum", "count", "min", "max", "avg", "lower", "upper", "exists"]);
 const TABLE_FUNCTIONS = /\b(file|url|s3|s3cluster|remote|remotesecure|mysql|postgresql|mongo|mongodb|hdfs|input|cluster|clusterallreplicas|sqlite|redis|executable)\s*\(/iu;
+// Match the maximum interval that the coverage evaluator can enumerate.
+// Row/time limits in the ClickHouse driver remain independent safeguards.
+const MAX_SCAN_DAYS = 400;
+const MAX_SQL_BYTES = 64 * 1024;
 
 export class SqlRejected extends Error {
   constructor(
@@ -58,6 +62,25 @@ export interface ParsedSql {
 export function parseReadonlySql(rawSql: string, dialect: "sqlite" | "clickhouse" = "sqlite"): ParsedSql {
   const sql = rawSql.trim().replace(/;+\s*$/u, "");
   if (!sql) throw new SqlRejected("invalid_sql", "SQL 为空");
+  if (Buffer.byteLength(sql, "utf8") > MAX_SQL_BYTES) throw new SqlRejected("sql_size_limit", "SQL 超出安全长度上限");
+  // Check before parsing. Ignore literals and comments so a closing bracket
+  // inside a string cannot hide later nesting from the parser safety limit.
+  let depth = 0; let quote = ""; let lineComment = false; let blockComment = false;
+  for (let i = 0; i < sql.length; i += 1) {
+    const char = sql[i]!; const next = sql[i + 1];
+    if (lineComment) { if (char === "\n" || char === "\r") lineComment = false; continue; }
+    if (blockComment) { if (char === "*" && next === "/") { blockComment = false; i += 1; } continue; }
+    if (quote) {
+      if (char === "\\") { i += 1; continue; }
+      if (char === quote) { if (next === quote) i += 1; else quote = ""; }
+      continue;
+    }
+    if (char === "-" && next === "-") { lineComment = true; i += 1; continue; }
+    if (char === "/" && next === "*") { blockComment = true; i += 1; continue; }
+    if (char === "'" || char === '"' || char === "`") { quote = char; continue; }
+    if (char === "(" && ++depth > 64) throw new SqlRejected("sql_depth_limit", "SQL 嵌套过深");
+    if (char === ")") depth = Math.max(0, depth - 1);
+  }
   if (TABLE_FUNCTIONS.test(sql) || /\b(system|information_schema)\s*\./iu.test(sql)) {
     throw new SqlRejected("dangerous_table", "不允许系统表、文件或外部数据源");
   }
@@ -74,6 +97,7 @@ export function parseReadonlySql(rawSql: string, dialect: "sqlite" | "clickhouse
   if (statements.length !== 1) throw new SqlRejected("multiple_statements", "只允许一条语句");
   const statement = asRecord(statements[0]);
   if (!statement) throw new SqlRejected("unparseable_sql", "SQL 无法安全解析");
+  assertAstBudget(statement);
   rejectShape(statement);
   const tables = [...physicalTables(statement, new Set())];
   if (tables.length === 0) throw new SqlRejected("missing_table", "查询没有引用表");
@@ -299,6 +323,8 @@ function authorizeSelect(statement: Record<string, unknown>, cteNames: Set<strin
       const bounds = dateBounds(statement.where, column, alias, direct.length > 1);
       if (!bounds.start || !bounds.end) throw new SqlRejected("unbounded_query", `必须为 ${table}.${column} 提供封闭的日期范围`);
       if (!isCalendarDate(bounds.start) || !isCalendarDate(bounds.end) || bounds.start > bounds.end) throw new SqlRejected("invalid_date_range", `${table}.${column} 的日期范围无效`);
+      const days = (Date.parse(`${bounds.end}T00:00:00.000Z`) - Date.parse(`${bounds.start}T00:00:00.000Z`)) / 86_400_000 + 1;
+      if (days > MAX_SCAN_DAYS) throw new SqlRejected("scan_date_limit", `单次查询日期范围不能超过 ${MAX_SCAN_DAYS} 天`);
     }
   }
   walkShallow(statement, (record) => {
@@ -375,6 +401,8 @@ function functionName(record: Record<string, unknown>): string | undefined {
 
 function dateBounds(where: unknown, column: string, alias?: string, requireQualified = false): { start?: string; end?: string } {
   const bounds: { start?: string; end?: string } = {};
+  const lower = (value: string) => { bounds.start = bounds.start && bounds.start > value ? bounds.start : value; };
+  const upper = (value: string) => { bounds.end = bounds.end && bounds.end < value ? bounds.end : value; };
   const matches = (value: unknown): boolean => {
     const record = asRecord(value);
     if (!record || columnOf(record) !== column) return false;
@@ -398,19 +426,53 @@ function dateBounds(where: unknown, column: string, alias?: string, requireQuali
       const start = literal(list[0]);
       const end = literal(list[1]);
       if (start && end) {
-        bounds.start = start;
-        bounds.end = end;
+        lower(start);
+        upper(end);
       }
       return;
     }
     if (!matches(record.left)) return;
     const value = literal(record.right);
     if (!value) return;
-    if (operator === ">=" || operator === ">") bounds.start = value;
-    if (operator === "<=" || operator === "<") bounds.end = value;
+    if (operator === "=") { lower(value); upper(value); }
+    if (operator === ">=" || operator === ">") lower(value);
+    if (operator === "<=" || operator === "<") upper(value);
   };
   visit(where);
   return bounds;
+}
+
+/** Exact inclusive predicates for evidence, restricted to one DATE column.
+ * The caller still has to prove every other conjunct and match the final range. */
+export function exactCalendarDatePredicate(node: unknown, column: string, qualifier: string): { start?: string; end?: string } | null {
+  const expr = asRecord(node); const left = asRecord(expr?.left);
+  if (!expr || expr.type !== "binary_expr" || !left || left.type !== "column_ref" || left.column !== column || (left.table && left.table !== qualifier)) return null;
+  const date = (value: unknown): string | null => {
+    const entry = asRecord(value);
+    return entry?.type === "single_quote_string" && typeof entry.value === "string" && isCalendarDate(entry.value) ? entry.value : null;
+  };
+  if (expr.operator === "BETWEEN") {
+    const right = asRecord(expr.right); const list = right?.type === "expr_list" && Array.isArray(right.value) ? right.value : [];
+    const start = date(list[0]); const end = date(list[1]);
+    return list.length === 2 && start && end && start <= end ? { start, end } : null;
+  }
+  const value = date(expr.right);
+  if (!value) return null;
+  if (expr.operator === "=") return { start: value, end: value };
+  if (expr.operator === ">=") return { start: value };
+  if (expr.operator === "<=") return { end: value };
+  return null;
+}
+
+function assertAstBudget(root: unknown): void {
+  const pending: Array<{ value: unknown; depth: number }> = [{ value: root, depth: 0 }];
+  let nodes = 0;
+  while (pending.length) {
+    const { value, depth } = pending.pop()!;
+    if (++nodes > 20_000 || depth > 128) throw new SqlRejected("sql_complexity_limit", "SQL 语法树过大或过深");
+    if (Array.isArray(value)) for (const child of value) pending.push({ value: child, depth: depth + 1 });
+    else if (value && typeof value === "object") for (const child of Object.values(value)) pending.push({ value: child, depth: depth + 1 });
+  }
 }
 
 function hasOperator(node: unknown, operator: string): boolean {
@@ -437,7 +499,7 @@ function identifierName(record: Record<string, unknown>): string | undefined {
 function literal(value: unknown): string | undefined {
   const record = asRecord(value);
   if (!record) return undefined;
-  if (typeof record.value === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(record.value)) return record.value;
+  if (record.type === "single_quote_string" && typeof record.value === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(record.value)) return record.value;
   return undefined;
 }
 

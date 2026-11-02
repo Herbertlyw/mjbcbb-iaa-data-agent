@@ -16,6 +16,19 @@ import { analyst, ask, bindTables, withRuntime } from "./helpers.js";
 
 const WEEK = "event_date >= '2026-10-06' AND event_date <= '2026-10-12'";
 
+test("覆盖分组与日期组合超预算时返回未知，不用截断分组冒充完整", async () => {
+  await withRuntime({}, async (runtime) => {
+    const contract = runtime.knowledge.contract_by_table.get("daily_installs")?.contract;
+    assert.ok(contract);
+    const rows = Array.from({ length: 275 }, (_, index) => ({ event_date: "2026-01-01", product_id: "starlane_drift", platform: "ios", country_code: `S${index}`, channel: "nebula_ads", new_users: 1 }));
+    const coverage = assessCoverage(contract, { product_id: "starlane_drift", platform: "ios", channel: "nebula_ads" }, { start: "2026-01-01", end: "2026-12-31" }, rows);
+    assert.equal(coverage.status, "unknown");
+    assert.match(coverage.reason, /超过预算/);
+    assert.equal(coverageHasGap(coverage), true);
+    assert.deepEqual(coverage.groups, []);
+  });
+});
+
 test("多维组合各自缺日时不能被完整的单维覆盖掩盖", () => {
   const contract = JSON.parse(readFileSync(new URL("../knowledge/lumenfox/contracts/daily-installs.json", import.meta.url), "utf8")) as DataContract;
   const rows = [

@@ -1,4 +1,4 @@
-import { parseReadonlySql } from "./sql.js";
+import { exactCalendarDatePredicate, parseReadonlySql } from "./sql.js";
 import type { DataContract, QueryResource } from "./types.js";
 
 export interface CellOperation {
@@ -60,15 +60,16 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
     if (!expression || expression.type !== "binary_expr") return false;
     if (expression.operator === "AND") return visit(expression.left) && visit(expression.right);
     const left = record(expression.left); const right = record(expression.right);
-    if (!left || left.type !== "column_ref" || typeof left.column !== "string" || (left.table && left.table !== qualifier) || !right || !["single_quote_string", "number"].includes(String(right.type))) return false;
-    const valueString = String(right.value);
+    if (!left || left.type !== "column_ref" || typeof left.column !== "string" || (left.table && left.table !== qualifier)) return false;
     if (left.column === dateColumn) {
-      if (right.type !== "single_quote_string" || !/^\d{4}-\d{2}-\d{2}$/u.test(valueString)) return false;
-      if (expression.operator === ">=" && !start) start = valueString;
-      else if (expression.operator === "<=" && !end) end = valueString;
-      else return false;
+      const bounds = exactCalendarDatePredicate(expression, dateColumn, qualifier);
+      if (!bounds || (bounds.start && start) || (bounds.end && end)) return false;
+      if (bounds.start) start = bounds.start;
+      if (bounds.end) end = bounds.end;
       return true;
     }
+    if (!right || !["single_quote_string", "number"].includes(String(right.type))) return false;
+    const valueString = String(right.value);
     if (expression.operator !== "=" || !dimensions.has(left.column) || Object.hasOwn(filters, left.column)) return false;
     filters[left.column] = valueString;
     return true;

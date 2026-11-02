@@ -1,5 +1,5 @@
 import type { CoverageGroup, CoverageReport, DataContract } from "./types.js";
-import { parseReadonlySql } from "./sql.js";
+import { exactCalendarDatePredicate, parseReadonlySql } from "./sql.js";
 import { isCalendarDate } from "./config.js";
 
 /** The coverage query must describe the same population as the user's WHERE.
@@ -27,14 +27,15 @@ export function provenCoverageFilters(sql: string, contract: DataContract, timeR
     if (expr.operator === "AND") return visit(expr.left) && visit(expr.right);
     const left = object(expr.left);
     const right = object(expr.right);
-    if (!left || left.type !== "column_ref" || typeof left.column !== "string" || (left.table && left.table !== qualifier) || !right || right.type !== "single_quote_string" || typeof right.value !== "string") return false;
+    if (!left || left.type !== "column_ref" || typeof left.column !== "string" || (left.table && left.table !== qualifier)) return false;
     if (left.column === series!.date_column) {
-      if (!/^\d{4}-\d{2}-\d{2}$/u.test(right.value)) return false;
-      if (expr.operator === ">=" && !start) start = right.value;
-      else if (expr.operator === "<=" && !end) end = right.value;
-      else return false;
+      const bounds = exactCalendarDatePredicate(expr, series!.date_column, qualifier);
+      if (!bounds || (bounds.start && start) || (bounds.end && end)) return false;
+      if (bounds.start) start = bounds.start;
+      if (bounds.end) end = bounds.end;
       return true;
     }
+    if (!right || right.type !== "single_quote_string" || typeof right.value !== "string") return false;
     if (expr.operator !== "=" || !dimensions.has(left.column) || Object.hasOwn(equalities, left.column) || !/^[A-Za-z0-9_-]+$/u.test(right.value)) return false;
     equalities[left.column] = right.value;
     return true;
@@ -71,14 +72,21 @@ export function assessCoverage(
   const pinned = series.dimensions.every((dimension) => equalities[dimension]);
   const overall = classify(rows, series.date_column, series.metrics, series.predicted_column ?? null, series.prediction_values, series.prediction_mode, dates);
   const groups: CoverageGroup[] = [];
+  let groupDays = 0;
   if (!pinned) {
     for (const dimension of series.dimensions) {
       if (equalities[dimension]) continue;
-      const values = [...new Set(rows.map((row) => row[dimension]).filter((value) => value !== undefined && value !== null).map(String))];
-      if (values.length < 2) continue;
-      for (const value of values) {
-        const subset = classify(rows.filter((row) => String(row[dimension]) === value), series.date_column, series.metrics, series.predicted_column ?? null, series.prediction_values, series.prediction_mode, dates);
-        groups.push({ dimension, value, ...subset });
+      const values = new Map<string, Array<Record<string, unknown>>>();
+      for (const row of rows) {
+        const raw = row[dimension]; if (raw === undefined || raw === null) continue;
+        const value = String(raw); const subset = values.get(value) ?? [];
+        subset.push(row); values.set(value, subset);
+      }
+      if (values.size < 2) continue;
+      groupDays += values.size * dates.length;
+      if (groupDays > 100_000) return { ...empty("unknown", "覆盖分组和日期组合超过预算，未证明完整覆盖。"), ...overall };
+      for (const [value, subset] of values) {
+        groups.push({ dimension, value, ...classify(subset, series.date_column, series.metrics, series.predicted_column ?? null, series.prediction_values, series.prediction_mode, dates) });
       }
     }
     // Marginal coverage can look complete while each combination is missing
@@ -93,6 +101,8 @@ export function assessCoverage(
         group.push(row); combinations.set(key, group);
         if (combinations.size > 200) return { ...empty("unknown", "组合过多，未证明覆盖。"), ...overall };
       }
+      groupDays += combinations.size * dates.length;
+      if (groupDays > 100_000) return { ...empty("unknown", "覆盖分组和日期组合超过预算，未证明完整覆盖。"), ...overall };
       for (const [value, subset] of combinations) {
         groups.push({ dimension: free.join(","), value, ...classify(subset, series.date_column, series.metrics, series.predicted_column ?? null, series.prediction_values, series.prediction_mode, dates) });
       }
