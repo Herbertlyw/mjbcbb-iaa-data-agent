@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { transformResult, type ResultTable } from "../src/result-transform.js";
+import { RESULT_CALCULATION_MAX_ROWS, transformResult, type ResultTable, type TransformStep } from "../src/result-transform.js";
 import { alignAggregates } from "../src/result-alignment.js";
 import { computeArithmetic } from "../src/exact-arithmetic.js";
 import type { VerifiedAggregate } from "../src/aggregate-evidence.js";
@@ -72,4 +72,53 @@ test("分组全集保留缺侧和零分母，而非填零", () => {
   const row = (group: string, value: string): VerifiedAggregate => ({ source_resource_id: "synthetic", table: "synthetic", column: "metric", output_column: "total", operation: "sum", value, scale: 0, unit: "人", description: "合成数量", filters: { product: "A" }, group: { channel: group }, range: { start: "2026-01-01", end: "2026-01-01", timezone: "UTC" }, prediction: "actual_observed_only" });
   const result = alignAggregates([row("A", "5"), row("B", "4")], [row("A", "0"), row("C", "8")], ["channel"], "divide", computeArithmetic);
   assert.deepEqual(result?.map((item) => [item.group.channel, item.status, item.result?.value ?? null]), [["A", "zero_divisor", null], ["B", "missing_right", null], ["C", "missing_left", null]]);
+});
+
+test("超过预览页的完整结果参与多步变换，NULL、真实零与精确和分开", () => {
+  const data: ResultTable = {
+    columns: [
+      { name: "channel", type: "text", unit: "渠道", label: "渠道" },
+      { name: "amount", type: "decimal", unit: "USD", label: "金额", scale: 2 },
+    ],
+    // 401 rows deliberately exceed both the old limit of 200 and a 100-row page.
+    rows: Array.from({ length: 401 }, (_, index) => ({
+      channel: index % 2 ? "B" : "A",
+      amount: index === 0 ? "90071992547409.91" : index % 100 === 0 ? null : index % 2 ? "0.00" : "0.01",
+    })),
+  };
+  const result = transformResult(data, [
+    { op: "filter", column: "amount", comparison: "is_not_null" },
+    { op: "sort", keys: [{ column: "amount", direction: "desc", nulls: "last" }] },
+    { op: "group", by: ["channel"], aggregates: [{ op: "sum", column: "amount", as: "total" }, { op: "count_all", as: "n" }] },
+  ]);
+  assert.ok(result);
+  assert.deepEqual(result.rows.map((row) => ({ ...row })).sort((a, b) => String(a.channel).localeCompare(String(b.channel))), [
+    { channel: "A", total: "90071992547411.87", n: "197" },
+    { channel: "B", total: "0.00", n: "200" },
+  ]);
+});
+
+test("完整计算对行数、字节和步骤设硬边界，超过预算不以样本代替", () => {
+  const columns: ResultTable["columns"] = [{ name: "item", type: "text", unit: "维度", label: "项目" }];
+  const count: TransformStep[] = [{ op: "group", by: [], aggregates: [{ op: "count_all", as: "n" }] }];
+  const rows = Array.from({ length: RESULT_CALCULATION_MAX_ROWS }, () => ({ item: "x" }));
+  assert.equal(transformResult({ columns, rows }, [...count])?.rows[0]?.n, String(RESULT_CALCULATION_MAX_ROWS));
+  assert.equal(transformResult({ columns, rows: [...rows, { item: "x" }] }, [...count]), null);
+  const oversized = Array.from({ length: 8_000 }, () => ({ item: "x".repeat(255) }));
+  assert.equal(transformResult({ columns, rows: oversized }, [...count]), null);
+  const elevenSteps = Array.from({ length: 11 }, () => ({ op: "filter" as const, column: "item", comparison: "ne" as const, value: "y" }));
+  assert.equal(transformResult({ columns, rows: [{ item: "x" }] }, elevenSteps), null);
+});
+
+test("超过 200 个分组做全集对齐，缺侧与零除数仍有独立状态", () => {
+  const row = (group: string, value: string): VerifiedAggregate => ({ source_resource_id: "synthetic", table: "synthetic", column: "metric", output_column: "total", operation: "sum", value, scale: 0, unit: "人", description: "合成数量", filters: { product: "A" }, group: { channel: group }, range: { start: "2026-01-01", end: "2026-01-01", timezone: "UTC" }, prediction: "actual_observed_only" });
+  const left = Array.from({ length: 301 }, (_, i) => row(`G${String(i).padStart(3, "0")}`, "6"));
+  const right = Array.from({ length: 300 }, (_, i) => row(`G${String(i + 1).padStart(3, "0")}`, i === 0 ? "0" : "3"));
+  const result = alignAggregates(left, right, ["channel"], "divide", computeArithmetic);
+  assert.ok(result);
+  assert.equal(result.length, 301);
+  assert.equal(result[0]?.status, "missing_right");
+  assert.equal(result[1]?.status, "zero_divisor");
+  assert.equal(result[300]?.result?.value, "2.000000000000000000");
+  assert.equal(alignAggregates([...left, left[0]!], right, ["channel"], "divide", computeArithmetic), null, "重复组不能冒充完整对齐");
 });

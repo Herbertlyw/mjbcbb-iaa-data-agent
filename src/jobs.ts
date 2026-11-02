@@ -468,6 +468,16 @@ export class JobService {
     let error = agentError;
     const finalBeat = await this.stateCall("heartbeat", jobId, this.owner, fence, Date.now(), this.host.config.leaseMs);
     if (!finalBeat.ok) return;
+    // Restored tool receipts are history, not current authorization. Recheck
+    // the exact saved resources, knowledge and publication before committing.
+    if (analysis && !current.cancel_requested && !finalBeat.cancel_requested && !timedOut && !(agentError && hardFailure(agentError.code))) {
+      let valid = false;
+      try { valid = await this.host.tools.revalidateAnalysis(session.session_id, jobId, analysis); } catch { valid = false; }
+      if (!valid) {
+        analysis = null;
+        error = { code: "analysis_authority_changed", message: "候选证据、授权或来源已变化，未提交旧结论。" };
+      }
+    }
     if (current.cancel_requested || finalBeat.cancel_requested) {
       status = "cancelled";
       analysis = null;
@@ -475,6 +485,8 @@ export class JobService {
     } else if (timedOut) {
       status = "timed_out";
       error = { code: "job_timed_out", message: "任务执行超时。终态不会被再次运行；只有租约过期且尚未终态的任务才会被回收。" };
+    } else if (error?.code === "analysis_authority_changed") {
+      status = "failed";
     } else if (agentError && hardFailure(agentError.code)) {
       status = "failed";
       error = agentError;

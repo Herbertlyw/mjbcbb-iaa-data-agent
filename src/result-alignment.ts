@@ -1,5 +1,6 @@
 import { fromAggregate, type ArithmeticOp, type ArithmeticValue } from "./exact-arithmetic.js";
 import type { VerifiedAggregate } from "./aggregate-evidence.js";
+import { fitsResultCalculationBytes, RESULT_CALCULATION_MAX_ROWS } from "./result-transform.js";
 
 export interface AlignmentRef { resource_id: string; cell: string }
 export interface AlignmentSpec { op: ArithmeticOp; keys: string[]; left: AlignmentRef; right: AlignmentRef }
@@ -15,7 +16,7 @@ export interface AlignedRow {
  * group did not occur in that query result; it is never replaced by zero. */
 export function alignAggregates(left: VerifiedAggregate[], right: VerifiedAggregate[], keys: string[], op: ArithmeticOp, calculate: (op: ArithmeticOp, a: ArithmeticValue, b: ArithmeticValue) => ArithmeticValue | null): AlignedRow[] | null {
   if (!Array.isArray(keys) || !keys.length || keys.length > 3 || new Set(keys).size !== keys.length || keys.some((key) => typeof key !== "string" || !/^[a-z_][a-z0-9_]{0,63}$/u.test(key)) || !["add", "subtract", "multiply", "divide"].includes(op)) return null;
-  if (!left.length || !right.length || left.length > 200 || right.length > 200) return null;
+  if (!Array.isArray(left) || !Array.isArray(right) || !left.length || !right.length || left.length > RESULT_CALCULATION_MAX_ROWS || right.length > RESULT_CALCULATION_MAX_ROWS || !fitsResultCalculationBytes(left) || !fitsResultCalculationBytes(right)) return null;
   const names = [...keys].sort();
   function collect(values: VerifiedAggregate[]): Map<string, VerifiedAggregate> | null {
     const map = new Map<string, VerifiedAggregate>();
@@ -30,7 +31,7 @@ export function alignAggregates(left: VerifiedAggregate[], right: VerifiedAggreg
   const a = collect(left); const b = collect(right);
   if (!a || !b) return null;
   const groups = [...new Set([...a.keys(), ...b.keys()])].sort();
-  if (groups.length > 200) return null;
+  if (groups.length > RESULT_CALCULATION_MAX_ROWS) return null;
   const result: AlignedRow[] = [];
   for (const key of groups) {
     const values = JSON.parse(key) as string[];
@@ -45,5 +46,5 @@ export function alignAggregates(left: VerifiedAggregate[], right: VerifiedAggreg
     if (!computed) return null;
     result.push({ group, left: leftValue, right: rightValue, result: computed, status: computed.value === null ? "zero_divisor" : "matched" });
   }
-  return result;
+  return fitsResultCalculationBytes(result) ? result : null;
 }

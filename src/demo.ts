@@ -53,6 +53,7 @@ const HARBORLIGHT_QUESTIONS = [
   { id: "ratio", label: "收入／成本", text: "合成收入成本比：2026-10-08 美国 iOS 雾帆的收入除以成本。" },
   { id: "grouped-ratio", label: "多渠道比率", text: "合成多渠道收入成本比：按国家和渠道对齐 2026-10-08 收入与成本。" },
   { id: "alignment", label: "跨期分组变换", text: "合成分组对齐：按国家对照 2026-10-06 与 2026-10-08 的新增，并筛选、排序及求和下降组。" },
+  { id: "large-transform", label: "完整分页计算", text: "合成完整分页：统计 2026-10-06 纸灯 Android 雾帆各虚构地区的新增总数。" },
 ] as const;
 
 export function demoForScenario(harborlight: boolean, fixtureToday?: string) {

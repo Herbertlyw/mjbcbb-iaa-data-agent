@@ -312,9 +312,18 @@
           <p class="muted">${escapeHtml(source.engine || "本地合成库")} · ${escapeHtml(source.time_range.start)} 到 ${escapeHtml(source.time_range.end)} · ${escapeHtml(source.time_range.timezone)} · ${source.complete_population ? "结果未截断" : "源结果受限制，不是完整总体"} · 契约 ${Object.entries(source.contract_revisions || {}).map(([table, revision]) => `${escapeHtml(table)}@${escapeHtml(revision)}`).join(", ")}</p>
           ${source.execution_id || source.observed_at ? `<p class="muted">${source.execution_id ? `执行 ID：${escapeHtml(source.execution_id)}` : ""}${source.observed_at ? ` · 查询结果保存时间：${escapeHtml(source.observed_at)}` : ""}${source.data_capture_hash ? ` · 捕获内容指纹：${escapeHtml(source.data_capture_hash)}（不是不可变版本或签名）` : ""}</p>` : ""}
           <table><thead><tr>${head.map((key) => `<th>${escapeHtml(key)}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table>
+          ${source.evidence_eligible && head.length && source.returned_rows > Math.min(source.rows.length, 20) && analysis.resource_hashes?.[source.resource_id] ? `<p class="muted">已保存 ${escapeHtml(source.returned_rows)} 行；当前表格从前 ${Math.min(source.rows.length, 20)} 行开始展示。</p><button class="secondary resource-next" data-resource="${escapeHtml(source.resource_id)}" data-hash="${escapeHtml(analysis.resource_hashes[source.resource_id])}" data-offset="${Math.min(source.rows.length, 20)}">加载更多结果行</button>` : ""}
         </div>`;
       }).join("");
       const calcs = ""; // 已验证计算由服务端按契约渲染；不展示模型自选的单元格别名。
+      const record = analysis.analysis_declaration;
+      const modelNotes = record ? `<details class="source"><summary>模型工作记录（自报，未验证为事实）</summary>
+        <p>范围：${escapeHtml(record.declaration.scope || "未声明")}</p><p>粒度：${escapeHtml(record.declaration.grain || "未声明")}</p>
+        <p>预期分组：${escapeHtml((record.declaration.expected_group_keys || []).join("、") || "未声明")}</p>
+        <p>待解决问题：${escapeHtml((record.declaration.unresolved_questions || []).join("；") || "无")}</p>
+        <p>假设：${escapeHtml((record.declaration.assumptions || []).join("；") || "无")}</p>
+        ${(record.declaration.source_excerpts || []).map((item) => `<p>当前可读知识中的逐字摘录（不证明适用性）：${escapeHtml(item.asset_id)} · ${escapeHtml(item.quote)}</p>`).join("")}
+        ${(record.verified_cells || []).map((item) => `<p>已核对的保存结果单元（不代表完整总体）：${escapeHtml(item.field)} = ${escapeHtml(item.value === null ? "NULL" : item.value)} ${escapeHtml(item.unit)} · 行 ${escapeHtml(item.row)} · ${escapeHtml(item.resource_id)}</p>`).join("")}</details>` : "";
       resultEl.innerHTML = `
         <p class="muted">${escapeHtml(job.user_text)}</p>
         <p class="muted">模型 ${escapeHtml(job.model_id || "未记录")} · 档位 ${escapeHtml(job.reasoning || "未记录")}</p>
@@ -322,10 +331,27 @@
         ${job.error ? `<p>${escapeHtml(job.error.message)}</p>` : ""}
         <div class="answer">${escapeHtml(analysis.answer)}</div>
         <ul>${limits}</ul>
+        ${modelNotes}
         ${analysis.clarification_question ? `<p><strong>需要澄清：</strong>${escapeHtml(analysis.clarification_question)}</p>` : ""}
         ${["failed", "cancelled", "timed_out"].includes(job.status) ? `<button id="retry" class="secondary">用新的幂等键重试</button>` : ""}
         <div class="sources">${sources}${calcs}</div>`;
       document.querySelector("#retry")?.addEventListener("click", () => run(() => ask(job.user_text)));
+      for (const button of resultEl.querySelectorAll(".resource-next")) button.addEventListener("click", () => run(async () => {
+        button.disabled = true;
+        try {
+          const sessionId = state.sessionId; const jobId = state.jobId;
+          const params = new URLSearchParams({ offset: button.dataset.offset, limit: "50", resource_hash: button.dataset.hash });
+          const page = await apiJson(`/api/sessions/${encodeURIComponent(sessionId)}/resources/${encodeURIComponent(button.dataset.resource)}?${params}`);
+          if (state.sessionId !== sessionId || state.jobId !== jobId || !button.isConnected) return;
+          const table = button.closest(".source").querySelector("table");
+          const headings = [...table.querySelectorAll("thead th")].map((item) => item.textContent);
+          const rows = page.resource.rows.map((row) => `<tr>${headings.map((key) => `<td>${escapeHtml(row[key] === null ? "NULL" : row[key])}</td>`).join("")}</tr>`).join("");
+          table.querySelector("tbody").insertAdjacentHTML("beforeend", rows);
+          if (page.has_more) button.dataset.offset = String(page.next_row_offset);
+          else button.textContent = "已显示全部保存行";
+          button.disabled = !page.has_more;
+        } catch (error) { button.disabled = false; throw error; }
+      }));
     }
 
     function listen(jobId) {

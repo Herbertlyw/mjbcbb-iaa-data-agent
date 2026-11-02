@@ -192,6 +192,8 @@ export interface CoverageReport {
   actual_dates: string[];
   unknown_prediction_dates: string[];
   groups: CoverageGroup[];
+  groups_total?: number;
+  groups_has_more?: boolean;
   /** Digest of the bounded coverage observation, not a database snapshot. */
   observation_hash?: string;
   per_table?: CoverageReport[];
@@ -327,6 +329,7 @@ export interface AnalysisSource {
   coverage: CoverageReport;
   freshness_receipts: FreshnessReceipt[];
   evidence_eligible?: boolean;
+  preview_has_more?: boolean;
 }
 
 export interface AnalysisRecord {
@@ -338,6 +341,7 @@ export interface AnalysisRecord {
   limitations: string[];
   clarification_question: string | null;
   citations: Array<{ resource_id: string; note: string }>;
+  resource_hashes?: Record<string, string>;
   sources: AnalysisSource[];
   calculations: Array<{
     resource_id: string;
@@ -351,9 +355,17 @@ export interface AnalysisRecord {
   comparisons?: import("./evidence-comparison.js").VerifiedComparison[];
   aggregate_comparisons?: import("./aggregate-comparison.js").AggregateComparison[];
   arithmetic_results?: Array<{ resource_id: string; operation: import("./exact-arithmetic.js").ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef; result: import("./exact-arithmetic.js").ArithmeticValue }>;
-  transform_results?: Array<{ resource_id: string; source_resource_id: string; steps: import("./result-transform.js").TransformStep[]; result: import("./result-transform.js").ResultTable }>;
-  alignment_results?: Array<{ resource_id: string; spec: import("./result-alignment.js").AlignmentSpec; rows: import("./result-alignment.js").AlignedRow[] }>;
+  transform_results?: Array<{ resource_id: string; source_resource_id: string; steps: import("./result-transform.js").TransformStep[]; result: import("./result-transform.js").ResultTable; total_rows?: number; preview_has_more?: boolean }>;
+  alignment_results?: Array<{ resource_id: string; spec: import("./result-alignment.js").AlignmentSpec; rows: import("./result-alignment.js").AlignedRow[]; total_rows?: number; preview_has_more?: boolean }>;
   aggregates?: import("./aggregate-evidence.js").VerifiedAggregate[];
+  aggregate_total?: number;
+  aggregates_has_more?: boolean;
+  analysis_declaration?: {
+    provenance: "model_declared";
+    declaration: import("./analysis-declaration.js").AnalysisDeclaration;
+    excerpts_checked: number;
+    verified_cells: Array<{ resource_id: string; execution_id: string; row: number; column: string; field: string; unit: string; value: string | boolean | null }>;
+  };
   model_suggested_status: string;
   model_draft: string;
   server_reasons: string[];

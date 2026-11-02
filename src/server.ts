@@ -84,7 +84,7 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
           title: session.title,
           role: session.role,
           created_at: session.created_at,
-          jobs: (await stateCall(runtime, "listJobs", session.session_id)).map(publicJob),
+          jobs: await Promise.all((await stateCall(runtime, "listJobs", session.session_id)).map((job) => publicJob(runtime, job))),
         }))),
       });
       return;
@@ -106,8 +106,19 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
         role: session.role,
         created_at: session.created_at,
         slots: session.slots,
-        jobs: (await stateCall(runtime, "listJobs", session.session_id)).map(publicJob),
+        jobs: await Promise.all((await stateCall(runtime, "listJobs", session.session_id)).map((job) => publicJob(runtime, job))),
       });
+      return;
+    }
+    const resourceMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/resources\/([^/]+)$/u);
+    if (method === "GET" && resourceMatch?.[1] && resourceMatch[2]) {
+      const session = await ownedSession(runtime, req, decodeURIComponent(resourceMatch[1]));
+      const offset = Number(url.searchParams.get("offset") ?? "0");
+      const limit = Number(url.searchParams.get("limit") ?? "50");
+      const expected = url.searchParams.get("resource_hash") ?? undefined;
+      const page = await runtime.tools.readSessionResource(session.session_id, { resource_id: decodeURIComponent(resourceMatch[2]), row_offset: offset, row_limit: limit, expected_resource_hash: expected });
+      if (!page.ok) { send(res, 400, { error: { code: page.code, message: page.message } }); return; }
+      send(res, 200, page);
       return;
     }
     const messageMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/messages$/u);
@@ -121,7 +132,7 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
       const job = runtime.config.stateMode === "mysql"
         ? await runtime.jobs.submitAsync(await runtime.mysqlAsyncState(), session, stringField(body, "text"), stringField(body, "idempotency_key"), selection)
         : runtime.jobs.submit(session.session_id, stringField(body, "text"), stringField(body, "idempotency_key"), selection);
-      send(res, 202, publicJob(job));
+      send(res, 202, await publicJob(runtime, job));
       return;
     }
     const payloadMatch = url.pathname.match(/^\/api\/sessions\/([^/]+)\/provider-payloads\/([^/]+)$/u);
@@ -153,7 +164,7 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
     if (method === "GET" && jobMatch?.[1]) {
       const job = await requireJob(runtime, decodeURIComponent(jobMatch[1]));
       await ownedSession(runtime, req, job.session_id);
-      send(res, 200, publicJob(job));
+      send(res, 200, await publicJob(runtime, job));
       return;
     }
     const cancelMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/cancel$/u);
@@ -162,7 +173,7 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
       await ownedSession(runtime, req, existing.session_id);
       const cancelled = await stateCall(runtime, "requestCancel", existing.job_id);
       runtime.jobs.abortLocal(existing.job_id);
-      send(res, 200, publicJob(cancelled));
+      send(res, 200, await publicJob(runtime, cancelled));
       return;
     }
     const eventMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/events$/u);
@@ -263,7 +274,9 @@ function streamEvents(runtime: Runtime, jobId: string, url: URL, req: IncomingMe
   res.on("close", close);
 }
 
-function publicJob(job: JobRecord) {
+async function publicJob(runtime: Runtime, job: JobRecord) {
+  const candidate = ["failed", "timed_out", "cancelled"].includes(job.status) ? null : job.analysis;
+  const readable = !candidate || await runtime.tools.canReadStoredAnalysis(job.session_id, candidate);
   return {
     job_id: job.job_id,
     session_id: job.session_id,
@@ -275,8 +288,8 @@ function publicJob(job: JobRecord) {
     version: job.version,
     // Historic records are not rewritten. Do not present an old candidate as
     // a delivered answer when its task ultimately failed, timed out or cancelled.
-    analysis: ["failed", "timed_out", "cancelled"].includes(job.status) ? null : job.analysis,
-    error: job.error,
+    analysis: readable ? candidate : null,
+    error: readable ? job.error : { code: "analysis_access_changed", message: "当前权限或契约已变化，历史分析暂不可显示；保存的记录没有被删除。" },
     usage: job.usage ?? null,
     model_id: job.model_id ?? null,
     reasoning: job.reasoning ?? null,

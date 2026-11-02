@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isAnalysisDeclaration, type AnalysisDeclaration } from "./analysis-declaration.js";
 import { currentCalendarDate, type AppConfig } from "./config.js";
 import { assessCoverage, combineCoverage, coverageHasGap, provenCoverageFilters, unknownCoverage } from "./coverage.js";
 import { plainRows } from "./database.js";
@@ -9,11 +10,11 @@ import { computeArithmetic, fromAggregate, sumDecimalStrings, type ArithmeticOp,
 import { verifyDecimalCell, type VerifiedDecimalCell } from "./decimal-cell-evidence.js";
 import { verifyDatabaseAggregates, type VerifiedAggregate } from "./aggregate-evidence.js";
 import { joinDimensionObservations, prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema, type JoinEvidencePlan, type VerifiedJoinValue } from "./join-evidence.js";
-import { transformResult, type ResultColumn, type ResultTable, type ResultValue, type TransformStep } from "./result-transform.js";
+import { fitsResultCalculationBytes, RESULT_CALCULATION_MAX_ROWS, RESULT_CALCULATION_MAX_BYTES, transformResult, type ResultColumn, type ResultTable, type ResultValue, type TransformStep } from "./result-transform.js";
 import { alignAggregates, type AlignedRow, type AlignmentSpec } from "./result-alignment.js";
 import { dimensionSnapshotMatches, freshnessManifest, freshnessPeriodKey, matchesFreshnessManifest, readPublication, type FreshnessPublication } from "./freshness.js";
 import type { MysqlFreshnessStore } from "./mysql-freshness.js";
-import { canQueryTable, canRead, contractValidity, tableGrain } from "./knowledge.js";
+import { canQueryTable, canRead, contractValidity, tableGrain, validateKnowledgeSources } from "./knowledge.js";
 import { newId, type SessionRecord, type SessionStore } from "./session.js";
 import type {
   AnalysisRecord,
@@ -22,6 +23,7 @@ import type {
   ArithmeticRef,
   ArithmeticResource,
   CalculationResource,
+  CoverageReport,
   ContractBinding,
   DataContract,
   FreshnessReceipt,
@@ -50,6 +52,29 @@ type ToolResult = ToolFailure | { ok: true; [key: string]: unknown };
 type PrivateJoinProof = { rows: Array<Record<string, unknown>>; column_types: Record<string, string>; capture_hash: string };
 type JoinQueryResource = QueryResource & { join_proof?: PrivateJoinProof };
 
+/** Full coverage stays in the resource; model/API responses receive a bounded
+ * preview with an explicit count, never a claim that omitted groups are absent. */
+function coveragePreview(report: CoverageReport): CoverageReport {
+  const groups: CoverageReport["groups"] = []; let bytes = 0;
+  for (const group of report.groups.slice(0, 20)) {
+    const size = Buffer.byteLength(JSON.stringify(group));
+    if (bytes + size > 8000) break;
+    groups.push(group); bytes += size;
+  }
+  return { ...report, groups, groups_total: report.groups.length, groups_has_more: report.groups.length > groups.length, ...(report.per_table ? { per_table: report.per_table.map(coveragePreview) } : {}) };
+}
+
+/** Keep response payloads bounded independently of the saved result budget. */
+function previewRows<T>(rows: T[], limit: number): T[] {
+  const preview: T[] = []; let bytes = 2;
+  for (const row of rows.slice(0, limit)) {
+    const size = Buffer.byteLength(JSON.stringify(row)) + 1;
+    if (bytes + size > 32_000) break;
+    preview.push(row); bytes += size;
+  }
+  return preview;
+}
+
 export class ToolService {
   private readonly assetBytesRead = new Map<string, number>();
   private readonly configuredScanLimit: number;
@@ -64,6 +89,7 @@ export class ToolService {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
     const session = await this.ctx.sessions.requireAsync(sessionId);
+    if (!await validateKnowledgeSources(this.ctx.knowledge, this.ctx.knowledge.assets.filter((asset) => asset.status === "published" && asset.discoverable && canRead(this.ctx.knowledge, session.role, asset.asset_id)).map((asset) => asset.asset_id))) return fail("knowledge_source_changed", "知识目录或可读资产已变化，请重新加载后再检索。");
     const query = (input.query ?? "").trim().toLowerCase();
     const kinds = new Set(input.kinds ?? []);
     const offset = input.offset ?? 0; const limit = input.limit ?? 50;
@@ -297,6 +323,7 @@ export class ToolService {
       throw error;
     }
     const bindings = guarded.tables.map((table) => this.queryableBinding(session, table));
+    if (!await validateKnowledgeSources(this.ctx.knowledge, bindings.map((binding) => binding.asset_id))) return fail("knowledge_source_changed", "权限、连接规则或本次契约文件已变化，请重新加载并绑定。");
     const timezones = new Set(bindings.map((binding) => binding.timezone));
     if (timezones.size !== 1) return fail("timezone_conflict", "一张查询里的契约时区不一致");
     const revisions = new Set(bindings.map((binding) => binding.registry_revision));
@@ -412,6 +439,7 @@ export class ToolService {
       if (signal?.aborted) return fail("query_cancelled", "查询已取消");
       return fail("coverage_query_failed", "覆盖统计无法完成，查询结果没有保存。");
     }
+    if (Buffer.byteLength(JSON.stringify(coverage)) > 500_000) coverage = unknownCoverage("覆盖回执超过保存预算，未证明完整覆盖。");
     // Coverage can itself be a separate database query. It must be included in
     // the freshness interval, rather than checking only the first SELECT.
     const afterCoverage = await this.currentFreshness();
@@ -468,6 +496,7 @@ export class ToolService {
     };
     await this.ctx.sessions.saveResourceAsync(resource);
     const resourceHash = createHash("sha256").update(JSON.stringify(resource)).digest("hex");
+    const preview = previewRows(resource.rows, previewLimit);
     return {
       ok: true,
       resource_id: resource.resource_id,
@@ -492,11 +521,11 @@ export class ToolService {
       column_types: resource.column_types ?? null,
       elapsed_ms: resource.elapsed_ms,
       columns: resource.columns,
-      rows: resource.rows.slice(0, previewLimit),
+      rows: preview,
       resource_hash: resourceHash,
-      preview_has_more: previewLimit < resource.rows.length,
-      next_row_offset: previewLimit < resource.rows.length ? previewLimit : null,
-      coverage: resource.coverage,
+      preview_has_more: preview.length < resource.rows.length,
+      next_row_offset: preview.length < resource.rows.length ? preview.length : null,
+      coverage: coveragePreview(resource.coverage),
       freshness_receipts: resource.freshness_receipts,
       notice: truncated || sqlLimited ? `源结果受截断或 SQL LIMIT 约束，不能当作完整总体。resource_id=${resource.resource_id}` : `结果来自本地合成 ${resource.engine}。预览与保存资源分页分开。resource_id=${resource.resource_id}`,
     };
@@ -509,6 +538,14 @@ export class ToolService {
   ): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
+    if (!await validateKnowledgeSources(this.ctx.knowledge)) return fail("knowledge_source_changed", "权限或知识目录已变化，请重新加载。");
+    const references = input.align ? [input.align.left?.resource_id, input.align.right?.resource_id] : input.transform ? [input.transform.resource_id] : input.arithmetic ? [input.arithmetic.left?.resource_id, input.arithmetic.right?.resource_id] : [input.resource_id];
+    for (const id of references) {
+      if (typeof id !== "string") continue;
+      const resource = await this.ctx.sessions.lookupResourceAsync(sessionId, id);
+      if (!resource.ok) return fail(resource.code, resource.message);
+      if (!await this.resourceReadable(sessionId, resource.resource, new Set())) return fail("resource_authorization_changed", "资源引用的授权、契约或来源发生变化，不能继续读取或计算。");
+    }
     if (input.align) {
       if (input.transform || input.arithmetic || input.resource_id || input.operations) return fail("invalid_alignment", "分组对齐须单独提交。");
       return this.calculateAlignment(sessionId, input.align);
@@ -615,12 +652,13 @@ export class ToolService {
     if (!fresh.ok) return fresh;
     if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
     const inputTable = await this.resolveTransform(session, jobId, input.resource_id, fresh.publication, new Set());
-    if (!inputTable) return fail("transform_lineage_unsupported", "输入必须为当前任务完整、可验证的查询或变换资源。");
+    if (!inputTable) return fail("transform_lineage_unsupported", `输入必须为当前任务完整、可验证的查询或变换资源；计算上限为 ${RESULT_CALCULATION_MAX_ROWS} 行和 ${RESULT_CALCULATION_MAX_BYTES} 字节。`);
     const result = transformResult(inputTable.table, input.steps);
     if (!result) return fail("invalid_transform", "变换参数、类型、单位或资源边界不受支持。");
     const resource: TransformResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "transform", created_at: new Date().toISOString(), source_resource_id: input.resource_id, steps: input.steps, input_hashes: inputTable.hashes, result, input_truncated: false, complete_population: true };
     await this.ctx.sessions.saveResourceAsync(resource);
-    return { ok: true, resource_id: resource.resource_id, result, dependencies: Object.keys(resource.input_hashes), notice: `变换仅应用于完整已保存结果；正式交付时递归复核来源。resource_id=${resource.resource_id}` };
+    const preview = previewRows(result.rows, 100);
+    return { ok: true, resource_id: resource.resource_id, result: { ...result, rows: preview }, result_total_rows: result.rows.length, result_has_more: result.rows.length > preview.length, dependencies: Object.keys(resource.input_hashes), notice: `变换应用于完整已保存结果；预览限 100 行及 32 KB，可使用 read_session_resource 续读。正式交付时递归复核来源。resource_id=${resource.resource_id}` };
   }
 
   private async calculateAlignment(sessionId: string, spec: AlignmentSpec): Promise<ToolResult> {
@@ -633,7 +671,8 @@ export class ToolService {
     if (!checked) return fail("alignment_lineage_unsupported", "分组、指标口径、范围或完整来源无法证明。");
     const resource: AlignmentResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "alignment", created_at: new Date().toISOString(), spec, input_hashes: checked.hashes, rows: checked.rows, input_truncated: false, complete_population: true };
     await this.ctx.sessions.saveResourceAsync(resource);
-    return { ok: true, resource_id: resource.resource_id, rows: checked.rows, dependencies: Object.keys(checked.hashes), notice: `按完整结果的分组键全集对齐；某侧未出现的组不补零。resource_id=${resource.resource_id}` };
+    const preview = previewRows(checked.rows, 100);
+    return { ok: true, resource_id: resource.resource_id, rows: preview, result_total_rows: checked.rows.length, result_has_more: checked.rows.length > preview.length, dependencies: Object.keys(checked.hashes), notice: `按完整结果的分组键全集对齐；预览限 100 行及 32 KB，某侧未出现的组不补零。resource_id=${resource.resource_id}` };
   }
 
   private async resolveAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[] } | null> {
@@ -679,7 +718,7 @@ export class ToolService {
           const result = page.resource as QueryResource;
           if (result.job_id !== jobId || !Array.isArray(result.rows) || result.rows.length > 100) return null;
           rows.push(...result.rows);
-          if (rows.length > 200) return null;
+          if (rows.length > RESULT_CALCULATION_MAX_ROWS) return null;
           const next = page.next_row_offset;
           if (!page.has_more) break;
           if (!Number.isInteger(next) || (next as number) !== offset + result.rows.length || !result.rows.length) return null;
@@ -798,6 +837,7 @@ export class ToolService {
     if (cancelled) return cancelled;
     const found = await this.ctx.sessions.lookupResourceAsync(sessionId, input.resource_id ?? "");
     if (!found.ok) return fail(found.code, found.message);
+    if (!await this.resourceReadable(sessionId, found.resource, new Set())) return fail("resource_authorization_changed", "资源引用的授权、契约或来源发生变化，不能继续读取。");
     const hash = createHash("sha256").update(JSON.stringify(found.resource)).digest("hex");
     const offset = input.row_offset ?? 0;
     const limit = input.row_limit ?? 50;
@@ -807,14 +847,16 @@ export class ToolService {
       const resource = found.resource; const available = resource.result.columns.map((column) => column.name);
       const selected = input.columns ?? available;
       if (offset > resource.result.rows.length || !Array.isArray(selected) || selected.some((name) => typeof name !== "string" || !available.includes(name)) || new Set(selected).size !== selected.length) return fail("invalid_resource_page", "行偏移或列选择不合法。");
-      const rows = resource.result.rows.slice(offset, offset + limit).map((row) => Object.fromEntries(selected.map((name) => [name, row[name]])));
+      const rows = previewRows(resource.result.rows.slice(offset, offset + limit).map((row) => Object.fromEntries(selected.map((name) => [name, row[name]]))), limit);
+      if (!rows.length && offset < resource.result.rows.length) return fail("resource_page_byte_limit", "单行超过页面字节上限，请选择较少字段。");
       const next = offset + rows.length;
       return { ok: true, resource: { ...resource, result: { columns: resource.result.columns.filter((column) => selected.includes(column.name)), rows } }, resource_hash: hash, has_more: next < resource.result.rows.length, next_row_offset: next < resource.result.rows.length ? next : null, resource_truncated: false };
     }
     if (found.resource.kind === "alignment") {
       const resource = found.resource;
       if (input.columns || offset > resource.rows.length) return fail("invalid_resource_page", "对齐结果仅支持行分页。");
-      const rows = resource.rows.slice(offset, offset + limit); const next = offset + rows.length;
+      const rows = previewRows(resource.rows.slice(offset, offset + limit), limit); const next = offset + rows.length;
+      if (!rows.length && offset < resource.rows.length) return fail("resource_page_byte_limit", "单行超过页面字节上限。");
       return { ok: true, resource: { ...resource, rows }, resource_hash: hash, has_more: next < resource.rows.length, next_row_offset: next < resource.rows.length ? next : null, resource_truncated: false };
     }
     if (found.resource.kind !== "query_result") {
@@ -825,12 +867,13 @@ export class ToolService {
     if (offset > source.rows.length) return fail("invalid_resource_page", "行偏移超出已保存的结果。");
     const columns = input.columns ?? source.columns;
     if (!Array.isArray(columns) || columns.some((column) => typeof column !== "string" || !source.columns.includes(column)) || new Set(columns).size !== columns.length) return fail("invalid_resource_columns", "只能选择资源中已有且不重复的列。");
-    const rows = source.rows.slice(offset, offset + limit).map((row) => Object.fromEntries(columns.map((column) => [column, row[column]])));
+    const rows = previewRows(source.rows.slice(offset, offset + limit).map((row) => Object.fromEntries(columns.map((column) => [column, row[column]]))), limit);
+    if (!rows.length && offset < source.rows.length) return fail("resource_page_byte_limit", "单行超过页面字节上限，请选择较少字段。");
     const next = offset + rows.length;
     const { join_proof: _privateProof, ...publicSource } = source;
     return {
       ok: true,
-      resource: { ...publicSource, columns, rows },
+      resource: { ...publicSource, columns, rows, coverage: coveragePreview(publicSource.coverage) },
       resource_hash: hash,
       row_offset: offset,
       row_limit: limit,
@@ -845,6 +888,8 @@ export class ToolService {
   async updateAnalysis(sessionId: string, input: AnalysisInput, signal?: AbortSignal): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
+    if (input.declaration !== undefined && !isAnalysisDeclaration(input.declaration)) return fail("invalid_analysis_declaration", "分析工作记录格式或长度不合法。");
+    if (typeof input.draft_answer !== "string" || input.draft_answer.length > 32_000 || !Array.isArray(input.resource_ids ?? []) || (input.resource_ids?.length ?? 0) > 40 || input.resource_ids?.some((id) => typeof id !== "string" || id.length > 128) || (input.clarification_question !== undefined && (typeof input.clarification_question !== "string" || input.clarification_question.length > 2000))) return fail("analysis_input_limit", "分析草稿或资源引用超过上限。");
     const session = await this.ctx.sessions.requireAsync(sessionId);
     const jobId = session.active_job_id ?? "";
     const citations: AnalysisRecord["citations"] = [];
@@ -896,6 +941,14 @@ export class ToolService {
         });
       }
     }
+    const declaredExcerptIds = input.declaration?.source_excerpts?.map((item) => item.asset_id) ?? [];
+    for (const assetId of declaredExcerptIds) {
+      const allowed = await this.authorizeRead(sessionId, assetId);
+      if (!allowed.ok) return fail("analysis_declaration_source_invalid", "工作记录引用的知识来源不可读取或已变化。");
+    }
+    const contractIds = resources.filter((item): item is QueryResource => item.kind === "query_result").flatMap((item) => Object.keys(item.asset_hashes));
+    if (contractIds.some((assetId) => !canRead(this.ctx.knowledge, session.role, assetId))) return fail("analysis_declaration_source_invalid", "当前主体不能读取引用的契约，旧证据不能交付。");
+    if (!await validateKnowledgeSources(this.ctx.knowledge, [...contractIds, ...declaredExcerptIds])) return fail("knowledge_source_changed", "权限或引用的契约、知识文件已变化；旧证据不能交付。");
     const claimsNumbers = input.suggested_status === "completed" || input.suggested_status === "partial";
     const verifiedQueries = sources.filter((source) => source.sql && source.freshness_receipts.length > 0);
     if (claimsNumbers && !input.clarification_question && verifiedQueries.length === 0) {
@@ -916,6 +969,7 @@ export class ToolService {
         limitations: ["没有可引用的成功查询。", "数据来自本地合成库，不是生产数据。"],
         clarification_question: null,
         citations,
+        resource_hashes: Object.fromEntries(resources.map((resource) => [resource.resource_id, createHash("sha256").update(JSON.stringify(resource)).digest("hex")])),
         sources,
         calculations,
         model_suggested_status: input.suggested_status,
@@ -930,6 +984,10 @@ export class ToolService {
     if (input.clarification_question) {
       status = "needs_clarification";
       reasons.push("clarification_requested");
+    }
+    if (input.declaration?.unresolved_questions.length && status === "completed") {
+      status = "partial";
+      reasons.push("model_declared_unresolved");
     }
     if ((status === "completed" || status === "partial") && sources.length === 0) {
       status = input.clarification_question ? "needs_clarification" : "failed";
@@ -959,7 +1017,8 @@ export class ToolService {
         source.coverage = joinCoverage(joined.plan, (original as JoinQueryResource).join_proof!.rows);
         source.rows = [];
         eligible.add(source.resource_id);
-        joinLines.push(...joined.values.map((value) => renderVerifiedJoin(value, source.resource_id)));
+        joinLines.push(...joined.values.slice(0, 100).map((value) => renderVerifiedJoin(value, source.resource_id)));
+        if (joined.values.length > 100) joinLines.push(`JOIN 验证了 ${joined.values.length} 个分组，此处展示前 100 个；其余分组保存在当前结果资源中。`);
         continue;
       }
       source.evidence_eligible = Boolean(currentContract && currentFresh && (shape || databaseAggregates) && !source.truncated && source.complete_population);
@@ -993,6 +1052,24 @@ export class ToolService {
         if (status === "completed") status = "partial";
         reasons.push("completeness_gap");
       }
+    }
+    let analysisDeclaration: AnalysisRecord["analysis_declaration"];
+    if (input.declaration) {
+      for (const excerpt of input.declaration.source_excerpts ?? []) {
+        const asset = this.ctx.knowledge.by_id.get(excerpt.asset_id);
+        if (!asset || asset.content_hash !== excerpt.content_hash || !asset.body.includes(excerpt.quote)) return fail("analysis_declaration_source_invalid", "工作记录摘录与当前可读的知识版本不一致。");
+      }
+      const cells: NonNullable<AnalysisRecord["analysis_declaration"]>["verified_cells"] = [];
+      for (const ref of input.declaration.result_cells ?? []) {
+        const source = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === ref.resource_id);
+        const contract = source && source.tables.length === 1 ? this.ctx.knowledge.contract_by_table.get(source.tables[0]!)?.contract : undefined;
+        const table = source && contract && eligible.has(source.resource_id) && source.execution_id === ref.execution_id ? rawResultTable(source, contract) : null;
+        const column = table?.columns.find((item) => item.name === ref.column);
+        const row = table?.rows[ref.row];
+        if (!source || !table || !column || !row || !Object.hasOwn(row, ref.column)) return fail("analysis_declaration_cell_invalid", "工作记录的结果引用不可验证：必须是当前任务、当前执行号的完整授权直接投影。");
+        cells.push({ ...ref, field: column.label, unit: column.unit, value: row[ref.column]! });
+      }
+      analysisDeclaration = { provenance: "model_declared", declaration: structuredClone(input.declaration), excerpts_checked: input.declaration.source_excerpts?.length ?? 0, verified_cells: cells };
     }
     // A shared publication is not a ClickHouse snapshot. Detect observed
     // contradictions for the same table and coverage population rather than
@@ -1099,7 +1176,8 @@ export class ToolService {
       }
       if (checked.partial) { reasons.push(checked.partial_reason ?? "transform_coverage_incomplete"); if (status === "completed") status = "partial"; }
       noteUnprovenSnapshot(checked.leaves);
-      transformResults.push({ resource_id: resource.resource_id, source_resource_id: resource.source_resource_id, steps: resource.steps, result: checked.table });
+      const preview = previewRows(checked.table.rows, 100);
+      transformResults.push({ resource_id: resource.resource_id, source_resource_id: resource.source_resource_id, steps: resource.steps, result: { ...checked.table, rows: preview }, total_rows: checked.table.rows.length, preview_has_more: checked.table.rows.length > preview.length });
       transformLines.push(...renderTransform(resource, source.table, checked.table));
     }
     const alignmentResults: NonNullable<AnalysisRecord["alignment_results"]> = [];
@@ -1114,7 +1192,8 @@ export class ToolService {
       }
       if (checked.rows.some((row) => row.status !== "matched")) { reasons.push("alignment_incomplete"); if (status === "completed") status = "partial"; }
       noteUnprovenSnapshot(checked.leaves);
-      alignmentResults.push({ resource_id: resource.resource_id, spec: resource.spec, rows: checked.rows });
+      const preview = previewRows(checked.rows, 100);
+      alignmentResults.push({ resource_id: resource.resource_id, spec: resource.spec, rows: preview, total_rows: checked.rows.length, preview_has_more: checked.rows.length > preview.length });
       alignmentLines.push(...renderAlignment(resource, checked.rows));
     }
     if (verified.some((cell) => cell.precision === "floating_point_approximate")) {
@@ -1127,6 +1206,7 @@ export class ToolService {
     if (reasons.includes("calculation_lineage_unsupported") && status === "completed") status = "partial";
     if (input.suggested_status === "completed" && status !== "completed") reasons.push("model_completion_was_not_authoritative");
     const limitations: string[] = [];
+    if (reasons.includes("model_declared_unresolved")) limitations.push("模型工作记录仍有待解决问题；其范围、粒度和假设均为自报，不作为已验证事实。");
     if (input.findings?.length || input.limitations?.length) limitations.push("模型提供的标签、分组、单位、状态和自由文字未作为事实采用；数值与范围由服务端元数据生成。");
     if (reasons.includes("calculation_lineage_unsupported") || reasons.includes("query_lineage_unsupported")) limitations.push("部分表达式或计算缺少可证明的血缘，没有作为已验证数值展示。");
     if (reasons.includes("comparison_unverifiable")) limitations.push("部分比较的范围、覆盖、单位、预测状态或整数精度无法证明，没有展示比较结果。");
@@ -1148,7 +1228,8 @@ export class ToolService {
     if (aggregates.some((item) => Object.keys(item.group).length)) limitations.push("分组只展示查询中出现的取值，未出现的组合没有补零。");
     if (joinLines.length) limitations.push("JOIN 分组只证明实际匹配键在本次查询捕获数据中没有放大；未出现的分组未补零，跨表不具备原子快照。");
     limitations.push("数据来自本地合成库，不是生产数据。");
-    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...verifiedDecimal.map(renderDecimalCell), ...comparisons.map(renderComparison), ...aggregates.map(renderAggregate), ...aggregateComparisons.map(renderAggregateComparison), ...arithmeticResults.map(renderArithmetic), ...transformLines];
+    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...verifiedDecimal.map(renderDecimalCell), ...comparisons.map(renderComparison), ...aggregates.slice(0, 100).map(renderAggregate), ...aggregateComparisons.map(renderAggregateComparison), ...arithmeticResults.map(renderArithmetic), ...transformLines];
+    if (aggregates.length > 100) derivedLines.push(`已验证聚合共 ${aggregates.length} 个，此处展示前 100 个；其余结果保存在当前查询资源中。`);
     derivedLines.push(...alignmentLines);
     if (reasons.includes("clickhouse_observation_nonatomic")) derivedLines.push("结果基于各次 ClickHouse 观测；查询和覆盖统计不是同一原子快照，未证明共同数据版本。");
     if (reasons.includes("coverage_observations_conflict")) derivedLines.push("相同范围的覆盖观测内容发生变化，跨次计算结果不能作为一致数据集的完整结论。");
@@ -1169,14 +1250,18 @@ export class ToolService {
       limitations: unique(limitations),
       clarification_question: input.clarification_question ?? null,
       citations,
-      sources,
+      resource_hashes: Object.fromEntries(resources.map((resource) => [resource.resource_id, createHash("sha256").update(JSON.stringify(resource)).digest("hex")])),
+      sources: sources.map((source) => { const preview = previewRows(source.rows, 100); return { ...source, rows: preview, preview_has_more: source.rows.length > preview.length, coverage: coveragePreview(source.coverage) }; }),
       calculations,
       comparisons,
       aggregate_comparisons: aggregateComparisons,
       arithmetic_results: arithmeticResults,
       transform_results: transformResults,
       alignment_results: alignmentResults,
-      aggregates,
+      aggregates: aggregates.slice(0, 100),
+      aggregate_total: aggregates.length,
+      aggregates_has_more: aggregates.length > 100,
+      ...(analysisDeclaration ? { analysis_declaration: analysisDeclaration } : {}),
       model_suggested_status: input.suggested_status,
       model_draft: input.draft_answer,
       server_reasons: unique(reasons),
@@ -1271,7 +1356,80 @@ export class ToolService {
     if (!canRead(this.ctx.knowledge, session.role, assetId)) {
       return fail("asset_not_authorized", "当前角色不能读取这个资产", { asset_id: assetId });
     }
+    if (!await validateKnowledgeSources(this.ctx.knowledge, [assetId])) return fail("knowledge_source_changed", "知识来源或权限已变化，请重新加载。", { asset_id: assetId });
     return { ok: true, asset };
+  }
+
+  /** Before terminal commit, including after a restored Pi receipt, recheck
+   * current authority and exact saved resources instead of trusting the old
+   * tool response or model-provided notes. */
+  async revalidateAnalysis(sessionId: string, jobId: string, analysis: AnalysisRecord): Promise<boolean> {
+    if (analysis.session_id !== sessionId || analysis.job_id !== jobId || !Array.isArray(analysis.citations) || !Array.isArray(analysis.sources) || !analysis.resource_hashes || !await validateKnowledgeSources(this.ctx.knowledge)) return false;
+    const session = await this.ctx.sessions.requireAsync(sessionId);
+    for (const citation of analysis.citations) {
+      const found = await this.ctx.sessions.lookupResourceAsync(sessionId, citation.resource_id);
+      if (!found.ok || found.resource.job_id !== jobId || analysis.resource_hashes[citation.resource_id] !== createHash("sha256").update(JSON.stringify(found.resource)).digest("hex") || !await this.resourceReadable(sessionId, found.resource, new Set())) return false;
+    }
+    const excerpts = analysis.analysis_declaration?.declaration.source_excerpts ?? [];
+    for (const excerpt of excerpts) {
+      const asset = this.ctx.knowledge.by_id.get(excerpt.asset_id);
+      if (!asset || !canRead(this.ctx.knowledge, session.role, excerpt.asset_id) || asset.content_hash !== excerpt.content_hash || !asset.body.includes(excerpt.quote)) return false;
+    }
+    if (!await validateKnowledgeSources(this.ctx.knowledge, excerpts.map((item) => item.asset_id))) return false;
+    const verifiedSources = analysis.sources.filter((source) => source.evidence_eligible);
+    if (verifiedSources.length) {
+      const current = await this.currentFreshness();
+      if (!current.ok || !current.publication || current.publication.valid_until < currentCalendarDate(this.ctx.config, this.ctx.knowledge.timezone)) return false;
+      if (verifiedSources.some((source) => source.freshness_receipts.length !== source.tables.length || source.freshness_receipts.some((receipt) => receipt.publication_id !== current.publication!.publication_id || receipt.version !== current.publication!.version || current.publication!.tables[receipt.table]?.status !== "fresh"))) return false;
+    }
+    return true;
+  }
+
+  /** Access to a settled historical answer also follows current permissions.
+   * This is an access check, not a claim that historical data is still fresh. */
+  async canReadStoredAnalysis(sessionId: string, analysis: AnalysisRecord): Promise<boolean> {
+    try {
+      if (analysis.session_id !== sessionId || !Array.isArray(analysis.sources)) return false;
+      const session = await this.ctx.sessions.requireAsync(sessionId); const ids: string[] = [];
+      for (const source of analysis.sources) {
+        if (!Array.isArray(source.tables)) return false;
+        for (const table of source.tables) {
+          const asset = this.ctx.knowledge.contract_by_table.get(table); const contract = asset?.contract;
+          if (!asset || !contract || !canRead(this.ctx.knowledge, session.role, asset.asset_id) || !canQueryTable(this.ctx.knowledge, session.role, table) || source.contract_revisions?.[table] !== contract.revision || source.asset_hashes?.[asset.asset_id] !== asset.content_hash) return false;
+          ids.push(asset.asset_id);
+        }
+      }
+      for (const excerpt of analysis.analysis_declaration?.declaration.source_excerpts ?? []) {
+        const asset = this.ctx.knowledge.by_id.get(excerpt.asset_id);
+        if (!asset || !canRead(this.ctx.knowledge, session.role, excerpt.asset_id) || asset.content_hash !== excerpt.content_hash || !asset.body.includes(excerpt.quote)) return false;
+        ids.push(excerpt.asset_id);
+      }
+      return validateKnowledgeSources(this.ctx.knowledge, ids);
+    } catch { return false; }
+  }
+
+  /** Recheck each leaf after restart; historical resources remain readable only
+   * while the current principal still has the contract and table permissions. */
+  private async resourceReadable(sessionId: string, resource: SessionResource, path: Set<string>): Promise<boolean> {
+    if (path.has(resource.resource_id) || path.size >= 32) return false;
+    const next = new Set(path); next.add(resource.resource_id);
+    if (resource.kind === "query_result") {
+      const session = await this.ctx.sessions.requireAsync(sessionId);
+      if (resource.registry_revision !== this.ctx.knowledge.registry_revision) return false;
+      const ids: string[] = [];
+      for (const table of resource.tables) {
+        const asset = this.ctx.knowledge.contract_by_table.get(table); const contract = asset?.contract;
+        if (!asset || !contract || !canRead(this.ctx.knowledge, session.role, asset.asset_id) || !canQueryTable(this.ctx.knowledge, session.role, table) || contractValidity(contract, currentCalendarDate(this.ctx.config, contract.timezone)) || resource.contract_revisions[table] !== contract.revision || resource.asset_hashes[asset.asset_id] !== asset.content_hash) return false;
+        ids.push(asset.asset_id);
+      }
+      return validateKnowledgeSources(this.ctx.knowledge, ids);
+    }
+    const ids = resource.kind === "calculation" ? [resource.source_resource_id] : resource.kind === "arithmetic" ? [resource.left.resource_id, resource.right.resource_id] : resource.kind === "transform" ? [resource.source_resource_id] : [resource.spec.left.resource_id, resource.spec.right.resource_id];
+    for (const id of new Set(ids)) {
+      const parent = await this.ctx.sessions.lookupResourceAsync(sessionId, id);
+      if (!parent.ok || (resource.job_id && parent.resource.job_id !== resource.job_id) || !await this.resourceReadable(sessionId, parent.resource, next)) return false;
+    }
+    return true;
   }
 
   private ruleFor(session: SessionRecord, table: string): TableRule {
@@ -1377,6 +1535,7 @@ export interface AnalysisInput {
   limitations?: string[];
   findings?: AnalysisFinding[];
   comparisons?: Array<{ left: { resource_id: string; cell: string }; right: { resource_id: string; cell: string } }>;
+  declaration?: AnalysisDeclaration;
 }
 
 /** The proof contains values already authorized in the original SQL, but is
@@ -1451,7 +1610,7 @@ function stableHashes(value: Record<string, string>): string {
 /** Convert only a complete direct projection of an observed-only contract.
  * SQL admission alone is insufficient evidence of column lineage or exactness. */
 function rawResultTable(source: QueryResource, contract: DataContract): ResultTable | null {
-  if (!contract.series || contract.series.prediction_mode !== "observed_only" || contract.series.predicted_column || source.truncated || source.sql_limited || !source.complete_population || source.total_rows_exact !== true || source.rows.length > 200 || source.rows.length !== source.returned_rows || source.rows.length !== source.total_rows || (source.engine === "clickhouse-local" && !source.execution_id)) return null;
+  if (!contract.series || contract.series.prediction_mode !== "observed_only" || contract.series.predicted_column || source.truncated || source.sql_limited || !source.complete_population || source.total_rows_exact !== true || source.rows.length > RESULT_CALCULATION_MAX_ROWS || source.rows.length !== source.returned_rows || source.rows.length !== source.total_rows || (source.engine === "clickhouse-local" && !source.execution_id)) return null;
   if (!verifyCell(source, contract, { op: "count_rows", as: "shape" }, source.rows.length)) return null;
   const projections = parseReadonlySql(source.sql).ast.columns;
   if (!Array.isArray(projections) || projections.length !== source.columns.length || projections.length > 40) return null;
@@ -1497,7 +1656,7 @@ function rawResultTable(source: QueryResource, contract: DataContract): ResultTa
     rows.push(result);
   }
   const result = { columns: fields.map(({ column }) => column), rows };
-  return Buffer.byteLength(JSON.stringify(result)) <= 200_000 ? result : null;
+  return fitsResultCalculationBytes(result) ? result : null;
 }
 
 function aggregateTable(items: VerifiedAggregate[]): ResultTable | null {
@@ -1566,18 +1725,25 @@ function renderTransform(resource: TransformResource, input: ResultTable, result
   }
   const lines = [`结果变换：${descriptions.join(" → ")}；输入 ${resource.source_resource_id}；计算资源 ${resource.resource_id}。计数指输入结果行，不自动代表业务明细行；聚合忽略 NULL，未知值没有补零。`];
   if (!result.rows.length) lines.push("变换后无结果行；不补零。");
-  for (const row of result.rows) lines.push(result.columns.map((column) => `${column.label}=${row[column.name] === null ? "NULL" : String(row[column.name])}（${column.unit}）`).join("；") + "。");
+  let shown = 0; let bytes = 0;
+  for (const row of result.rows.slice(0, 100)) {
+    const line = result.columns.map((column) => `${column.label}=${row[column.name] === null ? "NULL" : String(row[column.name])}（${column.unit}）`).join("；") + "。";
+    const size = Buffer.byteLength(line); if (bytes + size > 32_000) break;
+    lines.push(line); bytes += size; shown += 1;
+  }
+  if (result.rows.length > shown) lines.push(`已验证结果共 ${result.rows.length} 行，此处展示 ${shown} 行；可按资源分页回读其余行。`);
   return lines;
 }
 
 function renderAlignment(resource: AlignmentResource, rows: AlignedRow[]): string[] {
   const lines = [`按分组键全集对齐并执行 ${resource.spec.op}；输入 ${resource.spec.left.resource_id}、${resource.spec.right.resource_id}；计算资源 ${resource.resource_id}。未出现的组不补零。`];
-  for (const row of rows) {
+  for (const row of rows.slice(0, 100)) {
     const group = Object.entries(row.group).map(([key, value]) => `${key}=${value}`).join("，");
     const show = (value: ArithmeticValue | null) => value ? `${value.basis.table}.${value.basis.column} ${value.value} ${value.unit}` : "该查询结果未出现此组";
     const result = row.status === "zero_divisor" ? "除数为零，结果不可计算" : row.result ? `${row.result.value} ${row.result.unit}` : "缺少一侧分组，结果未知";
     lines.push(`${group}：左侧 ${show(row.left)}；右侧 ${show(row.right)}；结果 ${result}。`);
   }
+  if (rows.length > 100) lines.push(`已验证对齐结果共 ${rows.length} 行，此处展示 100 行；可按资源分页回读其余行。`);
   return lines;
 }
 
@@ -1683,7 +1849,7 @@ function renderDerivedAndGroups(cells: VerifiedCell[], resources: SessionResourc
         const values = [...new Set(source.rows.map((row) => row[dimension] as string))];
         if (values.length < 2) continue;
         const parts: string[] = [];
-        for (const value of values) {
+        for (const value of values.slice(0, 100)) {
           const subset = source.rows.filter((row) => row[dimension] === value);
           const mapping = contract.series.prediction_values;
           const flag = contract.series.predicted_column;
@@ -1694,7 +1860,7 @@ function renderDerivedAndGroups(cells: VerifiedCell[], resources: SessionResourc
           if (!verifyCell({ ...source, rows: subset }, contract, op, total)) continue;
           parts.push(`${value}=${formatNumber(total)}`);
         }
-        if (parts.length) lines.push(`${cell.table}.${cell.column} 按 ${dimension} 分组：${parts.join("，")}${cell.precision === "floating_point_approximate" ? "（浮点近似）" : ""}；单位 ${cell.unit}；${cell.prediction}；其他筛选 ${Object.entries(cell.filters).map(([key, value]) => `${key}=${value}`).join("，") || "无"}；${cell.range.start} 到 ${cell.range.end}（${cell.range.timezone}）；来源 ${id}。NULL 与无记录没有补零。`);
+        if (parts.length) lines.push(`${cell.table}.${cell.column} 按 ${dimension} 分组：${parts.join("，")}${values.length > 100 ? `（共 ${values.length} 组，此处展示前 100 组）` : ""}${cell.precision === "floating_point_approximate" ? "（浮点近似）" : ""}；单位 ${cell.unit}；${cell.prediction}；其他筛选 ${Object.entries(cell.filters).map(([key, value]) => `${key}=${value}`).join("，") || "无"}；${cell.range.start} 到 ${cell.range.end}（${cell.range.timezone}）；来源 ${id}。NULL 与无记录没有补零。`);
       }
     }
   }

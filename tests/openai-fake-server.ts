@@ -126,6 +126,7 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成收入成本比")) return scripted(turn, ratioSteps);
   if (latest.includes("合成多渠道收入成本比")) return scripted(turn, groupedRatioSteps);
   if (latest.includes("合成分组对齐")) return scripted(turn, alignmentSteps);
+  if (latest.includes("合成完整分页")) return scripted(turn, largeTransformSteps);
   if (latest.includes("合成产品维表关联")) return scripted(turn, validJoinSteps);
   if (latest.includes("合成渠道维表关联")) return scripted(turn, validChannelJoinSteps);
   if (latest.includes("合成精确金额")) return scripted(turn, decimalSteps);
@@ -135,6 +136,19 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("日本") && (hasBase || latest.includes("雾帆"))) return scripted(turn, japanSteps);
   if (latest.includes("连表")) return scripted(turn, unsafeJoinSteps);
   return scripted(turn, defaultSteps);
+}
+
+function largeTransformSteps(ids: string[]) {
+  return [
+    { id: "large_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "large_query", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE event_date = '2026-10-06' AND title_id = 'paper_lantern' AND platform = 'android' AND channel_id = 'mist_ads' ORDER BY country_code", preview_limit: 20 }) },
+    { id: "large_transform", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: [
+      { op: "filter", column: "new_users", comparison: "gt", value: "0" },
+      { op: "sort", keys: [{ column: "country_code", direction: "asc", nulls: "last" }] },
+      { op: "group", by: [], aggregates: [{ op: "sum", column: "new_users", as: "total" }, { op: "count_all", as: "count" }] },
+    ] } }) },
+    { id: "large_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids, declaration: { scope: "纸灯 Android 雾帆的虚构地区", grain: "业务日和地区", expected_group_keys: ["country_code"], unresolved_questions: [], assumptions: ["这些地区代码仅为合成示例"] } }) },
+  ];
 }
 
 function ratioSteps(ids: string[]) {

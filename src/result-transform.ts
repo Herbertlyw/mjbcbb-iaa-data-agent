@@ -10,6 +10,18 @@ export interface ResultColumn {
 }
 export interface ResultTable { columns: ResultColumn[]; rows: Array<Record<string, ResultValue>> }
 export type ComparisonOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
+/** Limits apply to the complete input AND every intermediate result. They are
+ * independent of preview-page size and of the query driver's storage cap. */
+export const RESULT_CALCULATION_MAX_ROWS = 10_000;
+export const RESULT_CALCULATION_MAX_BYTES = 2_000_000;
+export const RESULT_TRANSFORM_MAX_STEPS = 10;
+
+export function fitsResultCalculationBytes(value: unknown): boolean {
+  try {
+    const encoded = JSON.stringify(value);
+    return typeof encoded === "string" && Buffer.byteLength(encoded) <= RESULT_CALCULATION_MAX_BYTES;
+  } catch { return false; }
+}
 export type TransformStep =
   | ({ op: "filter"; column: string } & ({ comparison: ComparisonOp; value: string | boolean | null; other_column?: never } | { comparison: ComparisonOp; other_column: string; value?: never } | { comparison: "is_null" | "is_not_null"; value?: never; other_column?: never }))
   | { op: "compare"; left: string; right: string; comparison: ComparisonOp; as: string }
@@ -21,7 +33,7 @@ const comparisons = new Set<ComparisonOp>(["eq", "ne", "lt", "le", "gt", "ge"]);
 
 /** Returns null for malformed instructions, incompatible units or overflow. */
 export function transformResult(input: ResultTable, steps: TransformStep[]): ResultTable | null {
-  if (!Array.isArray(steps) || steps.length < 1 || steps.length > 10 || !validTable(input)) return null;
+  if (!Array.isArray(steps) || steps.length < 1 || steps.length > RESULT_TRANSFORM_MAX_STEPS || !validTable(input)) return null;
   let table: ResultTable = { columns: input.columns.map((c) => ({ ...c })), rows: input.rows.map((r) => ({ ...r })) };
   for (const step of steps) {
     if (!step || typeof step !== "object") return null;
@@ -112,13 +124,13 @@ export function transformResult(input: ResultTable, steps: TransformStep[]): Res
 
 function validName(name: unknown, columns: ResultColumn[]): name is string { return typeof name === "string" && namePattern.test(name) && !["__proto__", "constructor", "prototype"].includes(name) && !columns.some((c) => c.name === name); }
 function validTable(table: ResultTable): boolean {
-  if (!table || !Array.isArray(table.columns) || !table.columns.length || table.columns.length > 40 || !Array.isArray(table.rows) || table.rows.length > 200) return false;
+  if (!table || !Array.isArray(table.columns) || !table.columns.length || table.columns.length > 40 || !Array.isArray(table.rows) || table.rows.length > RESULT_CALCULATION_MAX_ROWS || !fitsResultCalculationBytes(table)) return false;
   const names: ResultColumn[] = [];
   for (const field of table.columns) {
     if (!field || !validName(field.name, names) || !["text", "decimal", "boolean"].includes(field.type) || typeof field.label !== "string" || typeof field.unit !== "string" || (field.type === "decimal" && (!Number.isInteger(field.scale) || field.scale! < 0 || field.scale! > 76))) return false;
     names.push(field);
   }
-  return table.rows.every((row) => row && typeof row === "object" && Object.keys(row).length === names.length && names.every((field) => Object.hasOwn(row, field.name) && validValue(row[field.name], field))) && Buffer.byteLength(JSON.stringify(table)) <= 200_000;
+  return table.rows.every((row) => row && typeof row === "object" && Object.keys(row).length === names.length && names.every((field) => Object.hasOwn(row, field.name) && validValue(row[field.name], field)));
 }
 function validValue(value: unknown, field: ResultColumn): value is ResultValue {
   if (value === null) return true;

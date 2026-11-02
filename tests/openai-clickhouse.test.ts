@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -312,6 +312,38 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
         assert.equal((sessions as Array<{ actor_id: string }>)[0]?.actor_id, "demo-analyst");
       }
     } finally { await joinDb.end(); }
+    const largeSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const largeSessionId = ((await largeSession.json()) as { session_id: string }).session_id;
+    const largeExpected = (JSON.parse(readFileSync(path.join(root, "eval", "harborlight-query-golden.json"), "utf8")) as { pagination_case: { count: number; sum: string } }).pagination_case;
+    const large = await postQuestion(apiPort, largeSessionId, "合成完整分页：统计 2026-10-06 纸灯 Android 雾帆各虚构地区的新增总数。");
+    assert.equal(large.status, "completed", `${JSON.stringify(large.error)} ${large.analysis?.answer ?? ""}`);
+    assert.match(large.analysis?.answer ?? "", new RegExp(`的合计=${largeExpected.sum}（人）`));
+    assert.match(large.analysis?.answer ?? "", new RegExp(`输入结果行数=${largeExpected.count}`));
+    assert.equal(large.analysis?.analysis_declaration?.provenance, "model_declared");
+    assert.doesNotMatch(large.analysis?.answer ?? "", /这些地区代码仅为合成示例/);
+    const largeSource = large.analysis?.sources?.[0];
+    assert.equal(largeSource?.engine, "clickhouse-local");
+    assert.equal(largeSource?.total_rows, largeExpected.count);
+    assert.equal(largeSource?.rows?.length, 100);
+    assert.equal(largeSource?.preview_has_more, true);
+    const largeHash = large.analysis?.resource_hashes?.[String(largeSource?.resource_id)];
+    assert.ok(largeHash);
+    const pageUrl = `http://127.0.0.1:${apiPort}/api/sessions/${largeSessionId}/resources/${largeSource?.resource_id}?offset=100&limit=100&resource_hash=${largeHash}`;
+    const pageResponse = await fetch(pageUrl);
+    assert.equal(pageResponse.status, 200);
+    const page = await pageResponse.json() as { resource: { rows: unknown[] }; has_more: boolean; next_row_offset: number };
+    assert.equal(page.resource.rows.length, 100); assert.equal(page.has_more, true); assert.equal(page.next_row_offset, 200);
+    assert.equal((await fetch(pageUrl, { headers: { "x-demo-actor": "demo-viewer" } })).status, 404);
+    const stalePage = await fetch(pageUrl.replace(String(largeHash), "wrong"));
+    assert.equal(stalePage.status, 400);
+    assert.deepEqual(large.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "query", "calculate_session_cells", "update_analysis"]);
+    const largeDb = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password: statePassword, database: "lumenfox_it" });
+    try {
+      const [rows] = await largeDb.query("SELECT body_json FROM resources WHERE resource_id = ?", [largeSource?.resource_id]);
+      const saved = JSON.parse(String((rows as Array<{ body_json: string }>)[0]?.body_json)) as { session_id: string; job_id: string; rows: unknown[]; truncated: boolean };
+      assert.equal(saved.session_id, largeSessionId); assert.equal(saved.job_id, large.job_id);
+      assert.equal(saved.rows.length, largeExpected.count); assert.equal(saved.truncated, false);
+    } finally { await largeDb.end(); }
     const alignSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const alignSessionId = ((await alignSession.json()) as { session_id: string }).session_id;
     const align = await postQuestion(apiPort, alignSessionId, "合成分组对齐：按国家对照 10 月 6 日与 8 日的新增，并筛选、排序及求和下降组。");
@@ -540,7 +572,7 @@ async function waitJob(port: number, jobId: string) {
       job_id: string;
       error?: { code?: string; message?: string };
       usage?: { input_tokens: number | null; usage_source?: string };
-      analysis?: { status?: string; answer?: string; sources?: Array<{ engine?: string; resource_id?: string; execution_id?: string; observed_at?: string; freshness_receipts?: unknown[] }> };
+      analysis?: { status?: string; answer?: string; resource_hashes?: Record<string, string>; analysis_declaration?: { provenance?: string }; sources?: Array<{ engine?: string; resource_id?: string; execution_id?: string; observed_at?: string; freshness_receipts?: unknown[]; total_rows?: number; rows?: unknown[]; preview_has_more?: boolean }> };
       events: Array<{ type: string; payload: Record<string, unknown> }>;
     };
     if (!["queued", "running"].includes(job.status)) return job;

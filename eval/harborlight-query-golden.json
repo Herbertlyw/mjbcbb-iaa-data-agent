@@ -1,6 +1,7 @@
 {
   "simulated": true,
   "note": "手工按小型合成行计算的查询期望；不使用代理计算生成答案。",
+  "pagination_case": { "description": "240 个互不相同的虚构地区，每行依次为 1 至 240。", "count": 240, "sum": "28920", "derivation": "240 × 241 ÷ 2 = 28920。" },
   "cases": [
     { "id": "paper-japan-week", "table": "fact_fox_daily_install", "metric": "new_users", "title": "paper_lantern", "country": "JP", "channel": "mist_ads", "start": "2026-10-06", "end": "2026-10-12", "expected": "70", "status": "completed", "reason": "七日各 10，合计 70。" },
     { "id": "paper-japan-three-days", "table": "fact_fox_daily_install", "metric": "new_users", "title": "paper_lantern", "country": "JP", "channel": "mist_ads", "start": "2026-10-06", "end": "2026-10-08", "expected": "30", "status": "completed", "reason": "三日各 10，合计 30。" },

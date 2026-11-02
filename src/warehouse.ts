@@ -186,6 +186,12 @@ export function smallWarehouse() {
       installs.push({ event_date: date, title_id: "glass_minnow", platform: "ios", country_code: "DE", channel_id: "mist_ads", new_users: glass, device_token: null });
     }
   }
+  // A separate synthetic Android population exercises complete-resource
+  // pagination. Values 1..240 have the independently checkable sum 28,920;
+  // region labels are fictional identifiers, not real country codes.
+  for (let index = 1; index <= 240; index += 1) {
+    installs.push({ event_date: "2026-10-06", title_id: "paper_lantern", platform: "android", country_code: `S${String(index).padStart(3, "0")}`, channel_id: "mist_ads", new_users: index, device_token: null });
+  }
   const revenue: RevenueRow[] = [];
   const spend: SpendRow[] = [];
   const payments = WAREHOUSE_DATES.map((date) => ({ event_date: date, title_id: "paper_lantern", platform: "ios", country_code: "US", channel_id: "mist_ads", amount_usd: date === "2026-10-06" ? "90071992547409.91" : date === "2026-10-07" ? "0.09" : date === "2026-10-08" ? "1.00" : date === "2026-10-09" ? null : "0.00", cost_usd: date === "2026-10-06" ? "0.10" : date === "2026-10-07" ? "0.03" : date === "2026-10-08" ? "2.00" : date === "2026-10-09" ? null : "0.00" }));

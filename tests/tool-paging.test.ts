@@ -1,6 +1,29 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { analyst, withRuntime } from "./helpers.js";
+import type { QueryResource } from "../src/types.js";
+
+test("宽行分页受字节上限约束，续页按实际返回行数推进", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    assert.equal((await runtime.tools.readDataContractView(session.session_id, { asset_id: "contract.daily_installs" })).ok, true);
+    runtime.sessions.setActiveJob(session.session_id, "wide_page_job");
+    const query = await runtime.tools.query(session.session_id, { sql: "SELECT event_date, country_code, new_users FROM daily_installs WHERE event_date = '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads'" });
+    assert.equal(query.ok, true); if (!query.ok) return;
+    const found = runtime.sessions.lookupResource(session.session_id, String(query.resource_id));
+    assert.ok(found.ok && found.resource.kind === "query_result"); if (!found.ok || found.resource.kind !== "query_result") return;
+    const resource = structuredClone(found.resource) as QueryResource;
+    resource.rows = Array.from({ length: 3 }, (_, index) => ({ event_date: "2026-10-06", country_code: `${index}${"X".repeat(12_000)}`, new_users: index }));
+    resource.total_rows = 3; resource.returned_rows = 3; resource.total_rows_exact = true;
+    runtime.state.saveResource(resource);
+    const first = await runtime.tools.readSessionResource(session.session_id, { resource_id: resource.resource_id, row_limit: 100 });
+    assert.equal(first.ok, true); if (!first.ok) return;
+    assert.equal((first.resource as QueryResource).rows.length, 2); assert.equal(first.next_row_offset, 2); assert.equal(first.has_more, true);
+    const second = await runtime.tools.readSessionResource(session.session_id, { resource_id: resource.resource_id, row_offset: 2, row_limit: 100, expected_resource_hash: String(first.resource_hash) });
+    assert.equal(second.ok, true); if (!second.ok) return;
+    assert.equal((second.resource as QueryResource).rows.length, 1); assert.equal(second.has_more, false);
+  });
+});
 
 test("搜索稳定续页，版本变化与越权正文不泄露", async () => {
   await withRuntime({}, async (runtime) => {
