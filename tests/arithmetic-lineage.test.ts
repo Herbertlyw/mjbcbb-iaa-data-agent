@@ -10,6 +10,11 @@ test("定点除法 18 位、半数远离零以及大数不经过浮点", () => {
   assert.equal(computeArithmetic("divide", value("-1"), value("6"))?.value, "-0.166666666666666667");
   assert.equal(computeArithmetic("multiply", value("9007199254740993"), value("3"))?.value, "27021597764222979");
   assert.equal(computeArithmetic("divide", value("1"), value("0"))?.value, null);
+  const revenue = value("9"); const cost = value("3"); cost.basis = { ...cost.basis, column: "other" };
+  assert.equal(computeArithmetic("divide", revenue, cost), null, "不同指标不能因数值或单位相同就自动比较");
+  assert.equal(computeArithmetic("divide", revenue, cost, true)?.value, "3.000000000000000000");
+  const otherCountry = { ...cost, scopes: [{ ...cost.scopes[0]!, filters: { region: "B" } }] };
+  assert.equal(computeArithmetic("divide", revenue, otherCountry, true), null, "不同指标必须使用相同范围");
 });
 
 test("同任务聚合的四则运算可递归复核，零分母、篡改和跨任务失败关闭", async () => {

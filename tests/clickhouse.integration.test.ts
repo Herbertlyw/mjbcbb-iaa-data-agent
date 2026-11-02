@@ -231,7 +231,7 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
         WHERE i.event_date >= '2026-10-06' AND i.event_date <= '2026-10-12'
           AND i.title_id = 'paper_lantern' AND i.platform = 'ios' AND i.country_code = 'US' AND r.is_predicted = 0`);
       assert.notEqual(Number(duplicated[0]?.n), 43.5);
-      await verifyEvidenceLineage(runtime, reader, freshnessPath);
+      await verifyEvidenceLineage(runtime, reader, freshnessPath, admin);
     } finally {
       await runtime.close();
       await reader.close();
@@ -244,7 +244,7 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
   }
 });
 
-async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, reader: ReturnType<typeof createClickHouseClient>, freshnessPath: string) {
+async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, reader: ReturnType<typeof createClickHouseClient>, freshnessPath: string, admin: ReturnType<typeof createClickHouseClient>) {
   const session = runtime.sessions.create("analyst");
   await bindTables(runtime, session.session_id, ["contract.fact_fox_daily_install", "contract.fact_fox_daily_active", "contract.fact_fox_daily_payment", "contract.fact_fox_ad_receipt", "contract.fact_fox_daily_spend"]);
   runtime.sessions.setActiveJob(session.session_id, "job_evidence_lineage");
@@ -261,6 +261,18 @@ async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, 
   const one = await decimalDay("2026-10-08");
   const missing = await decimalDay("2026-10-09");
   const zero = await decimalDay("2026-10-10");
+  const cost = await runtime.tools.query(session.session_id, { sql: `SELECT SUM(cost_usd) AS total FROM fact_fox_daily_payment WHERE event_date >= '2026-10-08' AND event_date <= '2026-10-08' AND ${common} AND country_code = 'US' AND channel_id = 'mist_ads'` });
+  assert.equal(cost.ok, true, JSON.stringify(cost));
+  if (!one.ok || !cost.ok) throw new Error("cross-metric query rejected");
+  const ratio = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "divide", left: { resource_id: String(one.resource_id), cell: "total" }, right: { resource_id: String(cost.resource_id), cell: "total" } } });
+  assert.equal(ratio.ok, true, JSON.stringify(ratio));
+  if (!ratio.ok) throw new Error("cross-metric calculation rejected");
+  assert.equal((ratio.result as { value: string }).value, "0.500000000000000000");
+  const ratioAnswer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(one.resource_id), String(cost.resource_id), String(ratio.resource_id)] });
+  assert.equal(ratioAnswer.ok, true);
+  if (ratioAnswer.ok) { assert.equal(ratioAnswer.status, "partial"); assert.match(String(ratioAnswer.answer), /未证明共同数据版本/); assert.match(String(ratioAnswer.answer), /amount_usd divide fact_fox_daily_payment\.cost_usd/); assert.match(String(ratioAnswer.answer), /0\.500000000000000000 比值/); }
+  const reversed = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "divide", left: { resource_id: String(cost.resource_id), cell: "total" }, right: { resource_id: String(one.resource_id), cell: "total" } } });
+  assert.equal(reversed.ok, false, "反向指标关系未经契约声明");
   const rawDecimal = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, amount_usd FROM fact_fox_daily_payment WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND ${common} AND country_code = 'US' AND channel_id = 'mist_ads' ORDER BY event_date`, preview_limit: 1 });
   assert.equal(rawDecimal.ok, true, JSON.stringify(rawDecimal));
   if (!rawDecimal.ok) throw new Error("decimal detail rejected");
@@ -271,7 +283,7 @@ async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, 
   assert.equal((rawSum.cells as Record<string, string>).exact, "90071992547411.00");
   const rawAnswer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(rawDecimal.resource_id), String(rawSum.resource_id)] });
   assert.equal(rawAnswer.ok, true);
-  if (rawAnswer.ok) { assert.equal(rawAnswer.status, "completed"); assert.match(String(rawAnswer.answer), /完整资源精确十进制合计 90071992547411\.00/); }
+  if (rawAnswer.ok) { assert.equal(rawAnswer.status, "partial"); assert.match(String(rawAnswer.answer), /未证明共同数据版本/); assert.match(String(rawAnswer.answer), /完整资源精确十进制合计 90071992547411\.00/); }
   const rawNull = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, amount_usd FROM fact_fox_daily_payment WHERE event_date >= '2026-10-09' AND event_date <= '2026-10-09' AND ${common} AND country_code = 'US' AND channel_id = 'mist_ads'` });
   assert.equal(rawNull.ok, true);
   if (rawNull.ok) {
@@ -298,7 +310,8 @@ async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, 
   });
   assert.equal(exact.ok, true, JSON.stringify(exact));
   if (!exact.ok) throw new Error("decimal analysis rejected");
-  assert.equal(exact.status, "completed", JSON.stringify(exact));
+  assert.equal(exact.status, "partial", JSON.stringify(exact));
+  assert.match(String(exact.answer), /未证明共同数据版本/);
   const exactComparisons = exact.aggregate_comparisons as Array<{ difference: string; ratio: string | null; change_percent: string | null }>;
   assert.deepEqual(exactComparisons.map(({ difference, ratio, change_percent }) => [difference, ratio, change_percent]), [["90071992547408.91", "90071992547409.9100", "9007199254740891.00"], ["0.91", "11.1111", "1011.11"], ["1.00", null, null]]);
   assert.match(String(exact.answer), /90071992547409\.91/);
@@ -311,7 +324,8 @@ async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, 
   const aggregateResult = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(aggregateQuery.resource_id)] });
   assert.equal(aggregateResult.ok, true, JSON.stringify(aggregateResult));
   if (!aggregateResult.ok) throw new Error("aggregate analysis rejected");
-  assert.equal(aggregateResult.status, "completed", JSON.stringify(aggregateResult));
+  assert.equal(aggregateResult.status, "partial", JSON.stringify(aggregateResult));
+  assert.match(String(aggregateResult.answer), /未证明共同数据版本/);
   const aggregateCells = aggregateResult.aggregates as Array<{ operation: string; value: string; group: Record<string, string> }>;
   assert.deepEqual(aggregateCells.map((a) => [a.group.country_code, a.operation, a.value]), [["JP", "sum", "10"], ["JP", "count_nonnull", "1"], ["US", "sum", "100"], ["US", "count_nonnull", "1"]]);
   const channels = await runtime.tools.query(session.session_id, { sql: `SELECT channel_id, SUM(new_users) AS total FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND ${common} AND country_code = 'US' GROUP BY channel_id ORDER BY channel_id` });
@@ -320,7 +334,8 @@ async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, 
   const channelResult = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(channels.resource_id)] });
   assert.equal(channelResult.ok, true, JSON.stringify(channelResult));
   if (!channelResult.ok) throw new Error("channel analysis rejected");
-  assert.equal(channelResult.status, "completed", JSON.stringify(channelResult));
+  assert.equal(channelResult.status, "partial", JSON.stringify(channelResult));
+  assert.match(String(channelResult.answer), /未证明共同数据版本/);
   assert.deepEqual((channelResult.aggregates as Array<{ value: string; group: Record<string, string> }>).map((a) => [a.group.channel_id, a.value]), [["mist_ads", "100"], ["pebble_net", "5"]]);
   const multi = await runtime.tools.query(session.session_id, { sql: `SELECT country_code, channel_id, SUM(new_users) AS total FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND ${common} GROUP BY country_code, channel_id ORDER BY country_code, channel_id` });
   assert.equal(multi.ok, true, JSON.stringify(multi));
@@ -328,7 +343,8 @@ async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, 
   const multiResult = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(multi.resource_id)] });
   assert.equal(multiResult.ok, true, JSON.stringify(multiResult));
   if (!multiResult.ok) throw new Error("multi-group analysis rejected");
-  assert.equal(multiResult.status, "completed", JSON.stringify(multiResult));
+  assert.equal(multiResult.status, "partial", JSON.stringify(multiResult));
+  assert.match(String(multiResult.answer), /未证明共同数据版本/);
   assert.deepEqual((multiResult.aggregates as Array<{ value: string; group: Record<string, string> }>).map((a) => [a.group.country_code, a.group.channel_id, a.value]), [["JP", "mist_ads", "10"], ["US", "mist_ads", "100"], ["US", "pebble_net", "5"]]);
   async function calculate(sql: string, column: string, predicted: "any" | "actual_only" | "predicted_only" = "any") {
     const query = await runtime.tools.query(session.session_id, { sql });
@@ -426,6 +442,27 @@ async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, 
   const stale = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(installs.query.resource_id), String(installs.calculation.resource_id)] });
   assert.equal(stale.ok, true);
   if (stale.ok) { assert.notEqual(stale.status, "completed"); assert.doesNotMatch(String(stale.answer), /合计 70/); assert.deepEqual((stale.sources as Array<{ rows: unknown[] }>)[0]?.rows, []); }
+  // The shared freshness pointer does not create an atomic ClickHouse snapshot.
+  // Insert a synthetic row between two reads on this test's isolated server.
+  const incomeBefore = await runtime.tools.query(session.session_id, { sql: `SELECT SUM(amount_usd) AS total FROM fact_fox_daily_payment WHERE event_date >= '2026-10-08' AND event_date <= '2026-10-08' AND ${common} AND country_code = 'US' AND channel_id = 'mist_ads'` });
+  assert.equal(incomeBefore.ok, true, JSON.stringify(incomeBefore));
+  await clickHouseInsert(admin, "fact_fox_daily_payment", [{ event_date: "2026-10-08", title_id: "paper_lantern", platform: "ios", country_code: "US", channel_id: "mist_ads", amount_usd: "0.00", cost_usd: "3.00" }]);
+  const costAfter = await runtime.tools.query(session.session_id, { sql: `SELECT SUM(cost_usd) AS total FROM fact_fox_daily_payment WHERE event_date >= '2026-10-08' AND event_date <= '2026-10-08' AND ${common} AND country_code = 'US' AND channel_id = 'mist_ads'` });
+  assert.equal(costAfter.ok, true, JSON.stringify(costAfter));
+  if (!incomeBefore.ok || !costAfter.ok) return;
+  assert.equal((incomeBefore.rows as Array<{ total: string }>)[0]?.total, "1");
+  assert.equal((costAfter.rows as Array<{ total: string }>)[0]?.total, "5");
+  const mixedSnapshot = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "divide", left: { resource_id: String(incomeBefore.resource_id), cell: "total" }, right: { resource_id: String(costAfter.resource_id), cell: "total" } } });
+  assert.equal(mixedSnapshot.ok, true, JSON.stringify(mixedSnapshot));
+  if (!mixedSnapshot.ok) return;
+  const snapshotAnswer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(incomeBefore.resource_id), String(costAfter.resource_id), String(mixedSnapshot.resource_id)] });
+  assert.equal(snapshotAnswer.ok, true);
+  if (snapshotAnswer.ok) {
+    assert.equal(snapshotAnswer.status, "partial");
+    assert.ok((snapshotAnswer.server_reasons as string[]).includes("clickhouse_snapshot_unproven"));
+    assert.match(String(snapshotAnswer.answer), /未证明共同数据版本/);
+    assert.match(String(snapshotAnswer.answer), /0\.200000000000000000/);
+  }
 }
 
 async function runSplitProcess(clickhouseUrl: string, freshnessPath: string, dir: string, clickhousePort: number) {

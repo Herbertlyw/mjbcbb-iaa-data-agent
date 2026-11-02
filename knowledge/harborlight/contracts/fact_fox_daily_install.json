@@ -1,6 +1,6 @@
 {
   "asset_id": "contract.fact_fox_daily_install",
-  "revision": "contract.fact_fox_daily_install-r2",
+  "revision": "contract.fact_fox_daily_install-r3",
   "table": "fact_fox_daily_install",
   "engine": "clickhouse-local",
   "simulated": true,
@@ -15,6 +15,7 @@
   "must_filter": [
     "event_date"
   ],
+  "grain": ["event_date", "title_id", "platform", "country_code", "channel_id"],
   "series": {
     "date_column": "event_date",
     "dimensions": [

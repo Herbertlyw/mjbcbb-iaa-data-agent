@@ -171,7 +171,8 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(fake.observations.some((item) => item.sawUserText && item.sawKnowledgeBody && item.authorizationMatched), true);
     const followup = await postQuestion(apiPort, session.session_id, "那日本呢？");
     const followupTools = followup.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name);
-    assert.equal(followup.status, "completed", `followup=${followup.status} tools=${followupTools.join("> ")} answer=${followup.analysis?.answer ?? ""} error=${JSON.stringify(followup.error)} events=${JSON.stringify(followup.events.filter((e) => ["model_context", "tool_finished"].includes(e.type)))} obs=${JSON.stringify(fake.observations.slice(-4))}`);
+    assert.equal(followup.status, "partial", `followup=${followup.status} tools=${followupTools.join("> ")} answer=${followup.analysis?.answer ?? ""} error=${JSON.stringify(followup.error)} events=${JSON.stringify(followup.events.filter((e) => ["model_context", "tool_finished"].includes(e.type)))} obs=${JSON.stringify(fake.observations.slice(-4))}`);
+    assert.match(followup.analysis?.answer ?? "", /未证明共同数据版本/);
     assert.match(followup.analysis?.answer ?? "", /70/);
     assert.equal(followup.analysis?.sources?.[0]?.engine, "clickhouse-local");
     assert.deepEqual(followupTools, ["read_data_contract_view", "query", "calculate_session_cells", "update_analysis"]);
@@ -207,7 +208,8 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     const history = await reopened.json() as { jobs: Array<{ job_id: string; user_text: string }> };
     assert.deepEqual(history.jobs.map((item) => item.user_text), [question, "那日本呢？"]);
     const third = await postQuestion(apiPort, session.session_id, "日期改成 2026-10-06 到 2026-10-08。");
-    assert.equal(third.status, "completed", JSON.stringify(third.error));
+    assert.equal(third.status, "partial", JSON.stringify(third.error));
+    assert.match(third.analysis?.answer ?? "", /未证明共同数据版本/);
     assert.match(third.analysis?.answer ?? "", /30/);
     assert.equal(third.analysis?.sources?.[0]?.engine, "clickhouse-local");
     const source3 = third.analysis?.sources?.[0]?.resource_id;
@@ -224,7 +226,8 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     const decimalSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const decimalSessionId = ((await decimalSession.json()) as { session_id: string }).session_id;
     const decimal = await postQuestion(apiPort, decimalSessionId, "合成精确金额：比较 2026-10-06 和 2026-10-08。");
-    assert.equal(decimal.status, "completed", JSON.stringify(decimal.error));
+    assert.equal(decimal.status, "partial", JSON.stringify(decimal.error));
+    assert.match(decimal.analysis?.answer ?? "", /未证明共同数据版本/);
     assert.match(decimal.analysis?.answer ?? "", /90071992547409\.91/);
     assert.match(decimal.analysis?.answer ?? "", /90071992547408\.91/);
     assert.match(decimal.analysis?.answer ?? "", /90071992547409\.9100/);
@@ -245,6 +248,51 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
         assert.ok(resource.freshness_receipts.length > 0);
       }
     } finally { await decimalDb.end(); }
+    const ratioSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const ratioSessionId = ((await ratioSession.json()) as { session_id: string }).session_id;
+    const ratio = await postQuestion(apiPort, ratioSessionId, "合成收入成本比：2026-10-08 美国 iOS 雾帆的收入除以成本。");
+    assert.equal(ratio.status, "partial", `${JSON.stringify(ratio.error)} ${ratio.analysis?.answer ?? ""}`);
+    assert.match(ratio.analysis?.answer ?? "", /未证明共同数据版本/);
+    assert.match(ratio.analysis?.answer ?? "", /amount_usd divide fact_fox_daily_payment\.cost_usd/);
+    assert.match(ratio.analysis?.answer ?? "", /0\.500000000000000000 比值/);
+    assert.equal(ratio.analysis?.sources?.length, 2);
+    assert.equal(ratio.analysis?.sources?.every((source) => source.engine === "clickhouse-local" && source.freshness_receipts?.length), true);
+    assert.deepEqual(ratio.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "query", "query", "calculate_session_cells", "update_analysis"]);
+    const ratioDb = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password: statePassword, database: "lumenfox_it" });
+    try {
+      for (const source of ratio.analysis?.sources ?? []) {
+        const [rows] = await ratioDb.query("SELECT body_json FROM resources WHERE resource_id = ?", [source.resource_id]);
+        const resource = JSON.parse(String((rows as Array<{ body_json: string }>)[0]?.body_json)) as { session_id: string; job_id: string };
+        assert.equal(resource.session_id, ratioSessionId);
+        assert.equal(resource.job_id, ratio.job_id);
+      }
+    } finally { await ratioDb.end(); }
+    const groupedSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const groupedSessionId = ((await groupedSession.json()) as { session_id: string }).session_id;
+    const groupedRatio = await postQuestion(apiPort, groupedSessionId, "合成多渠道收入成本比：按国家和渠道对齐 2026-10-08 收入与成本。");
+    assert.equal(groupedRatio.status, "partial", `${JSON.stringify(groupedRatio.error)} ${groupedRatio.analysis?.answer ?? ""}`);
+    assert.match(groupedRatio.analysis?.answer ?? "", /未证明共同数据版本/);
+    assert.match(groupedRatio.analysis?.answer ?? "", /channel_id=mist_ads，country_code=JP.*结果 1\.500000000000000000 比值/);
+    assert.match(groupedRatio.analysis?.answer ?? "", /channel_id=mist_ads，country_code=US.*结果 0\.500000000000000000 比值/);
+    assert.match(groupedRatio.analysis?.answer ?? "", /channel_id=pebble_net，country_code=US.*结果 2\.000000000000000000 比值/);
+    assert.equal(groupedRatio.analysis?.sources?.length, 2);
+    const joinSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const joinSessionId = ((await joinSession.json()) as { session_id: string }).session_id;
+    const join = await postQuestion(apiPort, joinSessionId, "合成产品维表关联：统计纸灯日本 iOS 雾帆 2026-10-06 到 2026-10-12 新增。");
+    assert.equal(join.status, "failed", "MySQL 终态不能忽略维表 freshness 缺失");
+    assert.equal(join.error?.code, "freshness_version_changed");
+    assert.equal(join.analysis, null);
+    assert.deepEqual(join.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "read_data_contract_view", "query", "update_analysis"]);
+    assert.ok(join.events.some((event) => event.type === "tool_finished" && event.payload.tool_name === "query" && event.payload.is_error === false));
+    const alignSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const alignSessionId = ((await alignSession.json()) as { session_id: string }).session_id;
+    const align = await postQuestion(apiPort, alignSessionId, "合成分组对齐：按国家对照 10 月 6 日与 8 日的新增，并筛选、排序及求和下降组。");
+    assert.equal(align.status, "partial", `${JSON.stringify(align.error)} ${align.analysis?.answer ?? ""}`);
+    assert.match(align.analysis?.answer ?? "", /未证明共同数据版本/);
+    assert.match(align.analysis?.answer ?? "", /country_code=US.*结果 -20 人/);
+    assert.match(align.analysis?.answer ?? "", /的合计=-20（人）/);
+    assert.equal(align.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === "calculate_session_cells").length, 2);
+    assert.equal(align.analysis?.sources?.length, 2);
     const withoutRecordSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const withoutRecordId = ((await withoutRecordSession.json()) as { session_id: string }).session_id;
     const withoutRecord = await postQuestion(apiPort, withoutRecordId, "合成问题：不调用记录工具，查询日本新增。");

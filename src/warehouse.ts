@@ -52,8 +52,9 @@ export const WAREHOUSE_TABLES: TableSpec[] = [
   fact("fact_fox_daily_active", "每日活跃", "同一粒度的活跃用户，不从新增填补。", "event_date", ["active_users"], null, [], [
     metric("active_users", "Nullable(Int32)", "活跃用户。NULL 是缺失，0 是真实零。", true, "人"),
   ], "与新增同一批日期。10-12 日本 iOS 纸灯雾帆是合成异常波动。"),
-  fact("fact_fox_daily_payment", "合成精确金额", "演示 Decimal 保留精度，不是真实交易。", "event_date", ["amount_usd"], null, [], [
+  fact("fact_fox_daily_payment", "合成精确金额", "演示 Decimal 保留精度，不是真实交易。", "event_date", ["amount_usd", "cost_usd"], null, [], [
     metric("amount_usd", "Nullable(Decimal(18,2))", "虚构金额，使用精确十进制美元。", true, "USD"),
+    metric("cost_usd", "Nullable(Decimal(18,2))", "相同粒度的虚构成本。", true, "USD"),
   ], "合成金额仅用于验证定点计算。"),
   {
     ...fact("fact_fox_retention_cohort", "留存 cohort", "按 cohort 日和留存日龄的留存人数。", "cohort_date", ["retained_users"], null, [], [
@@ -187,7 +188,11 @@ export function smallWarehouse() {
   }
   const revenue: RevenueRow[] = [];
   const spend: SpendRow[] = [];
-  const payments = WAREHOUSE_DATES.map((date) => ({ event_date: date, title_id: "paper_lantern", platform: "ios", country_code: "US", channel_id: "mist_ads", amount_usd: date === "2026-10-06" ? "90071992547409.91" : date === "2026-10-07" ? "0.09" : date === "2026-10-08" ? "1.00" : date === "2026-10-09" ? null : "0.00" }));
+  const payments = WAREHOUSE_DATES.map((date) => ({ event_date: date, title_id: "paper_lantern", platform: "ios", country_code: "US", channel_id: "mist_ads", amount_usd: date === "2026-10-06" ? "90071992547409.91" : date === "2026-10-07" ? "0.09" : date === "2026-10-08" ? "1.00" : date === "2026-10-09" ? null : "0.00", cost_usd: date === "2026-10-06" ? "0.10" : date === "2026-10-07" ? "0.03" : date === "2026-10-08" ? "2.00" : date === "2026-10-09" ? null : "0.00" }));
+  payments.push(
+    { event_date: "2026-10-08", title_id: "paper_lantern", platform: "ios", country_code: "US", channel_id: "pebble_net", amount_usd: "6.00", cost_usd: "3.00" },
+    { event_date: "2026-10-08", title_id: "paper_lantern", platform: "ios", country_code: "JP", channel_id: "mist_ads", amount_usd: "3.00", cost_usd: "2.00" },
+  );
   const revenuePlan: Record<string, [number | null, number]> = {
     "2026-10-06": [12.5, 0],
     "2026-10-07": [0, 0],

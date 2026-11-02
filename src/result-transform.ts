@@ -1,0 +1,144 @@
+/** Transform only complete, already verified rows. Values are decimal strings;
+ * no calculation here converts a numeric input through JavaScript Number. */
+export type ResultValue = string | boolean | null;
+export interface ResultColumn {
+  name: string;
+  type: "text" | "decimal" | "boolean";
+  unit: string;
+  label: string;
+  scale?: number;
+}
+export interface ResultTable { columns: ResultColumn[]; rows: Array<Record<string, ResultValue>> }
+export type ComparisonOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
+export type TransformStep =
+  | { op: "filter"; column: string; comparison: ComparisonOp; value: string | boolean | null }
+  | { op: "compare"; left: string; right: string; comparison: ComparisonOp; as: string }
+  | { op: "sort"; keys: Array<{ column: string; direction: "asc" | "desc"; nulls: "first" | "last" }> }
+  | { op: "group"; by: string[]; aggregates: Array<{ op: "count_all" | "count" | "sum" | "min" | "max"; column?: string; as: string }> };
+
+const namePattern = /^[a-z_][a-z0-9_]{0,63}$/u;
+const comparisons = new Set<ComparisonOp>(["eq", "ne", "lt", "le", "gt", "ge"]);
+
+/** Returns null for malformed instructions, incompatible units or overflow. */
+export function transformResult(input: ResultTable, steps: TransformStep[]): ResultTable | null {
+  if (!Array.isArray(steps) || steps.length < 1 || steps.length > 10 || !validTable(input)) return null;
+  let table: ResultTable = { columns: input.columns.map((c) => ({ ...c })), rows: input.rows.map((r) => ({ ...r })) };
+  for (const step of steps) {
+    if (!step || typeof step !== "object") return null;
+    const column = (name: string) => table.columns.find((c) => c.name === name);
+    if (step.op === "filter") {
+      const field = column(step.column);
+      if (!field || !comparisons.has(step.comparison) || !validValue(step.value, field)) return null;
+      table.rows = table.rows.filter((row) => compare(row[field.name]!, step.value, field, step.comparison) === true);
+    } else if (step.op === "compare") {
+      const left = column(step.left); const right = column(step.right);
+      if (!left || !right || !validName(step.as, table.columns) || !comparisons.has(step.comparison) || left.type !== right.type || left.unit !== right.unit) return null;
+      const output: ResultColumn = { name: step.as, type: "boolean", unit: "布尔值", label: `比较（${left.label} ${step.comparison} ${right.label}）` };
+      table.columns.push(output);
+      table.rows = table.rows.map((row) => ({ ...row, [step.as]: compare(row[left.name]!, row[right.name]!, left, step.comparison) }));
+    } else if (step.op === "sort") {
+      if (!Array.isArray(step.keys) || !step.keys.length || step.keys.length > 8 || step.keys.some((key) => !column(key.column) || !["asc", "desc"].includes(key.direction) || !["first", "last"].includes(key.nulls))) return null;
+      table.rows = table.rows.map((row, index) => ({ row, index })).sort((a, b) => {
+        for (const key of step.keys) {
+          const field = column(key.column)!; const x = a.row[key.column]!; const y = b.row[key.column]!;
+          if (x === null || y === null) { if (x !== y) return x === null ? (key.nulls === "first" ? -1 : 1) : (key.nulls === "first" ? 1 : -1); continue; }
+          const n = order(x, y, field);
+          if (n) return key.direction === "asc" ? n : -n;
+        }
+        return a.index - b.index;
+      }).map(({ row }) => row);
+    } else if (step.op === "group") {
+      if (!Array.isArray(step.by) || step.by.length > 8 || new Set(step.by).size !== step.by.length || step.by.some((name) => !column(name)) || !Array.isArray(step.aggregates) || !step.aggregates.length || step.aggregates.length > 20) return null;
+      const outputs: ResultColumn[] = step.by.map((name) => ({ ...column(name)! }));
+      for (const agg of step.aggregates) {
+        if (!agg || !["count_all", "count", "sum", "min", "max"].includes(agg.op) || !validName(agg.as, outputs)) return null;
+        const field = agg.column ? column(agg.column) : undefined;
+        if (agg.op === "count_all" ? agg.column !== undefined : !field) return null;
+        if (agg.op === "sum" && field?.type !== "decimal") return null;
+        if ((agg.op === "min" || agg.op === "max") && field?.type === "boolean") return null;
+        outputs.push(agg.op === "count" || agg.op === "count_all"
+          ? { name: agg.as, type: "decimal", unit: "结果行", label: agg.op === "count_all" ? "输入结果行数" : `${field!.label} 的非 NULL 结果行数`, scale: 0 }
+          : { ...field!, name: agg.as, label: `${field!.label} 的${{ sum: "合计", min: "最小值", max: "最大值" }[agg.op as "sum" | "min" | "max"]}` });
+      }
+      const groups = new Map<string, Array<Record<string, ResultValue>>>();
+      for (const row of table.rows) {
+        const key = JSON.stringify(step.by.map((name) => row[name]));
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key)!.push(row);
+      }
+      if (!step.by.length && !groups.size) groups.set("[]", []);
+      const rows: Array<Record<string, ResultValue>> = [];
+      for (const [key, group] of groups) {
+        const values = JSON.parse(key) as ResultValue[];
+        const output: Record<string, ResultValue> = Object.create(null) as Record<string, ResultValue>;
+        step.by.forEach((name, index) => { output[name] = values[index]!; });
+        for (const agg of step.aggregates) {
+          if (agg.op === "count_all") { output[agg.as] = String(group.length); continue; }
+          const field = column(agg.column!)!;
+          const present = group.map((row) => row[field.name]!).filter((value): value is string | boolean => value !== null);
+          if (agg.op === "count") { output[agg.as] = String(present.length); continue; }
+          if (!present.length) { output[agg.as] = null; continue; }
+          if (agg.op === "sum") {
+            const total = sum(present as string[], field.scale!);
+            if (total === undefined) return null;
+            output[agg.as] = total;
+          } else {
+            output[agg.as] = present.reduce((a, b) => (agg.op === "min" ? order(a, b, field) <= 0 : order(a, b, field) >= 0) ? a : b);
+          }
+        }
+        rows.push(output);
+      }
+      table = { columns: outputs, rows };
+    } else return null;
+    if (!validTable(table)) return null;
+  }
+  return table;
+}
+
+function validName(name: unknown, columns: ResultColumn[]): name is string { return typeof name === "string" && namePattern.test(name) && !["__proto__", "constructor", "prototype"].includes(name) && !columns.some((c) => c.name === name); }
+function validTable(table: ResultTable): boolean {
+  if (!table || !Array.isArray(table.columns) || !table.columns.length || table.columns.length > 40 || !Array.isArray(table.rows) || table.rows.length > 200) return false;
+  const names: ResultColumn[] = [];
+  for (const field of table.columns) {
+    if (!field || !validName(field.name, names) || !["text", "decimal", "boolean"].includes(field.type) || typeof field.label !== "string" || typeof field.unit !== "string" || (field.type === "decimal" && (!Number.isInteger(field.scale) || field.scale! < 0 || field.scale! > 38))) return false;
+    names.push(field);
+  }
+  return table.rows.every((row) => row && typeof row === "object" && Object.keys(row).length === names.length && names.every((field) => Object.hasOwn(row, field.name) && validValue(row[field.name], field))) && Buffer.byteLength(JSON.stringify(table)) <= 200_000;
+}
+function validValue(value: unknown, field: ResultColumn): value is ResultValue {
+  if (value === null) return true;
+  if (field.type === "boolean") return typeof value === "boolean";
+  if (typeof value !== "string" || value.length > 256) return false;
+  return field.type === "text" || decimal(value) !== null;
+}
+function decimal(value: string): { n: bigint; scale: number } | null {
+  const m = /^(-?)(\d+)(?:\.(\d+))?$/u.exec(value);
+  if (!m || m[2]!.length + (m[3]?.length ?? 0) > 76 || (m[3]?.length ?? 0) > 38) return null;
+  const n = BigInt(m[2]! + (m[3] ?? ""));
+  return { n: m[1] ? -n : n, scale: m[3]?.length ?? 0 };
+}
+function order(a: Exclude<ResultValue, null>, b: Exclude<ResultValue, null>, field: ResultColumn): number {
+  if (field.type === "decimal") {
+    const x = decimal(a as string)!; const y = decimal(b as string)!; const scale = Math.max(x.scale, y.scale);
+    const left = x.n * 10n ** BigInt(scale - x.scale); const right = y.n * 10n ** BigInt(scale - y.scale);
+    return left < right ? -1 : left > right ? 1 : 0;
+  }
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+function compare(a: ResultValue, b: ResultValue, field: ResultColumn, op: ComparisonOp): boolean | null {
+  if (a === null || b === null) return null;
+  const result = order(a, b, field);
+  return { eq: result === 0, ne: result !== 0, lt: result < 0, le: result <= 0, gt: result > 0, ge: result >= 0 }[op];
+}
+function sum(values: string[], scale: number): string | undefined {
+  let n = 0n;
+  for (const value of values) {
+    const parsed = decimal(value);
+    if (!parsed || parsed.scale > scale) return undefined;
+    n += parsed.n * 10n ** BigInt(scale - parsed.scale);
+  }
+  const negative = n < 0n; const digits = (negative ? -n : n).toString();
+  if (digits.length > 76) return undefined;
+  const padded = digits.padStart(scale + 1, "0");
+  return `${negative ? "-" : ""}${scale ? `${padded.slice(0, -scale)}.${padded.slice(-scale)}` : padded}`;
+}

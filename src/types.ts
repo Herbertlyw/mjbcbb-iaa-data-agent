@@ -274,10 +274,39 @@ export interface ArithmeticResource {
   complete_population: true;
 }
 
-export type SessionResource = QueryResource | CalculationResource | ArithmeticResource;
+export interface TransformResource {
+  resource_id: string;
+  session_id: string;
+  job_id: string;
+  kind: "transform";
+  created_at: string;
+  source_resource_id: string;
+  steps: import("./result-transform.js").TransformStep[];
+  input_hashes: Record<string, string>;
+  result: import("./result-transform.js").ResultTable;
+  input_truncated: false;
+  complete_population: true;
+}
+
+export interface AlignmentResource {
+  resource_id: string;
+  session_id: string;
+  job_id: string;
+  kind: "alignment";
+  created_at: string;
+  spec: import("./result-alignment.js").AlignmentSpec;
+  input_hashes: Record<string, string>;
+  rows: import("./result-alignment.js").AlignedRow[];
+  input_truncated: false;
+  complete_population: true;
+}
+
+export type SessionResource = QueryResource | CalculationResource | ArithmeticResource | TransformResource | AlignmentResource;
 
 export interface AnalysisSource {
   resource_id: string;
+  execution_id?: string;
+  data_capture_hash?: string;
   sql: string;
   tables: string[];
   contract_revisions: Record<string, string>;
@@ -319,6 +348,8 @@ export interface AnalysisRecord {
   comparisons?: import("./evidence-comparison.js").VerifiedComparison[];
   aggregate_comparisons?: import("./aggregate-comparison.js").AggregateComparison[];
   arithmetic_results?: Array<{ resource_id: string; operation: import("./exact-arithmetic.js").ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef; result: import("./exact-arithmetic.js").ArithmeticValue }>;
+  transform_results?: Array<{ resource_id: string; source_resource_id: string; steps: import("./result-transform.js").TransformStep[]; result: import("./result-transform.js").ResultTable }>;
+  alignment_results?: Array<{ resource_id: string; spec: import("./result-alignment.js").AlignmentSpec; rows: import("./result-alignment.js").AlignedRow[] }>;
   aggregates?: import("./aggregate-evidence.js").VerifiedAggregate[];
   model_suggested_status: string;
   model_draft: string;

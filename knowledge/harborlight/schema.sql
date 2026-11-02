@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS fact_fox_daily_payment (
   platform LowCardinality(String),
   country_code LowCardinality(String),
   channel_id LowCardinality(String),
-  amount_usd Nullable(Decimal(18,2))
+  amount_usd Nullable(Decimal(18,2)),
+  cost_usd Nullable(Decimal(18,2))
 ) ENGINE = MergeTree
 PARTITION BY toYYYYMM(event_date)
 ORDER BY (event_date, title_id, platform, country_code, channel_id);

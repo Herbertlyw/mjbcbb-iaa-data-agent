@@ -8,6 +8,9 @@ import { compareDecimalAggregates, type AggregateComparison } from "./aggregate-
 import { computeArithmetic, fromAggregate, sumDecimalStrings, type ArithmeticOp, type ArithmeticValue } from "./exact-arithmetic.js";
 import { verifyDecimalCell, type VerifiedDecimalCell } from "./decimal-cell-evidence.js";
 import { verifyDatabaseAggregates, type VerifiedAggregate } from "./aggregate-evidence.js";
+import { prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema, type JoinEvidencePlan, type VerifiedJoinValue } from "./join-evidence.js";
+import { transformResult, type ResultColumn, type ResultTable, type ResultValue, type TransformStep } from "./result-transform.js";
+import { alignAggregates, type AlignedRow, type AlignmentSpec } from "./result-alignment.js";
 import { freshnessManifest, freshnessPeriodKey, matchesFreshnessManifest, readPublication, type FreshnessPublication } from "./freshness.js";
 import type { MysqlFreshnessStore } from "./mysql-freshness.js";
 import { canQueryTable, canRead, contractValidity, tableGrain } from "./knowledge.js";
@@ -15,6 +18,7 @@ import { newId, type SessionRecord, type SessionStore } from "./session.js";
 import type {
   AnalysisRecord,
   AnalysisStatus,
+  AlignmentResource,
   ArithmeticRef,
   ArithmeticResource,
   CalculationResource,
@@ -25,6 +29,7 @@ import type {
   QueryResource,
   SessionResource,
   ToolFailure,
+  TransformResource,
 } from "./types.js";
 import { clickHouseColumns, clickHouseColumnTypes, clickHouseQueryBounded } from "./clickhouse-client.js";
 import { assertJoinKeys, guardSql, parseReadonlySql, SqlRejected, type TableRule } from "./sql.js";
@@ -42,6 +47,8 @@ export interface ToolContext {
 }
 
 type ToolResult = ToolFailure | { ok: true; [key: string]: unknown };
+type PrivateJoinProof = { rows: Array<Record<string, unknown>>; column_types: Record<string, string>; capture_hash: string };
+type JoinQueryResource = QueryResource & { join_proof?: PrivateJoinProof };
 
 export class ToolService {
   private readonly assetBytesRead = new Map<string, number>();
@@ -325,6 +332,11 @@ export class ToolService {
       if (error instanceof SqlRejected) return fail(error.code, error.message);
       throw error;
     }
+    const joinContracts = guarded.tables.map((table) => this.ctx.knowledge.contract_by_table.get(table)?.contract);
+    const joinFact = joinContracts.find((contract) => contract?.series);
+    const joinDimension = joinContracts.find((contract) => contract && !contract.series);
+    const joinPlan = this.ctx.businessEngine === "clickhouse" && guarded.tables.length === 2 && joinFact && joinDimension
+      ? prepareJoinEvidence(guarded.sql, joinFact, joinDimension, this.ctx.knowledge.joins) : null;
     const initialFreshness = await this.currentFreshness();
     if (!initialFreshness.ok) return initialFreshness;
     const published = initialFreshness.publication;
@@ -354,11 +366,23 @@ export class ToolService {
     if (latency === "timeout") return fail("query_timeout", "查询超时，没有留下结果");
     let rows: Array<Record<string, unknown>>;
     let bounded: Awaited<ReturnType<typeof clickHouseQueryBounded>> | null = null;
+    let joinProof: PrivateJoinProof | undefined;
     const started = Date.now();
     try {
       if (this.ctx.businessEngine === "clickhouse") {
         if (!this.ctx.clickhouse) throw new Error("clickhouse_unavailable");
-        bounded = await clickHouseQueryBounded(this.ctx.clickhouse, guarded.sql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
+        bounded = await clickHouseQueryBounded(this.ctx.clickhouse, joinPlan?.executionSql ?? guarded.sql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
+        if (joinPlan && joinFact && joinDimension) {
+          const captured = bounded.rows;
+          const types = bounded.column_types;
+          const cleanRows = captured.map(({ __da_join_proof: _proof, ...row }) => row);
+          const { __da_join_proof: _proofType, ...cleanTypes } = types;
+          if (!bounded.truncated && verifyJoinExecutionSchema(joinPlan, joinFact, joinDimension, types) && verifyJoinEvidence(joinPlan, captured) && Buffer.byteLength(JSON.stringify({ captured, cleanRows, types })) <= this.ctx.config.maxResultBytes) {
+            joinProof = { rows: captured, column_types: types, capture_hash: joinCaptureHash(guarded.sql, bounded.query_id, captured, types) };
+          }
+          bounded.rows = cleanRows;
+          bounded.column_types = cleanTypes;
+        }
         rows = bounded.rows;
       } else rows = await this.executeGuarded(guarded.sql, signal);
     } catch (error) {
@@ -377,7 +401,7 @@ export class ToolService {
     }
     let coverage;
     try {
-      coverage = await this.coverageForTables(guarded.sql, guarded.tables, guarded.time_range, bindings, signal);
+      coverage = joinPlan && joinProof ? joinCoverage(joinPlan, joinProof.rows) : await this.coverageForTables(guarded.sql, guarded.tables, guarded.time_range, bindings, signal);
     } catch {
       if (signal?.aborted) return fail("query_cancelled", "查询已取消");
       return fail("coverage_query_failed", "覆盖统计无法完成，查询结果没有保存。");
@@ -402,7 +426,7 @@ export class ToolService {
       truncated = true;
     }
     const timezone = bindings[0]?.timezone ?? this.ctx.knowledge.timezone;
-    const resource: QueryResource = {
+    const resource: JoinQueryResource = {
       resource_id: newId("res"),
       session_id: session.session_id,
       kind: "query_result",
@@ -433,6 +457,7 @@ export class ToolService {
       rows: returned,
       coverage,
       freshness_receipts: freshnessReceipts,
+      ...(joinProof ? { join_proof: joinProof } : {}),
     };
     await this.ctx.sessions.saveResourceAsync(resource);
     const resourceHash = createHash("sha256").update(JSON.stringify(resource)).digest("hex");
@@ -472,11 +497,19 @@ export class ToolService {
 
   async calculateSessionCells(
     sessionId: string,
-    input: { resource_id?: string; operations?: CellOperation[]; arithmetic?: { op: ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef } },
+    input: { resource_id?: string; operations?: CellOperation[]; arithmetic?: { op: ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef }; transform?: { resource_id: string; steps: TransformStep[] }; align?: AlignmentSpec },
     signal?: AbortSignal,
   ): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
+    if (input.align) {
+      if (input.transform || input.arithmetic || input.resource_id || input.operations) return fail("invalid_alignment", "分组对齐须单独提交。");
+      return this.calculateAlignment(sessionId, input.align);
+    }
+    if (input.transform) {
+      if (input.arithmetic || input.resource_id || input.operations) return fail("invalid_transform", "表格变换须单独提交。");
+      return this.calculateTransform(sessionId, input.transform);
+    }
     if (input.arithmetic) {
       if (input.resource_id || input.operations) return fail("invalid_arithmetic", "四则运算与单资源汇总须分开提交。");
       return this.calculateArithmetic(sessionId, input.arithmetic);
@@ -542,11 +575,107 @@ export class ToolService {
     const left = await this.resolveArithmetic(session, jobId, expression.left, fresh.publication, new Set());
     const right = await this.resolveArithmetic(session, jobId, expression.right, fresh.publication, new Set());
     if (!left || !right) return fail("arithmetic_lineage_unsupported", "输入不属于当前任务、已变化或不能证明完整血缘。");
-    const result = computeArithmetic(expression.op, left.value, right.value);
-    if (!result) return fail("arithmetic_scope_incompatible", "输入的指标、单位、覆盖或范围不能安全组合。");
+    const result = this.computeProvenArithmetic(expression.op, left.value, right.value);
+    if (!result) return fail("arithmetic_scope_incompatible", "指标关系须由契约声明，且单位、粒度、实际/预测状态及范围须兼容。");
     const resource: ArithmeticResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "arithmetic", created_at: new Date().toISOString(), operation: expression.op, left: expression.left, right: expression.right, input_hashes: { ...left.hashes, ...right.hashes }, result, input_truncated: false, complete_population: true };
     await this.ctx.sessions.saveResourceAsync(resource);
     return { ok: true, resource_id: resource.resource_id, result: resource.result, dependencies: Object.keys(resource.input_hashes), notice: `${result.value === null ? "除数为零，结果不可计算；没有补成零。" : "定点计算；除法保留 18 位小数、半数远离零。正式结论须引用所有来源并经服务端复核。"} resource_id=${resource.resource_id}` };
+  }
+
+  private computeProvenArithmetic(op: ArithmeticOp, left: ArithmeticValue, right: ArithmeticValue): ArithmeticValue | null {
+    const a = left.basis; const b = right.basis;
+    const aBases = left.bases ?? [a]; const bBases = right.bases ?? [b];
+    let declared = false;
+    if (aBases.length === 1 && bBases.length === 1 && (a.table !== b.table || a.column !== b.column)) {
+      const leftContract = this.ctx.knowledge.contract_by_table.get(a.table)?.contract;
+      const rightContract = this.ctx.knowledge.contract_by_table.get(b.table)?.contract;
+      const aSeries = leftContract?.series; const bSeries = rightContract?.series;
+      const keys = (items: string[]) => JSON.stringify([...items].sort());
+      const equalGrain = leftContract && rightContract && aSeries && bSeries && aSeries.date_column === bSeries.date_column && keys(aSeries.dimensions) === keys(bSeries.dimensions) && keys(tableGrain(this.ctx.knowledge, a.table)) === keys(tableGrain(this.ctx.knowledge, b.table));
+      const metric = (table: string, field: string, name: string) => name === `${table}.${field}` || name === field && a.table === b.table;
+      const definitions = [...(leftContract?.derived_metrics ?? []), ...(a.table === b.table ? [] : rightContract?.derived_metrics ?? [])];
+      declared = Boolean(equalGrain && op === "divide" && a.operation === "sum" && b.operation === "sum" && a.prediction === "actual_observed_only" && b.prediction === a.prediction && a.timezone === b.timezone && a.unit === b.unit && a.unit !== "契约未声明" && definitions.some((item) => item.operation === op && item.prediction === "actual_only" && item.unit === "比值" && metric(a.table, a.column, item.numerator) && metric(b.table, b.column, item.denominator)));
+    }
+    return computeArithmetic(op, left, right, declared);
+  }
+
+  private async calculateTransform(sessionId: string, input: { resource_id: string; steps: TransformStep[] }): Promise<ToolResult> {
+    if (!input || typeof input.resource_id !== "string" || !Array.isArray(input.steps)) return fail("invalid_transform", "变换须指定输入资源和操作列表。");
+    const session = await this.ctx.sessions.requireAsync(sessionId);
+    const jobId = session.active_job_id;
+    if (!jobId) return fail("missing_active_job", "表格变换需要当前任务。");
+    const fresh = await this.currentFreshness();
+    if (!fresh.ok) return fresh;
+    if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
+    const inputTable = await this.resolveTransform(session, jobId, input.resource_id, fresh.publication, new Set());
+    if (!inputTable) return fail("transform_lineage_unsupported", "输入必须为当前任务完整、可验证的聚合资源或变换资源。");
+    const result = transformResult(inputTable.table, input.steps);
+    if (!result) return fail("invalid_transform", "变换参数、类型、单位或资源边界不受支持。");
+    const resource: TransformResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "transform", created_at: new Date().toISOString(), source_resource_id: input.resource_id, steps: input.steps, input_hashes: inputTable.hashes, result, input_truncated: false, complete_population: true };
+    await this.ctx.sessions.saveResourceAsync(resource);
+    return { ok: true, resource_id: resource.resource_id, result, dependencies: Object.keys(resource.input_hashes), notice: `变换仅应用于完整已保存结果；正式交付时递归复核来源。resource_id=${resource.resource_id}` };
+  }
+
+  private async calculateAlignment(sessionId: string, spec: AlignmentSpec): Promise<ToolResult> {
+    const session = await this.ctx.sessions.requireAsync(sessionId); const jobId = session.active_job_id;
+    if (!jobId) return fail("missing_active_job", "分组对齐需要当前任务。");
+    const fresh = await this.currentFreshness();
+    if (!fresh.ok) return fresh;
+    if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
+    const checked = await this.resolveAlignment(session, jobId, spec, fresh.publication);
+    if (!checked) return fail("alignment_lineage_unsupported", "分组、指标口径、范围或完整来源无法证明。");
+    const resource: AlignmentResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "alignment", created_at: new Date().toISOString(), spec, input_hashes: checked.hashes, rows: checked.rows, input_truncated: false, complete_population: true };
+    await this.ctx.sessions.saveResourceAsync(resource);
+    return { ok: true, resource_id: resource.resource_id, rows: checked.rows, dependencies: Object.keys(checked.hashes), notice: `按完整结果的分组键全集对齐；某侧未出现的组不补零。resource_id=${resource.resource_id}` };
+  }
+
+  private async resolveAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[] } | null> {
+    if (!spec || !spec.left || !spec.right || typeof spec.left.resource_id !== "string" || typeof spec.right.resource_id !== "string" || typeof spec.left.cell !== "string" || typeof spec.right.cell !== "string") return null;
+    const inputs: Array<{ source: QueryResource; aggregates: VerifiedAggregate[] }> = [];
+    for (const ref of [spec.left, spec.right]) {
+      const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, ref.resource_id);
+      if (!found.ok || found.resource.kind !== "query_result" || found.resource.job_id !== jobId) return null;
+      const source = found.resource; const contract = this.arithmeticContract(session, source, publication);
+      const aggregates = contract && verifyDatabaseAggregates(source, contract)?.filter((item) => item.output_column === ref.cell);
+      if (!aggregates?.length) return null;
+      inputs.push({ source, aggregates });
+    }
+    const first = inputs[0]!.aggregates[0]!; const second = inputs[1]!.aggregates[0]!;
+    if (stableHashes(first.filters) !== stableHashes(second.filters)) return null;
+    const aScope = fromAggregate(first); const bScope = fromAggregate(second);
+    aScope.scopes[0]!.filters = { ...first.filters }; bScope.scopes[0]!.filters = { ...second.filters };
+    if (!this.computeProvenArithmetic(spec.op, aScope, bScope)) return null;
+    const rows = alignAggregates(inputs[0]!.aggregates, inputs[1]!.aggregates, spec.keys, spec.op, (op, a, b) => this.computeProvenArithmetic(op, a, b));
+    if (!rows) return null;
+    const hashes = Object.fromEntries(inputs.map(({ source }) => [source.resource_id, createHash("sha256").update(JSON.stringify(source)).digest("hex")]));
+    return { rows, hashes, leaves: [...new Set(inputs.map(({ source }) => source.resource_id))] };
+  }
+
+  private async resolveTransform(session: SessionRecord, jobId: string, resourceId: string, publication: FreshnessPublication, path: Set<string>): Promise<{ table: ResultTable; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
+    if (typeof resourceId !== "string" || path.has(resourceId) || path.size >= 8) return null;
+    const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, resourceId);
+    if (!found.ok || found.resource.job_id !== jobId) return null;
+    const resource = found.resource;
+    const ownHash = createHash("sha256").update(JSON.stringify(resource)).digest("hex");
+    if (resource.kind === "query_result") {
+      const contract = this.arithmeticContract(session, resource, publication);
+      const aggregates = contract && verifyDatabaseAggregates(resource, contract);
+      const table = aggregates && aggregateTable(aggregates);
+      return table ? { table, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial: false } : null;
+    }
+    if (resource.kind === "alignment") {
+      const checked = await this.resolveAlignment(session, jobId, resource.spec, publication);
+      if (!checked || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) return null;
+      const table = alignmentTable(resource.spec, checked.rows);
+      return table ? { table, hashes: { ...checked.hashes, [resource.resource_id]: ownHash }, leaves: checked.leaves, partial: checked.rows.some((row) => row.status !== "matched") } : null;
+    }
+    if (resource.kind !== "transform") return null;
+    const next = new Set(path); next.add(resourceId);
+    const source = await this.resolveTransform(session, jobId, resource.source_resource_id, publication, next);
+    if (!source || stableHashes(source.hashes) !== stableHashes(resource.input_hashes)) return null;
+    const table = transformResult(source.table, resource.steps);
+    if (!table || JSON.stringify(table) !== JSON.stringify(resource.result)) return null;
+    return { table, hashes: { ...source.hashes, [resource.resource_id]: ownHash }, leaves: source.leaves, partial: source.partial };
   }
 
   private async resolveArithmetic(session: SessionRecord, jobId: string, ref: ArithmeticRef, publication: FreshnessPublication, path: Set<string>): Promise<{ value: ArithmeticValue; hashes: Record<string, string>; leaves: string[] } | null> {
@@ -587,7 +716,7 @@ export class ToolService {
     const hashes = { ...left.hashes, ...right.hashes };
     const stable = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
     if (stable(hashes) !== stable(resource.input_hashes)) return null;
-    const value = computeArithmetic(resource.operation, left.value, right.value);
+    const value = this.computeProvenArithmetic(resource.operation, left.value, right.value);
     if (!value || JSON.stringify(value) !== JSON.stringify(resource.result)) return null;
     return { value, hashes: { ...hashes, [resource.resource_id]: ownHash }, leaves: [...new Set([...left.leaves, ...right.leaves])] };
   }
@@ -610,19 +739,34 @@ export class ToolService {
     const limit = input.row_limit ?? 50;
     if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) return fail("invalid_resource_page", "行偏移须为非负整数，每页限 1 到 100 行。");
     if ((offset > 0 && !input.expected_resource_hash) || (input.expected_resource_hash && input.expected_resource_hash !== hash)) return fail("resource_version_changed", "续读须携带首页的资源哈希，资源变化后请从头读取。");
+    if (found.resource.kind === "transform") {
+      const resource = found.resource; const available = resource.result.columns.map((column) => column.name);
+      const selected = input.columns ?? available;
+      if (offset > resource.result.rows.length || !Array.isArray(selected) || selected.some((name) => typeof name !== "string" || !available.includes(name)) || new Set(selected).size !== selected.length) return fail("invalid_resource_page", "行偏移或列选择不合法。");
+      const rows = resource.result.rows.slice(offset, offset + limit).map((row) => Object.fromEntries(selected.map((name) => [name, row[name]])));
+      const next = offset + rows.length;
+      return { ok: true, resource: { ...resource, result: { columns: resource.result.columns.filter((column) => selected.includes(column.name)), rows } }, resource_hash: hash, has_more: next < resource.result.rows.length, next_row_offset: next < resource.result.rows.length ? next : null, resource_truncated: false };
+    }
+    if (found.resource.kind === "alignment") {
+      const resource = found.resource;
+      if (input.columns || offset > resource.rows.length) return fail("invalid_resource_page", "对齐结果仅支持行分页。");
+      const rows = resource.rows.slice(offset, offset + limit); const next = offset + rows.length;
+      return { ok: true, resource: { ...resource, rows }, resource_hash: hash, has_more: next < resource.rows.length, next_row_offset: next < resource.rows.length ? next : null, resource_truncated: false };
+    }
     if (found.resource.kind !== "query_result") {
       if (offset !== 0 || input.columns) return fail("invalid_resource_page", "计算资源没有可分页的表格行。");
       return { ok: true, resource: found.resource, resource_hash: hash, has_more: false, resource_truncated: found.resource.input_truncated };
     }
-    const source = found.resource;
+    const source = found.resource as JoinQueryResource;
     if (offset > source.rows.length) return fail("invalid_resource_page", "行偏移超出已保存的结果。");
     const columns = input.columns ?? source.columns;
     if (!Array.isArray(columns) || columns.some((column) => typeof column !== "string" || !source.columns.includes(column)) || new Set(columns).size !== columns.length) return fail("invalid_resource_columns", "只能选择资源中已有且不重复的列。");
     const rows = source.rows.slice(offset, offset + limit).map((row) => Object.fromEntries(columns.map((column) => [column, row[column]])));
     const next = offset + rows.length;
+    const { join_proof: _privateProof, ...publicSource } = source;
     return {
       ok: true,
-      resource: { ...source, columns, rows },
+      resource: { ...publicSource, columns, rows },
       resource_hash: hash,
       row_offset: offset,
       row_limit: limit,
@@ -679,6 +823,8 @@ export class ToolService {
           complete_population: found.resource.complete_population,
           simulated: true,
           engine: found.resource.engine,
+          ...(found.resource.execution_id ? { execution_id: found.resource.execution_id } : {}),
+          ...((found.resource as JoinQueryResource).join_proof ? { data_capture_hash: (found.resource as JoinQueryResource).join_proof!.capture_hash } : {}),
           rows: found.resource.rows,
           coverage: found.resource.coverage ?? unknownCoverage("资源没有覆盖回执，覆盖情况未知。"),
           freshness_receipts: found.resource.freshness_receipts ?? [],
@@ -733,6 +879,7 @@ export class ToolService {
     const liveFreshness = deliveredFreshness.publication;
     const eligible = new Set<string>();
     const aggregates: VerifiedAggregate[] = [];
+    const joinLines: string[] = [];
     for (const source of sources) {
       const original = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === source.resource_id);
       const asset = original && original.tables.length === 1 ? this.ctx.knowledge.contract_by_table.get(original.tables[0] ?? "") : undefined;
@@ -741,9 +888,22 @@ export class ToolService {
       const currentFresh = Boolean(liveFreshness && liveFreshness.valid_until >= currentCalendarDate(this.ctx.config, this.ctx.knowledge.timezone) && source.freshness_receipts.length === source.tables.length && source.tables.every((table) => source.freshness_receipts.some((receipt) => receipt.table === table)) && source.freshness_receipts.every((receipt) => receipt.publication_id === liveFreshness.publication_id && receipt.version === liveFreshness.version && liveFreshness.tables[receipt.table]?.status === "fresh"));
       const shape = original && contract && verifyCell(original, contract, { op: "count_rows", as: "internal" }, original.rows.length);
       const databaseAggregates = original && contract && verifyDatabaseAggregates(original, contract);
+      const joined = original && liveFreshness ? verifyJoinResource(original as JoinQueryResource, session, this.ctx.knowledge, this.ctx.config, liveFreshness) : null;
+      if (joined) {
+        source.evidence_eligible = true;
+        source.coverage = joinCoverage(joined.plan, (original as JoinQueryResource).join_proof!.rows);
+        source.rows = [];
+        eligible.add(source.resource_id);
+        joinLines.push(...joined.values.map((value) => renderVerifiedJoin(value, source.resource_id)));
+        continue;
+      }
       source.evidence_eligible = Boolean(currentContract && currentFresh && (shape || databaseAggregates) && !source.truncated && source.complete_population);
       if (source.evidence_eligible) {
         eligible.add(source.resource_id);
+        if (source.engine === "clickhouse-local") {
+          reasons.push("clickhouse_snapshot_unproven");
+          if (status === "completed") status = "partial";
+        }
         if (databaseAggregates) aggregates.push(...databaseAggregates);
         // SQL aliases are model-controlled and can look like another metric or
         // unit. The verified statements use contract names; do not present the
@@ -755,6 +915,7 @@ export class ToolService {
         }
       }
       else {
+        delete source.data_capture_hash;
         if (!currentFresh) reasons.push("freshness_version_changed");
         if (!currentContract) reasons.push("contract_or_authorization_changed");
         if (source.truncated || !source.complete_population) reasons.push("truncated_result_is_not_population");
@@ -803,6 +964,12 @@ export class ToolService {
     }
     const comparisons: VerifiedComparison[] = [];
     const aggregateComparisons: AggregateComparison[] = [];
+    const noteUnprovenSnapshot = (ids: string[]) => {
+      if (ids.some((id) => sources.some((source) => source.resource_id === id && source.engine === "clickhouse-local"))) {
+        reasons.push("clickhouse_snapshot_unproven");
+        if (status === "completed") status = "partial";
+      }
+    };
     for (const request of (input.comparisons ?? []).slice(0, 20)) {
       if (!request || !request.left || !request.right || typeof request.left.resource_id !== "string" || typeof request.left.cell !== "string" || typeof request.right.resource_id !== "string" || typeof request.right.cell !== "string") {
         reasons.push("comparison_unverifiable");
@@ -817,12 +984,12 @@ export class ToolService {
         { calculation_id: request.left.resource_id, cell: request.left.cell, source: a },
         { calculation_id: request.right.resource_id, cell: request.right.cell, source: b }, aSource, bSource, contract,
       );
-      if (comparison) comparisons.push(comparison);
+      if (comparison) { comparisons.push(comparison); noteUnprovenSnapshot([a!.sourceResourceId, b!.sourceResourceId]); }
       else {
         const left = aggregates.filter((item) => item.source_resource_id === request.left.resource_id && item.output_column === request.left.cell);
         const right = aggregates.filter((item) => item.source_resource_id === request.right.resource_id && item.output_column === request.right.cell);
         const decimal = left.length === 1 && right.length === 1 ? compareDecimalAggregates(left[0]!, right[0]!) : null;
-        if (decimal) aggregateComparisons.push(decimal);
+        if (decimal) { aggregateComparisons.push(decimal); noteUnprovenSnapshot([decimal.left.source_resource_id, decimal.right.source_resource_id]); }
         else reasons.push("comparison_unverifiable");
       }
     }
@@ -838,7 +1005,39 @@ export class ToolService {
         continue;
       }
       arithmeticResults.push({ resource_id: resource.resource_id, operation: resource.operation, left: resource.left, right: resource.right, result: checked.value });
+      noteUnprovenSnapshot(checked.leaves);
       if (checked.value.value === null && status === "completed") status = "partial";
+    }
+    const transformResults: NonNullable<AnalysisRecord["transform_results"]> = [];
+    const transformLines: string[] = [];
+    for (const resource of resources) {
+      if (resource.kind !== "transform") continue;
+      const checked = liveFreshness && jobId ? await this.resolveTransform(session, jobId, resource.resource_id, liveFreshness, new Set()) : null;
+      const source = liveFreshness && jobId ? await this.resolveTransform(session, jobId, resource.source_resource_id, liveFreshness, new Set()) : null;
+      if (!checked || !source || checked.leaves.some((id) => !eligible.has(id))) {
+        reasons.push("transform_lineage_unsupported");
+        if (status === "completed") status = "partial";
+        continue;
+      }
+      if (checked.partial) { reasons.push("alignment_incomplete"); if (status === "completed") status = "partial"; }
+      noteUnprovenSnapshot(checked.leaves);
+      transformResults.push({ resource_id: resource.resource_id, source_resource_id: resource.source_resource_id, steps: resource.steps, result: checked.table });
+      transformLines.push(...renderTransform(resource, source.table, checked.table));
+    }
+    const alignmentResults: NonNullable<AnalysisRecord["alignment_results"]> = [];
+    const alignmentLines: string[] = [];
+    for (const resource of resources) {
+      if (resource.kind !== "alignment") continue;
+      const checked = liveFreshness && jobId ? await this.resolveAlignment(session, jobId, resource.spec, liveFreshness) : null;
+      if (!checked || checked.leaves.some((id) => !eligible.has(id)) || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) {
+        reasons.push("alignment_lineage_unsupported");
+        if (status === "completed") status = "partial";
+        continue;
+      }
+      if (checked.rows.some((row) => row.status !== "matched")) { reasons.push("alignment_incomplete"); if (status === "completed") status = "partial"; }
+      noteUnprovenSnapshot(checked.leaves);
+      alignmentResults.push({ resource_id: resource.resource_id, spec: resource.spec, rows: checked.rows });
+      alignmentLines.push(...renderAlignment(resource, checked.rows));
     }
     if (verified.some((cell) => cell.precision === "floating_point_approximate")) {
       reasons.push("floating_point_approximate");
@@ -854,6 +1053,10 @@ export class ToolService {
     if (reasons.includes("calculation_lineage_unsupported") || reasons.includes("query_lineage_unsupported")) limitations.push("部分表达式或计算缺少可证明的血缘，没有作为已验证数值展示。");
     if (reasons.includes("comparison_unverifiable")) limitations.push("部分比较的范围、覆盖、单位、预测状态或整数精度无法证明，没有展示比较结果。");
     if (reasons.includes("arithmetic_lineage_unsupported")) limitations.push("部分四则运算的递归来源、资源哈希、授权或新鲜度无法证明，没有展示结果。");
+    if (reasons.includes("transform_lineage_unsupported")) limitations.push("部分结果变换的递归来源、资源哈希、授权或新鲜度无法证明，没有展示结果。");
+    if (reasons.includes("alignment_lineage_unsupported")) limitations.push("部分分组对齐的完整来源、范围或口径无法证明，没有展示结果。");
+    if (reasons.includes("alignment_incomplete")) limitations.push("对齐来源存在未出现的分组或零分母；变换未把未知结果当作零。");
+    if (reasons.includes("clickhouse_snapshot_unproven")) limitations.push("ClickHouse 查询和覆盖统计是多次读取，可能发生数据变化；未证明共同数据版本，计算仅基于各次已捕获结果。");
     if (reasons.includes("alias_preview_hidden")) limitations.push("含模型自选列别名的结果预览已隐藏；正式数值按契约字段及单位展示。");
     if (reasons.includes("floating_point_approximate")) limitations.push("浮点字段及其派生值仅是近似数，尚未实现可验证的精确十进制金额计算。");
     if (reasons.includes("coverage_unknown")) limitations.push("预期覆盖范围无法确定，覆盖情况未知。");
@@ -863,8 +1066,12 @@ export class ToolService {
     if (reasons.includes("true_zeros_disclosed")) limitations.push("结果包含数值为零的行；预测状态按契约单独标示。");
     if (reasons.includes("predicted_values_disclosed")) limitations.push("预测值和实际值分开列出。");
     if (aggregates.some((item) => Object.keys(item.group).length)) limitations.push("分组只展示查询中出现的取值，未出现的组合没有补零。");
+    if (joinLines.length) limitations.push("JOIN 分组只证明实际匹配键在本次查询捕获数据中没有放大；未出现的分组未补零，跨表不具备原子快照。");
     limitations.push("数据来自本地合成库，不是生产数据。");
-    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...verifiedDecimal.map(renderDecimalCell), ...comparisons.map(renderComparison), ...aggregates.map(renderAggregate), ...aggregateComparisons.map(renderAggregateComparison), ...arithmeticResults.map(renderArithmetic)];
+    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...verifiedDecimal.map(renderDecimalCell), ...comparisons.map(renderComparison), ...aggregates.map(renderAggregate), ...aggregateComparisons.map(renderAggregateComparison), ...arithmeticResults.map(renderArithmetic), ...transformLines];
+    derivedLines.push(...alignmentLines);
+    if (reasons.includes("clickhouse_snapshot_unproven")) derivedLines.push("这些结果和计算基于 ClickHouse 的已捕获数据；查询和覆盖统计并非同一原子快照，未证明共同数据版本。");
+    derivedLines.push(...joinLines);
     let answer = renderAnswer(status, verified, sources, input.clarification_question, derivedLines);
     const draftNumbers = input.draft_answer.match(/\d+(?:\.\d+)?/g) ?? [];
     if (draftNumbers.some((item) => !answer.includes(item))) {
@@ -886,6 +1093,8 @@ export class ToolService {
       comparisons,
       aggregate_comparisons: aggregateComparisons,
       arithmetic_results: arithmeticResults,
+      transform_results: transformResults,
+      alignment_results: alignmentResults,
       aggregates,
       model_suggested_status: input.suggested_status,
       model_draft: input.draft_answer,
@@ -1085,6 +1294,44 @@ export interface AnalysisInput {
   comparisons?: Array<{ left: { resource_id: string; cell: string }; right: { resource_id: string; cell: string } }>;
 }
 
+/** The proof contains values already authorized in the original SQL, but is
+ * internal metadata and is never returned as model-visible resource rows. */
+function verifyJoinResource(resource: JoinQueryResource, session: SessionRecord, knowledge: KnowledgeBase, config: AppConfig, publication: FreshnessPublication): { plan: JoinEvidencePlan; values: VerifiedJoinValue[] } | null {
+  if (resource.engine !== "clickhouse-local" || !resource.execution_id || resource.tables.length !== 2 || resource.truncated || resource.sql_limited || !resource.complete_population || resource.total_rows_exact !== true || !resource.join_proof || resource.registry_revision !== knowledge.registry_revision || publication.valid_until < currentCalendarDate(config, knowledge.timezone)) return null;
+  const assets = resource.tables.map((table) => knowledge.contract_by_table.get(table));
+  if (assets.some((asset) => !asset?.contract || resource.contract_revisions[asset.contract.table] !== asset.contract.revision || resource.asset_hashes[asset.asset_id] !== asset.content_hash || !canQueryTable(knowledge, session.role, asset.contract.table) || contractValidity(asset.contract, currentCalendarDate(config, asset.contract.timezone)))) return null;
+  const fact = assets.find((asset) => asset?.contract?.series)?.contract;
+  const dimension = assets.find((asset) => asset?.contract && !asset.contract.series)?.contract;
+  if (!fact || !dimension) return null;
+  const receipts = resource.freshness_receipts;
+  if (receipts.length !== 1 || receipts[0]?.table !== fact.table || receipts[0].status !== "fresh" || receipts[0].publication_id !== publication.publication_id || receipts[0].version !== publication.version || publication.tables[fact.table]?.status !== "fresh") return null;
+  const plan = prepareJoinEvidence(resource.sql, fact, dimension, knowledge.joins);
+  if (!plan || plan.range.start !== resource.time_range.start || plan.range.end !== resource.time_range.end || plan.range.timezone !== resource.time_range.timezone || !verifyJoinExecutionSchema(plan, fact, dimension, resource.join_proof.column_types)) return null;
+  if (resource.join_proof.capture_hash !== joinCaptureHash(resource.sql, resource.execution_id, resource.join_proof.rows, resource.join_proof.column_types)) return null;
+  const visible = resource.join_proof.rows.map(({ __da_join_proof: _proof, ...row }) => row);
+  if (JSON.stringify(visible) !== JSON.stringify(resource.rows)) return null;
+  const values = verifyJoinEvidence(plan, resource.join_proof.rows);
+  return values ? { plan, values } : null;
+}
+
+function joinCaptureHash(sql: string, executionId: string, rows: Array<Record<string, unknown>>, columnTypes: Record<string, string>): string {
+  return createHash("sha256").update(JSON.stringify({ sql, execution_id: executionId, rows, column_types: columnTypes })).digest("hex");
+}
+
+function joinCoverage(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>): QueryResource["coverage"] {
+  const metricCount = new Set(plan.metrics.map((item) => item.column)).size;
+  const zeros = new Set<string>();
+  for (const row of rows) for (const tuple of row.__da_join_proof as unknown[][]) {
+    if (tuple.slice(1, 1 + metricCount).some((value) => value === 0 || value === "0")) zeros.add(String(tuple[0]));
+  }
+  return { status: "known", reason: "本次 JOIN 查询捕获的已出现分组按完整事实粒度逐日验证；未出现的分组不补零。", table: plan.fact, expected_days: plan.expectedDates.length, absent_dates: [], null_dates: [], zero_dates: [...zeros].sort(), predicted_dates: [], actual_dates: [...plan.expectedDates], unknown_prediction_dates: [], groups: [] };
+}
+
+function renderVerifiedJoin(item: VerifiedJoinValue, resourceId: string): string {
+  const fields = (value: Record<string, string>) => Object.entries(value).map(([key, part]) => `${key}=${part}`).join("，") || "无";
+  return `${item.fact}.${item.column}（${item.description}）：已核验 JOIN ${item.operation === "sum" ? "求和" : "非 NULL 计数"} ${item.value}；单位 ${item.unit}；分组 ${fields(item.group)}；事实筛选 ${fields(item.factFilters)}；维表筛选 ${fields(item.dimensionFilters)}；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${resourceId}。结果与维表匹配证明来自同次查询，非跨表原子快照。`;
+}
+
 function renderComparison(comparison: VerifiedComparison): string {
   const { left, right, difference, change_percent } = comparison;
   const scope = (cell: VerifiedCell) => `${Object.entries(cell.filters).map(([key, value]) => `${key}=${value}`).join("，")}；${cell.range.start} 到 ${cell.range.end}（${cell.range.timezone}）；来源 ${cell.sourceResourceId}`;
@@ -1105,7 +1352,94 @@ function renderAggregateComparison(item: AggregateComparison): string {
 function renderArithmetic(item: NonNullable<AnalysisRecord["arithmetic_results"]>[number]): string {
   const value = item.result.value === null ? "除数为零，结果不可计算" : `${item.result.value} ${item.result.unit}`;
   const scope = item.result.scopes.map((entry) => `${Object.entries(entry.filters).map(([key, part]) => `${key}=${part}`).join("，")}；${entry.start} 到 ${entry.end}`).join(" / ");
-  return `${item.result.basis.table}.${item.result.basis.column} 可复核四则运算 ${item.operation}：${value}；范围 ${scope}（${item.result.basis.timezone}）；输入 ${item.left.resource_id}、${item.right.resource_id}；计算资源 ${item.resource_id}。除法保留 18 位，半数远离零。`;
+  return `${item.result.formula ?? `${item.result.basis.table}.${item.result.basis.column}`} 可复核四则运算 ${item.operation}：${value}；范围 ${scope}（${item.result.basis.timezone}）；输入 ${item.left.resource_id}、${item.right.resource_id}；计算资源 ${item.resource_id}。除法保留 18 位，半数远离零。`;
+}
+
+function stableHashes(value: Record<string, string>): string {
+  return JSON.stringify(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+}
+
+/** Reconstruct rows solely from verified aggregate outputs and contract labels,
+ * never from model-chosen aliases as semantic descriptions. */
+function aggregateTable(items: VerifiedAggregate[]): ResultTable | null {
+  if (!items.length) return null;
+  const first = items[0]!;
+  const groupKeys = Object.keys(first.group).sort();
+  const columns: ResultColumn[] = groupKeys.map((name) => ({ name, type: "text", unit: `维度 ${first.table}.${name}`, label: `${first.table}.${name}` }));
+  const grouped = new Map<string, Record<string, ResultValue>>();
+  const metrics = new Map<string, ResultColumn>();
+  for (const item of items) {
+    if (item.table !== first.table || item.source_resource_id !== first.source_resource_id || JSON.stringify(Object.keys(item.group).sort()) !== JSON.stringify(groupKeys)) return null;
+    const metric: ResultColumn = { name: item.output_column, type: "decimal", unit: item.unit, label: `${item.table}.${item.column} ${item.operation === "sum" ? "合计" : "非 NULL 计数"}`, scale: item.scale };
+    const previous = metrics.get(metric.name);
+    if (previous && JSON.stringify(previous) !== JSON.stringify(metric)) return null;
+    if (groupKeys.includes(metric.name)) return null;
+    metrics.set(metric.name, metric);
+    const key = JSON.stringify(groupKeys.map((name) => item.group[name]));
+    let row = grouped.get(key);
+    if (!row) {
+      row = Object.create(null) as Record<string, ResultValue>;
+      for (const name of groupKeys) row[name] = item.group[name]!;
+      grouped.set(key, row);
+    }
+    if (Object.hasOwn(row, metric.name)) return null;
+    row[metric.name] = item.value;
+  }
+  columns.push(...metrics.values());
+  const rows = [...grouped.values()];
+  if (rows.some((row) => Object.keys(row).length !== columns.length)) return null;
+  return { columns, rows };
+}
+
+function alignmentTable(spec: AlignmentSpec, rows: AlignedRow[]): ResultTable | null {
+  const left = rows.find((row) => row.left)?.left;
+  const right = rows.find((row) => row.right)?.right;
+  const output = rows.find((row) => row.result)?.result;
+  const reserved = ["left_value", "right_value", "result_value", "alignment_status"];
+  if (!left || !right || !output || spec.keys.some((key) => reserved.includes(key))) return null;
+  const leftLabel = `${left.basis.table}.${left.basis.column}`; const rightLabel = `${right.basis.table}.${right.basis.column}`;
+  const columns: ResultColumn[] = [
+    ...[...spec.keys].sort().map((name) => ({ name, type: "text" as const, unit: `维度 ${name}`, label: name })),
+    { name: "left_value", type: "decimal", unit: left.unit, label: `左侧 ${leftLabel}`, scale: left.scale },
+    { name: "right_value", type: "decimal", unit: right.unit, label: `右侧 ${rightLabel}`, scale: right.scale },
+    { name: "result_value", type: "decimal", unit: output.unit, label: `${leftLabel} ${spec.op} ${rightLabel}`, scale: output.scale },
+    { name: "alignment_status", type: "text", unit: "状态", label: "对齐状态" },
+  ];
+  for (const row of rows) {
+    if (row.left && (row.left.unit !== left.unit || row.left.scale !== left.scale || row.left.basis.table !== left.basis.table || row.left.basis.column !== left.basis.column)) return null;
+    if (row.right && (row.right.unit !== right.unit || row.right.scale !== right.scale || row.right.basis.table !== right.basis.table || row.right.basis.column !== right.basis.column)) return null;
+    if (row.result && (row.result.unit !== output.unit || row.result.scale !== output.scale)) return null;
+  }
+  return { columns, rows: rows.map((row) => ({ ...row.group, left_value: row.left?.value ?? null, right_value: row.right?.value ?? null, result_value: row.result?.value ?? null, alignment_status: row.status })) };
+}
+
+function renderTransform(resource: TransformResource, input: ResultTable, result: ResultTable): string[] {
+  const descriptions: string[] = [];
+  let current = input;
+  const label = (name: string) => current.columns.find((column) => column.name === name)?.label ?? "未知字段";
+  for (const step of resource.steps) {
+    if (step.op === "filter") descriptions.push(`筛选 ${label(step.column)} ${step.comparison} ${JSON.stringify(step.value)}`);
+    else if (step.op === "compare") descriptions.push(`比较 ${label(step.left)} ${step.comparison} ${label(step.right)}`);
+    else if (step.op === "sort") descriptions.push(`排序 ${step.keys.map((key) => `${label(key.column)} ${key.direction}（NULL ${key.nulls}）`).join("、")}`);
+    else descriptions.push(`按 ${step.by.map(label).join("、") || "全部结果"} 分组；${step.aggregates.map((item) => item.op === "count_all" ? "输入结果行数" : `${label(item.column!)} ${item.op}`).join("、")}`);
+    const next = transformResult(current, [step]);
+    if (next) current = next;
+  }
+  const lines = [`结果变换：${descriptions.join(" → ")}；输入 ${resource.source_resource_id}；计算资源 ${resource.resource_id}。计数指输入结果行，不自动代表业务明细行；聚合忽略 NULL，未知值没有补零。`];
+  if (!result.rows.length) lines.push("变换后无结果行；不补零。");
+  for (const row of result.rows) lines.push(result.columns.map((column) => `${column.label}=${row[column.name] === null ? "NULL" : String(row[column.name])}（${column.unit}）`).join("；") + "。");
+  return lines;
+}
+
+function renderAlignment(resource: AlignmentResource, rows: AlignedRow[]): string[] {
+  const lines = [`按分组键全集对齐并执行 ${resource.spec.op}；输入 ${resource.spec.left.resource_id}、${resource.spec.right.resource_id}；计算资源 ${resource.resource_id}。未出现的组不补零。`];
+  for (const row of rows) {
+    const group = Object.entries(row.group).map(([key, value]) => `${key}=${value}`).join("，");
+    const show = (value: ArithmeticValue | null) => value ? `${value.basis.table}.${value.basis.column} ${value.value} ${value.unit}` : "该查询结果未出现此组";
+    const result = row.status === "zero_divisor" ? "除数为零，结果不可计算" : row.result ? `${row.result.value} ${row.result.unit}` : "缺少一侧分组，结果未知";
+    lines.push(`${group}：左侧 ${show(row.left)}；右侧 ${show(row.right)}；结果 ${result}。`);
+  }
+  return lines;
 }
 
 function renderDecimalCell(item: VerifiedDecimalCell): string {

@@ -193,7 +193,7 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "calculate_session_cells",
       label: "计算会话单元格",
-      description: "汇总当前任务查询资源，或对可证明的同指标聚合/先前四则运算资源做定点四则运算；正式交付须同时引用所有查询来源。",
+      description: "汇总当前任务查询资源；可对可证明的聚合资源做定点四则运算或表格变换。正式交付须同时引用所有查询来源。",
       parameters: Type.Object({
         resource_id: Type.Optional(Type.String({ description: "当前会话的查询资源 ID" })),
         operations: Type.Optional(Type.Array(
@@ -208,6 +208,21 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
           op: Type.Union([Type.Literal("add"), Type.Literal("subtract"), Type.Literal("multiply"), Type.Literal("divide")]),
           left: Type.Object({ resource_id: Type.String(), cell: Type.String(), group: Type.Optional(Type.Record(Type.String(), Type.String())) }),
           right: Type.Object({ resource_id: Type.String(), cell: Type.String(), group: Type.Optional(Type.Record(Type.String(), Type.String())) }),
+        })),
+        align: Type.Optional(Type.Object({
+          op: Type.Union([Type.Literal("add"), Type.Literal("subtract"), Type.Literal("multiply"), Type.Literal("divide")]),
+          keys: Type.Array(Type.String(), { minItems: 1, maxItems: 3 }),
+          left: Type.Object({ resource_id: Type.String(), cell: Type.String() }),
+          right: Type.Object({ resource_id: Type.String(), cell: Type.String() }),
+        })),
+        transform: Type.Optional(Type.Object({
+          resource_id: Type.String(),
+          steps: Type.Array(Type.Union([
+            Type.Object({ op: Type.Literal("filter"), column: Type.String(), comparison: Type.Union([Type.Literal("eq"), Type.Literal("ne"), Type.Literal("lt"), Type.Literal("le"), Type.Literal("gt"), Type.Literal("ge")]), value: Type.Union([Type.String(), Type.Boolean(), Type.Null()]) }),
+            Type.Object({ op: Type.Literal("compare"), left: Type.String(), right: Type.String(), comparison: Type.Union([Type.Literal("eq"), Type.Literal("ne"), Type.Literal("lt"), Type.Literal("le"), Type.Literal("gt"), Type.Literal("ge")]), as: Type.String() }),
+            Type.Object({ op: Type.Literal("sort"), keys: Type.Array(Type.Object({ column: Type.String(), direction: Type.Union([Type.Literal("asc"), Type.Literal("desc")]), nulls: Type.Union([Type.Literal("first"), Type.Literal("last")]) }), { minItems: 1, maxItems: 8 }) }),
+            Type.Object({ op: Type.Literal("group"), by: Type.Array(Type.String(), { maxItems: 8 }), aggregates: Type.Array(Type.Object({ op: Type.Union([Type.Literal("count_all"), Type.Literal("count"), Type.Literal("sum"), Type.Literal("min"), Type.Literal("max")]), column: Type.Optional(Type.String()), as: Type.String() }), { minItems: 1, maxItems: 20 }) }),
+          ]), { minItems: 1, maxItems: 10 }),
         })),
       }),
       execute: async (_toolCallId, params, signal) =>

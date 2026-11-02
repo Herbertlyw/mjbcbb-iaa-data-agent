@@ -6,6 +6,9 @@ export interface ArithmeticValue {
   scale: number;
   unit: string;
   basis: { table: string; column: string; operation: string; unit: string; prediction: string; timezone: string };
+  /** Ordered, server-generated source identities, not model labels. */
+  bases?: Array<ArithmeticValue["basis"]>;
+  formula?: string;
   scopes: Array<{ filters: Record<string, string>; start: string; end: string }>;
 }
 
@@ -29,8 +32,12 @@ export function fromAggregate(item: VerifiedAggregate): ArithmeticValue {
 
 /** Arithmetic is deliberately limited to one contracted metric and compatible
  * scopes. No missing group or NULL is silently converted into zero. */
-export function computeArithmetic(op: ArithmeticOp, left: ArithmeticValue, right: ArithmeticValue): ArithmeticValue | null {
-  if (JSON.stringify(left.basis) !== JSON.stringify(right.basis) || !left.scopes.every((a) => right.scopes.every((b) => compatible(a, b)))) return null;
+export function computeArithmetic(op: ArithmeticOp, left: ArithmeticValue, right: ArithmeticValue, declaredCrossMetric = false): ArithmeticValue | null {
+  const leftBases = left.bases ?? [left.basis]; const rightBases = right.bases ?? [right.basis];
+  const identity = (bases: ArithmeticValue["basis"][]) => JSON.stringify([...new Set(bases.map((base) => JSON.stringify(base)))].sort());
+  const sameBasis = identity(leftBases) === identity(rightBases);
+  if (!sameBasis && (!declaredCrossMetric || leftBases.length !== 1 || rightBases.length !== 1)) return null;
+  if (sameBasis ? !left.scopes.every((a) => right.scopes.every((b) => compatible(a, b))) : !left.scopes.every((a) => right.scopes.every((b) => identicalScope(a, b)))) return null;
   if ((op === "add" || op === "subtract") && left.unit !== right.unit) return null;
   if (left.value === null || right.value === null) return null;
   const a = parse(left.value, left.scale); const b = parse(right.value, right.scale);
@@ -52,7 +59,13 @@ export function computeArithmetic(op: ArithmeticOp, left: ArithmeticValue, right
   if (result !== null && (result < 0n ? -result : result).toString().length > 76) return null;
   const scopes = [...left.scopes, ...right.scopes];
   if (scopes.length > 32) return null;
-  return { value: result === null ? null : fixed(result, scale), scale, unit, basis: left.basis, scopes };
+  const bases = [...new Map([...leftBases, ...rightBases].map((base) => [JSON.stringify(base), base])).values()];
+  const label = (value: ArithmeticValue) => value.formula ?? `${value.basis.table}.${value.basis.column}`;
+  return { value: result === null ? null : fixed(result, scale), scale, unit, basis: left.basis, ...(bases.length > 1 ? { bases, formula: `(${label(left)} ${op} ${label(right)})` } : left.formula || right.formula ? { formula: `(${label(left)} ${op} ${label(right)})` } : {}), scopes };
+}
+
+function identicalScope(a: ArithmeticValue["scopes"][number], b: ArithmeticValue["scopes"][number]): boolean {
+  return a.start === b.start && a.end === b.end && JSON.stringify(Object.entries(a.filters).sort()) === JSON.stringify(Object.entries(b.filters).sort());
 }
 
 function compatible(a: ArithmeticValue["scopes"][number], b: ArithmeticValue["scopes"][number]): boolean {

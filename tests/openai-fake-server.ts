@@ -13,7 +13,7 @@ export interface ProtocolObservation {
   currentTurnRoles: string[];
 }
 
-export async function startFakeOpenAI(token: string): Promise<{ url: string; observations: ProtocolObservation[]; close: () => Promise<void> }> {
+export async function startFakeOpenAI(token: string, options: { recordObservations?: boolean } = {}): Promise<{ url: string; observations: ProtocolObservation[]; close: () => Promise<void> }> {
   const observations: ProtocolObservation[] = [];
   const server = createServer((request, response) => {
     const chunks: Buffer[] = [];
@@ -32,7 +32,7 @@ export async function startFakeOpenAI(token: string): Promise<{ url: string; obs
       } catch {
         reasoningEffort = null;
       }
-      observations.push({
+      if (options.recordObservations !== false) observations.push({
         script,
         sawUserText: body.includes("纸灯 在 2026-10-06 到 2026-10-12（美国、iOS、雾帆）的新增用户是多少？"),
         sawKnowledgeBody: body.includes("NULL 不计入，0 是真实零"),
@@ -94,7 +94,7 @@ export async function startFakeOpenAI(token: string): Promise<{ url: string; obs
   return {
     url: `http://127.0.0.1:${port}/v1`,
     observations,
-    close: () => new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+    close: () => new Promise((resolve, reject) => { server.closeAllConnections(); server.close((error) => (error ? reject(error) : resolve())); }),
   };
 }
 
@@ -117,6 +117,10 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   const earlierUsers = messages.slice(0, messages.length - turn.length).filter((message) => message.role === "user").map(messageText);
   const hasBase = earlierUsers.some((text) => text.includes("纸灯") && text.includes("美国") && text.includes("iOS") && text.includes("雾帆") && text.includes("2026-10-06") && text.includes("2026-10-12"));
   if (latest.includes("不调用记录")) return scripted(turn, noRecordSteps);
+  if (latest.includes("合成收入成本比")) return scripted(turn, ratioSteps);
+  if (latest.includes("合成多渠道收入成本比")) return scripted(turn, groupedRatioSteps);
+  if (latest.includes("合成分组对齐")) return scripted(turn, alignmentSteps);
+  if (latest.includes("合成产品维表关联")) return scripted(turn, validJoinSteps);
   if (latest.includes("合成精确金额")) return scripted(turn, decimalSteps);
   if (latest.includes("玻璃鲦") && latest.includes("德国")) return scripted(turn, glassSteps);
   if (latest.includes("只说看看收入") || (latest.includes("日本") && !hasBase && !latest.includes("纸灯"))) return scripted(turn, clarifySteps);
@@ -126,10 +130,57 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   return scripted(turn, defaultSteps);
 }
 
+function ratioSteps(ids: string[]) {
+  const where = "event_date >= '2026-10-08' AND event_date <= '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'";
+  return [
+    { id: "ratio_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "ratio_revenue", name: "query", arguments: JSON.stringify({ sql: `SELECT SUM(amount_usd) AS total FROM fact_fox_daily_payment WHERE ${where}` }) },
+    { id: "ratio_cost", name: "query", arguments: JSON.stringify({ sql: `SELECT SUM(cost_usd) AS total FROM fact_fox_daily_payment WHERE ${where}` }) },
+    { id: "ratio_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ arithmetic: { op: "divide", left: { resource_id: ids[0] ?? "", cell: "total" }, right: { resource_id: ids[1] ?? "", cell: "total" } } }) },
+    { id: "ratio_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+function groupedRatioSteps(ids: string[]) {
+  const where = "event_date >= '2026-10-08' AND event_date <= '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios'";
+  return [
+    { id: "grouped_ratio_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "grouped_ratio_revenue", name: "query", arguments: JSON.stringify({ sql: `SELECT country_code, channel_id, SUM(amount_usd) AS total FROM fact_fox_daily_payment WHERE ${where} GROUP BY country_code, channel_id` }) },
+    { id: "grouped_ratio_cost", name: "query", arguments: JSON.stringify({ sql: `SELECT country_code, channel_id, SUM(cost_usd) AS total FROM fact_fox_daily_payment WHERE ${where} GROUP BY country_code, channel_id` }) },
+    { id: "grouped_ratio_align", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "divide", keys: ["country_code", "channel_id"], left: { resource_id: ids[0] ?? "", cell: "total" }, right: { resource_id: ids[1] ?? "", cell: "total" } } }) },
+    { id: "grouped_ratio_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+function alignmentSteps(ids: string[]) {
+  const query = (date: string) => `SELECT country_code, SUM(new_users) AS total FROM fact_fox_daily_install WHERE event_date >= '${date}' AND event_date <= '${date}' AND title_id = 'paper_lantern' AND platform = 'ios' AND channel_id = 'mist_ads' GROUP BY country_code`;
+  return [
+    { id: "align_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "align_first", name: "query", arguments: JSON.stringify({ sql: query("2026-10-06") }) },
+    { id: "align_second", name: "query", arguments: JSON.stringify({ sql: query("2026-10-08") }) },
+    { id: "align_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "subtract", keys: ["country_code"], left: { resource_id: ids[0] ?? "", cell: "total" }, right: { resource_id: ids[1] ?? "", cell: "total" } } }) },
+    { id: "align_transform", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[2] ?? "", steps: [
+      { op: "filter", column: "result_value", comparison: "lt", value: "0" },
+      { op: "sort", keys: [{ column: "result_value", direction: "asc", nulls: "last" }] },
+      { op: "group", by: [], aggregates: [{ op: "sum", column: "result_value", as: "negative_total" }] },
+    ] } }) },
+    { id: "align_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
 function noRecordSteps() {
   return [
     { id: "no_record_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
     { id: "no_record_query", name: "query", arguments: JSON.stringify({ sql: "SELECT SUM(new_users) AS total FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'JP' AND channel_id = 'mist_ads'" }) },
+  ];
+}
+
+function validJoinSteps(ids: string[]) {
+  return [
+    { id: "join_fact", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "join_dim", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.dim_fox_title" }) },
+    { id: "join_query", name: "query", arguments: JSON.stringify({ sql: "SELECT d.title_name AS label, SUM(f.new_users) AS total FROM fact_fox_daily_install f JOIN dim_fox_title d ON f.title_id = d.title_id WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-12' AND f.title_id = 'paper_lantern' AND f.platform = 'ios' AND f.country_code = 'JP' AND f.channel_id = 'mist_ads' GROUP BY d.title_name ORDER BY d.title_name" }) },
+    { id: "join_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
   ];
 }
 
