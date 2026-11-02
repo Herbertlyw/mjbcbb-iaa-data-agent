@@ -256,6 +256,9 @@ test("数据库分组聚合只交付完整覆盖且契约可证明的整数结�
     assert.match(String(result.answer), /country_code=US/);
     assert.deepEqual((result.sources as Array<{ rows: unknown[] }>)[0]?.rows, []);
     assert.match((result.limitations as string[]).join(" "), /未出现的组合没有补零/);
+    const twoDimensions = await analyze(`SELECT country_code, channel, SUM(new_users) AS total FROM daily_installs WHERE ${day} AND product_id = 'starlane_drift' AND platform = 'ios' GROUP BY country_code, channel ORDER BY country_code, channel`);
+    assert.equal(twoDimensions.status, "completed", JSON.stringify(twoDimensions));
+    assert.deepEqual((twoDimensions.aggregates as Array<{ group: Record<string, string>; value: string }>).map((a) => [a.group.country_code, a.group.channel, a.value]), [["JP", "nebula_ads", "10"], ["US", "nebula_ads", "120"]]);
     for (const sql of [
       `SELECT SUM(new_users) AS country_code FROM daily_installs WHERE ${day} AND ${base} AND country_code = 'US'`,
       `SELECT SUM(new_users + 1) AS total FROM daily_installs WHERE ${day} AND ${base} AND country_code = 'US'`,

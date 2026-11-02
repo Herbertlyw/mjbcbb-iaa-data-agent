@@ -32,6 +32,9 @@ export function createClickHouseClient(config: ClickHouseConfig, readonly: boole
       max_execution_time: Math.max(config.timeoutSeconds, 1),
       max_rows_to_read: String(config.maxRowsToRead),
       read_overflow_mode: "throw",
+      // Decimal JSON numbers would be rounded by JSON.parse before evidence
+      // validation. Keep their exact base-10 representation end to end.
+      output_format_json_quote_decimals: 1,
     },
   });
 }
@@ -52,10 +55,14 @@ export async function clickHouseInsert<T>(client: ClickHouseClient, table: strin
 }
 
 export async function clickHouseColumns(client: ClickHouseClient, table: string): Promise<string[]> {
+  return Object.keys(await clickHouseColumnTypes(client, table));
+}
+
+export async function clickHouseColumnTypes(client: ClickHouseClient, table: string): Promise<Record<string, string>> {
   if (!/^[a-z_][a-z0-9_]*$/u.test(table)) throw new Error("unsafe table");
   const result = await client.query({ query: `DESCRIBE TABLE ${table}`, format: "JSONEachRow" });
-  const rows = await result.json<{ name: string }>();
-  return rows.map((row) => row.name);
+  const rows = await result.json<{ name: string; type: string }>();
+  return Object.fromEntries(rows.map((row) => [row.name, row.type]));
 }
 
 function normalizeRow(row: Record<string, unknown>): Record<string, unknown> {

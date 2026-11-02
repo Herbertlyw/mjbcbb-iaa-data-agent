@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import test from "node:test";
 import type { AddressInfo } from "node:net";
 import { modelPrompt } from "../src/agent.js";
-import { assessCoverage, provenCoverageFilters } from "../src/coverage.js";
+import { assessCoverage, coverageHasGap, provenCoverageFilters } from "../src/coverage.js";
 import { verifyCell } from "../src/evidence.js";
 import { currentCalendarDate, isCalendarDate, loadConfig } from "../src/config.js";
 import { DEMO_QUESTIONS } from "../src/demo.js";
@@ -15,6 +15,20 @@ import type { CoverageReport, DataContract, QueryResource } from "../src/types.j
 import { analyst, ask, bindTables, withRuntime } from "./helpers.js";
 
 const WEEK = "event_date >= '2026-10-06' AND event_date <= '2026-10-12'";
+
+test("多维组合各自缺日时不能被完整的单维覆盖掩盖", () => {
+  const contract = JSON.parse(readFileSync(new URL("../knowledge/lumenfox/contracts/daily-installs.json", import.meta.url), "utf8")) as DataContract;
+  const rows = [
+    { event_date: "2026-10-06", country_code: "US", channel: "nebula_ads", new_users: 10 },
+    { event_date: "2026-10-06", country_code: "JP", channel: "comet_network", new_users: 20 },
+    { event_date: "2026-10-07", country_code: "US", channel: "comet_network", new_users: 30 },
+    { event_date: "2026-10-07", country_code: "JP", channel: "nebula_ads", new_users: 40 },
+  ];
+  const report = assessCoverage(contract, { product_id: "starlane_drift", platform: "ios" }, { start: "2026-10-06", end: "2026-10-07" }, rows);
+  assert.equal(report.groups.filter((group) => group.dimension === "country_code" || group.dimension === "channel").every((group) => group.absent_dates.length === 0), true);
+  assert.equal(report.groups.filter((group) => group.dimension === "country_code,channel").length, 4);
+  assert.equal(coverageHasGap(report), true);
+});
 
 test("当前日期使用显式时区，模拟时钟和无效日期有明确边界", () => {
   const instant = new Date("2026-01-01T01:00:00.000Z");

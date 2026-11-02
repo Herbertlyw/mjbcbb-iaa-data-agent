@@ -81,6 +81,22 @@ export function assessCoverage(
         groups.push({ dimension, value, ...subset });
       }
     }
+    // Marginal coverage can look complete while each combination is missing
+    // different days. Verify each observed tuple before proving multi-group SQL.
+    const free = series.dimensions.filter((dimension) => !equalities[dimension]);
+    if (free.length > 1) {
+      const combinations = new Map<string, Array<Record<string, unknown>>>();
+      for (const row of rows) {
+        if (free.some((dimension) => typeof row[dimension] !== "string")) return { ...empty("unknown", "组合维度不完整，不能证明覆盖。"), ...overall };
+        const key = JSON.stringify(free.map((dimension) => row[dimension]));
+        const group = combinations.get(key) ?? [];
+        group.push(row); combinations.set(key, group);
+        if (combinations.size > 200) return { ...empty("unknown", "组合过多，未证明覆盖。"), ...overall };
+      }
+      for (const [value, subset] of combinations) {
+        groups.push({ dimension: free.join(","), value, ...classify(subset, series.date_column, series.metrics, series.predicted_column ?? null, series.prediction_values, series.prediction_mode, dates) });
+      }
+    }
   }
   return {
     status: "known",
@@ -160,7 +176,7 @@ function classify(
       for (const metric of metrics) {
         const value = row[metric];
         if (value === null || value === undefined) hasNull = true;
-        else if (Number(value) === 0) hasZero = true;
+        else if ((typeof value === "number" && value === 0) || (typeof value === "string" && /^-?0+(?:\.0+)?$/u.test(value))) hasZero = true;
         const flag = predictedColumn ? row[predictedColumn] : undefined;
         const validFlag = (typeof flag === "number" || typeof flag === "string" && /^-?\d+(?:\.\d+)?$/u.test(flag)) && mapping && mapping.actual !== mapping.predicted;
         if (!predictedColumn && predictionMode === "observed_only") hasActual = true;

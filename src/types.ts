@@ -213,6 +213,7 @@ export interface QueryResource {
   simulated: true;
   elapsed_ms?: number;
   scan_limit?: number;
+  decimal_types?: Record<string, string>;
   sql: string;
   tables: string[];
   contract_revisions: Record<string, string>;
@@ -294,6 +295,7 @@ export interface AnalysisRecord {
     complete_population: boolean;
   }>;
   comparisons?: import("./evidence-comparison.js").VerifiedComparison[];
+  aggregate_comparisons?: import("./aggregate-comparison.js").AggregateComparison[];
   aggregates?: import("./aggregate-evidence.js").VerifiedAggregate[];
   model_suggested_status: string;
   model_draft: string;
