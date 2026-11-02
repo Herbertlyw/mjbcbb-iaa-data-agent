@@ -47,6 +47,15 @@ test("真实 AgentSession 保存 JSONL 分支，知识正文进入下一次 faux
     const roles = reopened.buildSessionContext().messages.map((message) => message.role);
     assert.ok(roles.includes("toolResult"));
     assert.equal(roles.includes("compactionSummary"), false);
+    const entries = new Map(reopened.getEntries().filter((entry) => entry.type === "message").map((entry) => [entry.id, entry]));
+    const savedEvents = job.events.filter((event) => event.type === "snapshot_saved");
+    assert.ok(savedEvents.length > 3);
+    for (const event of savedEvents) {
+      const entry = entries.get(String(event.payload.leaf_id));
+      assert.ok(entry && entry.type === "message");
+      assert.equal(entry.message.role, event.payload.role, "事件所引用的 leaf 必须属于当时完成的消息");
+      if (entry.message.role === "toolResult") assert.equal(entry.message.toolCallId, event.payload.tool_call_id);
+    }
 
     const follow = await ask(runtime, session.session_id, "那安卓呢？");
     assert.notEqual(follow.status, "failed", JSON.stringify(follow.error));
@@ -63,6 +72,28 @@ test("真实 AgentSession 保存 JSONL 分支，知识正文进入下一次 faux
       body: { format: SESSION_SNAPSHOT_FORMAT },
     });
     assert.equal(stale, false);
+  });
+});
+
+test("Pi 工具回执持久化后的异步屏障不冻结定时器，也不会提前执行下一工具", async () => {
+  await withRuntime({ modelMode: "pi", piProvider: "faux", toolResultHoldMs: 350, toolResultHoldNames: ["search_assets"] }, async (runtime) => {
+    const session = analyst(runtime);
+    const submitted = runtime.jobs.submit(session.session_id, question, "snapshot-barrier");
+    const deadline = Date.now() + 5000;
+    while (!runtime.jobs.require(submitted.job_id).events.some((event) => event.type === "transcript_saved" && event.payload.tool_name === "search_assets")) {
+      if (Date.now() > deadline) throw new Error("未观察到合成工具回执");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    let ticked = false;
+    setTimeout(() => { ticked = true; }, 30);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const during = runtime.jobs.require(submitted.job_id);
+    assert.equal(ticked, true);
+    const checkpoint = during.events.findIndex((event) => event.type === "transcript_saved" && event.payload.tool_name === "search_assets");
+    assert.equal(during.events.slice(checkpoint + 1).some((event) => event.type === "tool_started"), false);
+    const done = await waitForJob(runtime, submitted.job_id);
+    assert.equal(done.status, "partial");
+    assert.equal(done.events.filter((event) => event.type === "job_finished").length, 1);
   });
 });
 

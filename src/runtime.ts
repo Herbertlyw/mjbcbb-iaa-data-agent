@@ -40,7 +40,7 @@ export class Runtime {
       clickhouse,
       ...(config.stateMode === "mysql" ? { mysqlFreshness: () => this.getMysqlFreshness() } : {}),
     });
-    this.jobs = new JobService({ config, sessions: this.sessions, tools: this.tools, state });
+    this.jobs = new JobService({ config, sessions: this.sessions, tools: this.tools, state, mysqlAsyncState: () => this.mysqlAsyncState() });
     if (config.startWorker) this.jobs.start();
   }
 

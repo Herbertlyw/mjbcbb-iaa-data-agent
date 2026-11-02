@@ -7,7 +7,6 @@ import {
   captureSessionSnapshot,
   decideResume,
   inspectCompaction,
-  holdSync,
   messageCallId,
   messageToolName,
   openGovernedSession,
@@ -55,6 +54,7 @@ export class JobService {
       sessions: SessionStore;
       tools: ToolService;
       state: StateStore;
+      mysqlAsyncState: () => Promise<AsyncMysqlStateStore>;
     },
   ) {
     host.sessions.setRevisionFn((jobId) => {
@@ -63,6 +63,12 @@ export class JobService {
       const reserved = host.state.reserveRevision(jobId, this.owner, fence);
       return reserved.ok ? reserved.count : "lost";
     });
+  }
+
+  private async stateCall<K extends Exclude<keyof StateStore, "close">>(op: K, ...args: Parameters<StateStore[K]>): Promise<ReturnType<StateStore[K]>> {
+    if (this.host.config.stateMode === "mysql") return await (await this.host.mysqlAsyncState()).call(op, ...args) as ReturnType<StateStore[K]>;
+    const method = this.host.state[op] as (...values: Parameters<StateStore[K]>) => ReturnType<StateStore[K]>;
+    return method.apply(this.host.state, args);
   }
 
   start(): void {
@@ -74,7 +80,7 @@ export class JobService {
   async stop(options: { cancel?: boolean } = {}): Promise<void> {
     this.running = false;
     if (options.cancel !== false) {
-      for (const jobId of this.localAgents.keys()) this.host.state.requestCancel(jobId);
+      for (const jobId of this.localAgents.keys()) await this.stateCall("requestCancel", jobId);
       for (const agent of this.localAgents.values()) agent.abort();
     }
     this.wake();
@@ -203,7 +209,7 @@ export class JobService {
 
   private async loop(): Promise<void> {
     while (this.running) {
-      const claim = this.host.state.claimNext(this.owner, Date.now(), this.host.config.leaseMs);
+      const claim = await this.stateCall("claimNext", this.owner, Date.now(), this.host.config.leaseMs);
       if (!claim) {
         if (this.running) await this.waitForWork();
         continue;
@@ -219,9 +225,9 @@ export class JobService {
   private async execute(claimed: JobRecord, fence: number): Promise<void> {
     const jobId = claimed.job_id;
     this.boundFences.set(jobId, fence);
-    const fresh = this.host.state.getJob(jobId);
+    const fresh = await this.stateCall("getJob", jobId);
     if (fresh?.cancel_requested) {
-      this.host.state.finish(jobId, this.owner, fence, "cancelled", null, null);
+      await this.stateCall("finish", jobId, this.owner, fence, "cancelled", null, null);
       this.publish(jobId);
       return;
     }
@@ -230,16 +236,16 @@ export class JobService {
       lost = true;
       this.localAgents.get(jobId)?.abort();
     };
-    if (!this.host.state.appendEvent(jobId, this.owner, fence, "job_started", { status: "running", fence, owner: this.owner })) {
+    if (!await this.stateCall("appendEvent", jobId, this.owner, fence, "job_started", { status: "running", fence, owner: this.owner })) {
       return;
     }
-    this.host.state.appendEvent(jobId, this.owner, fence, "turn_resolved", { kind: claimed.turn.kind });
+    if (!await this.stateCall("appendEvent", jobId, this.owner, fence, "turn_resolved", { kind: claimed.turn.kind })) return;
     this.publish(jobId);
     // started_at survives lease takeover; recovery does not receive a fresh wall-clock budget.
     const startedAt = claimed.started_at ? Date.parse(claimed.started_at) : Date.now();
     const remainingMs = this.host.config.jobTimeoutMs - Math.max(0, Date.now() - startedAt);
     if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
-      this.host.state.finish(jobId, this.owner, fence, "timed_out", null, { code: "job_timed_out", message: "任务的墙钟预算已耗尽，恢复后不会重新开始计时。" });
+      await this.stateCall("finish", jobId, this.owner, fence, "timed_out", null, { code: "job_timed_out", message: "任务的墙钟预算已耗尽，恢复后不会重新开始计时。" });
       this.boundFences.delete(jobId);
       this.publish(jobId);
       return;
@@ -251,11 +257,16 @@ export class JobService {
       timedOut = true;
       this.localAgents.get(jobId)?.abort();
     }, remainingMs);
+    let beating: Promise<void> | null = null;
     const heartbeat = setInterval(() => {
-      if (this.suppressHeartbeat) return;
-      const beat = this.host.state.heartbeat(jobId, this.owner, fence, Date.now(), this.host.config.leaseMs);
-      if (!beat.ok) lostFence();
-      if (beat.cancel_requested) this.localAgents.get(jobId)?.abort();
+      if (this.suppressHeartbeat || beating || lost) return;
+      beating = (async () => {
+        try {
+          const beat = await this.stateCall("heartbeat", jobId, this.owner, fence, Date.now(), this.host.config.leaseMs);
+          if (!beat.ok) lostFence();
+          if (beat.cancel_requested) this.localAgents.get(jobId)?.abort();
+        } catch { lostFence(); }
+      })().finally(() => { beating = null; });
     }, this.host.config.heartbeatMs);
     let unsubscribe: () => void = () => undefined;
     let agentError: { code: string; message: string } | null = null;
@@ -385,6 +396,7 @@ export class JobService {
     } finally {
       clearTimeout(timer);
       clearInterval(heartbeat);
+      if (beating) await beating;
       unsubscribe();
       disposeSession?.();
       this.boundFences.delete(jobId);
@@ -392,12 +404,14 @@ export class JobService {
       this.host.sessions.setActiveJob(session.session_id, undefined);
     }
     if (lost) return;
-    const current = this.host.state.getJob(jobId);
+    const current = await this.stateCall("getJob", jobId);
     if (!current || current.fence !== fence || isTerminal(current.status)) return;
     let status: JobStatus;
     let analysis = sessionAnalyses(session).filter((item) => item.job_id === jobId).at(-1) ?? recoveredAnalysis;
     let error = agentError;
-    if (current.cancel_requested || this.host.state.heartbeat(jobId, this.owner, fence, Date.now(), this.host.config.leaseMs).cancel_requested) {
+    const finalBeat = await this.stateCall("heartbeat", jobId, this.owner, fence, Date.now(), this.host.config.leaseMs);
+    if (!finalBeat.ok) return;
+    if (current.cancel_requested || finalBeat.cancel_requested) {
       status = "cancelled";
       analysis = null;
       error = null;
@@ -413,8 +427,8 @@ export class JobService {
     } else {
       status = analysis.status;
     }
-    const steps = this.host.config.piProvider === "openai-compatible" ? this.host.state.listProviderSteps(jobId) : [];
-    this.host.state.finish(jobId, this.owner, fence, status, analysis, error, measuredUsage(this.host.config.modelMode, this.host.config.piProvider, modelCalls, toolCalls, steps));
+    const steps = this.host.config.piProvider === "openai-compatible" ? await this.stateCall("listProviderSteps", jobId) : [];
+    await this.stateCall("finish", jobId, this.owner, fence, status, analysis, error, measuredUsage(this.host.config.modelMode, this.host.config.piProvider, modelCalls, toolCalls, steps));
     this.publish(jobId);
   }
 
@@ -433,9 +447,9 @@ export class JobService {
     rememberCandidate: (analysis: AnalysisRecord) => void;
   }): Promise<"ok" | "lost"> {
     if (this.host.config.piProvider === "openai-compatible") {
-      const pending = this.host.state.listProviderSteps(input.jobId).filter((step) => step.status === "dispatched");
+      const pending = (await this.stateCall("listProviderSteps", input.jobId)).filter((step) => step.status === "dispatched");
       for (const step of pending) {
-        this.host.state.settleProviderStep({
+        await this.stateCall("settleProviderStep", {
           stepId: step.step_id,
           jobId: input.jobId,
           owner: this.owner,
@@ -449,7 +463,7 @@ export class JobService {
         });
       }
       if (pending.length > 0) {
-        this.host.state.appendEvent(input.jobId, this.owner, input.fence, "provider_outcome_unknown", {
+        await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "provider_outcome_unknown", {
           step_ids: pending.map((step) => step.step_id),
           usage_source: "unknown",
         });
@@ -460,13 +474,13 @@ export class JobService {
         return "ok";
       }
     }
-    const progress = this.host.state.loadAgentSnapshot(input.sessionId, { jobId: input.jobId, kind: "progress" });
-    const settled = progress ? null : this.host.state.loadAgentSnapshot(input.sessionId, { kind: "settled" });
+    const progress = await this.stateCall("loadAgentSnapshot", input.sessionId, { jobId: input.jobId, kind: "progress" });
+    const settled = progress ? null : await this.stateCall("loadAgentSnapshot", input.sessionId, { kind: "settled" });
     const record = progress ?? settled;
     const snapshot = record?.body as unknown as PiSessionSnapshotBody | undefined;
     let governed;
     try {
-      const storedJob = this.host.state.getJob(input.jobId);
+      const storedJob = await this.stateCall("getJob", input.jobId);
       const selection = resolveModelChoice(this.host.config, {
         modelId: storedJob?.model_id ?? undefined,
         reasoning: storedJob?.reasoning ?? undefined,
@@ -518,7 +532,11 @@ export class JobService {
     let modelCalls = 0;
     let toolCalls = 0;
     input.onUnsubscribe(
-      session.subscribe((event) => {
+      // AgentSession's public listeners run before its JSONL append and are not
+      // awaited. Agent listeners are awaited in registration order; the session
+      // registered its own listener first, so this sees the just-appended leaf
+      // and prevents the next tool/model step until the checkpoint is durable.
+      session.agent.subscribe(async (event, signal) => {
         if (event.type === "message_end" && event.message.role === "assistant") {
           modelCalls += 1;
           input.onModelCall();
@@ -541,71 +559,63 @@ export class JobService {
           fail({ code: "budget_exhausted", message: "模型调用或工具调用超过预算。未知 token 和费用不会被记成 0。" });
           void session.abort();
         }
-        if (event.type === "message_end") {
-          const message = event.message;
-          queueMicrotask(() => {
-            if (lost || !session.sessionManager.getSessionFile()) return;
-            try {
-              const saved = this.host.state.saveAgentSnapshot({
-                sessionId: input.sessionId,
-                jobId: input.jobId,
-                owner: this.owner,
-                fence: input.fence,
-                kind: "progress",
-                body: captureSessionSnapshot(session, input.userText) as unknown as Record<string, unknown>,
+        if (lost) return;
+        try {
+          if (event.type === "message_end") {
+            const message = event.message;
+            // Pi keeps setup-only entries in memory until a user/assistant
+            // message exists; there is no JSONL file to snapshot yet.
+            if (message.role === "system" && !session.sessionManager.getEntries().some((entry) => entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant"))) return;
+            // Capture before the first await so later branches cannot replace it.
+            const snapshot = captureSessionSnapshot(session, input.userText);
+            const saved = await this.stateCall("saveAgentSnapshot", {
+              sessionId: input.sessionId, jobId: input.jobId, owner: this.owner,
+              fence: input.fence, kind: "progress", body: snapshot as unknown as Record<string, unknown>,
+            });
+            if (!saved) { markLost(); return; }
+            const snapshotEvent = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "snapshot_saved", {
+              role: message.role,
+              tool_name: "toolName" in message ? message.toolName : null,
+              tool_call_id: messageCallId(message),
+              leaf_id: snapshot.leaf_id,
+              format: "pi-coding-agent-session-jsonl-v3",
+            });
+            if (!snapshotEvent) { markLost(); return; }
+            this.publishEvent(input.jobId, snapshotEvent);
+            if (message.role === "toolResult") {
+              const transcriptEvent = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "transcript_saved", {
+                tool_name: message.toolName, tool_call_id: message.toolCallId,
+                format: "pi-coding-agent-session-jsonl-v3", leaf_id: snapshot.leaf_id,
+                branch_entry_ids: snapshot.branch_entry_ids,
               });
-              if (!saved) {
-                console.error("pi progress snapshot rejected");
-                markLost();
-              } else {
-                const toolCallId = messageCallId(message);
-                this.host.state.appendEvent(input.jobId, this.owner, input.fence, "snapshot_saved", {
-                  role: message.role,
-                  tool_name: "toolName" in message ? message.toolName : null,
-                  tool_call_id: toolCallId,
-                  leaf_id: session.sessionManager.getLeafId(),
-                  format: "pi-coding-agent-session-jsonl-v3",
-                });
-                if (message.role === "toolResult") {
-                  this.host.state.appendEvent(input.jobId, this.owner, input.fence, "transcript_saved", {
-                    tool_name: message.toolName,
-                    tool_call_id: message.toolCallId,
-                    format: "pi-coding-agent-session-jsonl-v3",
-                    leaf_id: session.sessionManager.getLeafId(),
-                    branch_entry_ids: session.sessionManager.getBranch().map((entry) => entry.id),
-                  });
-                }
-                this.publish(input.jobId);
-                const holdNames = this.host.config.toolResultHoldNames;
-                const holdThis = message.role === "toolResult" && (holdNames.length === 0 || holdNames.includes(message.toolName));
-                if (holdThis) holdSync(this.host.config.toolResultHoldMs);
-              }
-            } catch (error) {
-              if (error instanceof SessionSnapshotError && error.code === "session_snapshot_missing") return;
-              console.error("pi progress snapshot failed; details omitted");
-              fail({ code: "session_snapshot_write_failed", message: "会话快照写入失败" });
+              if (!transcriptEvent) { markLost(); return; }
+              this.publishEvent(input.jobId, transcriptEvent);
+              const names = this.host.config.toolResultHoldNames;
+              if (!names.length || names.includes(message.toolName)) await pauseForTest(this.host.config.toolResultHoldMs, signal);
             }
-          });
-        }
-        if (event.type === "tool_execution_start") {
-          if (!this.host.state.appendEvent(input.jobId, this.owner, input.fence, "tool_started", { tool_name: event.toolName, tool_call_id: event.toolCallId, args: sanitizeToolArgs(event.args) })) markLost();
-          this.publish(input.jobId);
-        }
-        if (event.type === "tool_execution_end") {
-          const details = event.result && typeof event.result === "object" && "details" in event.result ? event.result.details : undefined;
-          const detailsRecord = details && typeof details === "object" ? (details as Record<string, unknown>) : {};
-          if (
-            !this.host.state.appendEvent(input.jobId, this.owner, input.fence, "tool_finished", {
+          }
+          if (event.type === "tool_execution_start") {
+            const started = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "tool_started", { tool_name: event.toolName, tool_call_id: event.toolCallId, args: sanitizeToolArgs(event.args) });
+            if (!started) markLost(); else this.publishEvent(input.jobId, started);
+          }
+          if (event.type === "tool_execution_end") {
+            const details = event.result && typeof event.result === "object" && "details" in event.result ? event.result.details : undefined;
+            const detailsRecord = details && typeof details === "object" ? (details as Record<string, unknown>) : {};
+            const finished = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "tool_finished", {
               tool_name: event.toolName,
               tool_call_id: event.toolCallId,
               is_error: event.isError,
               code: detailsRecord.code ?? null,
               resource_id: detailsRecord.resource_id ?? null,
-            })
-          ) {
-            markLost();
+            });
+            if (!finished) markLost(); else this.publishEvent(input.jobId, finished);
           }
-          this.publish(input.jobId);
+        } catch (error) {
+          // An asynchronous timeout/bridge failure can have committed. Stop the
+          // agent; recovery must re-read authority and never assume rollback.
+          console.error(`pi event persistence failed: ${error instanceof SessionSnapshotError ? error.code : "state_error"}`);
+          fail({ code: "session_snapshot_write_failed", message: "会话进度无法确认，任务已停止等待恢复。" });
+          markLost();
         }
       }),
     );
@@ -626,7 +636,7 @@ export class JobService {
       compactionHidesToolResults: inspection.hidesToolResults,
       userTextPersisted: inspection.userTextPersisted,
     });
-    this.host.state.appendEvent(input.jobId, this.owner, input.fence, "model_context", {
+    const contextEvent = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "model_context", {
       restored: Boolean(record),
       decision: decision.decision,
       query_may_rerun: "query_may_rerun" in decision ? decision.query_may_rerun : false,
@@ -641,6 +651,7 @@ export class JobService {
       leaf_tool_name: leafMessage ? messageToolName(leafMessage) : null,
       branch_entry_ids: session.sessionManager.getBranch().map((entry) => entry.id),
     });
+    if (!contextEvent) { markLost(); return "lost"; }
     this.publish(input.jobId);
     if (decision.action === "reject") {
       fail({ code: decision.code, message: decision.message });
@@ -656,7 +667,7 @@ export class JobService {
         await session.prompt(input.userText, { expandPromptTemplates: false, source: "rpc" });
       }
       if (this.host.config.piProvider === "openai-compatible") {
-        const failedStep = this.host.state.listProviderSteps(input.jobId).find((step) => step.status === "error");
+        const failedStep = (await this.stateCall("listProviderSteps", input.jobId)).find((step) => step.status === "error");
         if (failedStep) {
           fail({ code: failedStep.error_code ?? "provider_error", message: "供应商请求失败。日志不包含密钥、请求头或用户原文。" });
         }
@@ -667,7 +678,7 @@ export class JobService {
           user_message_sha256: snapshot?.user_message_sha256,
           decision: decision.decision,
         });
-        const saved = this.host.state.saveAgentSnapshot({
+        const saved = await this.stateCall("saveAgentSnapshot", {
           sessionId: input.sessionId,
           jobId: input.jobId,
           owner: this.owner,
@@ -690,10 +701,15 @@ export class JobService {
   }
 
   private publish(jobId: string): void {
+    if (!this.subscribers.get(jobId)?.size) return;
     const job = this.host.state.getJob(jobId);
     const latest = job?.events.at(-1);
     if (!latest) return;
-    for (const listener of this.subscribers.get(jobId) ?? []) listener(latest);
+    this.publishEvent(jobId, latest);
+  }
+
+  private publishEvent(jobId: string, event: { seq: number; type: string }): void {
+    for (const listener of this.subscribers.get(jobId) ?? []) listener(event);
   }
 
   private waitForWork(): Promise<void> {
@@ -713,6 +729,16 @@ export class JobService {
   private wake(): void {
     this.notify?.();
   }
+}
+
+/** Test-only recovery barrier. It never blocks the event loop and aborts promptly. */
+function pauseForTest(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", finish); resolve(); };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener("abort", finish, { once: true });
+  });
 }
 
 function hardFailure(code: string): boolean {

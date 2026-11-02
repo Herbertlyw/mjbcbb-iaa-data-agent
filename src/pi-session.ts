@@ -459,13 +459,6 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function holdSync(ms: number): void {
-  if (ms <= 0) return;
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-export { holdSync };
-
 export function inspectCompaction(
   entries: readonly { type: string; message?: { role?: string; content?: unknown; toolCallId?: string } }[],
   contextMessages: readonly { role?: string; toolCallId?: string }[],

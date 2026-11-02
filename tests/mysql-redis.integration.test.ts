@@ -267,6 +267,40 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
       await delayConnection.query("DROP TRIGGER IF EXISTS test_session_delay");
       await delayConnection.end();
     }
+    // Exercise the real Pi worker path while a progress snapshot holds a MySQL
+    // row lock. The timer must fire while the server-side trigger is asleep.
+    const snapshotDb = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user, password, database });
+    const slowRuntime = createRuntime({ stateMode: "mysql", mysqlHost: "127.0.0.1", mysqlPort, mysqlUser: user, mysqlPassword: password, mysqlDatabase: database, redisHost: "127.0.0.1", redisPort, databasePath, freshnessPath, reseedDatabase: false, publishFreshnessOnStart: false, startWorker: false, ephemeralDir: undefined, modelMode: "pi", piProvider: "faux", leaseMs: 10000, heartbeatMs: 400 });
+    let slowRun: Promise<void> | undefined;
+    try {
+      await snapshotDb.query("CREATE TRIGGER test_slow_snapshot BEFORE INSERT ON agent_snapshots FOR EACH ROW DO SLEEP(0.7)");
+      const session = slowRuntime.sessions.create("analyst");
+      const job = slowRuntime.jobs.submit(session.session_id, "合成问题：看看收入", `slow-snapshot-${randomUUID()}`);
+      const state = await slowRuntime.mysqlAsyncState();
+      const claim = await state.call("claimJob", job.job_id, slowRuntime.jobs.workerOwner, Date.now(), 10000);
+      assert.ok(claim);
+      slowRun = slowRuntime.jobs.runClaimed(claim);
+      let sleeping = false;
+      for (let attempt = 0; attempt < 100 && !sleeping; attempt += 1) {
+        const [rows] = await snapshotDb.query("SELECT COUNT(*) AS n FROM information_schema.PROCESSLIST WHERE USER = ? AND STATE = 'User sleep'", [user]);
+        sleeping = Number((rows as Array<{ n: number }>)[0]?.n ?? 0) > 0;
+        if (!sleeping) await delay(20);
+      }
+      assert.equal(sleeping, true, "未观察到隔离 MySQL 的慢快照屏障");
+      const start = Date.now();
+      await delay(80);
+      assert.ok(Date.now() - start < 500, "快照写入等待期间 worker 定时器应继续运行");
+      await slowRun;
+      const result = await state.call("getJob", job.job_id);
+      assert.ok(result && ["needs_clarification", "partial", "completed"].includes(result.status), JSON.stringify(result?.error));
+      assert.equal(result.events.filter((event) => event.type === "job_finished").length, 1);
+      assert.deepEqual(result.events.map((event) => event.seq), result.events.map((_, index) => index + 1));
+    } finally {
+      await slowRun?.catch(() => undefined);
+      await slowRuntime.close({ abandon: true });
+      await snapshotDb.query("DROP TRIGGER IF EXISTS test_slow_snapshot");
+      await snapshotDb.end();
+    }
     const baseEnv = isolatedEnv({ mysqlPort, redisPort, apiPort, databasePath, freshnessPath, recoveryMs: "60000" });
     const api = startRole("src/api.ts", baseEnv);
     children.push(api);
