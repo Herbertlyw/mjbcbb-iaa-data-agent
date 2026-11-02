@@ -34,6 +34,7 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
         external_model: false,
         remote_dispatch: false,
         model_provider: runtime.config.modelMode === "pi" ? runtime.config.piProvider : "deterministic",
+        protocol_scripted: runtime.config.modelMode === "pi" && Boolean(runtime.config.protocolScript),
         language_understanding: runtime.config.modelMode === "pi"
           ? runtime.config.piProvider === "faux"
             ? "faux-local-not-external-model"

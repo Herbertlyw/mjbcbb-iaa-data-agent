@@ -7,11 +7,11 @@
   <style>
     :root {
       color-scheme: light;
-      --ink: #1b2420;
-      --paper: #f3efe4;
-      --panel: #fffaf2;
-      --line: #d9d0c0;
-      --teal: #0e6b62;
+      --ink: #172526;
+      --paper: #f5f7f5;
+      --panel: #fff;
+      --line: #e1e8e4;
+      --teal: #146b59;
       --queued: #3d5a80;
       --running: #0e6b62;
       --completed: #1f7a4d;
@@ -22,49 +22,67 @@
       --timeout: #643b86;
     }
     * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, #efe4c8 0, transparent 28rem),
-        var(--paper);
-      font: 16px/1.5 "Avenir Next", "PingFang SC", "Noto Sans SC", sans-serif;
-    }
+    [hidden] { display: none !important; }
+    body { margin: 0; min-height: 100vh; color: var(--ink); background: var(--paper); font: 14px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", sans-serif; }
     header {
       display: flex;
       justify-content: space-between;
       gap: 1rem;
-      padding: 1.2rem 1.5rem;
-      border-bottom: 1px solid var(--line);
+      padding: 1rem 2rem;
+      border-bottom: 1px solid var(--line); background: white; align-items: center;
     }
-    h1 { margin: 0; font-family: "Iowan Old Style", Palatino, "Songti SC", serif; font-size: 1.7rem; }
-    .banner { margin: 0.2rem 0 0; color: #5d5348; }
-    main { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 92px); }
-    aside, section { padding: 1rem; }
-    aside { border-right: 1px solid var(--line); }
+    h1 { margin: 0; font-size: 1.15rem; letter-spacing: -.02em; }
+    h2 { font-size: .8rem; color: #687872; font-weight: 650; margin: 1.6rem 0 .7rem; }
+    .brand { display: flex; align-items: center; gap: .8rem; }
+    .brand-mark { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 11px; background: #dcefe7; color: #176650; font-weight: 800; font-size: .8rem; }
+    .banner { margin: .1rem 0 0; color: #71817b; font-size: .78rem; }
+    .header-actions { display: flex; align-items: center; gap: .75rem; }
+    .model-controls { display: flex; gap: .5rem; align-items: center; color: #63736d; font-size: .78rem; }
+    select { max-width: 220px; padding: .35rem .5rem; border: 1px solid var(--line); border-radius: 8px; color: #334b42; background: white; font: inherit; }
+    main { display: grid; grid-template-columns: 260px minmax(0, 1fr); min-height: calc(100vh - 72px); }
+    aside { padding: 1.2rem; border-right: 1px solid var(--line); background: #fbfcfb; }
+    section { padding: 2.8rem 2rem 4rem; min-width: 0; }
+    .workspace { max-width: 900px; margin: 0 auto; }
+    .eyebrow { margin: 0 0 .5rem; color: var(--teal); font-size: .75rem; font-weight: 750; letter-spacing: .08em; }
+    .workspace h2 { margin: 0; color: var(--ink); font-size: 1.8rem; line-height: 1.3; letter-spacing: -.03em; }
+    .intro { margin: .5rem 0 1.5rem; color: #6d7d76; }
+    .composer { padding: .75rem; border: 1px solid #d7e3dc; border-radius: 16px; background: white; box-shadow: 0 8px 30px #193d2e0a; }
     button, textarea { font: inherit; }
     button {
       border: 0;
-      border-radius: 999px;
-      padding: 0.45rem 0.8rem;
+      border-radius: 9px;
+      padding: 0.55rem 1rem;
       background: var(--teal);
       color: white;
       cursor: pointer;
     }
-    button.secondary { background: transparent; color: var(--ink); border: 1px solid var(--line); }
-    button:disabled { opacity: 0.55; cursor: wait; }
+    button.secondary { background: white; color: #38544a; border: 1px solid var(--line); }
+    button:hover:not(:disabled) { filter: brightness(.96); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid #4d9d80; outline-offset: 2px; }
     .sessions, .log, .sources { display: grid; gap: 0.5rem; }
     .session, .event, .source {
       text-align: left;
       border: 1px solid var(--line);
       background: var(--panel);
-      border-radius: 12px;
-      padding: 0.7rem;
+      border-radius: 9px;
+      padding: 0.65rem 0.75rem;
     }
-    .session.active { outline: 2px solid var(--teal); }
-    textarea { width: 100%; min-height: 6rem; border: 1px solid var(--line); border-radius: 12px; padding: 0.8rem; background: white; }
+    .session.active { border-color: #a5d3bf; background: #edf7f1; color: #146b59; }
+    textarea { display: block; width: 100%; min-height: 7rem; resize: vertical; border: 0; padding: .5rem; background: transparent; color: var(--ink); }
+    textarea:focus { outline: none; }
     .row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.7rem 0; }
+    .composer .row { justify-content: space-between; margin: .3rem .1rem .1rem; }
+    .hint, .empty { color: #87958e; font-size: .8rem; }
+    .prompt-label { margin: 1.6rem 0 .4rem; color: #7b8a82; font-size: .8rem; }
+    #prompts button { font-size: .8rem; border-radius: 999px; padding: .4rem .8rem; }
+    #result:not(:empty) { margin-top: 2rem; padding: 1.2rem; border: 1px solid var(--line); border-radius: 14px; background: white; }
+    details { margin-top: 1.5rem; color: #6e7d76; }
+    summary { cursor: pointer; font-weight: 600; }
+    .notice { margin-bottom: 1.2rem; padding: 1rem 1.2rem; border: 1px solid #ebc98f; border-radius: 12px; background: #fff8e9; color: #714a10; }
+    .notice p { margin: .3rem 0; }
+    code { border-radius: 5px; padding: .1rem .3rem; background: #f1eee5; }
+    a { color: #146b59; }
     .status {
       display: inline-flex;
       align-items: center;
@@ -81,44 +99,55 @@
     .status.failed { background: var(--failed); }
     .status.cancelled { background: var(--cancelled); }
     .status.timed_out { background: var(--timeout); }
-    .answer { white-space: pre-wrap; font-family: "Iowan Old Style", Palatino, "Songti SC", serif; font-size: 1.15rem; }
-    .muted { color: #655d53; }
-    table { width: 100%; border-collapse: collapse; background: white; }
+    .answer { white-space: pre-wrap; font-size: .95rem; line-height: 1.8; overflow-wrap: anywhere; }
+    .muted { color: #708078; }
+    .source { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; background: white; font-size: .8rem; }
     th, td { border-bottom: 1px solid var(--line); padding: 0.35rem 0.45rem; text-align: left; font-variant-numeric: tabular-nums; }
     @media (max-width: 800px) {
       main { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
+      header { padding: 1rem; flex-wrap: wrap; } section { padding: 1.5rem 1rem; }
+      .header-actions, .model-controls { flex-wrap: wrap; }
     }
   </style>
 </head>
 <body>
   <header>
-    <div>
-      <h1 id="scenario-title">本地数据分析</h1>
-      <p class="banner" id="banner">本地模拟。没有连接生产数据。</p>
-      <label>模型 <select id="model"></select></label>
-      <label>档位 <select id="reasoning"></select></label>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">DA</span>
+      <div><h1 id="scenario-title">Data Agent</h1><p class="banner" id="banner">正在连接本地服务…</p></div>
     </div>
-    <button id="new-session" class="secondary">新会话</button>
+    <div class="header-actions"><div class="model-controls">
+      <label>模型 <select id="model" disabled><option>等待连接</option></select></label>
+      <label>档位 <select id="reasoning" disabled><option>—</option></select></label>
+    </div><button id="new-session" class="secondary" disabled>＋ 新会话</button></div>
   </header>
   <main>
     <aside>
-      <h2>会话</h2>
+      <h2>会话历史</h2>
       <div id="sessions" class="sessions"></div>
-      <h2>本次会话的任务</h2>
+      <h2>当前会话</h2>
       <div id="history" class="sessions"></div>
     </aside>
     <section>
-      <div class="row" id="prompts"></div>
-      <textarea id="question" placeholder="问一个关于 Starlane Drift 的问题"></textarea>
-      <div class="row">
-        <button id="ask">提问</button>
+      <div class="workspace">
+      <div id="connection-notice" class="notice" role="status" hidden></div>
+      <p class="eyebrow">LOCAL DATA AGENT</p>
+      <h2>今天想了解什么？</h2>
+      <p class="intro">向合成数据提问，查看有来源的分析结果。</p>
+      <div class="composer">
+      <textarea id="question" aria-label="输入你的问题" placeholder="输入你的数据问题…" disabled></textarea>
+      <div class="row"><span class="hint">本地演示 · 不连接生产数据</span><div>
         <button id="cancel" class="secondary" hidden>取消任务</button>
         <span id="status" class="status queued" hidden>排队中</span>
-      </div>
+        <button id="ask" disabled>发送问题 ↑</button>
+      </div></div></div>
+      <p class="prompt-label">试试这些示例</p><div class="row" id="prompts"></div>
       <article id="result"></article>
-      <h2>工具与事件</h2>
+      <details><summary>工具与事件</summary>
       <div id="log" class="log"></div>
+      </details></div>
     </section>
   </main>
   <script>
@@ -141,6 +170,27 @@
     const questionEl = document.querySelector("#question");
     const askButton = document.querySelector("#ask");
     const cancelButton = document.querySelector("#cancel");
+    const newSessionButton = document.querySelector("#new-session");
+    const notice = document.querySelector("#connection-notice");
+
+    function showError(message) {
+      notice.hidden = false;
+      notice.textContent = message;
+    }
+
+    async function apiJson(url, options) {
+      const response = await fetch(url, options);
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error?.message || `服务请求失败（${response.status}）`);
+      return body;
+    }
+
+    function run(action) {
+      Promise.resolve().then(action).catch((error) => {
+        askButton.disabled = false;
+        showError(error instanceof TypeError ? "无法连接本地服务，请确认服务正在运行后刷新页面。" : error.message || "操作失败，请重试。");
+      });
+    }
 
     function badge(status) {
       statusEl.hidden = false;
@@ -149,24 +199,24 @@
     }
 
     async function loadSessions() {
-      const response = await fetch("/api/sessions");
-      const body = await response.json();
+      const body = await apiJson("/api/sessions");
       sessionsEl.innerHTML = "";
+      if (!body.sessions.length) sessionsEl.innerHTML = '<span class="empty">还没有会话</span>';
       for (const session of body.sessions) {
         const button = document.createElement("button");
         button.className = `session secondary ${session.session_id === state.sessionId ? "active" : ""}`;
         button.textContent = session.title;
-        button.addEventListener("click", () => openSession(session.session_id));
+        button.addEventListener("click", () => run(() => openSession(session.session_id)));
         sessionsEl.append(button);
       }
     }
 
     async function openSession(sessionId) {
+      if (state.sessionId !== sessionId) { state.source?.close(); state.jobId = null; }
       state.sessionId = sessionId;
       sessionStorage.setItem("lumenfox-session", sessionId);
       await loadSessions();
-      const response = await fetch(`/api/sessions/${sessionId}`);
-      const session = await response.json();
+      const session = await apiJson(`/api/sessions/${sessionId}`);
       const history = document.querySelector("#history");
       history.innerHTML = "";
       for (const job of session.jobs) {
@@ -177,23 +227,31 @@
         history.append(button);
       }
       const latest = session.jobs.at(-1);
-      if (latest) showJob(latest);
+      if (latest) {
+        showJob(latest);
+        if (latest.status === "queued" || latest.status === "running") listen(latest.job_id);
+      }
       else {
-        resultEl.innerHTML = "<p class=\"muted\">这个会话还没有问题。</p>";
+        resultEl.innerHTML = "";
         logEl.innerHTML = "";
         statusEl.hidden = true;
+        cancelButton.hidden = true;
+        askButton.disabled = false;
       }
     }
 
     async function createSession() {
-      const response = await fetch("/api/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
-      const session = await response.json();
+      const session = await apiJson("/api/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      state.source?.close(); state.jobId = null; state.streamJobId = null;
       state.sessionId = session.session_id;
       sessionStorage.setItem("lumenfox-session", session.session_id);
-      resultEl.innerHTML = "<p class=\"muted\">这个会话还没有问题。</p>";
+      resultEl.innerHTML = "";
       logEl.innerHTML = "";
       document.querySelector("#history").innerHTML = "";
       statusEl.hidden = true;
+      cancelButton.hidden = true;
+      askButton.disabled = false;
+      questionEl.value = "";
       await loadSessions();
     }
 
@@ -231,14 +289,16 @@
       badge(job.status);
       cancelButton.hidden = job.status !== "queued" && job.status !== "running";
       askButton.disabled = job.status === "queued" || job.status === "running";
-      renderEvents(job.events);
+      state.events = job.events || [];
+      renderEvents(state.events);
       const analysis = job.analysis;
       if (!analysis) {
         const pending = job.status === "queued" || job.status === "running";
         const note = job.status === "cancelled"
           ? "服务端终态：已取消。没有提交分析。"
           : job.error ? job.error.message : pending ? "等待服务端结论。" : `服务端终态：${labels[job.status] || job.status}。没有提交分析。`;
-        resultEl.innerHTML = `<p class="muted">${escapeHtml(job.user_text)}</p><p>${escapeHtml(note)}</p>`;
+        resultEl.innerHTML = `<p class="muted">${escapeHtml(job.user_text)}</p><p>${escapeHtml(note)}</p>${["failed", "cancelled", "timed_out"].includes(job.status) ? '<button id="retry" class="secondary">重新提问</button>' : ""}`;
+        document.querySelector("#retry")?.addEventListener("click", () => run(() => ask(job.user_text)));
         return;
       }
       const limits = analysis.limitations.map((item) => `<li>${escapeHtml(item)}</li>`).join("");
@@ -250,6 +310,7 @@
           <p class="muted">${source.evidence_eligible ? "当前证据" : "证据不可验证，未展示结果行"}。${escapeHtml(source.sql || "")}</p>
           <p class="muted">${escapeHtml(source.evidence_eligible ? coverageText(source) : "覆盖与新鲜度未作为当前有效证据使用。")}</p>
           <p class="muted">${escapeHtml(source.engine || "本地合成库")} · ${escapeHtml(source.time_range.start)} 到 ${escapeHtml(source.time_range.end)} · ${escapeHtml(source.time_range.timezone)} · ${source.complete_population ? "结果未截断" : "源结果受限制，不是完整总体"} · 契约 ${Object.entries(source.contract_revisions || {}).map(([table, revision]) => `${escapeHtml(table)}@${escapeHtml(revision)}`).join(", ")}</p>
+          ${source.execution_id ? `<p class="muted">执行 ID：${escapeHtml(source.execution_id)}${source.data_capture_hash ? ` · 捕获内容指纹：${escapeHtml(source.data_capture_hash)}（不是不可变版本或签名）` : ""}</p>` : ""}
           <table><thead><tr>${head.map((key) => `<th>${escapeHtml(key)}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table>
         </div>`;
       }).join("");
@@ -264,7 +325,7 @@
         ${analysis.clarification_question ? `<p><strong>需要澄清：</strong>${escapeHtml(analysis.clarification_question)}</p>` : ""}
         ${["failed", "cancelled", "timed_out"].includes(job.status) ? `<button id="retry" class="secondary">用新的幂等键重试</button>` : ""}
         <div class="sources">${sources}${calcs}</div>`;
-      document.querySelector("#retry")?.addEventListener("click", () => ask(job.user_text));
+      document.querySelector("#retry")?.addEventListener("click", () => run(() => ask(job.user_text)));
     }
 
     function listen(jobId) {
@@ -276,38 +337,54 @@
       state.terminal = false;
       const source = new EventSource(`/api/jobs/${jobId}/events?after=${state.lastSeq}`);
       state.source = source;
-      source.onmessage = async (event) => {
-        const body = JSON.parse(event.data);
+      source.onmessage = (event) => {
+        if (state.source !== source || state.jobId !== jobId) return;
+        let body;
+        try { body = JSON.parse(event.data); }
+        catch { source.close(); setTimeout(() => { if (state.source === source && state.jobId === jobId) listen(jobId); }, 500); return; }
         const seq = Number(body.seq || event.lastEventId || 0);
         if (seq && seq <= state.lastSeq) return;
+        if (seq && seq !== state.lastSeq + 1) { source.close(); setTimeout(() => { if (state.source === source && state.jobId === jobId) listen(jobId); }, 500); return; }
         if (seq) state.lastSeq = seq;
+        state.events ||= [];
+        if (!state.events.some((item) => item.seq === seq)) { state.events.push(body); state.events.sort((a, b) => a.seq - b.seq); renderEvents(state.events); }
         if (body.type === "job_finished" || body.type === "job_failed" || body.type === "job_cancelled" || body.type === "job_timed_out") {
           state.terminal = true;
           source.close();
-          const response = await fetch(`/api/jobs/${jobId}`);
-          showJob(await response.json());
-          await loadSessions();
-          const current = await fetch(`/api/sessions/${state.sessionId}`);
-          if (current.ok) await openSession(state.sessionId);
-        } else {
-          const response = await fetch(`/api/jobs/${jobId}`);
-          const job = await response.json();
-          badge(job.status);
-          renderEvents(job.events);
-          cancelButton.hidden = false;
+          void (async () => {
+            try {
+              const job = await apiJson(`/api/jobs/${jobId}`);
+              if (state.source !== source || state.jobId !== jobId) return;
+              showJob(job);
+              await loadSessions();
+              if (state.source === source && state.jobId === jobId && state.sessionId) await openSession(state.sessionId);
+            } catch {
+              if (state.source !== source || state.jobId !== jobId) return;
+              state.terminal = false;
+              if (seq) state.lastSeq = seq - 1;
+              setTimeout(() => { if (state.source === source && state.jobId === jobId) listen(jobId); }, 500);
+            }
+          })();
+        } else if (body.type === "job_started") {
+          badge("running");
         }
       };
       source.onerror = () => {
         source.close();
         if (state.terminal || state.jobId !== jobId) return;
-        setTimeout(() => listen(jobId), 500);
+        setTimeout(() => { if (state.source === source && state.jobId === jobId && !state.terminal) listen(jobId); }, 500);
       };
     }
 
     async function ask(text) {
+      text = text.trim();
+      if (!text) { showError("请先输入一个问题。"); questionEl.focus(); return; }
+      if (askButton.disabled) return;
+      askButton.disabled = true;
+      notice.hidden = true;
       if (!state.sessionId) await createSession();
       askButton.disabled = true;
-      const response = await fetch(`/api/sessions/${state.sessionId}/messages`, {
+      const job = await apiJson(`/api/sessions/${state.sessionId}/messages`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -317,26 +394,27 @@
           reasoning: document.querySelector("#reasoning").value,
         }),
       });
-      const job = await response.json();
-      if (!response.ok) {
-        askButton.disabled = false;
-        resultEl.textContent = job.error?.message || "提交失败";
-        return;
-      }
       showJob(job);
       listen(job.job_id);
     }
 
-    document.querySelector("#new-session").addEventListener("click", () => createSession());
-    askButton.addEventListener("click", () => ask(questionEl.value));
-    cancelButton.addEventListener("click", async () => {
+    newSessionButton.addEventListener("click", () => run(createSession));
+    askButton.addEventListener("click", () => run(() => ask(questionEl.value)));
+    cancelButton.addEventListener("click", () => run(async () => {
       if (!state.jobId) return;
-      const response = await fetch(`/api/jobs/${state.jobId}/cancel`, { method: "POST" });
-      showJob(await response.json());
-    });
+      showJob(await apiJson(`/api/jobs/${state.jobId}/cancel`, { method: "POST" }));
+    }));
 
     const prompts = document.querySelector("#prompts");
-    fetch("/api/demo").then((response) => response.json()).then((body) => {
+    async function initialize() {
+      if (location.protocol === "file:") {
+        document.querySelector("#banner").textContent = "尚未连接本地服务";
+        notice.hidden = false;
+        notice.innerHTML = '<strong>请通过本地服务打开，而不是直接打开 HTML 文件。</strong><p>在项目目录运行 <code>npm start</code>，然后访问 <a href="http://127.0.0.1:4317">http://127.0.0.1:4317</a>。</p><p>这是合成数据演示，需要 Node.js 和已安装的项目依赖。</p>';
+        return;
+      }
+      try {
+      const [body, health, sessions] = await Promise.all([apiJson("/api/demo"), apiJson("/api/health"), apiJson("/api/sessions")]);
       questionEl.placeholder = body.placeholder;
       document.title = `${body.scenario} 数据分析`;
       document.querySelector("#scenario-title").textContent = `${body.scenario} 数据分析`;
@@ -346,16 +424,15 @@
         button.textContent = question.label;
         button.addEventListener("click", () => {
           questionEl.value = question.text;
-          ask(question.text);
+          run(() => ask(question.text));
         });
         prompts.append(button);
       }
-    });
-    fetch("/api/health").then((response) => response.json()).then((health) => {
       const banner = document.querySelector("#banner");
       const select = document.querySelector("#model");
       const reasoning = document.querySelector("#reasoning");
       state.models = health.model_catalog?.models ?? [];
+      select.innerHTML = "";
       const fillReasoning = () => {
         const model = state.models.find((item) => item.id === select.value) || state.models[0];
         reasoning.innerHTML = "";
@@ -378,21 +455,29 @@
         banner.textContent = "演示模式：槽位编译器，不是通用语言理解。只读合成库，不是生产数据。";
       } else if (health.model_provider === "faux") {
         banner.textContent = "Pi 会话：本地 faux 模型，不是外部模型。业务查询走本机只读库。";
+      } else if (health.protocol_scripted) {
+        banner.textContent = "Pi 会话：本机脚本假模型，仅用于协议演示，不具备真实模型的自主分析能力。";
       } else if (health.remote_dispatch === false) {
         banner.textContent = "Pi 会话：只向 127.0.0.1 派发已验证的 openai-completions。这不是外部供应商联调，远程 HTTPS 默认关闭。";
       } else {
         banner.textContent = "Pi 会话：模型由服务端目录决定。没有密钥时不会改回演示结果。";
       }
-    });
-    fetch("/api/sessions")
-      .then((response) => response.json())
-      .then((body) => {
+      questionEl.disabled = false;
+      askButton.disabled = false;
+      newSessionButton.disabled = false;
+      select.disabled = false;
+      reasoning.disabled = false;
+      await loadSessions();
         const saved = sessionStorage.getItem("lumenfox-session");
-        const known = body.sessions?.find((item) => item.session_id === saved);
-        const latest = known || body.sessions?.at(-1);
-        if (latest) return openSession(latest.session_id);
-        return createSession();
-      });
+        const known = sessions.sessions?.find((item) => item.session_id === saved);
+        const latest = known || sessions.sessions?.at(-1);
+        if (latest) await openSession(latest.session_id);
+      } catch {
+        document.querySelector("#banner").textContent = "本地服务未连接";
+        showError("无法连接本地服务。请在项目目录运行 npm start，再通过终端显示的本地地址打开页面。");
+      }
+    }
+    initialize();
   </script>
 </body>
 </html>

@@ -1,0 +1,164 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import mysql from "mysql2/promise";
+import { clickHouseCommand, clickHouseInsert, clickHouseQuery, createClickHouseClient } from "../src/clickhouse-client.js";
+import { freshnessManifest, probeClickHouseFreshness } from "../src/freshness.js";
+import { loadKnowledge } from "../src/knowledge.js";
+import { MysqlFreshnessStore } from "../src/mysql-freshness.js";
+import { createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
+import { startFakeOpenAI } from "../tests/openai-fake-server.js";
+
+// A disposable integration stack. Docker only publishes random loopback ports;
+// all names, credentials and temporary files belong to this invocation.
+const root = fileURLToPath(new URL("..", import.meta.url));
+const id = randomUUID();
+const password = randomBytes(18).toString("hex");
+const readerPassword = randomBytes(18).toString("hex");
+const token = `fictional-${randomBytes(18).toString("hex")}`;
+const created: string[] = [];
+const children: ChildProcess[] = [];
+const dir = await mkdtemp(path.join(tmpdir(), "dataagent-stack-"));
+const watchdog = spawn(process.execPath, [path.join(root, "scripts", "stack-watchdog.mjs"), id, dir], { detached: true, stdio: ["pipe", "ignore", "ignore"] });
+await new Promise<void>((resolve, reject) => { watchdog.once("spawn", resolve); watchdog.once("error", reject); });
+watchdog.unref();
+let fake: Awaited<ReturnType<typeof startFakeOpenAI>> | undefined;
+let stopping = false;
+let stopSignal: (() => void) | undefined;
+const stopped = new Promise<void>((resolve) => { stopSignal = resolve; });
+
+function requestStop() { stopping = true; stopSignal?.(); }
+process.on("SIGINT", requestStop);
+process.on("SIGTERM", requestStop);
+
+async function command(program: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(program, args, { cwd: root, stdio: ["ignore", "pipe", "ignore"] });
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { output += chunk; });
+    child.once("error", () => reject(new Error(`${program} 无法启动`)));
+    child.once("exit", (code) => code === 0 ? resolve(output.trim()) : reject(new Error(`${program} 命令失败（${code ?? "信号终止"}）`)));
+  });
+}
+
+async function createContainer(name: string, args: string[]): Promise<void> {
+  if (stopping) throw new Error("启动已取消");
+  try {
+    await command("docker", ["run", "--pull=never", "--rm", "-d", "--name", name, "--label", `dataagent.isolated=${id}`, ...args]);
+    created.push(name);
+  } catch (error) {
+    // In case Docker created the container before reporting an error, only
+    // claim it if its invocation-specific label matches.
+    const label = await command("docker", ["inspect", "--format", '{{ index .Config.Labels "dataagent.isolated" }}', name]).catch(() => "");
+    if (label === id) created.push(name);
+    throw error;
+  }
+}
+
+async function mappedPort(name: string, port: number): Promise<number> {
+  const value = await command("docker", ["port", name, `${port}/tcp`]);
+  const match = /^127\.0\.0\.1:(\d+)$/u.exec(value);
+  if (!match) throw new Error("容器端口未绑定到本机回环地址");
+  return Number(match[1]);
+}
+
+async function freePort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return port;
+}
+
+async function waitUntil(check: () => Promise<boolean>, label: string): Promise<void> {
+  const deadline = Date.now() + 90_000;
+  while (!stopping && Date.now() < deadline) {
+    try { if (await check()) return; } catch { /* starting */ }
+    await new Promise((resolve) => setTimeout(resolve, 350));
+  }
+  throw new Error(`${label} 启动超时或被取消`);
+}
+
+function launch(file: string, env: NodeJS.ProcessEnv): ChildProcess {
+  const child = spawn(process.execPath, ["--import", "tsx", file], { cwd: root, env, stdio: "ignore" });
+  children.push(child);
+  child.once("exit", (code, signal) => {
+    if (!stopping) { console.error(`本地组件意外退出（${code ?? signal ?? "未知"}），正在清理本轮资源。`); process.exitCode = 1; requestStop(); }
+  });
+  child.once("error", () => { if (!stopping) { console.error("本地组件无法启动。"); process.exitCode = 1; requestStop(); } });
+  return child;
+}
+
+try {
+  console.log("创建独立的 ClickHouse、MySQL 和 Redis（仅随机回环端口）…");
+  const chName = `dataagent-stack-ch-${id}`;
+  const mysqlName = `dataagent-stack-mysql-${id}`;
+  const redisName = `dataagent-stack-redis-${id}`;
+  await createContainer(chName, ["--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", "127.0.0.1::8123", "-e", `CLICKHOUSE_PASSWORD=${password}`, "-e", "CLICKHOUSE_DB=harborlight", "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"]);
+  await createContainer(mysqlName, ["--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", "127.0.0.1::3306", "-e", `MYSQL_ROOT_PASSWORD=${password}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${password}`, "mysql:8.0.32"]);
+  await createContainer(redisName, ["--tmpfs", "/data:rw,size=64m", "-p", "127.0.0.1::6379", "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--save", "", "--appendonly", "no", "--requirepass", password]);
+  const [chPort, mysqlPort, redisPort, apiPort] = await Promise.all([mappedPort(chName, 8123), mappedPort(mysqlName, 3306), mappedPort(redisName, 6379), freePort()]);
+  const url = `http://127.0.0.1:${chPort}`;
+  await waitUntil(async () => (await fetch(url, { signal: AbortSignal.timeout(1000) })).ok, "ClickHouse");
+  await waitUntil(async () => {
+    const connection = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password, database: "lumenfox_it", connectTimeout: 1000 });
+    await connection.end(); return true;
+  }, "MySQL");
+  console.log("装载固定日期的合成样本并发布新鲜度…");
+  const base = { url, username: "default", password, maxRowsToRead: 5_000_000, timeoutSeconds: 30 };
+  const bootstrap = createClickHouseClient({ ...base, database: "default" }, false);
+  try { await clickHouseCommand(bootstrap, "CREATE DATABASE IF NOT EXISTS harborlight"); } finally { await bootstrap.close(); }
+  const admin = createClickHouseClient({ ...base, database: "harborlight" }, false);
+  try {
+    for (const table of WAREHOUSE_TABLES) await clickHouseCommand(admin, createTableSql(table));
+    const data = smallWarehouse();
+    const tables = { dim_fox_title: data.titles, dim_fox_channel: data.channels, fact_fox_daily_install: data.installs, fact_fox_daily_active: data.active, fact_fox_daily_payment: data.payments, fact_fox_ad_receipt: data.revenue, fact_fox_daily_spend: data.spend, fact_fox_retention_cohort: data.retention, fact_fox_cohort_payback: data.cohortPayback, fact_fox_experiment_arm: data.arms, fact_fox_experiment_metric: data.experimentMetrics };
+    for (const [table, rows] of Object.entries(tables)) await clickHouseInsert<unknown>(admin, table, rows);
+    await clickHouseCommand(admin, `CREATE USER fox_reader IDENTIFIED BY '${readerPassword}'`);
+    await clickHouseCommand(admin, "GRANT SELECT ON harborlight.* TO fox_reader");
+  } finally { await admin.close(); }
+  const knowledgeDir = path.join(root, "knowledge", "harborlight");
+  const targetsPath = path.join(knowledgeDir, "freshness-targets.json");
+  const reader = createClickHouseClient({ ...base, username: "fox_reader", password: readerPassword, database: "harborlight" }, true);
+  const freshness = await MysqlFreshnessStore.open({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password, database: "lumenfox_it" });
+  try {
+    const batch = await freshness.begin(freshnessManifest(loadKnowledge(knowledgeDir), targetsPath, { simulatedToday: "2026-10-29" }));
+    const observed = await probeClickHouseFreshness({ targetsPath, simulatedToday: "2026-10-29", query: (sql) => clickHouseQuery(reader, sql) as Promise<Array<{ event_date: string }>> });
+    if (await freshness.publish(batch.version, observed) !== "published") throw new Error("新鲜度发布未完成");
+  } finally { await freshness.close(); await reader.close(); }
+  fake = await startFakeOpenAI(token, { recordObservations: false });
+  const env = {
+    PATH: process.env.PATH ?? "", HOST: "127.0.0.1", PORT: String(apiPort), SIMULATED_TODAY: "2026-10-29", STATE_MODE: "mysql", BUSINESS_ENGINE: "clickhouse", KNOWLEDGE_DIR: knowledgeDir,
+    CLICKHOUSE_URL: url, CLICKHOUSE_USER: "fox_reader", CLICKHOUSE_PASSWORD: readerPassword, CLICKHOUSE_DATABASE: "harborlight",
+    FRESHNESS_PATH: path.join(dir, "freshness.json"), DATABASE_PATH: path.join(dir, "unused.sqlite"), RESEED_DATABASE: "false", PUBLISH_FRESHNESS_ON_START: "false",
+    MYSQL_HOST: "127.0.0.1", MYSQL_PORT: String(mysqlPort), MYSQL_USER: "lumenfox_it", MYSQL_PASSWORD: password, MYSQL_DATABASE: "lumenfox_it",
+    REDIS_HOST: "127.0.0.1", REDIS_PORT: String(redisPort), REDIS_PASSWORD: password, REDIS_QUEUE_KEY: `dataagent:stack:${id}`,
+    MODEL_MODE: "pi", PI_PROVIDER: "openai-compatible", PI_MODEL: "local-protocol", PI_API_KEY: token, PI_BASE_URL: fake.url,
+    PI_CONTEXT_WINDOW: "64000", PI_MAX_OUTPUT_TOKENS: "512", PI_REASONING: "off", PI_PROTOCOL_SCRIPT: "happy", RECOVERY_MS: "600", LEASE_MS: "4000", MAX_MODEL_CALLS: "24",
+  };
+  launch("src/api.ts", env); launch("src/dispatcher.ts", env); launch("src/worker.ts", env);
+  await waitUntil(async () => (await fetch(`http://127.0.0.1:${apiPort}/api/health`, { signal: AbortSignal.timeout(1000) })).ok, "API");
+  console.log(`\n本机演示：http://127.0.0.1:${apiPort}`);
+  console.log("固定日期的合成数据；Pi 连接脚本化的本机假服务，不是真实模型。按 Ctrl+C 停止并清理本轮资源。");
+  await stopped;
+} catch (error) {
+  if (!stopping) { console.error(error instanceof Error ? error.message : "隔离栈启动失败"); process.exitCode = 1; }
+} finally {
+  stopping = true;
+  for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+  await Promise.all(children.map((child) => child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 5000);
+    child.once("exit", () => { clearTimeout(timeout); resolve(); });
+  })));
+  if (fake) await fake.close();
+  for (const name of created.reverse()) await command("docker", ["rm", "-f", name]).catch(() => undefined);
+  await rm(dir, { recursive: true, force: true });
+  watchdog.stdin?.end();
+  console.log("本轮隔离栈已停止。");
+}
