@@ -193,7 +193,7 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "calculate_session_cells",
       label: "计算会话单元格",
-      description: "对当前任务查询资源计算 sum、count_null、count_zero 或 count_rows；也可对可证明的结果进行定点四则、按键对齐和表格变换。计算返回的资源 ID 与输入查询资源 ID 都需在正式交付时引用。",
+      description: "对当前任务查询资源计算 sum、count_null、count_zero 或 count_rows；对于完整、可证明来源的分组 SUM 或 COUNT 结果，可用 sum 对输出列再次汇总，count_rows 和 count_zero 数的是结果分组而非原始事实行。也可对可证明的结果进行定点四则、按键对齐和表格变换。计算返回的资源 ID 与输入查询资源 ID 都需在正式交付时引用；缺组、NULL、预测或截断不可自行补零。",
       parameters: Type.Object({
         resource_id: Type.Optional(Type.String({ description: "当前会话的查询资源 ID" })),
         operations: Type.Optional(Type.Array(

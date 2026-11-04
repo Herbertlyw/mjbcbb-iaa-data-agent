@@ -86,3 +86,62 @@ export function preflightClickHouseSql(sql: string): ClickHousePreflight {
   if (!query(root, new Set(), 0) || !physical.size) return { ok: false, code: "clickhouse_source_unsupported" };
   return { ok: true, tables: [...physical], identifiers: [...identifiers], functions: [...functions] };
 }
+
+export interface ClickHouseDirectRule { table: string; allowed_columns: string[]; sensitive_columns: string[] }
+export type ClickHouseDirectAuthorization = { applicable: false } | { applicable: true; ok: true; table: string; columns: string[] } | { applicable: true; ok: false; code: string };
+
+/** Independently bind physical fields in a single-relation ClickHouse AST.
+ * Complex scopes continue through the existing full policy; this function is
+ * an additional authorization boundary, not permission to skip that policy. */
+export function authorizeClickHouseDirect(sql: string, rules: readonly ClickHouseDirectRule[]): ClickHouseDirectAuthorization {
+  let statements: unknown;
+  try { statements = parse(sql, { locations: false }); } catch { return { applicable: false }; }
+  if (!Array.isArray(statements) || statements.length !== 1) return { applicable: false };
+  const root = obj(statements[0]);
+  if (root?.type !== "SelectWithUnionQuery" || !Array.isArray(root.selects) || root.selects.length !== 1) return { applicable: false };
+  const select = obj(root.selects[0]);
+  const from = obj(select?.from);
+  if (!select || select.type !== "SelectQuery" || (Array.isArray(select.with) && select.with.length) || !Array.isArray(from?.children) || from.children.length !== 1) return { applicable: false };
+  const element = obj(from.children[0]);
+  const expression = obj(element?.table_expression);
+  const table = obj(expression?.database_and_table_name);
+  if (!table || table.type !== "TableIdentifier" || table.database || expression?.subquery || expression?.table_function || element?.array_join || element?.table_join) return { applicable: false };
+  const name = typeof table.name === "string" ? table.name : "";
+  const rule = rules.find((item) => item.table === name);
+  if (!rule) return { applicable: true, ok: false, code: "unknown_table" };
+  const alias = typeof table.alias === "string" ? table.alias : name;
+  const selections = Array.isArray(select.select) ? select.select : [];
+  const aliases = new Set(selections.map((item) => obj(item)?.alias).filter((value): value is string => typeof value === "string"));
+  const columns = new Set<string>();
+  let visited = 0;
+  const visit = (value: unknown, allowAlias: boolean): string | null => {
+    if (++visited > 20000) return "sql_complexity_limit";
+    if (Array.isArray(value)) { for (const item of value) { const error = visit(item, allowAlias); if (error) return error; } return null; }
+    const node = obj(value); if (!node) return null;
+    if (node.type === "Subquery" || node.type === "SelectWithUnionQuery" || node.type === "SelectQuery") return "clickhouse_scope_unsupported";
+    if (node.type === "Identifier") {
+      const parts = Array.isArray(node.name_parts) ? node.name_parts : [node.name];
+      if (!parts.every((part) => typeof part === "string") || parts.length < 1 || parts.length > 2) return "clickhouse_identifier_unsupported";
+      const field = String(parts.at(-1));
+      if (parts.length === 2 && parts[0] !== alias && parts[0] !== name) return "column_not_in_contract";
+      if (rule.sensitive_columns.includes(field)) return "sensitive_field";
+      if (parts.length === 1 && allowAlias && aliases.has(field)) return null;
+      if (!rule.allowed_columns.includes(field)) return "column_not_in_contract";
+      columns.add(field);
+      return null;
+    }
+    for (const [key, child] of Object.entries(node)) {
+      if (["alias", "location", "parent"].includes(key)) continue;
+      const error = visit(child, allowAlias); if (error) return error;
+    }
+    return null;
+  };
+  for (const [key, value] of Object.entries(select)) {
+    if (["type", "from", "with", "location", "parent"].includes(key)) continue;
+    const error = visit(value, key === "order_by" || key === "group_by");
+    // Nested SELECTs use the established recursive policy instead.
+    if (error === "clickhouse_scope_unsupported") return { applicable: false };
+    if (error) return { applicable: true, ok: false, code: error };
+  }
+  return { applicable: true, ok: true, table: name, columns: [...columns] };
+}

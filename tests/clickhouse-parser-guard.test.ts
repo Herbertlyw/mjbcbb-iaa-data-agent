@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import test from "node:test";
-import { preflightClickHouseSql } from "../src/clickhouse-sql-preflight.js";
+import { authorizeClickHouseDirect, preflightClickHouseSql } from "../src/clickhouse-sql-preflight.js";
 import { guardSql, SqlRejected } from "../src/sql.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import { clickHouseCommand, clickHouseInsert, clickHouseQuery, clickHouseQueryBounded, createClickHouseClient } from "../src/clickhouse-client.js";
@@ -15,6 +15,27 @@ const knowledge = loadKnowledge("knowledge/harborlight");
 const fact = knowledge.contract_by_table.get("fact_fox_daily_install")!.contract!;
 const rules = [{ table: fact.table, allowed_columns: fact.columns.filter((column) => !fact.sensitive_columns.includes(column.name)).map((column) => column.name), sensitive_columns: fact.sensitive_columns, must_filter: fact.must_filter, column_types: Object.fromEntries(fact.columns.map((column) => [column.name, column.type])) }];
 const where = "event_date >= '2026-10-06' AND event_date <= '2026-10-08'";
+
+test("ClickHouse AST 独立绑定单表字段与别名，敏感列在投影、过滤和排序均拒绝", () => {
+  const legal = `SELECT f.country_code, sum(f.new_users) AS total FROM ${fact.table} AS f WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-08' AND f.country_code IN ('US','JP') GROUP BY f.country_code ORDER BY total DESC`;
+  const direct = authorizeClickHouseDirect(legal, rules);
+  assert.equal(direct.applicable, true);
+  if (direct.applicable && direct.ok) assert.deepEqual(new Set(direct.columns), new Set(["country_code", "new_users", "event_date"]));
+  else assert.fail("合法字段应能绑定");
+  assert.doesNotThrow(() => guardSql(legal, rules, "clickhouse"));
+  for (const sql of [
+    legal.replace("sum(f.new_users)", "sum(f.device_token)"),
+    legal.replace("f.country_code IN", "f.device_token IN"),
+    legal.replace("ORDER BY total", "ORDER BY f.device_token"),
+    legal.replace("sum(f.new_users)", "sum(x.new_users)"),
+    legal.replace(`FROM ${fact.table}`, "FROM another_table"),
+  ]) {
+    const result = authorizeClickHouseDirect(sql, rules);
+    assert.equal(result.applicable && !result.ok, true, sql);
+    assert.throws(() => guardSql(sql, rules, "clickhouse"), SqlRejected);
+  }
+  assert.equal(authorizeClickHouseDirect(`WITH q AS (SELECT event_date FROM ${fact.table} WHERE ${where}) SELECT event_date FROM q`, rules).applicable, false);
+});
 
 test("ClickHouse AST 递归识别物理来源，危险结构不会取代契约授权", () => {
   const query = `WITH a AS (SELECT event_date, new_users, country_code FROM ${fact.table} WHERE ${where}), b AS (SELECT event_date, new_users FROM a WHERE country_code IN ('US','JP')) SELECT event_date, new_users FROM b`;
