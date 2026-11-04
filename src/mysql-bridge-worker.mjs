@@ -339,7 +339,13 @@ async function createJob(input) {
       }
       return getJobOn(conn, String(existing[0].job_id));
     }
-    const [active] = await conn.query(`SELECT job_id FROM jobs WHERE session_id = ? AND status NOT IN ${TERMINAL} FOR UPDATE`, [input.job.session_id]);
+    // The session row above serializes all createJob calls for this session.
+    // A locking range scan here additionally acquires InnoDB next-key/gap
+    // locks in jobs, so concurrent inserts into *different* sessions can
+    // deadlock one another. A consistent read after the session lock sees all
+    // previously committed submissions for this session; a concurrently
+    // finishing job can only make this check conservatively return busy.
+    const [active] = await conn.query(`SELECT job_id FROM jobs WHERE session_id = ? AND status NOT IN ${TERMINAL}`, [input.job.session_id]);
     if (active[0]) {
       const error = new Error("session_busy");
       error.name = "session_busy";
