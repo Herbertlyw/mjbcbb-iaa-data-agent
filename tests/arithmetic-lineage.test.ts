@@ -38,6 +38,16 @@ test("引用明细行和整列时绑定执行号、范围及当前任务", async
     assert.equal(wrong.ok, false);
     const missing = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: { ...jp, row: 999 }, right: us } });
     assert.equal(missing.ok, false);
+    const unboundMulti = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: { resource_id: ref.resource_id, cell: ref.cell, row: 0 }, right: us } });
+    assert.equal(unboundMulti.ok, false, "多行结果不能隐式选择执行 ID");
+    const single = await runtime.tools.query(session.session_id, { sql: "SELECT event_date, country_code, new_users FROM daily_installs WHERE event_date = '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'" });
+    assert.equal(single.ok, true); if (!single.ok) return;
+    const singleRef = { resource_id: String(single.resource_id), cell: "new_users", row: 0 };
+    const singleValue = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: singleRef.resource_id, arithmetic: { op: "subtract", left: singleRef, right: singleRef } });
+    assert.equal(singleValue.ok, true, JSON.stringify(singleValue));
+    if (singleValue.ok) assert.equal((singleValue.result as { value: string }).value, "0");
+    const wrongSingle = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "subtract", left: { ...singleRef, execution_id: "wrong" }, right: singleRef } });
+    assert.equal(wrongSingle.ok, false);
     if (add.ok) {
       const delivered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [ref.resource_id, String(add.resource_id)] });
       assert.equal(delivered.ok, true, JSON.stringify(delivered));

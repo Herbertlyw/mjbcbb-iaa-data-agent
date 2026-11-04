@@ -723,6 +723,19 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       const created = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
       return ((await created.json()) as { session_id: string }).session_id;
     };
+    const batchSession = await another();
+    const batch = await postQuestion(apiPort, batchSession, "合成并发契约：查询已授权的新增用户。");
+    assert.equal(batch.status, "partial", `${JSON.stringify(batch.error)} ${batch.analysis?.answer ?? ""}`);
+    assert.match(batch.analysis?.answer ?? "", /670/u);
+    assert.match(batch.analysis?.answer ?? "", /NULL/u);
+    assert.deepEqual(batch.events.filter((event) => event.type === "tool_started").slice(0, 4).map((event) => event.payload.tool_name), ["read_data_contract_view", "read_data_contract_view", "read_data_contract_view", "query"]);
+    assert.equal(batch.events.some((event) => event.type === "tool_finished" && event.payload.is_error === true), false);
+    const batchDb = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password: statePassword, database: "lumenfox_it" });
+    try {
+      const [rows] = await batchDb.query("SELECT bindings_json FROM sessions WHERE session_id = ?", [batchSession]);
+      const bindings = JSON.parse(String((rows as Array<{ bindings_json: string }>)[0]!.bindings_json)) as Array<{ table: string }>;
+      assert.deepEqual(bindings.map((item) => item.table).sort(), ["dim_fox_channel", "fact_fox_daily_install", "fact_fox_daily_payment"]);
+    } finally { await batchDb.end(); }
     const glass = await postQuestion(apiPort, await another(), "玻璃鲦在德国 iOS、雾帆，2026-10-06 到 2026-10-12 的新增用户是多少？");
     assert.equal(glass.status, "completed", JSON.stringify(glass.error));
     assert.equal(glass.analysis?.sources?.[0]?.engine, "clickhouse-local", `${glass.status} ${glass.analysis?.answer ?? ""}`);
@@ -754,6 +767,14 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(sameResource.analysis?.sources?.[0]?.engine, "clickhouse-local");
     assert.deepEqual(sameResource.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "query", "calculate_session_cells", "update_analysis"]);
     assert.equal(sameResource.events.some((event) => event.type === "tool_finished" && event.payload.is_error === true), false);
+    const rawSingle = await postQuestion(apiPort, await another(), "合成单明细比较：支付流水减成本。");
+    assert.equal(rawSingle.status, "completed", `${JSON.stringify(rawSingle.error)} ${rawSingle.analysis?.answer ?? ""} ${JSON.stringify(rawSingle.events.filter((event) => event.type === "tool_finished").map((event) => ({ tool: event.payload.tool_name, code: event.payload.code })))}`);
+    assert.match(rawSingle.analysis?.answer ?? "", /四则运算 subtract：-1\.00 USD/u);
+    assert.equal(rawSingle.analysis?.sources?.[0]?.engine, "clickhouse-local");
+    assert.equal(rawSingle.events.some((event) => event.type === "tool_finished" && event.payload.is_error === true), false);
+    const rawSeparate = await postQuestion(apiPort, await another(), "合成不同明细来源：尝试跨查询逐行计算。");
+    assert.equal(rawSeparate.status, "failed");
+    assert.ok(rawSeparate.events.some((event) => event.type === "tool_finished" && event.payload.tool_name === "calculate_session_cells" && event.payload.code === "arithmetic_scope_incompatible"));
     const japan = await postQuestion(apiPort, await another(), "纸灯在日本、iOS、雾帆，2026-10-06 到 2026-10-12 的新增用户是多少？");
     assert.match(japan.analysis?.answer ?? "", /70/);
     const joined = await postQuestion(apiPort, await another(), "把纸灯美国 iOS 的新增和变现连表后告诉我新增合计。");

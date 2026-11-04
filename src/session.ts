@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Agent } from "@earendil-works/pi-agent-core";
 import type { ExecutionLease, StateStore, StoredSession } from "./state-store.js";
-import type { SessionResource } from "./types.js";
+import type { ContractBinding, SessionResource } from "./types.js";
 import type { AsyncMysqlStateStore } from "./async-mysql-state-store.js";
 
 export interface SessionRecord extends StoredSession {
@@ -63,6 +63,12 @@ export class SessionStore {
     const lease = this.activeLeases.get(session.session_id);
     if (this.asyncState) await (await this.asyncState()).call("saveSession", storedSession(session), lease);
     else this.state.saveSession(storedSession(session), lease);
+  }
+
+  async upsertContractBinding(session: SessionRecord, binding: ContractBinding): Promise<void> {
+    const lease = this.activeLeases.get(session.session_id);
+    if (this.asyncState) await (await this.asyncState()).call("upsertContractBinding", session.session_id, binding, session.role, session.actor_id, lease);
+    else this.state.upsertContractBinding(session.session_id, binding, session.role, session.actor_id, lease);
   }
 
   async saveResourceAsync(resource: SessionResource): Promise<SessionResource> {

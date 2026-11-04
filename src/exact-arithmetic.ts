@@ -24,6 +24,8 @@ export interface ArithmeticValue {
   /** Ordered, server-generated source identities, not model labels. */
   bases?: Array<ArithmeticValue["basis"]>;
   formula?: string;
+  /** Bound only for a directly verified row, never supplied by the model. */
+  row_identity?: { resource_id: string; execution_id: string; row: number };
   scopes: Array<{ filters: Record<string, string | null>; start: string; end: string }>;
 }
 

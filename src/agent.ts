@@ -173,8 +173,9 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "read_data_contract_view",
       label: "读取数据契约",
-      description: "读取表契约的受控视图。只有服务端判定可查询时才会写下当前绑定。",
+      description: "读取表契约的受控视图，包含字段、粒度、可见的派生指标定义和登记关系。只有服务端判定可查询时才会写下当前表绑定；关系不会授予其他表绑定，JOIN 仍须验证键、粒度和证据。",
       parameters: Type.Object({ asset_id: Type.String({ description: "契约资产 ID" }), columns_offset: Type.Optional(Type.Integer({ minimum: 0 })), columns_limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })), expected_content_hash: Type.Optional(Type.String()) }),
+      executionMode: "sequential",
       execute: async (_toolCallId, params, signal) => pack(await tools.readDataContractView(sessionId, params as { asset_id?: string; columns_offset?: number; columns_limit?: number; expected_content_hash?: string }, signal)),
     },
     {
@@ -193,7 +194,7 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "calculate_session_cells",
       label: "计算会话单元格",
-      description: "对当前任务查询资源计算 sum、count_null、count_zero 或 count_rows；对于完整、可证明来源的分组 SUM 或 COUNT 结果，可用 sum 对输出列再次汇总，count_rows 和 count_zero 数的是结果分组而非原始事实行。也可对可证明的结果进行定点四则、按键对齐和表格变换：一次只选 operations、arithmetic、align、transform 中一种；四则和变换通常省略顶层 resource_id，引用写在对应输入里。单行无分组聚合可指定 row=0；普通明细行须带执行 ID。计算返回的资源 ID 与输入查询资源 ID 都需在正式交付时引用；缺组、NULL、预测或截断不可自行补零。",
+      description: "对当前任务查询资源计算 sum、count_null、count_zero 或 count_rows；对于完整、可证明来源的分组 SUM 或 COUNT 结果，可用 sum 对输出列再次汇总，count_rows 和 count_zero 数的是结果分组而非原始事实行。也可对可证明的结果进行定点四则、按键对齐和表格变换：一次只选 operations、arithmetic、align、transform 中一种；四则和变换通常省略顶层 resource_id，引用写在对应输入里。单行资源可用 row=0，执行 ID 来自保存的查询记录；多行明细引用须显式提供执行 ID。计算返回的资源 ID 与输入查询资源 ID 都需在正式交付时引用；缺组、NULL、预测或截断不可自行补零。",
       parameters: Type.Object({
         resource_id: Type.Optional(Type.String({ description: "当前会话的查询资源 ID" })),
         operations: Type.Optional(Type.Array(

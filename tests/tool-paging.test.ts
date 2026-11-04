@@ -124,3 +124,18 @@ test("查询预览分页不截断完整资源，SQL LIMIT 不冒充完整总体"
     if (pageLimited.ok) assert.equal(pageLimited.resource_truncated, true);
   });
 });
+
+test("空查询明确提示检查编码与范围，不伪造成零", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    assert.equal((await runtime.tools.readDataContractView(session.session_id, { asset_id: "contract.daily_installs" })).ok, true);
+    runtime.sessions.setActiveJob(session.session_id, "empty_result_job");
+    const result = await runtime.tools.query(session.session_id, { sql: "SELECT event_date, new_users FROM daily_installs WHERE event_date = '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'IOS' AND country_code = 'US' AND channel = 'nebula_ads'" });
+    assert.equal(result.ok, true); if (!result.ok) return;
+    assert.deepEqual(result.rows, []);
+    assert.match(String(result.notice), /空结果不是数值零/u);
+    assert.match(String(result.notice), /大小写/u);
+    const calculation = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(result.resource_id), operations: [{ op: "sum", column: "new_users", as: "total" }] });
+    assert.equal(calculation.ok, true); if (calculation.ok) assert.equal((calculation.cells as Record<string, unknown>).total, null);
+  });
+});

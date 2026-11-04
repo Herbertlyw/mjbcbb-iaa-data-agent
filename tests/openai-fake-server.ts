@@ -111,6 +111,14 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
       // Pi session and persisted user message always keep the original text.
       const fixtureMessages = dateShift ? JSON.parse(shiftSyntheticDates(JSON.stringify(messages), -dateShift)) as ProtocolMessage[] : messages;
       const turnTools = currentTurn(fixtureMessages).filter((message) => message.role === "tool");
+      if (messageText(currentTurn(fixtureMessages)[0] ?? { role: "user" }).includes("合成并发契约") && turnTools.length === 0) {
+        const names = ["contract.fact_fox_daily_install", "contract.fact_fox_daily_payment", "contract.dim_fox_channel"];
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.write(`data: ${JSON.stringify(chunkFrame({ role: "assistant", tool_calls: names.map((asset_id, index) => ({ index, id: `batch_contract_${index}`, type: "function", function: { name: "read_data_contract_view", arguments: JSON.stringify({ asset_id }) } })) }))}\n\n`);
+        response.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 21, completion_tokens: 9, total_tokens: 30 } })}\n\n`);
+        response.end("data: [DONE]\n\n");
+        return;
+      }
       const call = script === "clarify-retry" && turnTools.length === 0
         ? { id: "call_reject", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: [] }) }
         : script === "minimal-clarification" && turnTools.length === 0
@@ -157,6 +165,8 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成空值标记投影")) return scripted(turn, nullMarkerSteps);
   if (latest.includes("合成条件阈值")) return scripted(turn, conditionalThresholdSteps);
   if (latest.includes("合成单资源比较")) return scripted(turn, sameResourceComparisonSteps);
+  if (latest.includes("合成单明细比较")) return scripted(turn, rawSingleComparisonSteps);
+  if (latest.includes("合成不同明细来源")) return scripted(turn, rawDifferentResourceSteps);
   if (latest.includes("不调用记录")) return scripted(turn, noRecordSteps);
   if (latest.includes("合成收入成本比")) return scripted(turn, ratioSteps);
   if (latest.includes("合成多渠道收入成本比")) return scripted(turn, groupedRatioSteps);
@@ -210,6 +220,26 @@ function sameResourceComparisonSteps(ids: string[]) {
     { id: "same_query", name: "query", arguments: JSON.stringify({ sql: "SELECT SUM(amount_usd) AS amount_sum, SUM(cost_usd) AS cost_sum, COUNT() AS row_cnt FROM fact_fox_daily_payment WHERE event_date = toDate('2026-10-08') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'" }) },
     { id: "same_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: id, arithmetic: { op: "subtract", left: { resource_id: id, cell: "amount_sum", row: 0 }, right: { resource_id: id, cell: "cost_sum", row: 0 } } }) },
     { id: "same_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", resource_ids: ids }) },
+  ];
+}
+
+function rawSingleComparisonSteps(ids: string[]) {
+  const id = ids[0] ?? "";
+  return [
+    { id: "raw_same_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "raw_same_query", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, title_id, platform, country_code, channel_id, amount_usd, cost_usd FROM fact_fox_daily_payment WHERE event_date = toDate('2026-10-08') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'" }) },
+    { id: "raw_same_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: id, arithmetic: { op: "subtract", left: { resource_id: id, cell: "amount_usd", row: 0 }, right: { resource_id: id, cell: "cost_usd", row: 0 } } }) },
+    { id: "raw_same_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", resource_ids: ids }) },
+  ];
+}
+
+function rawDifferentResourceSteps(ids: string[]) {
+  const sql = "SELECT event_date, title_id, platform, country_code, channel_id, amount_usd, cost_usd FROM fact_fox_daily_payment WHERE event_date = toDate('2026-10-08') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'";
+  return [
+    { id: "raw_diff_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "raw_diff_query_a", name: "query", arguments: JSON.stringify({ sql }) },
+    { id: "raw_diff_query_b", name: "query", arguments: JSON.stringify({ sql }) },
+    { id: "raw_diff_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ arithmetic: { op: "subtract", left: { resource_id: ids[0] ?? "", cell: "amount_usd", row: 0 }, right: { resource_id: ids[1] ?? "", cell: "cost_usd", row: 0 } } }) },
   ];
 }
 

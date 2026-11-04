@@ -200,6 +200,7 @@ async function dispatch(op, args) {
   if (op === "getSession") return getSession(args[0]);
   if (op === "listSessions") return listSessions();
   if (op === "saveSession") return saveSession(args[0], args[1]);
+  if (op === "upsertContractBinding") return upsertContractBinding(args[0], args[1], args[2], args[3], args[4]);
   if (op === "addMessage") return addMessage(args[0]);
   if (op === "listMessages") return listMessages(args[0]);
   if (op === "saveResource") return saveResource(args[0], args[1]);
@@ -282,6 +283,23 @@ async function saveSession(session, lease) {
     await conn.query("UPDATE sessions SET title = ?, slots_json = ?, bindings_json = ? WHERE session_id = ?", [
       session.title, JSON.stringify(session.slots), JSON.stringify(session.bindings), session.session_id,
     ]);
+    return null;
+  });
+}
+
+async function upsertContractBinding(sessionId, binding, role, actorId, lease) {
+  return transaction(async (conn) => {
+    if (lease) await assertExecutionLease(conn, sessionId, lease);
+    const [rows] = await conn.query("SELECT role, actor_id, bindings_json FROM sessions WHERE session_id = ? FOR UPDATE", [sessionId]);
+    const row = rows[0];
+    if (!row || binding.session_id !== sessionId || row.role !== role || (row.actor_id ?? "") !== (actorId ?? "")) throw new Error("binding_session_changed");
+    // The session row may have been locked until after this lease expired.
+    if (lease) await assertExecutionLease(conn, sessionId, lease);
+    const current = parseJson(row.bindings_json);
+    if (!Array.isArray(current)) throw new Error("binding_state_invalid");
+    const bindings = [...current.filter((item) => item.table !== binding.table), binding];
+    await conn.query("UPDATE sessions SET bindings_json = ? WHERE session_id = ?", [JSON.stringify(bindings), sessionId]);
+    if (lease) await assertExecutionLease(conn, sessionId, lease);
     return null;
   });
 }

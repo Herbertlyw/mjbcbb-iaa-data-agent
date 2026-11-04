@@ -65,6 +65,7 @@ export interface StateStore {
   getSession(sessionId: string): StoredSession | undefined;
   listSessions(): StoredSession[];
   saveSession(session: StoredSession, lease?: ExecutionLease): void;
+  upsertContractBinding(sessionId: string, binding: ContractBinding, role: string, actorId: string | undefined, lease?: ExecutionLease): void;
   addMessage(message: StoredMessage): void;
   listMessages(sessionId: string): StoredMessage[];
   saveResource(resource: SessionResource, lease?: ExecutionLease): void;
@@ -409,6 +410,16 @@ export class SqliteStateStore implements StateStore {
       this.db.prepare("UPDATE sessions SET title = ?, slots_json = ?, bindings_json = ? WHERE session_id = ?").run(
         session.title, JSON.stringify(session.slots), JSON.stringify(session.bindings), session.session_id,
       );
+    });
+  }
+
+  upsertContractBinding(sessionId: string, binding: ContractBinding, role: string, actorId: string | undefined, lease?: ExecutionLease): void {
+    this.transaction(() => {
+      if (lease) this.assertExecutionLease(sessionId, lease);
+      const row = this.getSession(sessionId);
+      if (!row || binding.session_id !== sessionId || row.role !== role || (row.actor_id ?? "") !== (actorId ?? "")) throw new Error("binding_session_changed");
+      const bindings = [...row.bindings.filter((item) => item.table !== binding.table), binding];
+      this.db.prepare("UPDATE sessions SET bindings_json = ? WHERE session_id = ?").run(JSON.stringify(bindings), sessionId);
     });
   }
 

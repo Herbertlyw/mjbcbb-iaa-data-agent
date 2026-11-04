@@ -50,6 +50,51 @@ test("隔离 MySQL 受控并发创建任务、同会话互斥及未知结果", a
     try {
       const [rows] = await connection.query("SELECT (SELECT COUNT(*) FROM jobs) AS jobs, (SELECT COUNT(*) FROM job_events) AS events, (SELECT COUNT(*) FROM messages) AS messages, (SELECT COUNT(*) FROM outbox) AS outbox");
       assert.deepEqual({ ...(rows as Array<Record<string, number>>)[0] }, { jobs: 50, events: 50, messages: 50, outbox: 50 });
+      // Concurrent contract tools must merge bindings instead of replacing a
+      // stale session snapshot. Exercise the real MySQL transaction and fence.
+      const bindingSession = await worker.sessions.createAsync("analyst");
+      const bindingJob = await worker.jobs.submitForSessionAsync(bindingSession.session_id, "虚构并发契约", "contracts");
+      const bindingAuthority = await worker.mysqlAsyncState();
+      const bindingClaim = await bindingAuthority.call("claimJob", bindingJob.job_id, "binding-owner", Date.now(), 20_000); assert.ok(bindingClaim);
+      worker.sessions.setActiveJob(bindingSession.session_id, bindingJob.job_id, { owner: "binding-owner", fence: bindingClaim.fence });
+      const contractResults = await Promise.all(["contract.daily_installs", "contract.daily_ad_revenue", "contract.daily_unit_economics"].map((asset_id) => worker.tools.readDataContractView(bindingSession.session_id, { asset_id })));
+      assert.ok(contractResults.every((result) => result.ok), JSON.stringify(contractResults));
+      const bound = await bindingAuthority.call("getSession", bindingSession.session_id); assert.ok(bound);
+      assert.deepEqual(bound.bindings.map((item) => item.table).sort(), ["daily_ad_revenue", "daily_installs", "daily_unit_economics"]);
+      assert.equal(bound.title, "虚构并发契约");
+      const oldBinding = { ...bound.bindings[0]!, receipt_id: "stale-synthetic-receipt" };
+      await bindingAuthority.call("expireLease", bindingJob.job_id);
+      await assert.rejects(() => bindingAuthority.call("upsertContractBinding", bindingSession.session_id, oldBinding, bound.role, bound.actor_id, { jobId: bindingJob.job_id, owner: "binding-owner", fence: bindingClaim.fence }));
+      const afterExpiry = await bindingAuthority.call("getSession", bindingSession.session_id); assert.ok(afterExpiry);
+      assert.deepEqual(afterExpiry.bindings, bound.bindings);
+      const takeover = await bindingAuthority.call("claimJob", bindingJob.job_id, "binding-new-owner", Date.now(), 20_000); assert.ok(takeover && takeover.fence > bindingClaim.fence);
+      await assert.rejects(() => bindingAuthority.call("upsertContractBinding", bindingSession.session_id, oldBinding, bound.role, bound.actor_id, { jobId: bindingJob.job_id, owner: "binding-owner", fence: bindingClaim.fence }));
+      await assert.rejects(() => bindingAuthority.call("upsertContractBinding", bindingSession.session_id, oldBinding, "viewer", bound.actor_id, { jobId: bindingJob.job_id, owner: "binding-new-owner", fence: takeover.fence }));
+      const afterTakeover = await bindingAuthority.call("getSession", bindingSession.session_id); assert.ok(afterTakeover);
+      assert.deepEqual(afterTakeover.bindings, bound.bindings);
+      worker.sessions.setActiveJob(bindingSession.session_id, undefined);
+      const waitingSession = await worker.sessions.createAsync("analyst");
+      const waitingJob = await worker.jobs.submitForSessionAsync(waitingSession.session_id, "虚构等待过期", "waiting");
+      const shortClaim = await bindingAuthority.call("claimJob", waitingJob.job_id, "waiting-owner", Date.now(), 1200); assert.ok(shortClaim);
+      await connection.beginTransaction();
+      await connection.query("SELECT session_id FROM sessions WHERE session_id = ? FOR UPDATE", [waitingSession.session_id]);
+      const waitingBinding = { ...oldBinding, session_id: waitingSession.session_id };
+      const blockedWrite = assert.rejects(() => bindingAuthority.call("upsertContractBinding", waitingSession.session_id, waitingBinding, waitingSession.role, waitingSession.actor_id, { jobId: waitingJob.job_id, owner: "waiting-owner", fence: shortClaim.fence }));
+      const waitingProbe = await mysql.createConnection(config);
+      try {
+        let ownsJobLock = false; const waitDeadline = Date.now() + 1000;
+        while (!ownsJobLock && Date.now() < waitDeadline) {
+          try { await waitingProbe.query("SELECT job_id FROM jobs WHERE job_id = ? FOR UPDATE NOWAIT", [waitingJob.job_id]); }
+          catch (error) { if ((error as { code?: string }).code === "ER_LOCK_NOWAIT") ownsJobLock = true; else throw error; }
+          if (!ownsJobLock) await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        assert.equal(ownsJobLock, true, "写入持有任务锁并等待会话行");
+        await new Promise((resolve) => setTimeout(resolve, 1400));
+        await connection.commit();
+        await blockedWrite;
+        const afterWait = await bindingAuthority.call("getSession", waitingSession.session_id); assert.ok(afterWait);
+        assert.deepEqual(afterWait.bindings, [], "等待中失效的租约不能提交绑定");
+      } finally { await connection.rollback().catch(() => undefined); await waitingProbe.end(); }
       // Hold the session row while an active worker holds its job row and
       // waits to update the session; a concurrent submit waits on session.
       // Once released, submission must not try to lock the worker's job row

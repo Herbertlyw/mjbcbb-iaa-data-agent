@@ -272,6 +272,37 @@ export class ToolService {
     const allowed = canQueryTable(this.ctx.knowledge, session.role, contract.table);
     const queryable = !validity && allowed;
     const denyReason = validity === "expired" ? "expired_contract" : validity === "not_yet_valid" ? "contract_not_yet_valid" : validity === "invalid" ? "invalid_contract_period" : !allowed ? "table_not_authorized" : undefined;
+    // Expose calculation and relationship metadata only when every referenced
+    // contract is published and visible/queryable to this principal. These
+    // hints do not create additional bindings or authorize a JOIN.
+    const visibleContract = (table: string) => {
+      const candidate = this.ctx.knowledge.contract_by_table.get(table);
+      return candidate?.status === "published" && candidate.contract && canRead(this.ctx.knowledge, session.role, candidate.asset_id) && canQueryTable(this.ctx.knowledge, session.role, table) ? candidate : undefined;
+    };
+    const visibleOperand = (name: string) => {
+      if (typeof name !== "string" || name.length > 257) return undefined;
+      const parts = name.split(".");
+      if (parts.length < 1 || parts.length > 2) return undefined;
+      const table = parts.length === 2 ? parts[0]! : contract.table;
+      const field = parts.at(-1)!; const source = visibleContract(table);
+      return source?.contract && source.contract.series?.metrics.includes(field) && !source.contract.sensitive_columns.includes(field) && source.contract.columns.some((column) => column.name === field) ? source : undefined;
+    };
+    const derived = (contract.derived_metrics ?? []).flatMap((item) => {
+      if (!item || typeof item.id !== "string" || item.id.length > 128 || typeof item.label !== "string" || item.label.length > 256 || typeof item.unit !== "string" || item.unit.length > 128 || !["add", "subtract", "multiply", "divide"].includes(item.operation) || item.prediction !== "actual_only") return [];
+      const left = visibleOperand(item.numerator); const right = visibleOperand(item.denominator);
+      return left && right ? [{ item, assets: [left.asset_id, right.asset_id] }] : [];
+    });
+    const joinAsset = this.ctx.knowledge.by_id.get("join.rules");
+    const relations = joinAsset?.status === "published" && canRead(this.ctx.knowledge, session.role, joinAsset.asset_id)
+      ? this.ctx.knowledge.joins.flatMap((join) => {
+        if (typeof join.join_id !== "string" || join.join_id.length > 128 || !Array.isArray(join.tables) || !join.tables.includes(contract.table) || join.tables.length !== 2 || join.tables.some((table) => typeof table !== "string" || table.length > 128) || !Array.isArray(join.keys) || !join.keys.length || join.keys.length > 16 || join.keys.some((key) => typeof key !== "string" || key.length > 128)) return [];
+        const sources = join.tables.map(visibleContract);
+        if (sources.some((source) => !source?.contract || join.keys.some((key) => !source.contract!.columns.some((column) => column.name === key) || source.contract!.sensitive_columns.includes(key)))) return [];
+        return [{ item: { join_id: join.join_id, tables: join.tables, keys: join.keys }, assets: sources.map((source) => source!.asset_id) }];
+      }) : [];
+    const extraAssets = [...derived.flatMap((item) => item.assets), ...relations.flatMap((item) => item.assets), ...(relations.length && joinAsset ? [joinAsset.asset_id] : [])];
+    if (!await validateKnowledgeSources(this.ctx.knowledge, extraAssets)) return fail("knowledge_source_changed", "契约或关联规则来源已变化，请重新加载后再读取。");
+    if (signal?.aborted) return fail("tool_cancelled", "工具已取消");
     const binding: ContractBinding = {
       receipt_id: `rcpt_${randomUUID()}`,
       session_id: session.session_id,
@@ -290,8 +321,7 @@ export class ToolService {
       valid_until: contract.valid_until,
       read_at: new Date().toISOString(),
     };
-    session.bindings = [...session.bindings.filter((item) => item.table !== contract.table), binding];
-    await this.ctx.sessions.saveAsync(session);
+    await this.ctx.sessions.upsertContractBinding(session, binding);
     const freshnessResult = await this.currentFreshness();
     const publication = freshnessResult.ok ? freshnessResult.publication : null;
     const publishedTable = publication?.tables[contract.table];
@@ -309,6 +339,10 @@ export class ToolService {
       series: contract.series ?? null,
       content_hash: asset.content_hash,
       grain: tableGrain(this.ctx.knowledge, contract.table),
+      derived_metrics: derived.slice(0, 20).map((item) => item.item),
+      derived_metrics_has_more: derived.length > 20,
+      registered_relationships: relations.slice(0, 20).map((item) => item.item),
+      registered_relationships_has_more: relations.length > 20,
       columns: contract.columns.slice(offset, offset + limit).map((column) => ({
         name: column.name,
         type: column.type,
@@ -328,7 +362,7 @@ export class ToolService {
       valid_from: contract.valid_from,
       valid_until: contract.valid_until,
       simulated: true,
-      notice: queryable ? "服务端已记录当前契约绑定。模型提交的资产 ID 本身不是授权。" : "契约已读取，但不能用于查询。",
+      notice: queryable ? "服务端已记录当前契约绑定。派生指标和登记关系仅说明口径，不授予其他表的读取或查询绑定；JOIN 还须核查键、粒度与证据，事实表之间可分别查询并对齐。" : "契约已读取，但不能用于查询。",
     };
   }
 
@@ -583,7 +617,7 @@ export class ToolService {
       next_row_offset: preview.length < resource.rows.length ? preview.length : null,
       coverage: coveragePreview(resource.coverage),
       freshness_receipts: resource.freshness_receipts,
-      notice: truncated || sqlLimited ? `源结果受截断或 SQL LIMIT 约束，不能当作完整总体。resource_id=${resource.resource_id}` : `结果来自本地合成 ${resource.engine}。预览与保存资源分页分开。resource_id=${resource.resource_id}`,
+      notice: truncated || sqlLimited ? `源结果受截断或 SQL LIMIT 约束，不能当作完整总体。resource_id=${resource.resource_id}` : resource.rows.length === 0 ? `给定筛选没有观测到行，空结果不是数值零；请核对契约中的编码、大小写、日期和授权范围，不要凭空补零。resource_id=${resource.resource_id}` : `结果来自本地合成 ${resource.engine}。预览与保存资源分页分开。resource_id=${resource.resource_id}`,
     };
   }
 
@@ -674,7 +708,7 @@ export class ToolService {
     if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
     const left = await this.resolveArithmetic(session, jobId, expression.left, fresh.publication, new Set());
     const right = await this.resolveArithmetic(session, jobId, expression.right, fresh.publication, new Set());
-    if (!left || !right) return fail("arithmetic_lineage_unsupported", "输入不属于当前任务、已变化或不能证明完整血缘。");
+    if (!left || !right) return fail("arithmetic_lineage_unsupported", "输入不属于当前任务、已变化或不能证明完整血缘。引用多行结果中的明细行时请提供查询结果中的 execution_id、row 和列名；单行资源可使用其保存的执行 ID。不要使用历史任务资源。");
     const result = this.computeProvenArithmetic(expression.op, left.value, right.value);
     if (!result) return fail("arithmetic_scope_incompatible", "指标关系须由契约声明，且单位、粒度、实际/预测状态及范围须兼容。");
     const resource: ArithmeticResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "arithmetic", created_at: new Date().toISOString(), operation: expression.op, left: expression.left, right: expression.right, input_hashes: { ...left.hashes, ...right.hashes }, result, input_truncated: false, complete_population: true };
@@ -699,7 +733,9 @@ export class ToolService {
       const metric = (table: string, field: string, name: string) => name === `${table}.${field}` || name === field && a.table === b.table;
       const definitions = [...(leftContract?.derived_metrics ?? []), ...(a.table === b.table ? [] : rightContract?.derived_metrics ?? [])];
       const expectedUnit = arithmeticUnit(op, a.unit, b.unit);
-      declared = Boolean(equalGrain && expectedUnit && a.operation === "sum" && b.operation === "sum" && a.prediction === "actual_observed_only" && b.prediction === a.prediction && a.timezone === b.timezone && definitions.some((item) => item.operation === op && item.prediction === "actual_only" && item.unit === expectedUnit && metric(a.table, a.column, item.numerator) && metric(b.table, b.column, item.denominator)));
+      const sameVerifiedRow = a.operation === "value" && b.operation === "value" && left.row_identity && right.row_identity && left.row_identity.resource_id === right.row_identity.resource_id && left.row_identity.execution_id === right.row_identity.execution_id && left.row_identity.row === right.row_identity.row;
+      const compatibleOperation = a.operation === "sum" && b.operation === "sum" || sameVerifiedRow;
+      declared = Boolean(equalGrain && expectedUnit && compatibleOperation && a.prediction === "actual_observed_only" && b.prediction === a.prediction && a.timezone === b.timezone && definitions.some((item) => item.operation === op && item.prediction === "actual_only" && item.unit === expectedUnit && metric(a.table, a.column, item.numerator) && metric(b.table, b.column, item.denominator)));
     }
     return computeArithmetic(op, left, right, declared);
   }
@@ -931,7 +967,11 @@ export class ToolService {
         if (matching.length === 1) return { value: fromAggregate(matching[0]!), hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id] };
       }
       if (ref.row !== undefined || ref.aggregate !== undefined || ref.execution_id !== undefined) {
-        if (ref.group || !ref.execution_id || ref.execution_id !== resource.execution_id || (ref.row === undefined) === (ref.aggregate === undefined) || (ref.row !== undefined && (!Number.isSafeInteger(ref.row) || ref.row < 0)) || (ref.aggregate !== undefined && ref.aggregate !== "sum") || coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length) return null;
+        // Only a one-row resource can unambiguously select row zero without
+        // a model-supplied ID. Use the stored execution ID, never invent one;
+        // explicit mismatches and all multi-row references still fail closed.
+        const executionId = ref.execution_id ?? (ref.row === 0 && resource.rows.length === 1 ? resource.execution_id : undefined);
+        if (ref.group || !executionId || executionId !== resource.execution_id || (ref.row === undefined) === (ref.aggregate === undefined) || (ref.row !== undefined && (!Number.isSafeInteger(ref.row) || ref.row < 0)) || (ref.aggregate !== undefined && ref.aggregate !== "sum") || coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length) return null;
         const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, new Set());
         const table = checked?.table; const column = table?.columns.find((candidate) => candidate.name === ref.cell);
         const shape = verifyCell(evidence, contract, { op: "count_rows", as: "shape" }, resource.rows.length);
@@ -961,7 +1001,7 @@ export class ToolService {
           value = sumDecimalStrings(table.rows.map((row) => row[ref.cell]), column.scale!);
           if (value === null) return null;
         }
-        const exact: ArithmeticValue = { value, scale: column.scale!, unit: column.unit, basis: { table: contract.table, column: field, operation: ref.row === undefined ? "sum" : "value", unit: column.unit, prediction: "actual_observed_only", timezone: resource.time_range.timezone }, scopes: [{ filters, start, end }] };
+        const exact: ArithmeticValue = { value, scale: column.scale!, unit: column.unit, basis: { table: contract.table, column: field, operation: ref.row === undefined ? "sum" : "value", unit: column.unit, prediction: "actual_observed_only", timezone: resource.time_range.timezone }, ...(ref.row === undefined ? {} : { row_identity: { resource_id: resource.resource_id, execution_id: executionId, row: ref.row } }), scopes: [{ filters, start, end }] };
         return { value: exact, hashes: checked.hashes, leaves: checked.leaves };
       }
       const canonical = (group: Record<string, string>) => JSON.stringify(Object.entries(group).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
