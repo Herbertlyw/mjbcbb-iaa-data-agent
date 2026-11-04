@@ -235,10 +235,11 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.ok(branch.some((entry) => entry.message?.role === "user" && JSON.stringify(entry.message.content).includes(question)));
     assert.ok(branch.some((entry) => entry.message?.role === "toolResult"));
     const previousReceipt = branch.find((entry) => entry.message?.role === "toolResult" && entry.message.toolName === "update_analysis");
-    const followObservation = fake.observations.find((item) => item.userMessages.length === 2 && item.historySummaryCount === 1);
-    assert.ok(previousReceipt && followObservation);
-    const fullBytes = Buffer.byteLength(JSON.stringify(previousReceipt.message?.content));
-    assert.ok(followObservation.historySummaryBytes < fullBytes, "模型请求应减小旧分析回执，原生 JSONL 保留完整内容");
+    const previousQuery = branch.find((entry) => entry.message?.role === "toolResult" && entry.message.toolName === "query");
+    const followObservation = fake.observations.find((item) => item.userMessages.length === 2 && item.historySummaryCount === 2);
+    assert.ok(previousReceipt && previousQuery && followObservation);
+    const fullBytes = Buffer.byteLength(JSON.stringify(previousReceipt.message?.content)) + Buffer.byteLength(JSON.stringify(previousQuery.message?.content));
+    assert.ok(followObservation.historySummaryBytes < fullBytes, "模型请求应减小旧查询和分析回执，原生 JSONL 保留完整内容");
     if (process.env.DIAG_CONTEXT_SIZES === "1") console.log(`合成旧分析回执 ${fullBytes} 字节，发送摘要 ${followObservation.historySummaryBytes} 字节；追问请求体 ${followObservation.requestBytes} 字节。`);
     const [owned] = await db.query("SELECT resource_id, body_json FROM resources WHERE resource_id IN (?, ?)", [source1, source2]);
     for (const row of owned as Array<{ resource_id: string; body_json: string }>) {

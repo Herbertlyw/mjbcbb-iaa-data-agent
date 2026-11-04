@@ -44,3 +44,25 @@ test("失败回执和无法安全完整呈现的历史答案不伪装成完整�
   if (item?.role !== "toolResult" || item.content[0]?.type !== "text") throw new Error("missing receipt");
   assert.deepEqual([JSON.parse(item.content[0].text).answer, JSON.parse(item.content[0].text).answer_omitted], [null, true]);
 });
+
+test("只压缩已交付轮次的查询预览，保留范围、用户原话及未完成轮次", () => {
+  const query = (id: string) => ({ role: "toolResult", toolCallId: id, toolName: "query", isError: false, content: [{ type: "text", text: JSON.stringify({ ok: true, tables: ["fact_synthetic"], time_range: { start: "2026-10-06", end: "2026-10-08", timezone: "UTC", extra: "x".repeat(20_000) }, rows: [{ value: "y".repeat(20_000) }], resource_id: "old-resource" }) }], details: { rows: "private" }, timestamp: 1 });
+  const done = { role: "toolResult", toolCallId: "done", toolName: "update_analysis", isError: false, content: [{ type: "text", text: JSON.stringify({ ok: true, status: "completed", answer: "结果 30。" }) }], timestamp: 2 };
+  const old = query("old"); const unfinished = query("unfinished"); const current = query("current");
+  const messages = [{ role: "user", content: "原范围", timestamp: 0 }, old, done, { role: "user", content: "之前失败的一轮", timestamp: 3 }, unfinished, { role: "user", content: "新的追问", timestamp: 4 }, current];
+  const context = { messages } as unknown as TranscriptContext; const original = JSON.stringify(context);
+  const projected = compactPreviousAnalyses(context);
+  assert.equal(JSON.stringify(context), original);
+  assert.equal(projected.messages[0], messages[0]);
+  assert.equal(projected.messages[3], messages[3]);
+  assert.equal(projected.messages[4], unfinished);
+  assert.equal(projected.messages[6], current);
+  const result = projected.messages[1];
+  if (result?.role !== "toolResult" || result.content[0]?.type !== "text") throw new Error("missing prior query summary");
+  const summary = JSON.parse(result.content[0].text);
+  assert.deepEqual(summary.time_range, { start: "2026-10-06", end: "2026-10-08", timezone: "UTC" });
+  assert.deepEqual(summary.tables, ["fact_synthetic"]);
+  assert.match(summary.notice, /不是本次任务证据/u);
+  assert.equal("rows" in summary || "resource_id" in summary || "details" in result, false);
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) < 1000);
+});
