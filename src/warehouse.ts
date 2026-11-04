@@ -192,10 +192,12 @@ export function smallWarehouse() {
   for (let index = 1; index <= 240; index += 1) {
     installs.push({ event_date: "2026-10-06", title_id: "paper_lantern", platform: "android", country_code: `S${String(index).padStart(3, "0")}`, channel_id: "mist_ads", new_users: index, device_token: null });
   }
-  // Independent larger population: 1..1200 sums to 720600. The fictional
-  // identifiers have no relationship to actual countries or devices.
+  // Three independently countable days of 1..1200: 720600 each, 2161800 in
+  // total. Fictional region identifiers have no link to countries or devices.
   for (let index = 1; index <= 1200; index += 1) {
-    installs.push({ event_date: "2026-10-08", title_id: "glass_minnow", platform: "android", country_code: `Q${String(index).padStart(4, "0")}`, channel_id: "pebble_net", new_users: index, device_token: null });
+    for (const date of ["2026-10-06", "2026-10-07", "2026-10-08"]) {
+      installs.push({ event_date: date, title_id: "glass_minnow", platform: "android", country_code: `Q${String(index).padStart(4, "0")}`, channel_id: "pebble_net", new_users: index, device_token: null });
+    }
   }
   for (const date of WAREHOUSE_DATES.filter((day) => day >= "2026-10-06" && day <= "2026-10-12")) {
     installs.push({ event_date: date, title_id: "glass_minnow", platform: "android", country_code: "ZZ", channel_id: "mist_ads", new_users: 10, device_token: null });

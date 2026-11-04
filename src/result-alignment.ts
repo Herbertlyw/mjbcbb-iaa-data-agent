@@ -5,11 +5,15 @@ import { fitsResultCalculationBytes, RESULT_CALCULATION_MAX_ROWS, transformResul
 export interface AlignmentRef { resource_id: string; cell: string }
 export interface AlignmentSpec { op: ArithmeticOp; keys: string[]; left: AlignmentRef; right: AlignmentRef }
 export interface AlignedRow {
-  group: Record<string, string>;
-  status: "matched" | "missing_left" | "missing_right" | "zero_divisor";
+  group: Record<string, string | null>;
+  status: "matched" | "missing_left" | "missing_right" | "zero_divisor" | "partial_nulls" | "null_input" | "empty_inputs";
   left: ArithmeticValue | null;
   right: ArithmeticValue | null;
   result: ArithmeticValue | null;
+  left_count?: number;
+  left_null_count?: number;
+  right_count?: number;
+  right_null_count?: number;
 }
 
 /** Full outer alignment of already verified grouped outputs. Missing means the

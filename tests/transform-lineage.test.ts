@@ -6,6 +6,74 @@ import path from "node:path";
 import { analyst, bindTables, withRuntime } from "./helpers.js";
 import type { TransformResource } from "../src/types.js";
 
+test("已出现分组全部匹配也不能抹去输入缺日期，递归变换仍为部分完成", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "synthetic-gapped-alignment-"));
+  try {
+  const knowledgeDir = path.join(root, "knowledge"); cpSync(path.resolve("knowledge/lumenfox"), knowledgeDir, { recursive: true });
+  const seedPath = path.join(knowledgeDir, "seed.sql"); const seed = readFileSync(seedPath, "utf8");
+  const removed = "  ('2026-10-07', 'ios', 'JP', 'nebula_ads', 10),\n"; assert.ok(seed.includes(removed)); writeFileSync(seedPath, seed.replace(removed, ""));
+  await withRuntime({ knowledgeDir }, async (runtime) => {
+    const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]); runtime.sessions.setActiveJob(session.session_id, "job_gapped_alignment");
+    const day = async (start: string, end: string) => { const q = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, country_code, new_users FROM daily_installs WHERE event_date >= '${start}' AND event_date <= '${end}' AND product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads'` }); assert.equal(q.ok, true, JSON.stringify(q)); if (!q.ok) throw new Error("query"); return String(q.resource_id); };
+    const left = await day("2026-10-06", "2026-10-07"); const right = await day("2026-10-10", "2026-10-11");
+    const result = await runtime.tools.calculateSessionCells(session.session_id, { align: { op: "subtract", keys: ["country_code"], left: { resource_id: left, cell: "new_users" }, right: { resource_id: right, cell: "new_users" } } });
+    assert.equal(result.ok, true, JSON.stringify(result)); if (!result.ok) return;
+    assert.ok((result.rows as Array<{ status: string }>).every((row) => row.status === "matched"));
+    const resource = runtime.sessions.lookupResource(session.session_id, String(result.resource_id)); assert.ok(resource.ok && resource.resource.kind === "alignment"); if (resource.ok && resource.resource.kind === "alignment") assert.equal(resource.resource.coverage_incomplete, true);
+    const alignedAnswer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [left, right, String(result.resource_id)] });
+    assert.equal(alignedAnswer.ok, true); if (alignedAnswer.ok) { assert.equal(alignedAnswer.status, "partial"); assert.match(String(alignedAnswer.answer), /仅为已观察记录的计算/); }
+    const transformed = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(result.resource_id), steps: [{ op: "group", by: [], aggregates: [{ op: "sum", column: "result_value", as: "total" }] }] } });
+    assert.equal(transformed.ok, true, JSON.stringify(transformed)); if (!transformed.ok) return;
+    const answer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [left, right, String(transformed.resource_id)] });
+    assert.equal(answer.ok, true); if (answer.ok) { assert.equal(answer.status, "partial"); assert.ok((answer.server_reasons as string[]).includes("alignment_incomplete")); }
+  });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("完整资源按 NULL 键对齐并与字符串 NULL 区分；部分 NULL 降级且递归复核", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "synthetic-null-alignment-"));
+  try {
+    const knowledgeDir = path.join(root, "knowledge"); cpSync(path.resolve("knowledge/lumenfox"), knowledgeDir, { recursive: true });
+    const seedPath = path.join(knowledgeDir, "seed.sql"); const seed = readFileSync(seedPath, "utf8");
+    writeFileSync(seedPath, seed.replace("country_code TEXT NOT NULL,", "country_code TEXT,") + `\nINSERT INTO daily_installs (event_date,product_id,platform,country_code,channel,new_users) VALUES
+      ('2026-10-06','starlane_drift','ios',NULL,'nebula_ads',4), ('2026-10-07','starlane_drift','ios',NULL,'nebula_ads',1),
+      ('2026-10-08','starlane_drift','ios',NULL,'nebula_ads',2), ('2026-10-09','starlane_drift','ios',NULL,'nebula_ads',1),
+      ('2026-10-06','starlane_drift','ios','NULL','nebula_ads',7), ('2026-10-07','starlane_drift','ios','NULL','nebula_ads',1),
+      ('2026-10-08','starlane_drift','ios','NULL','nebula_ads',0), ('2026-10-09','starlane_drift','ios','NULL','nebula_ads',0),
+      ('2026-10-06','starlane_drift','ios','XX','nebula_ads',NULL), ('2026-10-07','starlane_drift','ios','XX','nebula_ads',2),
+      ('2026-10-08','starlane_drift','ios','XX','nebula_ads',1), ('2026-10-09','starlane_drift','ios','XX','nebula_ads',1);\n`);
+    const contractPath = path.join(knowledgeDir, "contracts", "daily-installs.json");
+    const contract = JSON.parse(readFileSync(contractPath, "utf8"));
+    const dimension = contract.columns.find((column: { name: string }) => column.name === "country_code"); dimension.type = "Nullable(String)"; dimension.nullable = true;
+    writeFileSync(contractPath, JSON.stringify(contract));
+    await withRuntime({ knowledgeDir }, async (runtime) => {
+      const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]); runtime.sessions.setActiveJob(session.session_id, "job_nullable_keys");
+      const query = async (start: string, end: string) => {
+        const result = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, country_code, new_users FROM daily_installs WHERE event_date >= '${start}' AND event_date <= '${end}' AND product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads'` });
+        assert.equal(result.ok, true, JSON.stringify(result)); if (!result.ok) throw new Error("query rejected"); return String(result.resource_id);
+      };
+      const left = await query("2026-10-06", "2026-10-07"); const right = await query("2026-10-08", "2026-10-09");
+      const result = await runtime.tools.calculateSessionCells(session.session_id, { align: { op: "divide", keys: ["country_code"], left: { resource_id: left, cell: "new_users" }, right: { resource_id: right, cell: "new_users" } } });
+      assert.equal(result.ok, true, JSON.stringify(result)); if (!result.ok) return;
+      const rows = result.rows as Array<{ group: { country_code: string | null }; status: string; left_count?: number; left_null_count?: number; result: { value: string | null } | null }>;
+      const nullKey = rows.find((row) => row.group.country_code === null); assert.ok(nullKey); assert.equal(nullKey.status, "matched"); assert.equal(nullKey.result?.value, "1.666666666666666667");
+      const literal = rows.find((row) => row.group.country_code === "NULL"); assert.ok(literal); assert.equal(literal.status, "zero_divisor"); assert.equal(literal.result?.value, null);
+      const partial = rows.find((row) => row.group.country_code === "XX"); assert.ok(partial); assert.equal(partial.status, "partial_nulls"); assert.equal(partial.left_count, 2); assert.equal(partial.left_null_count, 1); assert.equal(partial.result?.value, "1.000000000000000000");
+      const delivered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [left, right, String(result.resource_id)] });
+      assert.equal(delivered.ok, true); if (delivered.ok) { assert.equal(delivered.status, "partial"); assert.match(String(delivered.answer), /NULL 键作为独立分组/); assert.match(String(delivered.answer), /仅非 NULL 部分/); assert.match(String(delivered.answer), /country_code=NULL（空键）/); assert.match(String(delivered.answer), /country_code="NULL"（字符串）/); }
+      const transformed = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(result.resource_id), steps: [{ op: "filter", column: "country_code", comparison: "is_null" }, { op: "group", by: [], aggregates: [{ op: "count_all", as: "number_of_groups" }] }] } });
+      assert.equal(transformed.ok, true, JSON.stringify(transformed));
+      if (transformed.ok) {
+        assert.equal(((transformed.result as { rows: Array<{ number_of_groups: string }> }).rows[0]!).number_of_groups, "1");
+        const answer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [left, right, String(transformed.resource_id)] });
+        assert.equal(answer.ok, true); if (answer.ok) assert.equal(answer.status, "partial");
+      }
+      const saved = runtime.sessions.lookupResource(session.session_id, String(result.resource_id)); assert.ok(saved.ok && saved.resource.kind === "alignment");
+      if (saved.ok && saved.resource.kind === "alignment") { const forged = structuredClone(saved.resource); forged.rows[0]!.status = "matched"; forged.rows[0]!.left_null_count = 999; runtime.state.saveResource(forged); const rejected = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [left, right, String(result.resource_id)] }); assert.equal(rejected.ok, true); if (rejected.ok) assert.ok((rejected.server_reasons as string[]).includes("alignment_lineage_unsupported")); }
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("完整明细按契约键先精确汇总再对齐，NULL 和跨任务资源不能冒充零", async () => {
   await withRuntime({}, async (runtime) => {
     const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
@@ -23,7 +91,12 @@ test("完整明细按契约键先精确汇总再对齐，NULL 和跨任务资源
     const delivered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [left, right, String(result.resource_id)] });
     assert.equal(delivered.ok, true); if (delivered.ok) assert.equal(delivered.status, "completed");
     const nullDay = await queryDay("2026-10-09");
-    const nullResult = await align(left, nullDay); assert.equal(nullResult.ok, false);
+    const nullResult = await align(left, nullDay); assert.equal(nullResult.ok, true, JSON.stringify(nullResult));
+    if (!nullResult.ok) return;
+    const us = (nullResult.rows as Array<{ group: { country_code: string | null }; status: string; right: { value: string | null } | null; right_null_count?: number; result: unknown }>).find((row) => row.group.country_code === "US");
+    assert.ok(us); assert.equal(us.status, "null_input"); assert.equal(us.right?.value, null); assert.equal(us.right_null_count, 1); assert.equal(us.result, null);
+    const partial = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [left, nullDay, String(nullResult.resource_id)] });
+    assert.equal(partial.ok, true); if (partial.ok) { assert.equal(partial.status, "partial"); assert.match(String(partial.answer), /全 NULL/); }
     runtime.sessions.setActiveJob(session.session_id, "job_raw_other");
     const foreign = await align(left, right); assert.equal(foreign.ok, false);
   });

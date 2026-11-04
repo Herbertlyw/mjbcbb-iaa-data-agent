@@ -10,8 +10,9 @@ import { computeArithmetic, fromAggregate, sumDecimalStrings, type ArithmeticOp,
 import { verifyDecimalCell, type VerifiedDecimalCell } from "./decimal-cell-evidence.js";
 import { verifyDatabaseAggregates, type VerifiedAggregate } from "./aggregate-evidence.js";
 import { joinDimensionObservations, joinMissingDimensionKeys, prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema, type JoinEvidencePlan, type VerifiedJoinValue } from "./join-evidence.js";
+import { joinResultTable } from "./join-result-table.js";
 import { fitsResultCalculationBytes, RESULT_CALCULATION_MAX_ROWS, RESULT_CALCULATION_MAX_BYTES, transformResult, type ResultColumn, type ResultTable, type ResultValue, type TransformStep } from "./result-transform.js";
-import { alignAggregates, type AlignedRow, type AlignmentSpec } from "./result-alignment.js";
+import { alignAggregates, alignCompleteTables, type AlignedRow, type AlignmentSpec, type CompleteKeyedInput } from "./result-alignment.js";
 import { dimensionSnapshotMatches, dimensionSnapshotStatusValid, freshnessManifest, freshnessPeriodKey, matchesFreshnessManifest, readPublication, type FreshnessPublication } from "./freshness.js";
 import type { MysqlFreshnessStore } from "./mysql-freshness.js";
 import { canQueryTable, canRead, contractValidity, tableGrain, validateKnowledgeSources } from "./knowledge.js";
@@ -682,23 +683,24 @@ export class ToolService {
     if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
     const checked = await this.resolveAlignment(session, jobId, spec, fresh.publication);
     if (!checked) return fail("alignment_lineage_unsupported", "分组、指标口径、范围或完整来源无法证明。");
-    const resource: AlignmentResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "alignment", created_at: new Date().toISOString(), spec, input_hashes: checked.hashes, rows: checked.rows, input_truncated: false, complete_population: true };
+    const resource: AlignmentResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "alignment", created_at: new Date().toISOString(), spec, input_hashes: checked.hashes, rows: checked.rows, coverage_incomplete: checked.partial, input_truncated: false, complete_population: true };
     await this.ctx.sessions.saveResourceAsync(resource);
     const preview = previewRows(checked.rows, 100);
-    return { ok: true, resource_id: resource.resource_id, rows: preview, result_total_rows: checked.rows.length, result_has_more: checked.rows.length > preview.length, dependencies: Object.keys(checked.hashes), notice: `按完整结果的分组键全集对齐；预览限 100 行及 32 KB，某侧未出现的组不补零。resource_id=${resource.resource_id}` };
+    return { ok: true, resource_id: resource.resource_id, rows: preview, result_total_rows: checked.rows.length, result_has_more: checked.rows.length > preview.length, coverage_incomplete: checked.partial, dependencies: Object.keys(checked.hashes), notice: `按完整结果的分组键全集对齐；预览限 100 行及 32 KB，某侧未出现的组不补零。${checked.partial ? "来源覆盖不完整或未知，结果只能部分交付。" : ""}resource_id=${resource.resource_id}` };
   }
 
-  private async resolveAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[] } | null> {
+  private async resolveAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
     if (!spec || !spec.left || !spec.right || typeof spec.left.resource_id !== "string" || typeof spec.right.resource_id !== "string" || typeof spec.left.cell !== "string" || typeof spec.right.cell !== "string") return null;
-    const inputs: Array<{ source: QueryResource; aggregates: VerifiedAggregate[] }> = [];
+    const inputs: Array<{ source: QueryResource; contract: DataContract; aggregates: VerifiedAggregate[] | null }> = [];
     for (const ref of [spec.left, spec.right]) {
       const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, ref.resource_id);
       if (!found.ok || found.resource.kind !== "query_result" || found.resource.job_id !== jobId) return null;
       const source = found.resource; const contract = this.arithmeticContract(session, source, publication);
-      const aggregates = contract && (verifyDatabaseAggregates(source, contract)?.filter((item) => item.output_column === ref.cell) ?? await this.groupRawForAlignment(session, jobId, source, contract, ref.cell, spec.keys, publication));
-      if (!aggregates?.length) return null;
-      inputs.push({ source, aggregates });
+      if (!contract) return null;
+      const aggregates = verifyDatabaseAggregates(source, contract)?.filter((item) => item.output_column === ref.cell) ?? null;
+      inputs.push({ source, contract, aggregates });
     }
+    if (!inputs[0]!.aggregates?.length || !inputs[1]!.aggregates?.length) return this.resolveCompleteRawAlignment(session, jobId, spec, publication, inputs);
     const first = inputs[0]!.aggregates[0]!; const second = inputs[1]!.aggregates[0]!;
     if (stableHashes(first.filters) !== stableHashes(second.filters)) return null;
     const aScope = fromAggregate(first); const bScope = fromAggregate(second);
@@ -707,35 +709,56 @@ export class ToolService {
     const rows = alignAggregates(inputs[0]!.aggregates, inputs[1]!.aggregates, spec.keys, spec.op, (op, a, b) => this.computeProvenArithmetic(op, a, b));
     if (!rows) return null;
     const hashes = Object.fromEntries(inputs.map(({ source }) => [source.resource_id, createHash("sha256").update(JSON.stringify(source)).digest("hex")]));
-    return { rows, hashes, leaves: [...new Set(inputs.map(({ source }) => source.resource_id))] };
+    return { rows, hashes, leaves: [...new Set(inputs.map(({ source }) => source.resource_id))], partial: false };
   }
 
-  /** Reconstruct grouped sums from all hash-bound pages, never the preview.
-   * Null-bearing inputs are rejected here until partial-null alignment has a
-   * delivery representation; they are not silently treated as zero. */
-  private async groupRawForAlignment(session: SessionRecord, jobId: string, source: QueryResource, contract: DataContract, cell: string, keys: string[], publication: FreshnessPublication): Promise<VerifiedAggregate[] | null> {
-    const evidence = this.evidenceSource(session, source); const series = contract.series;
-    if (!evidence || !series || series.prediction_mode !== "observed_only" || series.predicted_column || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length || !Array.isArray(keys) || !keys.length || keys.length > 3 || new Set(keys).size !== keys.length) return null;
-    const shape = verifyCell(evidence, contract, { op: "count_rows", as: "shape" }, source.rows.length);
-    const projections = parseReadonlySql(evidence.sql).ast.columns;
-    if (!shape || !Array.isArray(projections)) return null;
-    const fields = new Map<string, string>();
-    for (const entry of projections as Array<{ as?: string | null; expr?: { type?: string; column?: string } }>) if (entry.expr?.type === "column_ref" && entry.expr.column) fields.set(entry.as ?? entry.expr.column, entry.expr.column);
-    const field = fields.get(cell); const declared = contract.columns.find((item) => item.name === field);
-    if (!field || !declared?.unit || !series.metrics.includes(field) || keys.some((key) => fields.get(key) !== key || !series.dimensions.includes(key) || Object.hasOwn(shape.filters, key)) || !series.dimensions.every((key) => keys.includes(key) || Object.hasOwn(shape.filters, key))) return null;
-    const checked = await this.resolveTransform(session, jobId, source.resource_id, publication, new Set());
-    const table = checked?.table; const metric = table?.columns.find((column) => column.name === cell);
-    if (!table || !metric || metric.type !== "decimal" || metric.scale === undefined || keys.some((key) => table.columns.find((column) => column.name === key)?.type !== "text") || table.rows.some((row) => row[cell] === null || keys.some((key) => typeof row[key] !== "string"))) return null;
-    const reserved = new Set(table.columns.map((column) => column.name));
-    let sumName = "_alignment_sum"; while (reserved.has(sumName)) sumName += "_";
-    const grouped = transformResult(table, [{ op: "group", by: keys, aggregates: [{ op: "sum", column: cell, as: sumName }] }]);
-    if (!grouped?.rows.length) return null;
-    const output: VerifiedAggregate[] = [];
-    for (const row of grouped.rows) {
-      if (typeof row[sumName] !== "string" || keys.some((key) => typeof row[key] !== "string")) return null;
-      output.push({ source_resource_id: source.resource_id, table: contract.table, column: field, output_column: cell, operation: "sum", value: row[sumName] as string, scale: metric.scale, unit: declared.unit, description: declared.description, filters: shape.filters, group: Object.fromEntries(keys.map((key) => [key, row[key] as string])), range: source.time_range, prediction: "actual_observed_only" });
+  /** Both sides are complete direct projections, loaded through hash-bound
+   * pages and re-authorized on every calculation and delivery. */
+  private async resolveCompleteRawAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication, inputs: Array<{ source: QueryResource; contract: DataContract }>): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
+    const keys = spec.keys;
+    if (!Array.isArray(keys) || !keys.length || keys.length > 3 || new Set(keys).size !== keys.length || keys.some((key) => !/^[a-z_][a-z0-9_]{0,63}$/u.test(key))) return null;
+    const prepared: Array<{ input: CompleteKeyedInput; make: (value: string | null, values: ReadonlyArray<ResultValue>) => ArithmeticValue | null; filters: Record<string,string>; source: QueryResource; partial: boolean }> = [];
+    for (let i = 0; i < inputs.length; i++) {
+      const { source, contract } = inputs[i]!; const ref = i === 0 ? spec.left : spec.right;
+      const evidence = this.evidenceSource(session, source); const series = contract.series;
+      if (!evidence || !series || series.prediction_mode !== "observed_only" || series.predicted_column || source.coverage.unknown_prediction_dates.length || source.coverage.predicted_dates.length) return null;
+      const shape = verifyCell(evidence, contract, { op: "count_rows", as: "shape" }, source.rows.length);
+      const projections = parseReadonlySql(evidence.sql).ast.columns;
+      if (!shape || !Array.isArray(projections)) return null;
+      const fields = new Map<string, string>();
+      for (const entry of projections as Array<{ as?: string | null; expr?: { type?: string; column?: string } }>) if (entry.expr?.type === "column_ref" && entry.expr.column) fields.set(entry.as ?? entry.expr.column, entry.expr.column);
+      const field = fields.get(ref.cell); const declared = contract.columns.find((item) => item.name === field);
+      if (!field || !declared?.unit || !series.metrics.includes(field) || keys.some((key) => fields.get(key) !== key || !series.dimensions.includes(key) || Object.hasOwn(shape.filters, key)) || !series.dimensions.every((key) => keys.includes(key) || Object.hasOwn(shape.filters, key))) return null;
+      const checked = await this.resolveTransform(session, jobId, source.resource_id, publication, new Set());
+      const table = checked?.table; const metric = table?.columns.find((column) => column.name === ref.cell);
+      if (!table || !metric || metric.type !== "decimal" || metric.scale === undefined || keys.some((key) => table.columns.find((column) => column.name === key)?.type !== "text") || table.rows.some((row) => keys.some((key) => row[key] !== null && typeof row[key] !== "string"))) return null;
+      // Normalize only after physical key names and contract types have been
+      // checked; a model-provided alias never establishes key equivalence.
+      const normalized: ResultTable = { ...table, columns: table.columns.map((column) => keys.includes(column.name) ? { ...column, unit: `维度 ${column.name}` } : column) };
+      const make = (value: string | null, values: ReadonlyArray<ResultValue>): ArithmeticValue | null => {
+        if (values.some((v) => v !== null && typeof v !== "string")) return null;
+        const filters: Record<string,string|null> = { ...shape.filters };
+        for (let n = 0; n < keys.length; n++) filters[keys[n]!] = values[n] as string | null;
+        return { value, scale: metric.scale!, unit: declared.unit!, basis: { table: contract.table, column: field, operation: "sum", unit: declared.unit!, prediction: "actual_observed_only", timezone: source.time_range.timezone }, scopes: [{ filters, start: source.time_range.start, end: source.time_range.end }] };
+      };
+      prepared.push({ input: { table: normalized, valueColumn: ref.cell, keyColumns: keys, valueForGroup: make }, make, filters: shape.filters, source, partial: checked!.partial });
     }
-    return output;
+    if (prepared.length !== 2 || stableHashes(prepared[0]!.filters) !== stableHashes(prepared[1]!.filters)) return null;
+    const a = prepared[0]!, b = prepared[1]!;
+    const fakeKeys = keys.map(() => "scope");
+    const sampleA = a.make(`1${a.input.table.columns.find((c) => c.name === a.input.valueColumn)!.scale ? "." + "0".repeat(a.input.table.columns.find((c) => c.name === a.input.valueColumn)!.scale!) : ""}`, fakeKeys);
+    const sampleB = b.make(`1${b.input.table.columns.find((c) => c.name === b.input.valueColumn)!.scale ? "." + "0".repeat(b.input.table.columns.find((c) => c.name === b.input.valueColumn)!.scale!) : ""}`, fakeKeys);
+    if (!sampleA || !sampleB || !this.computeProvenArithmetic(spec.op, sampleA, sampleB)) return null;
+    const aligned = alignCompleteTables(a.input, b.input, spec.op, (op, x, y) => this.computeProvenArithmetic(op, x, y));
+    if (!aligned) return null;
+    const rows: AlignedRow[] = [];
+    for (const row of aligned) {
+      const values = keys.map((key) => row.group[key]!);
+      if (values.some((value) => value !== null && typeof value !== "string")) return null;
+      rows.push({ group: row.group as Record<string,string|null>, status: row.status, left: row.left ? a.make(row.left.value, values) : null, right: row.right ? b.make(row.right.value, values) : null, result: row.result, ...(row.left ? { left_count: row.left.count, left_null_count: row.left.null_count } : {}), ...(row.right ? { right_count: row.right.count, right_null_count: row.right.null_count } : {}) });
+    }
+    const hashes = Object.fromEntries(inputs.map(({ source }) => [source.resource_id, createHash("sha256").update(JSON.stringify(source)).digest("hex")]));
+    return { rows, hashes, leaves: [...new Set(inputs.map(({ source }) => source.resource_id))], partial: prepared.some((item) => item.partial) };
   }
 
   private async resolveTransform(session: SessionRecord, jobId: string, resourceId: string, publication: FreshnessPublication, path: Set<string>): Promise<{ table: ResultTable; hashes: Record<string, string>; leaves: string[]; partial: boolean; partial_reason?: "alignment_incomplete" | "transform_coverage_incomplete" } | null> {
@@ -745,6 +768,16 @@ export class ToolService {
     const resource = found.resource;
     const ownHash = createHash("sha256").update(JSON.stringify(resource)).digest("hex");
     if (resource.kind === "query_result") {
+      // JOIN rows are accepted only after revalidating their private proof,
+      // both contracts, authorization and the current publication. Build
+      // semantic column labels from the contracts rather than SQL aliases.
+      if (resource.tables.length === 2) {
+        const joined = verifyJoinResource(resource as JoinQueryResource, session, this.ctx.knowledge, this.ctx.config, publication);
+        const fact = joined && this.ctx.knowledge.contract_by_table.get(joined.plan.fact)?.contract;
+        const dimension = joined && this.ctx.knowledge.contract_by_table.get(joined.plan.dimension)?.contract;
+        const table = joined && fact && dimension && joinResultTable(joined.plan, joined.values, fact, dimension);
+        return table ? { table, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial: false } : null;
+      }
       const contract = this.arithmeticContract(session, resource, publication);
       const evidence = this.evidenceSource(session, resource);
       const aggregates = contract && evidence && verifyDatabaseAggregates(evidence, contract);
@@ -774,9 +807,9 @@ export class ToolService {
     }
     if (resource.kind === "alignment") {
       const checked = await this.resolveAlignment(session, jobId, resource.spec, publication);
-      if (!checked || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) return null;
+      if (!checked || Boolean(resource.coverage_incomplete) !== checked.partial || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) return null;
       const table = alignmentTable(resource.spec, checked.rows);
-      const partial = checked.rows.some((row) => row.status !== "matched");
+      const partial = checked.partial || checked.rows.some((row) => row.status !== "matched" || Object.values(row.group).some((value) => value === null));
       return table ? { table, hashes: { ...checked.hashes, [resource.resource_id]: ownHash }, leaves: checked.leaves, partial, ...(partial ? { partial_reason: "alignment_incomplete" as const } : {}) } : null;
     }
     if (resource.kind !== "transform") return null;
@@ -1236,15 +1269,16 @@ export class ToolService {
     for (const resource of resources) {
       if (resource.kind !== "alignment") continue;
       const checked = liveFreshness && jobId ? await this.resolveAlignment(session, jobId, resource.spec, liveFreshness) : null;
-      if (!checked || checked.leaves.some((id) => !eligible.has(id)) || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) {
+      if (!checked || Boolean(resource.coverage_incomplete) !== checked.partial || checked.leaves.some((id) => !eligible.has(id)) || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) {
         reasons.push("alignment_lineage_unsupported");
         if (status === "completed") status = "partial";
         continue;
       }
-      if (checked.rows.some((row) => row.status !== "matched")) { reasons.push("alignment_incomplete"); if (status === "completed") status = "partial"; }
+      if (checked.partial) { reasons.push("transform_coverage_incomplete"); if (status === "completed") status = "partial"; }
+      if (checked.rows.some((row) => row.status !== "matched" || Object.values(row.group).some((value) => value === null))) { reasons.push("alignment_incomplete"); if (status === "completed") status = "partial"; }
       noteUnprovenSnapshot(checked.leaves);
       const preview = previewRows(checked.rows, 100);
-      alignmentResults.push({ resource_id: resource.resource_id, spec: resource.spec, rows: preview, total_rows: checked.rows.length, preview_has_more: checked.rows.length > preview.length });
+      alignmentResults.push({ resource_id: resource.resource_id, spec: resource.spec, rows: preview, total_rows: checked.rows.length, preview_has_more: checked.rows.length > preview.length, coverage_incomplete: checked.partial });
       alignmentLines.push(...renderAlignment(resource, checked.rows));
     }
     if (verified.some((cell) => cell.precision === "floating_point_approximate")) {
@@ -1768,7 +1802,8 @@ function aggregateTable(items: VerifiedAggregate[]): ResultTable | null {
 function alignmentTable(spec: AlignmentSpec, rows: AlignedRow[]): ResultTable | null {
   const left = rows.find((row) => row.left)?.left;
   const right = rows.find((row) => row.right)?.right;
-  const output = rows.find((row) => row.result)?.result;
+  const sample = (item: ArithmeticValue) => ({ ...item, value: item.scale ? `1.${"0".repeat(item.scale)}` : "1" });
+  const output = rows.find((row) => row.result)?.result ?? (left && right ? computeArithmetic(spec.op, sample(left), { ...sample(right), scopes: left.scopes }, true) : null);
   const reserved = ["left_value", "right_value", "result_value", "alignment_status"];
   if (!left || !right || !output || spec.keys.some((key) => reserved.includes(key))) return null;
   const leftLabel = `${left.basis.table}.${left.basis.column}`; const rightLabel = `${right.basis.table}.${right.basis.column}`;
@@ -1813,11 +1848,13 @@ function renderTransform(resource: TransformResource, input: ResultTable, result
 
 function renderAlignment(resource: AlignmentResource, rows: AlignedRow[]): string[] {
   const lines = [`按分组键全集对齐并执行 ${resource.spec.op}；输入 ${resource.spec.left.resource_id}、${resource.spec.right.resource_id}；计算资源 ${resource.resource_id}。未出现的组不补零。`];
+  if (resource.coverage_incomplete) lines.push("来源覆盖不完整或未知；以下各组计算仅基于已观察记录，不能代表完整周期。");
+  if (rows.some((row) => Object.values(row.group).some((value) => value === null))) lines.push("NULL 键作为独立分组保留；当前覆盖回执不证明 NULL 键的周期完整性，因此只能部分交付。");
   for (const row of rows.slice(0, 100)) {
-    const group = Object.entries(row.group).map(([key, value]) => `${key}=${value}`).join("，");
-    const show = (value: ArithmeticValue | null) => value ? `${value.basis.table}.${value.basis.column} ${value.value} ${value.unit}` : "该查询结果未出现此组";
-    const result = row.status === "zero_divisor" ? "除数为零，结果不可计算" : row.result ? `${row.result.value} ${row.result.unit}` : "缺少一侧分组，结果未知";
-    lines.push(`${group}：左侧 ${show(row.left)}；右侧 ${show(row.right)}；结果 ${result}。`);
+    const group = Object.entries(row.group).map(([key, value]) => `${key}=${value === null ? "NULL（空键）" : value === "NULL" ? '"NULL"（字符串）' : value}`).join("，");
+    const show = (value: ArithmeticValue | null, count?: number, nullCount?: number) => value ? `${value.basis.table}.${value.basis.column} ${value.value === null ? "全 NULL" : value.value} ${value.unit}${count === undefined ? "" : `（${count} 行，${nullCount} 行 NULL）`}` : "该查询结果未出现此组";
+    const result = row.status === "zero_divisor" ? "除数为零，结果不可计算" : row.status === "null_input" ? "至少一侧全 NULL，结果未知" : row.status === "empty_inputs" ? "两侧无输入，结果未知" : row.result ? `${row.result.value} ${row.result.unit}${row.status === "partial_nulls" ? "（仅非 NULL 部分，不能代表完整分组）" : ""}` : "缺少一侧分组，结果未知";
+    lines.push(`${group}：左侧 ${show(row.left, row.left_count, row.left_null_count)}；右侧 ${show(row.right, row.right_count, row.right_null_count)}；结果 ${result}${row.result && resource.coverage_incomplete ? "（来源覆盖不完整，仅为已观察记录的计算）" : ""}。`);
   }
   if (rows.length > 100) lines.push(`已验证对齐结果共 ${rows.length} 行，此处展示 100 行；可按资源分页回读其余行。`);
   return lines;

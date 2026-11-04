@@ -3,7 +3,11 @@
   "note": "手工按小型合成行计算的查询期望；不使用代理计算生成答案。",
   "pagination_case": { "description": "240 个互不相同的虚构地区，每行依次为 1 至 240。", "count": 240, "sum": "28920", "derivation": "240 × 241 ÷ 2 = 28920。" },
   "large_pagination_case": { "description": "玻璃鲦 Android 卵石渠道的 1200 个虚构地区，每行依次为 1 至 1200。", "count": 1200, "sum": "720600", "derivation": "1200 × 1201 ÷ 2 = 720600。" },
+  "three_day_pagination_case": { "description": "相同的 1200 个虚构地区在连续三日各有一行。", "count": 3600, "sum": "2161800", "derivation": "3 × 1200 × 1201 ÷ 2 = 2161800。" },
   "cross_fact_case": { "description": "同一范围内的合成收入除以新增人数；不是用户归因。", "japan_mist": "0.300000000000000000", "us_mist": "0.008333333333333333", "us_pebble": "missing_right" },
+  "preaggregated_title_case": { "japan_known": "70", "zz_known": "70", "zz_unknown": "21", "derivation": "已知产品七日各 10；未匹配产品七日各 3。维表缺项保留 NULL。" },
+  "cross_fact_null_case": { "date": "2026-10-09", "us_mist": "null_input", "japan_mist": "missing_left", "derivation": "美国雾帆当日收入和新增均为 NULL；日本雾帆仅有新增 10，没有支付记录。" },
+  "cross_fact_partial_null_case": { "start": "2026-10-08", "end": "2026-10-09", "us_mist": "partial_nulls", "observed_ratio": "0.008333333333333333", "derivation": "美国雾帆两日非 NULL 部分：1.00 美元 / 120 人；另一天两项均 NULL，不能声称是完整两日比率。" },
   "cases": [
     { "id": "paper-japan-week", "table": "fact_fox_daily_install", "metric": "new_users", "title": "paper_lantern", "country": "JP", "channel": "mist_ads", "start": "2026-10-06", "end": "2026-10-12", "expected": "70", "status": "completed", "reason": "七日各 10，合计 70。" },
     { "id": "paper-japan-three-days", "table": "fact_fox_daily_install", "metric": "new_users", "title": "paper_lantern", "country": "JP", "channel": "mist_ads", "start": "2026-10-06", "end": "2026-10-08", "expected": "30", "status": "completed", "reason": "三日各 10，合计 30。" },

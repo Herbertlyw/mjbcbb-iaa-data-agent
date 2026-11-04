@@ -9,7 +9,7 @@ export interface ArithmeticValue {
   /** Ordered, server-generated source identities, not model labels. */
   bases?: Array<ArithmeticValue["basis"]>;
   formula?: string;
-  scopes: Array<{ filters: Record<string, string>; start: string; end: string }>;
+  scopes: Array<{ filters: Record<string, string | null>; start: string; end: string }>;
 }
 
 export function sumDecimalStrings(values: unknown[], scale: number): string | null {

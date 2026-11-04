@@ -119,11 +119,15 @@ test("隔离 ClickHouse LEFT 产品/渠道：真实 NULL、完整左侧、重复
           for (const sql of [productSql, channelSql]) {
             const query = await runtime.tools.query(session.session_id, { sql });
             assert.equal(query.ok, true, JSON.stringify(query)); if (!query.ok) throw new Error("left_query_rejected");
-            const answer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(query.resource_id)] });
+            const transformed = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(query.resource_id), steps: [{ op: "filter", column: "label", comparison: "is_null" }, { op: "group", by: [], aggregates: [{ op: "sum", column: "total", as: "missing_total" }] }] } });
+            assert.equal(transformed.ok, true, JSON.stringify(transformed)); if (!transformed.ok) throw new Error("left_transform_rejected");
+            assert.equal((transformed.result as { rows: Array<{ missing_total: string }> }).rows[0]?.missing_total, "21");
+            const answer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(query.resource_id), String(transformed.resource_id)] });
             assert.equal(answer.ok, true, JSON.stringify(answer)); if (!answer.ok) throw new Error("left_delivery_rejected");
             assert.equal(answer.status, "completed", JSON.stringify(answer));
             assert.match(String(answer.answer), /JOIN 求和 21；单位 人/);
             assert.match(String(answer.answer), /NULL（维表未匹配）/);
+            assert.match(String(answer.answer), /的合计=21（人）/);
           }
           const ungroupedSql = `SELECT SUM(f.new_users) AS total FROM fact_fox_daily_install f LEFT JOIN dim_fox_title d ON f.title_id = d.title_id WHERE ${dateRange} AND f.title_id = 'orphan_title' AND f.platform = 'ios' AND f.country_code = 'JP' AND f.channel_id = 'mist_ads'`;
           const ungrouped = await runtime.tools.query(session.session_id, { sql: ungroupedSql });

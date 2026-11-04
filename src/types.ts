@@ -303,6 +303,8 @@ export interface AlignmentResource {
   spec: import("./result-alignment.js").AlignmentSpec;
   input_hashes: Record<string, string>;
   rows: import("./result-alignment.js").AlignedRow[];
+  /** True when any verified input has incomplete or unknown coverage. */
+  coverage_incomplete?: boolean;
   input_truncated: false;
   complete_population: true;
 }
@@ -360,7 +362,7 @@ export interface AnalysisRecord {
   aggregate_comparisons?: import("./aggregate-comparison.js").AggregateComparison[];
   arithmetic_results?: Array<{ resource_id: string; operation: import("./exact-arithmetic.js").ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef; result: import("./exact-arithmetic.js").ArithmeticValue }>;
   transform_results?: Array<{ resource_id: string; source_resource_id: string; steps: import("./result-transform.js").TransformStep[]; result: import("./result-transform.js").ResultTable; total_rows?: number; preview_has_more?: boolean }>;
-  alignment_results?: Array<{ resource_id: string; spec: import("./result-alignment.js").AlignmentSpec; rows: import("./result-alignment.js").AlignedRow[]; total_rows?: number; preview_has_more?: boolean }>;
+  alignment_results?: Array<{ resource_id: string; spec: import("./result-alignment.js").AlignmentSpec; rows: import("./result-alignment.js").AlignedRow[]; total_rows?: number; preview_has_more?: boolean; coverage_incomplete?: boolean }>;
   aggregates?: import("./aggregate-evidence.js").VerifiedAggregate[];
   aggregate_total?: number;
   aggregates_has_more?: boolean;

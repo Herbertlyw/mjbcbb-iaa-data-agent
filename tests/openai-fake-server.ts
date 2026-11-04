@@ -126,10 +126,15 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成收入成本比")) return scripted(turn, ratioSteps);
   if (latest.includes("合成多渠道收入成本比")) return scripted(turn, groupedRatioSteps);
   if (latest.includes("合成分组对齐")) return scripted(turn, alignmentSteps);
+  if (latest.includes("合成部分空值跨事实")) return scripted(turn, (ids) => rawNullCrossFactSteps(ids, true));
+  if (latest.includes("合成空值跨事实")) return scripted(turn, rawNullCrossFactSteps);
   if (latest.includes("合成明细跨事实")) return scripted(turn, rawCrossFactSteps);
+  if (latest.includes("合成 CTE 左关联未匹配")) return scripted(turn, (ids) => preaggregatedTitleSteps(ids, true));
+  if (latest.includes("合成 CTE 预聚合关联")) return scripted(turn, (ids) => preaggregatedTitleSteps(ids, false));
   if (latest.includes("合成 CTE 查询")) return scripted(turn, cteSteps);
   if (latest.includes("合成左关联产品")) return scripted(turn, leftTitleSteps);
   if (latest.includes("合成跨事实比率")) return scripted(turn, crossFactRatioSteps);
+  if (latest.includes("合成三千六百行")) return scripted(turn, largerTransformSteps);
   if (latest.includes("合成千行完整计算")) return scripted(turn, thousandTransformSteps);
   if (latest.includes("合成完整分页")) return scripted(turn, largeTransformSteps);
   if (latest.includes("合成产品维表关联")) return scripted(turn, validJoinSteps);
@@ -141,6 +146,19 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("日本") && (hasBase || latest.includes("雾帆"))) return scripted(turn, japanSteps);
   if (latest.includes("连表")) return scripted(turn, unsafeJoinSteps);
   return scripted(turn, defaultSteps);
+}
+
+function preaggregatedTitleSteps(ids: string[], unmatched: boolean) {
+  const filter = unmatched ? "f.platform = 'android' AND f.country_code = 'ZZ' AND f.channel_id = 'mist_ads'" : "f.platform = 'ios' AND f.country_code = 'JP' AND f.channel_id = 'mist_ads'";
+  const inner = `SELECT f.event_date, f.title_id, f.platform, f.country_code, f.channel_id, SUM(f.new_users) AS subtotal FROM fact_fox_daily_install f WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-12' AND ${filter} GROUP BY f.event_date, f.title_id, f.platform, f.country_code, f.channel_id`;
+  const sql = `WITH p AS (${inner}) SELECT p.title_id, d.title_name AS label, SUM(p.subtotal) AS total FROM p LEFT JOIN dim_fox_title d ON p.title_id = d.title_id GROUP BY p.title_id, d.title_name ORDER BY p.title_id`;
+  return [
+    { id: "preaggregate_fact_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "preaggregate_title_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.dim_fox_title" }) },
+    { id: "preaggregate_query", name: "query", arguments: JSON.stringify({ sql }) },
+    ...(unmatched ? [{ id: "preaggregate_transform", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: [{ op: "filter", column: "label", comparison: "is_null" }, { op: "group", by: [], aggregates: [{ op: "sum", column: "total", as: "missing_total" }] }] } }) }] : []),
+    { id: "preaggregate_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
 }
 
 function cteSteps(ids: string[]) {
@@ -175,6 +193,18 @@ function rawCrossFactSteps(ids: string[]) {
   ];
 }
 
+function rawNullCrossFactSteps(ids: string[], partial = false) {
+  const where = `${partial ? "event_date >= '2026-10-08' AND event_date <= '2026-10-09'" : "event_date = '2026-10-09'"} AND title_id = 'paper_lantern' AND platform = 'ios'`;
+  return [
+    { id: "null_payment_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "null_install_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "null_amount", name: "query", arguments: JSON.stringify({ sql: `SELECT event_date, title_id, platform, country_code, channel_id, amount_usd FROM fact_fox_daily_payment WHERE ${where}` }) },
+    { id: "null_users", name: "query", arguments: JSON.stringify({ sql: `SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE ${where}` }) },
+    { id: "null_align", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "divide", keys: ["country_code", "channel_id"], left: { resource_id: ids[0] ?? "", cell: "amount_usd" }, right: { resource_id: ids[1] ?? "", cell: "new_users" } } }) },
+    { id: "null_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
 function thousandTransformSteps(ids: string[]) {
   return [
     { id: "thousand_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
@@ -185,6 +215,18 @@ function thousandTransformSteps(ids: string[]) {
       { op: "group", by: [], aggregates: [{ op: "sum", column: "new_users", as: "total" }, { op: "count_all", as: "count" }] },
     ] } }) },
     { id: "thousand_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+function largerTransformSteps(ids: string[]) {
+  return [
+    { id: "larger_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "larger_query", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND title_id = 'glass_minnow' AND platform = 'android' AND channel_id = 'pebble_net' ORDER BY country_code, event_date", preview_limit: 20 }) },
+    { id: "larger_transform", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: [
+      { op: "filter", column: "new_users", comparison: "gt", value: "0" },
+      { op: "group", by: [], aggregates: [{ op: "sum", column: "new_users", as: "total" }, { op: "count_all", as: "count" }] },
+    ] } }) },
+    { id: "larger_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
   ];
 }
 

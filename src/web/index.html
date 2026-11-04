@@ -284,6 +284,28 @@
       return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
     }
 
+    function renderCalculationTables(analysis) {
+      const more = (id, count, shown, hash) => count > shown && hash ? `<p class="muted">显示 ${shown}/${escapeHtml(count)} 行。</p><button class="secondary calculation-next" data-resource="${escapeHtml(id)}" data-hash="${escapeHtml(hash)}" data-offset="${shown}">加载更多计算行</button>` : "";
+      const transforms = (analysis.transform_results || []).map((item) => {
+        const columns = item.result.columns;
+        const rows = item.result.rows.slice(0, 20);
+        return `<div class="source calculation" data-kind="transform"><strong>已核验的结果变换</strong><p class="muted">计算资源 ${escapeHtml(item.resource_id)} · 输入 ${escapeHtml(item.source_resource_id)}</p><table><thead><tr>${columns.map((column) => `<th>${escapeHtml(column.label)}（${escapeHtml(column.unit)}）</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${columns.map((column) => `<td>${escapeHtml(row[column.name] === null ? "NULL" : row[column.name])}</td>`).join("")}</tr>`).join("")}</tbody></table>${more(item.resource_id, item.total_rows ?? rows.length, rows.length, analysis.resource_hashes?.[item.resource_id])}</div>`;
+      }).join("");
+      const alignments = (analysis.alignment_results || []).map((item) => {
+        const rows = item.rows.slice(0, 20);
+        return `<div class="source calculation" data-kind="alignment" data-coverage-incomplete="${item.coverage_incomplete ? "true" : "false"}"><strong>已核验的分组对齐</strong><p class="muted">计算资源 ${escapeHtml(item.resource_id)} · ${escapeHtml(item.spec.left.resource_id)} / ${escapeHtml(item.spec.right.resource_id)} · 运算 ${escapeHtml(item.spec.op)}。缺侧、NULL 和零分母不会补零。${item.coverage_incomplete ? "来源覆盖不完整，所有分组仅基于已观察记录。" : ""}</p><table><thead><tr><th>分组</th><th>左侧</th><th>右侧</th><th>结果</th><th>状态</th></tr></thead><tbody>${rows.map((row) => alignmentRowHtml(row, item.coverage_incomplete)).join("")}</tbody></table>${more(item.resource_id, item.total_rows ?? rows.length, rows.length, analysis.resource_hashes?.[item.resource_id])}</div>`;
+      }).join("");
+      return transforms + alignments;
+    }
+
+    function alignmentRowHtml(row, incomplete) {
+      const names = { matched: "已匹配", missing_left: "缺少左侧", missing_right: "缺少右侧", null_input: "全 NULL", partial_nulls: "部分 NULL", zero_divisor: "除数为零", empty_inputs: "无输入" };
+      const value = (item) => item ? `${item.value === null ? "NULL" : item.value} ${item.unit || ""}` : "—";
+      const group = Object.entries(row.group).map(([key, part]) => `${key}=${part === null ? "NULL" : part}`).join("，") || "总体";
+      const counts = (side) => Number.isSafeInteger(row[`${side}_count`]) ? `（${row[`${side}_count`]} 行，${row[`${side}_null_count`] ?? "?"} 行 NULL）` : "";
+      return `<tr><td>${escapeHtml(group)}</td><td>${escapeHtml(value(row.left) + counts("left"))}</td><td>${escapeHtml(value(row.right) + counts("right"))}</td><td>${escapeHtml(value(row.result))}</td><td>${escapeHtml((names[row.status] || "不可验证") + (incomplete ? "（来源覆盖不完整）" : ""))}</td></tr>`;
+    }
+
     function showJob(job) {
       state.jobId = job.job_id;
       badge(job.status);
@@ -316,7 +338,7 @@
           ${source.evidence_eligible && head.length && source.returned_rows > Math.min(source.rows.length, 20) && analysis.resource_hashes?.[source.resource_id] ? `<p class="muted">已保存 ${escapeHtml(source.returned_rows)} 行；当前表格从前 ${Math.min(source.rows.length, 20)} 行开始展示。</p><button class="secondary resource-next" data-resource="${escapeHtml(source.resource_id)}" data-hash="${escapeHtml(analysis.resource_hashes[source.resource_id])}" data-offset="${Math.min(source.rows.length, 20)}">加载更多结果行</button>` : ""}
         </div>`;
       }).join("");
-      const calcs = ""; // 已验证计算由服务端按契约渲染；不展示模型自选的单元格别名。
+      const calcs = renderCalculationTables(analysis);
       const record = analysis.analysis_declaration;
       const modelNotes = record ? `<details class="source"><summary>模型工作记录（自报，未验证为事实）</summary>
         <p>范围：${escapeHtml(record.declaration.scope || "未声明")}</p><p>粒度：${escapeHtml(record.declaration.grain || "未声明")}</p>
@@ -347,6 +369,21 @@
           const table = button.closest(".source").querySelector("table");
           const headings = [...table.querySelectorAll("thead th")].map((item) => item.textContent);
           const rows = page.resource.rows.map((row) => `<tr>${headings.map((key) => `<td>${escapeHtml(row[key] === null ? "NULL" : row[key])}</td>`).join("")}</tr>`).join("");
+          table.querySelector("tbody").insertAdjacentHTML("beforeend", rows);
+          if (page.has_more) button.dataset.offset = String(page.next_row_offset);
+          else button.textContent = "已显示全部保存行";
+          button.disabled = !page.has_more;
+        } catch (error) { button.disabled = false; throw error; }
+      }));
+      for (const button of resultEl.querySelectorAll(".calculation-next")) button.addEventListener("click", () => run(async () => {
+        button.disabled = true;
+        try {
+          const sessionId = state.sessionId; const jobId = state.jobId;
+          const params = new URLSearchParams({ offset: button.dataset.offset, limit: "50", resource_hash: button.dataset.hash });
+          const page = await apiJson(`/api/sessions/${encodeURIComponent(sessionId)}/resources/${encodeURIComponent(button.dataset.resource)}?${params}`);
+          if (state.sessionId !== sessionId || state.jobId !== jobId || !button.isConnected) return;
+          const container = button.closest(".calculation"); const table = container.querySelector("table");
+          const rows = container.dataset.kind === "alignment" ? page.resource.rows.map((row) => alignmentRowHtml(row, container.dataset.coverageIncomplete === "true")).join("") : page.resource.result.rows.map((row) => `<tr>${page.resource.result.columns.map((column) => `<td>${escapeHtml(row[column.name] === null ? "NULL" : row[column.name])}</td>`).join("")}</tr>`).join("");
           table.querySelector("tbody").insertAdjacentHTML("beforeend", rows);
           if (page.has_more) button.dataset.offset = String(page.next_row_offset);
           else button.textContent = "已显示全部保存行";
