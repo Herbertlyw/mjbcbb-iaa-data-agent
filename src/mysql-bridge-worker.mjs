@@ -651,7 +651,7 @@ async function settleProviderStep(input) {
     const [budgets] = await conn.query("SELECT job_id FROM turn_budgets WHERE job_id = ? FOR UPDATE", [input.jobId]);
     if (!budgets[0]) return { ok: false, code: "step_missing" };
     if (input.status === "not_dispatched") {
-      if (input.inputTokens !== null || input.outputTokens !== null || input.usageSource !== "unknown" || !input.errorCode?.startsWith("global_budget_")) return { ok: false, code: "settlement_conflict" };
+      if (input.inputTokens !== null || input.outputTokens !== null || input.usageSource !== "unknown" || !(input.errorCode === "provider_cancelled" || input.errorCode?.startsWith("global_budget_"))) return { ok: false, code: "settlement_conflict" };
       await conn.query("UPDATE turn_budgets SET reserved_tokens = reserved_tokens - ?, model_calls_reserved = model_calls_reserved - 1 WHERE job_id = ?", [Number(step.reserved_total), input.jobId]);
       await conn.query("UPDATE provider_steps SET status = 'not_dispatched', settlement = 'settled', input_tokens = NULL, output_tokens = NULL, usage_source = 'unknown', duration_ms = ?, error_code = ? WHERE step_id = ? AND settlement = 'pending'", [input.durationMs, input.errorCode, input.stepId]);
       return { ok: true, code: "not_dispatched" };

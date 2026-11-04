@@ -131,6 +131,12 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
     assert.equal((await state.call("settleProviderStep", { ...notSent, errorCode: "global_budget_active_mismatch" })).code, "settlement_conflict");
     assert.equal((await state.call("getTurnBudget", job.job_id))?.reserved_tokens, 0);
     assert.equal((await state.call("listProviderSteps", job.job_id)).find((item) => item.step_id === "step_blocked")?.status, "not_dispatched");
+    assert.equal((await state.call("beginProviderStep", input("step_cancel_before_dispatch"))).ok, true);
+    const cancelledBeforeDispatch = { ...notSent, stepId: "step_cancel_before_dispatch", errorCode: "provider_cancelled" };
+    assert.equal((await state.call("settleProviderStep", { ...cancelledBeforeDispatch, errorCode: "provider_timeout" })).code, "settlement_conflict");
+    assert.equal((await state.call("settleProviderStep", cancelledBeforeDispatch)).code, "not_dispatched");
+    assert.equal((await state.call("settleProviderStep", cancelledBeforeDispatch)).code, "idempotent");
+    assert.equal((await state.call("getTurnBudget", job.job_id))?.reserved_tokens, 0);
     const heldBegin = (await state.call("beginProviderStep", input("step_hold")));
     assert.equal(heldBegin.ok, true, heldBegin.code);
     const missing = (await state.call("settleProviderStep", {

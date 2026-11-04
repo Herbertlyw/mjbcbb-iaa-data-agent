@@ -86,26 +86,30 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
         body: JSON.stringify({ format: "metadata-only", estimated_input: estimate.tokens, estimate_source: estimate.source }),
       });
       if (!recorded) throw new Error("provider_fence_rejected");
+      const markNotDispatched = async (code: string) => {
+        const rejected = await ledger.state.settleProviderStep({ stepId, jobId: ledger.jobId, owner: ledger.owner, fence: ledger.fence, status: "not_dispatched", inputTokens: null, outputTokens: null, usageSource: "unknown", durationMs: Date.now() - started, errorCode: code });
+        if (!rejected.ok) throw new Error(rejected.code);
+      };
       if (options?.signal?.aborted) {
-        const settled = await ledger.state.settleProviderStep({ stepId, jobId: ledger.jobId, owner: ledger.owner, fence: ledger.fence, status: "error", inputTokens: null, outputTokens: null, usageSource: "unknown", durationMs: Date.now() - started, errorCode: "provider_cancelled" });
-        if (!settled.ok) throw new Error(settled.code);
+        await markNotDispatched("provider_cancelled");
         throw new Error("provider_cancelled");
       }
       if (config.globalBudgetId) {
+        try {
         globalBudget = await GlobalBudget.open({ path: config.globalBudgetPath, budgetId: config.globalBudgetId, maxRequests: config.globalBudgetMaxRequests, maxTokens: config.globalBudgetMaxTokens });
         const reservation = await globalBudget.reserve({ stepId, jobId: ledger.jobId, estimatedInput: estimate.tokens, reservedOutput: config.piMaxOutputTokens });
-        if (!reservation.ok) {
-          // A definitive gate refusal occurs before the transport exists. Only
-          // this known refusal may release the task reservation; a timeout or
-          // lost response remains unknown and is never retried automatically.
-          const rejected = await ledger.state.settleProviderStep({ stepId, jobId: ledger.jobId, owner: ledger.owner, fence: ledger.fence, status: "not_dispatched", inputTokens: null, outputTokens: null, usageSource: "unknown", durationMs: Date.now() - started, errorCode: reservation.code });
-          if (!rejected.ok) throw new Error(rejected.code);
-          throw new Error(reservation.code);
-        }
+        if (!reservation.ok) throw new Error(reservation.code);
         globalReserved = true;
         if (options?.signal?.aborted) throw new Error("provider_cancelled");
         const dispatch = await globalBudget.markDispatched(stepId);
         if (!dispatch.ok) throw new Error(dispatch.code);
+        } catch (error) {
+          // No transport has been created yet: the task can distinguish a
+          // definite non-dispatch even if the separate budget commit timed out.
+          // The global reservation remains held whenever its outcome is unknown.
+          await markNotDispatched(safeProviderError(error).code);
+          throw error;
+        }
       }
       const physical = { ...model, api: "openai-completions" as const, baseUrl: config.piBaseUrl, provider: config.piProvider };
       let stream;

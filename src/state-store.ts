@@ -769,7 +769,7 @@ export class SqliteStateStore implements StateStore {
         return { ok: false, code: "provider_fence_rejected" };
       }
       if (input.status === "not_dispatched") {
-        if (input.inputTokens !== null || input.outputTokens !== null || input.usageSource !== "unknown" || !input.errorCode?.startsWith("global_budget_")) return { ok: false, code: "settlement_conflict" };
+        if (input.inputTokens !== null || input.outputTokens !== null || input.usageSource !== "unknown" || !(input.errorCode === "provider_cancelled" || input.errorCode?.startsWith("global_budget_"))) return { ok: false, code: "settlement_conflict" };
         this.db.prepare("UPDATE turn_budgets SET reserved_tokens = reserved_tokens - ?, model_calls_reserved = model_calls_reserved - 1 WHERE job_id = ?").run(Number(step.reserved_total), input.jobId);
         this.db.prepare("UPDATE provider_steps SET status = 'not_dispatched', settlement = 'settled', input_tokens = NULL, output_tokens = NULL, usage_source = 'unknown', duration_ms = ?, error_code = ? WHERE step_id = ? AND settlement = 'pending'").run(input.durationMs, input.errorCode, input.stepId);
         return { ok: true, code: "not_dispatched" };

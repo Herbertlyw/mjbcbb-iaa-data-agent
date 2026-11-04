@@ -10,10 +10,63 @@ import { loadConfig, repoRoot, type AppConfig } from "../src/config.js";
 import { fetchDeepSeekOnly, fetchLoopbackOnly } from "../src/openai-gateway.js";
 import { analyst, ask, openRuntime, waitForJob, withRuntime } from "./helpers.js";
 import { startFakeOpenAI } from "./openai-fake-server.js";
-import type { ProviderStepBegin, ProviderStepDecision, ProviderStepSettle } from "../src/state-store.js";
+import type { ProviderStepBegin, ProviderStepDecision, ProviderStepSettle, StateStore } from "../src/state-store.js";
 import { GlobalBudget } from "../src/global-budget.js";
 
 const token = "fictional-loopback-token";
+
+test("模型派发前取消不访问供应商并明确记录未派发", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: "happy" }), async (runtime) => {
+      let release!: () => void; let entered!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const ready = new Promise<void>((resolve) => { entered = resolve; });
+      const original = runtime.state.saveProviderPayload.bind(runtime.state);
+      const state = runtime.state as unknown as { saveProviderPayload: (input: Parameters<StateStore["saveProviderPayload"]>[0]) => Promise<boolean> };
+      state.saveProviderPayload = async (input) => {
+        const saved = original(input);
+        if (input.kind === "request") { entered(); await gate; }
+        return saved;
+      };
+      try {
+        const session = analyst(runtime);
+        const submitted = runtime.jobs.submit(session.session_id, "合成问题", crypto.randomUUID());
+        await ready;
+        runtime.jobs.cancel(submitted.job_id);
+        release();
+        const job = await waitForJob(runtime, submitted.job_id);
+        assert.equal(job.status, "cancelled");
+        assert.equal(fake.observations.length, 0);
+        const step = runtime.state.listProviderSteps(job.job_id)[0];
+        assert.equal(step?.status, "not_dispatched");
+        assert.equal(step?.error_code, "provider_cancelled");
+        assert.equal(job.events.filter((event) => event.type === "job_cancelled").length, 1);
+      } finally { release(); }
+    });
+  } finally { await fake.close(); }
+});
+
+test("跨任务预算不可用且 HTTP 尚未创建时，任务明确记为未派发", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "global-gateway-missing-"));
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "happy", globalBudgetPath: path.join(dir, "absent.sqlite"), globalBudgetId: "missing-scope", globalBudgetMaxRequests: 2, globalBudgetMaxTokens: 100000 }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成问题");
+      assert.equal(job.status, "failed");
+      assert.equal(fake.observations.length, 0);
+      assert.equal(job.usage?.model_attempts, 1);
+      assert.equal(job.usage?.model_calls, 0);
+      assert.equal(job.usage?.provider_not_dispatched, 1);
+      assert.equal(job.usage?.provider_outcome_unknown, 0);
+      assert.equal(job.usage?.input_tokens, null);
+      const step = runtime.state.listProviderSteps(job.job_id)[0];
+      assert.equal(step?.status, "not_dispatched");
+      assert.equal(step?.settlement, "settled");
+    });
+  } finally { await fake.close(); rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("跨任务预算接入 Pi 派发，限流未知用量后不会跨会话超发", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "global-gateway-"));
