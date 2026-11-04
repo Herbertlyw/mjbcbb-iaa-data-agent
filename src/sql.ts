@@ -21,7 +21,7 @@ const WRITE_TYPES = new Set([
   "revoke",
 ]);
 
-const ALLOWED_FUNCTIONS = new Set(["sum", "count", "min", "max", "avg", "lower", "upper", "exists"]);
+const ALLOWED_FUNCTIONS = new Set(["sum", "count", "min", "max", "avg", "lower", "upper", "exists", "todate"]);
 const TABLE_FUNCTIONS = /\b(file|url|s3|s3cluster|remote|remotesecure|mysql|postgresql|mongo|mongodb|hdfs|input|cluster|clusterallreplicas|sqlite|redis|executable)\s*\(/iu;
 // Match the maximum interval that the coverage evaluator can enumerate.
 // Row/time limits in the ClickHouse driver remain independent safeguards.
@@ -196,6 +196,9 @@ function assertSelectJoinKeys(statement: Record<string, unknown>, joins: Registe
 
 export function guardSql(rawSql: string, rules: TableRule[], dialect: "sqlite" | "clickhouse" = "sqlite"): GuardedSql {
   const parsed = parseReadonlySql(rawSql, dialect);
+  if (dialect !== "clickhouse") walk(parsed.ast, (node) => {
+    if (functionName(node) === "todate") throw new SqlRejected("clickhouse_function_only", "toDate 常量函数仅支持 ClickHouse，SQLite 不会模拟其语义。");
+  });
   const preaggregated = rewritePreaggregatedDimensionJoin(parsed.ast);
   if (preaggregated) {
     const factRule = rules.find((rule) => rule.table === preaggregated.fact);
@@ -255,28 +258,36 @@ export function rewritePreaggregatedDimensionJoin(ast: Record<string, unknown>):
   return rewriteFlatPreaggregatedDimensionJoin(collapsed ?? ast);
 }
 
-/** Collapse only bijective direct-column wrappers; every projected value and
- * its source survives exactly once. No predicates, ordering, aggregation,
- * limits or extra CTEs can be erased by this proof. The resulting query still
- * goes through the regular authorization, grain and execution checks. */
+/** Collapse bijective direct-column wrappers. An equality predicate on an
+ * unchanged grouping key may be pushed through SUM: every contributing row
+ * in a group has that same key. All other predicates and modifiers fail
+ * closed. The rewritten query still passes normal authorization and evidence
+ * checks, and never moves a predicate across the outer LEFT JOIN. */
 function collapsePreaggregateProjectionWrappers(ast: Record<string, unknown>): Record<string, unknown> | null {
   const output = structuredClone(ast);
   if (!Array.isArray(output.from) || output.from.length !== 2) return null;
   const relation = asRecord(output.from[0]); if (!relation) return null;
   const ident = (value: unknown): value is string => typeof value === "string" && /^[a-z_][a-z0-9_]*$/u.test(value)
     && !["__proto__", "prototype", "constructor"].includes(value);
+  let checkedPhysicalScope = false;
   const rename = (base: Record<string, unknown>, wrapper: Record<string, unknown>, source: string): boolean => {
-    if (wrapper.type !== "select" || wrapper.with || wrapper._next || wrapper.distinct || wrapper.options || wrapper.where || wrapper.groupby || wrapper.having || wrapper.orderby || wrapper.limit || wrapper.window || wrapper.for_update || wrapper.into || !Array.isArray(wrapper.from) || wrapper.from.length !== 1 || !Array.isArray(wrapper.columns) || !Array.isArray(base.columns)) return false;
+    if (wrapper.type !== "select" || wrapper.with || wrapper._next || wrapper.distinct || wrapper.options || wrapper.groupby || wrapper.having || wrapper.orderby || wrapper.limit || wrapper.window || wrapper.for_update || wrapper.into || !Array.isArray(wrapper.from) || wrapper.from.length !== 1 || !Array.isArray(wrapper.columns) || !Array.isArray(base.columns)) return false;
     const from = asRecord(wrapper.from[0]);
     if (!from || from.db || from.join || (from.table !== source && !(source === "" && from.expr)) || (source && from.expr)) return false;
     const alias = String(from.as || from.table || ""); if (!ident(alias)) return false;
+    const physicalNames = new Set<string>();
+    walkShallow(base, (node) => { if (node.type === "column_ref" && typeof node.column === "string") physicalNames.add(node.column); });
     const original = new Map<string, Record<string, unknown>>();
     for (const raw of base.columns) {
       const col = asRecord(raw); const expr = asRecord(col?.expr);
       const name = col?.as || (expr?.type === "column_ref" ? expr.column : undefined);
-      if (!col || !ident(name) || original.has(name)) return false;
+      // ClickHouse can substitute SELECT aliases into other expressions in the
+      // same scope. Never reason about a renamed layer if an output alias could
+      // instead name a different physical column in the aggregate query.
+      if (!col || !ident(name) || original.has(name) || (!checkedPhysicalScope && physicalNames.has(name) && !(expr?.type === "column_ref" && expr.column === name))) return false;
       original.set(name, col);
     }
+    checkedPhysicalScope = true;
     const names = new Map<string, string>(); const used = new Set<string>();
     for (const raw of wrapper.columns) {
       const col = asRecord(raw); const expr = asRecord(col?.expr);
@@ -286,6 +297,32 @@ function collapsePreaggregateProjectionWrappers(ast: Record<string, unknown>): R
       names.set(expr.column, target); used.add(target);
     }
     if (!names.size || names.size !== original.size) return false;
+    if (wrapper.where) {
+      const grouped = asRecord(base.groupby)?.columns;
+      if (!Array.isArray(grouped) || !base.where) return false;
+      const existing = new Set<string>();
+      walkShallow(base.where, (node) => {
+        if (node.type === "column_ref" && typeof node.column === "string") existing.add(node.column);
+      });
+      const push: Record<string, unknown>[] = [];
+      const visit = (value: unknown): boolean => {
+        const predicate = asRecord(value);
+        if (!predicate || predicate.type !== "binary_expr") return false;
+        if (predicate.operator === "AND") return visit(predicate.left) && visit(predicate.right);
+        if (predicate.operator !== "=") return false;
+        const ref = asRecord(predicate.left); const literal = asRecord(predicate.right);
+        if (!ref || ref.type !== "column_ref" || ref.collate || !ident(ref.column) || (ref.table && ref.table !== alias)
+          || !literal || literal.type !== "single_quote_string" || typeof literal.value !== "string" || !/^[\p{L}\p{N}_ .-]{1,100}$/u.test(literal.value)) return false;
+        const physical = asRecord(original.get(ref.column)?.expr);
+        if (!physical || physical.type !== "column_ref" || physical.collate || !ident(physical.column) || existing.has(physical.column)) return false;
+        if (!grouped.some((item) => { const group = asRecord(item); return group?.type === "column_ref" && !group.collate && group.column === physical.column && (group.table || "") === (physical.table || ""); })) return false;
+        existing.add(physical.column);
+        push.push({ type: "binary_expr", operator: "=", left: structuredClone(physical), right: structuredClone(literal) });
+        return true;
+      };
+      if (!visit(wrapper.where) || !push.length) return false;
+      for (const predicate of push) base.where = { type: "binary_expr", operator: "AND", left: base.where, right: predicate };
+    }
     for (const [old, col] of original) col.as = names.get(old)!;
     return true;
   };
@@ -704,7 +741,21 @@ function rejectFunctions(node: unknown): void {
     const name = functionName(record);
     if (!name) return;
     if (!ALLOWED_FUNCTIONS.has(name)) throw new SqlRejected("dangerous_function", `函数 ${name} 不在允许列表中`);
+    if (name === "todate" && !clickHouseDateConstant(record)) throw new SqlRejected("unsafe_date_function", "toDate 仅接受一个 ClickHouse Date 范围内的规范日期字符串常量。");
   });
+}
+
+/** Only the one-argument, literal ClickHouse Date conversion is safe to
+ * identify with an inclusive calendar bound. Dynamic expressions, timezones,
+ * numeric arguments and conversions outside Date's range remain unsupported. */
+function clickHouseDateConstant(value: unknown): string | undefined {
+  const call = asRecord(value);
+  if (!call || call.type !== "function" || functionName(call) !== "todate" || call.over) return undefined;
+  const args = asRecord(call.args); const list = args?.type === "expr_list" && Array.isArray(args.value) ? args.value : [];
+  if (list.length !== 1) return undefined;
+  const item = asRecord(list[0]);
+  if (item?.type !== "single_quote_string" || typeof item.value !== "string" || !isCalendarDate(item.value) || item.value < "1970-01-01" || item.value > "2149-06-06") return undefined;
+  return item.value;
 }
 
 function functionName(record: Record<string, unknown>): string | undefined {
@@ -772,7 +823,8 @@ export function exactCalendarDatePredicate(node: unknown, column: string, qualif
   if (!expr || expr.type !== "binary_expr" || !left || left.type !== "column_ref" || left.column !== column || (left.table && left.table !== qualifier)) return null;
   const date = (value: unknown): string | null => {
     const entry = asRecord(value);
-    return entry?.type === "single_quote_string" && typeof entry.value === "string" && isCalendarDate(entry.value) ? entry.value : null;
+    if (entry?.type === "single_quote_string" && typeof entry.value === "string" && isCalendarDate(entry.value)) return entry.value;
+    return clickHouseDateConstant(entry) ?? null;
   };
   if (expr.operator === "BETWEEN") {
     const right = asRecord(expr.right); const list = right?.type === "expr_list" && Array.isArray(right.value) ? right.value : [];
@@ -823,7 +875,7 @@ function literal(value: unknown): string | undefined {
   const record = asRecord(value);
   if (!record) return undefined;
   if (record.type === "single_quote_string" && typeof record.value === "string" && /^\d{4}-\d{2}-\d{2}$/u.test(record.value)) return record.value;
-  return undefined;
+  return clickHouseDateConstant(record);
 }
 
 function walk(node: unknown, visit: (record: Record<string, unknown>) => void): void {

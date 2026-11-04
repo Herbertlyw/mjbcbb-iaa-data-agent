@@ -1,8 +1,7 @@
+import { isolatedDocker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { execFile } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { promisify } from "node:util";
 import test from "node:test";
 import { assertJoinKeys, guardSql, parseReadonlySql, rewritePreaggregatedDimensionJoin, SqlRejected, type TableRule } from "../src/sql.js";
 import { loadKnowledge } from "../src/knowledge.js";
@@ -43,7 +42,7 @@ test("多层一对一列投影保留预聚合、连接与结果等价", () => {
 test("多层作用域拒绝遗漏列、附加过滤、越权、无界扫描和错误 JOIN", () => {
   const bad = [
     cte.replace("v AS revenue, c AS cost", "v AS revenue, v AS cost"),
-    cte.replace("FROM a)", "FROM a WHERE k = 'a')"),
+    cte.replace("FROM a)", "FROM a WHERE v = '1')"),
     cte.replace("SUM(f.value) AS v", "SUM(f.secret) AS v"),
     cte.replace("f.event_date >= '2026-10-01' AND f.event_date <= '2026-10-02'", "f.id = 'a'"),
     cte.replace("p.product = d.id", "p.product = d.label"),
@@ -64,11 +63,10 @@ test("隔离 ClickHouse 多层 CTE/派生表的真实查询和证据 SQL 结果�
     `WITH a AS (${first}), b AS (SELECT id AS item, amount AS price, cost AS c FROM a), c AS (SELECT item AS product, price AS revenue, c AS cost2 FROM b) ${q.replace("SOURCE", "c p")}`,
     q.replace("SOURCE", `(SELECT item AS product, price AS revenue, c AS cost2 FROM (SELECT id AS item, amount AS price, cost AS c FROM (${first}) a) b) p`),
   ];
-  const exec = promisify(execFile); const name = `dataagent-layered-${randomUUID()}`; const password = randomBytes(20).toString("hex"); let created = false;
-  const docker = async (args: string[]) => { try { return (await exec("docker", args)).stdout; } catch { throw new Error("isolated_container_operation_failed"); } };
+  const name = `dataagent-layered-${randomUUID()}`; const password = randomBytes(20).toString("hex"); const ownedContainers: string[] = [];
   try {
-    await docker(["run", "--pull=never", "-d", "--name", name, "--label", `dataagent.test.run=${name}`, "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", "127.0.0.1::8123", "-e", `CLICKHOUSE_PASSWORD=${password}`, "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"]); created = true;
-    const port = Number(/^127\.0\.0\.1:(\d+)\s*$/u.exec(await docker(["port", name, "8123/tcp"]))?.[1]); assert.ok(port > 0);
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", name, "--label", `dataagent.test.run=${name}`, "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", "127.0.0.1::8123", "-e", `CLICKHOUSE_PASSWORD=${password}`, "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"], name, name, ownedContainers);
+    const port = await loopbackPort(name, 8123); assert.ok(port > 0);
     const url = `http://127.0.0.1:${port}`; const deadline = Date.now() + 45_000;
     while (true) { try { if ((await fetch(`${url}/ping`, { signal: AbortSignal.timeout(1000) })).ok) break; } catch {} if (Date.now() > deadline) throw new Error("isolated_clickhouse_start_timeout"); await new Promise((resolve) => setTimeout(resolve, 250)); }
     const ch = createClickHouseClient({ url, username: "default", password, database: "default", maxRowsToRead: 1_000_000, timeoutSeconds: 10 }, false);
@@ -86,5 +84,5 @@ test("隔离 ClickHouse 多层 CTE/派生表的真实查询和证据 SQL 结果�
         assert.deepEqual(values.map((x) => [x.column, x.value]), [["amount_usd", "90071992547411.00"], ["cost_usd", "2.13"]]);
       }
     } finally { await ch.close(); }
-  } finally { if (created) await docker(["rm", "-f", name]).catch(() => undefined); }
+  } finally { for (const owned of ownedContainers) await isolatedDocker(["rm", "-f", owned]).catch(() => undefined); }
 });
