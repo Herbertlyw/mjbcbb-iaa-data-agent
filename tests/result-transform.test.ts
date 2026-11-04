@@ -49,6 +49,25 @@ test("比较遇 NULL 为未知，过滤仅保留 true，NULL 顺序可指定", (
   assert.deepEqual(empty?.rows.map((row) => ({ ...row })), [{ sum: null, n: "0" }]);
 });
 
+test("受授权分组比率定点除法：正负半数远离零，NULL 和零分母未知", () => {
+  const data: ResultTable = { columns: [
+    { name: "a", type: "decimal", unit: "USD", label: "金额", scale: 0 },
+    { name: "b", type: "decimal", unit: "USD", label: "成本", scale: 0 },
+  ], rows: [
+    { a: "1", b: "2000000000000000000" }, { a: "-1", b: "2000000000000000000" },
+    { a: "1", b: "-2000000000000000000" }, { a: "0", b: "2" },
+    { a: "1", b: "0" }, { a: null, b: "2" },
+  ] };
+  const steps: TransformStep[] = [{ op: "divide", left: "a", right: "b", as: "ratio" }];
+  assert.equal(transformResult(data, steps), null, "没有宿主授权不能计算");
+  assert.equal(transformResult(data, steps, () => false), null);
+  const result = transformResult(data, steps, () => true); assert.ok(result);
+  assert.deepEqual(result.rows.map((row) => row.ratio), ["0.000000000000000001", "-0.000000000000000001", "-0.000000000000000001", "0.000000000000000000", null, null]);
+  assert.equal(result.columns.find((column) => column.name === "ratio")?.unit, "比值");
+  const filtered = transformResult(result, [{ op: "filter", column: "ratio", comparison: "gt", value: "0" }, { op: "group", by: [], aggregates: [{ op: "count_all", as: "n" }] }]);
+  assert.equal(filtered?.rows[0]?.n, "1");
+});
+
 test("参考计算模块：NULL 谓词、列比较筛选和等值十进制分组", () => {
   const missing = transformResult(fixture, [{ op: "filter", column: "amount", comparison: "is_null" }]);
   assert.deepEqual(missing?.rows.map((row) => row.country), ["US", "JP"]);

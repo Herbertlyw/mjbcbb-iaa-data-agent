@@ -45,7 +45,8 @@ export function joinResultTable(plan: JoinEvidencePlan, values: VerifiedJoinValu
     // in VerifiedJoinValue, so fail closed rather than guessing a mapping.
     if (metrics.has(key)) return null;
     metrics.set(key, metric); names.add(metric.output);
-    columns.push({ name: metric.output, type: "decimal", unit, label: `${fact.table}.${metric.column}（${declared.description}）的${metric.operation === "sum" ? "合计" : "非 NULL 计数"}`, scale });
+    columns.push({ name: metric.output, type: "decimal", unit, label: `${fact.table}.${metric.column}（${declared.description}）的${metric.operation === "sum" ? "合计" : "非 NULL 计数"}`, scale,
+      ...(metric.operation === "sum" ? { metric: { table: fact.table, column: metric.column, operation: "sum" as const } } : {}) });
   }
   const rows = new Map<string, { row: Record<string, ResultValue>; cells: Set<string>; unmatched: number }>();
   const expectedGroups = [...groupNames].sort();

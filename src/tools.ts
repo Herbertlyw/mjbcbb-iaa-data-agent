@@ -9,7 +9,7 @@ import { compareDecimalAggregates, type AggregateComparison } from "./aggregate-
 import { computeArithmetic, fromAggregate, isExactZero, sumDecimalStrings, type ArithmeticOp, type ArithmeticValue } from "./exact-arithmetic.js";
 import { verifyDecimalCell, type VerifiedDecimalCell } from "./decimal-cell-evidence.js";
 import { verifyDatabaseAggregates, type VerifiedAggregate } from "./aggregate-evidence.js";
-import { joinDimensionObservations, joinMissingDimensionKeys, prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema, type JoinEvidencePlan, type VerifiedJoinValue } from "./join-evidence.js";
+import { joinDimensionObservations, joinMissingDimensionKeys, prepareJoinAggregateEvidence, prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema, type JoinEvidencePlan, type VerifiedJoinValue } from "./join-evidence.js";
 import { joinResultTable } from "./join-result-table.js";
 import { fitsResultCalculationBytes, RESULT_CALCULATION_MAX_ROWS, RESULT_CALCULATION_MAX_BYTES, transformResult, type ResultColumn, type ResultTable, type ResultValue, type TransformStep } from "./result-transform.js";
 import { alignAggregates, alignCompleteTables, type AlignedRow, type AlignmentSpec, type CompleteKeyedInput } from "./result-alignment.js";
@@ -367,7 +367,7 @@ export class ToolService {
     const joinContracts = guarded.tables.map((table) => this.ctx.knowledge.contract_by_table.get(table)?.contract);
     const joinFact = joinContracts.find((contract) => contract?.series);
     const joinDimension = joinContracts.find((contract) => contract && !contract.series);
-    const joinPlan = this.ctx.businessEngine === "clickhouse" && guarded.tables.length === 2 && joinFact && joinDimension
+    let joinPlan = this.ctx.businessEngine === "clickhouse" && guarded.tables.length === 2 && joinFact && joinDimension
       ? prepareJoinEvidence(guarded.sql, joinFact, joinDimension, this.ctx.knowledge.joins) : null;
     const initialFreshness = await this.currentFreshness();
     if (!initialFreshness.ok) return initialFreshness;
@@ -402,12 +402,23 @@ export class ToolService {
     let rows: Array<Record<string, unknown>>;
     let bounded: Awaited<ReturnType<typeof clickHouseQueryBounded>> | null = null;
     let joinProof: PrivateJoinProof | undefined;
-    const executedSql = joinPlan?.executionSql ?? guarded.sql;
+    let executedSql = joinPlan?.executionSql ?? guarded.sql;
     const started = Date.now();
     try {
       if (this.ctx.businessEngine === "clickhouse") {
         if (!this.ctx.clickhouse) throw new Error("clickhouse_unavailable");
         bounded = await clickHouseQueryBounded(this.ctx.clickhouse, executedSql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
+        // Retry only a successfully returned, read-only observation whose
+        // detailed proof did not fit or could not verify. This is a new
+        // observation, never a continuation or a claim of a shared snapshot.
+        if (joinPlan?.coarse && joinFact && joinDimension && (bounded.truncated || !verifyJoinExecutionSchema(joinPlan, joinFact, joinDimension, bounded.column_types) || !verifyJoinEvidence(joinPlan, bounded.rows) || Buffer.byteLength(JSON.stringify({ captured: bounded.rows, cleanRows: bounded.rows.map(({ __da_join_proof: _proof, ...row }) => row), types: bounded.column_types })) > this.ctx.config.maxResultBytes)) {
+          const aggregatePlan = prepareJoinAggregateEvidence(guarded.sql, joinFact, joinDimension, this.ctx.knowledge.joins);
+          if (aggregatePlan) {
+            joinPlan = aggregatePlan;
+            executedSql = aggregatePlan.executionSql;
+            bounded = await clickHouseQueryBounded(this.ctx.clickhouse, executedSql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
+          }
+        }
         if (joinPlan && joinFact && joinDimension) {
           const captured = bounded.rows;
           const types = bounded.column_types;
@@ -667,12 +678,38 @@ export class ToolService {
     if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
     const inputTable = await this.resolveTransform(session, jobId, input.resource_id, fresh.publication, new Set());
     if (!inputTable) return fail("transform_lineage_unsupported", `输入必须为当前任务完整、可验证的查询或变换资源；计算上限为 ${RESULT_CALCULATION_MAX_ROWS} 行和 ${RESULT_CALCULATION_MAX_BYTES} 字节。`);
-    const result = transformResult(inputTable.table, input.steps);
-    if (!result) return fail("invalid_transform", "变换参数、类型、单位或资源边界不受支持。");
+    const transformed = this.applyProvenTransform(inputTable.table, input.steps);
+    if (!transformed) return fail("invalid_transform", "变换参数、类型、契约指标关系或资源边界不受支持。");
+    const result = transformed.table;
     const resource: TransformResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "transform", created_at: new Date().toISOString(), source_resource_id: input.resource_id, steps: input.steps, input_hashes: inputTable.hashes, result, input_truncated: false, complete_population: true };
     await this.ctx.sessions.saveResourceAsync(resource);
     const preview = previewRows(result.rows, 100);
-    return { ok: true, resource_id: resource.resource_id, result: { ...result, rows: preview }, result_total_rows: result.rows.length, result_has_more: result.rows.length > preview.length, dependencies: Object.keys(resource.input_hashes), notice: `变换应用于完整已保存结果；预览限 100 行及 32 KB，可使用 read_session_resource 续读。正式交付时递归复核来源。resource_id=${resource.resource_id}` };
+    return { ok: true, resource_id: resource.resource_id, result: { ...result, rows: preview }, result_total_rows: result.rows.length, result_has_more: result.rows.length > preview.length, dependencies: Object.keys(resource.input_hashes), notice: `变换应用于完整已保存结果；预览限 100 行及 32 KB，可使用 read_session_resource 续读。${transformed.undefinedDivide ? "存在 NULL 输入或零分母，部分比率未知。" : ""}正式交付时递归复核来源。resource_id=${resource.resource_id}` };
+  }
+
+  /** Only host-reconstructed JOIN SUM provenance can establish a declared
+   * same-row ratio. Labels and units supplied by the model confer no rights. */
+  private authorizeTransformDivide(left: ResultColumn, right: ResultColumn): boolean {
+    const a = left.metric; const b = right.metric;
+    if (!a || !b || a.table !== b.table || a.operation !== "sum" || b.operation !== "sum") return false;
+    const contract = this.ctx.knowledge.contract_by_table.get(a.table)?.contract;
+    if (!contract?.series || contract.series.prediction_mode !== "observed_only" || contract.series.predicted_column || !contract.series.metrics.includes(a.column) || !contract.series.metrics.includes(b.column)) return false;
+    const leftColumn = contract.columns.find((item) => item.name === a.column); const rightColumn = contract.columns.find((item) => item.name === b.column);
+    if (!leftColumn?.unit || !rightColumn?.unit || left.unit !== leftColumn.unit || right.unit !== rightColumn.unit || contract.sensitive_columns.includes(a.column) || contract.sensitive_columns.includes(b.column)) return false;
+    const unit = left.unit === right.unit ? "比值" : `(${left.unit})/(${right.unit})`;
+    return Boolean(contract.derived_metrics?.some((item) => item.operation === "divide" && item.prediction === "actual_only" && item.numerator === a.column && item.denominator === b.column && item.unit === unit));
+  }
+
+  private applyProvenTransform(input: ResultTable, steps: TransformStep[]): { table: ResultTable; undefinedDivide: boolean } | null {
+    if (!Array.isArray(steps) || !steps.length || steps.length > 10) return null;
+    let table = input; let undefinedDivide = false;
+    for (const step of steps) {
+      if (step?.op === "divide" && table.rows.some((row) => row[step.left] === null || row[step.right] === null || isExactZero(row[step.right]))) undefinedDivide = true;
+      const next = transformResult(table, [step], (left, right) => this.authorizeTransformDivide(left, right));
+      if (!next) return null;
+      table = next;
+    }
+    return { table, undefinedDivide };
   }
 
   private async calculateAlignment(sessionId: string, spec: AlignmentSpec): Promise<ToolResult> {
@@ -777,7 +814,7 @@ export class ToolService {
     return { rows, hashes, leaves: [...new Set(inputs.map(({ source }) => source.resource_id))], partial: prepared.some((item) => item.partial) };
   }
 
-  private async resolveTransform(session: SessionRecord, jobId: string, resourceId: string, publication: FreshnessPublication, path: Set<string>): Promise<{ table: ResultTable; hashes: Record<string, string>; leaves: string[]; partial: boolean; partial_reason?: "alignment_incomplete" | "transform_coverage_incomplete" } | null> {
+  private async resolveTransform(session: SessionRecord, jobId: string, resourceId: string, publication: FreshnessPublication, path: Set<string>): Promise<{ table: ResultTable; hashes: Record<string, string>; leaves: string[]; partial: boolean; partial_reason?: "alignment_incomplete" | "transform_coverage_incomplete" | "transform_undefined_division" } | null> {
     if (typeof resourceId !== "string" || path.has(resourceId) || path.size >= 8) return null;
     const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, resourceId);
     if (!found.ok || found.resource.job_id !== jobId) return null;
@@ -832,9 +869,11 @@ export class ToolService {
     const next = new Set(path); next.add(resourceId);
     const source = await this.resolveTransform(session, jobId, resource.source_resource_id, publication, next);
     if (!source || stableHashes(source.hashes) !== stableHashes(resource.input_hashes)) return null;
-    const table = transformResult(source.table, resource.steps);
-    if (!table || JSON.stringify(table) !== JSON.stringify(resource.result)) return null;
-    return { table, hashes: { ...source.hashes, [resource.resource_id]: ownHash }, leaves: source.leaves, partial: source.partial, ...(source.partial_reason ? { partial_reason: source.partial_reason } : {}) };
+    const transformed = this.applyProvenTransform(source.table, resource.steps);
+    if (!transformed || JSON.stringify(transformed.table) !== JSON.stringify(resource.result)) return null;
+    const partial = source.partial || transformed.undefinedDivide;
+    const partialReason = source.partial_reason ?? (transformed.undefinedDivide ? "transform_undefined_division" as const : undefined);
+    return { table: transformed.table, hashes: { ...source.hashes, [resource.resource_id]: ownHash }, leaves: source.leaves, partial, ...(partialReason ? { partial_reason: partialReason } : {}) };
   }
 
   private async resolveArithmetic(session: SessionRecord, jobId: string, ref: ArithmeticRef, publication: FreshnessPublication, path: Set<string>): Promise<{ value: ArithmeticValue; hashes: Record<string, string>; leaves: string[] } | null> {
@@ -1111,6 +1150,10 @@ export class ToolService {
       if (joined) {
         source.evidence_eligible = true;
         source.coverage = joinCoverage(joined.plan, (original as JoinQueryResource).join_proof!.rows);
+        if (joined.plan.aggregateProof) {
+          reasons.push("coverage_unknown");
+          if (status === "completed") status = "partial";
+        }
         source.rows = [];
         eligible.add(source.resource_id);
         joinLines.push(...joined.values.slice(0, 100).map((value) => renderVerifiedJoin(value, source.resource_id)));
@@ -1316,6 +1359,7 @@ export class ToolService {
     if (reasons.includes("alignment_lineage_unsupported")) limitations.push("部分分组对齐的完整来源、范围或口径无法证明，没有展示结果。");
     if (reasons.includes("alignment_incomplete")) limitations.push("对齐来源存在未出现的分组或零分母；变换未把未知结果当作零。");
     if (reasons.includes("transform_coverage_incomplete")) limitations.push("变换输入存在未覆盖日期、NULL 或无法确认的预测状态；聚合忽略 NULL，不代表完整总体。");
+    if (reasons.includes("transform_undefined_division")) limitations.push("变换存在 NULL 输入或零分母，比率未知，没有补零。");
     if (reasons.includes("clickhouse_observation_nonatomic")) limitations.push("ClickHouse 查询和覆盖统计是独立读取；结果代表各次观测，不宣称跨查询原子快照或共同数据版本。");
     if (reasons.includes("coverage_observations_conflict")) limitations.push("相同范围的覆盖观测内容发生变化；跨次比较可能不一致，只能部分交付。");
     if (reasons.includes("alias_preview_hidden")) limitations.push("含模型自选列别名的结果预览已隐藏；正式数值按契约字段及单位展示。");
@@ -1664,7 +1708,8 @@ function verifyJoinResource(resource: JoinQueryResource, session: SessionRecord,
   if (!fact || !dimension) return null;
   const receipts = resource.freshness_receipts;
   if (receipts.length !== 2 || resource.tables.some((table) => !receipts.some((receipt) => receipt.table === table && receipt.status === "fresh" && receipt.publication_id === publication.publication_id && receipt.version === publication.version && publication.tables[table]?.status === "fresh"))) return null;
-  const plan = prepareJoinEvidence(resource.sql, fact, dimension, knowledge.joins);
+  const detailed = prepareJoinEvidence(resource.sql, fact, dimension, knowledge.joins);
+  const plan = detailed?.executionSql === resource.executed_sql ? detailed : prepareJoinAggregateEvidence(resource.sql, fact, dimension, knowledge.joins);
   if (!plan || plan.range.start !== resource.time_range.start || plan.range.end !== resource.time_range.end || plan.range.timezone !== resource.time_range.timezone || !verifyJoinExecutionSchema(plan, fact, dimension, resource.join_proof.column_types)) return null;
   if (plan.joinType === "left" && resource.execution_settings?.join_use_nulls !== true) return null;
   if (resource.executed_sql !== plan.executionSql || resource.join_proof.capture_hash !== joinCaptureHash(resource.sql, resource.executed_sql, resource.execution_id, resource.join_proof.rows, resource.join_proof.column_types)) return null;
@@ -1691,6 +1736,7 @@ function joinCaptureHash(sql: string, executedSql: string, executionId: string, 
 }
 
 function joinCoverage(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>): QueryResource["coverage"] {
+  if (plan.aggregateProof) return unknownCoverage("数据库全量聚合已检查本次观察的粒度与关联，但未证明每个业务日期和未出现分组的覆盖。");
   const metricCount = new Set(plan.metrics.map((item) => item.column)).size;
   const zeros = new Set<string>();
   for (const row of rows) for (const tuple of row.__da_join_proof as unknown[][]) {
@@ -1845,9 +1891,10 @@ function renderTransform(resource: TransformResource, input: ResultTable, result
   for (const step of resource.steps) {
     if (step.op === "filter") descriptions.push(`筛选 ${label(step.column)} ${step.comparison}${"other_column" in step && step.other_column ? ` ${label(step.other_column)}` : "value" in step ? ` ${JSON.stringify(step.value)}` : ""}`);
     else if (step.op === "compare") descriptions.push(`比较 ${label(step.left)} ${step.comparison} ${label(step.right)}`);
+    else if (step.op === "divide") descriptions.push(`计算 ${label(step.left)} / ${label(step.right)}（除法保留 18 位，半数远离零；NULL 或零分母结果未知）`);
     else if (step.op === "sort") descriptions.push(`排序 ${step.keys.map((key) => `${label(key.column)} ${key.direction}（NULL ${key.nulls}）`).join("、")}`);
     else descriptions.push(`按 ${step.by.map(label).join("、") || "全部结果"} 分组；${step.aggregates.map((item) => item.op === "count_all" ? "输入结果行数" : `${label(item.column!)} ${item.op}`).join("、")}`);
-    const next = transformResult(current, [step]);
+    const next = transformResult(current, [step], () => true);
     if (next) current = next;
   }
   const lines = [`结果变换：${descriptions.join(" → ")}；输入 ${resource.source_resource_id}；计算资源 ${resource.resource_id}。计数指输入结果行，不自动代表业务明细行；聚合忽略 NULL，未知值没有补零。`];

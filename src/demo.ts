@@ -61,6 +61,7 @@ const HARBORLIGHT_QUESTIONS = [
   { id: "mixed-fact", label: "聚合与明细对齐", text: "合成混合聚合明细：比较 2026-10-08 收入分组与新增明细。" },
   { id: "coarse-payment-join", label: "产品收入和成本", text: "合成粗粒度金额关联：按产品统计 2026-10-06 到 2026-10-08 的收入和成本。" },
   { id: "coarse-channel-join", label: "渠道收入和成本", text: "合成粗粒度渠道关联：按渠道统计 2026-10-08 美国收入和成本。" },
+  { id: "coarse-channel-ratio", label: "渠道关联比率", text: "合成渠道关联比率：按渠道比较 2026-10-08 美国收入和成本。" },
   { id: "cte", label: "CTE 查询", text: "合成 CTE 查询：纸灯日本 2026-10-06 到 2026-10-12 新增。" },
   { id: "left-title", label: "未匹配的产品", text: "合成左关联产品：保留 2026-10-06 到 2026-10-12 未匹配产品。" },
   { id: "cte-join", label: "预聚合产品关联", text: "合成 CTE 预聚合关联：日本产品 2026-10-06 到 2026-10-12 新增。" },

@@ -545,6 +545,16 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.match(channelCoarse.analysis?.answer ?? "", /的合计=5\.00（USD）/);
     assert.equal(channelCoarse.analysis?.sources?.[0]?.engine, "clickhouse-local");
     assert.equal(channelCoarse.analysis?.sources?.[0]?.freshness_receipts?.length, 2);
+    const channelRatio = await postQuestion(apiPort, await createSyntheticSession(), "合成渠道关联比率：按渠道比较收入和成本。");
+    assert.equal(channelRatio.status, "completed", `${JSON.stringify(channelRatio.error)} ${channelRatio.analysis?.answer ?? ""} events=${JSON.stringify(channelRatio.events)}`);
+    // Independent arithmetic for the above synthetic inputs: 1/2 = 0.5; 6/3 = 2.
+    assert.match(channelRatio.analysis?.answer ?? "", /=0\.500000000000000000（比值）/);
+    assert.match(channelRatio.analysis?.answer ?? "", /=2\.000000000000000000（比值）/);
+    assert.match(channelRatio.analysis?.answer ?? "", /半数远离零/);
+    assert.equal(channelRatio.analysis?.sources?.[0]?.engine, "clickhouse-local");
+    const inverseRatio = await postQuestion(apiPort, await createSyntheticSession(), "合成未声明反向比率：按渠道比较成本和收入。");
+    assert.ok(inverseRatio.events.some((event) => event.type === "tool_finished" && event.payload.tool_name === "calculate_session_cells" && event.payload.is_error === true));
+    assert.doesNotMatch(inverseRatio.analysis?.answer ?? "", /=2\.000000000000000000（比值）/);
     const preaggregatedLeft = await postQuestion(apiPort, await createSyntheticSession(), "合成 CTE 左关联未匹配：保留虚构产品。");
     assert.equal(preaggregatedLeft.status, "completed", `${JSON.stringify(preaggregatedLeft.error)} ${preaggregatedLeft.analysis?.answer ?? ""}`);
     assert.match(preaggregatedLeft.analysis?.answer ?? "", new RegExp(`JOIN 求和 ${preaggregatedExpected.zz_known}`));
@@ -571,7 +581,17 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     // Optional manual browser regression: a loopback proxy really drops the first
     // SSE socket and records the browser's subsequent cursor and event IDs.
     if (process.env.BROWSER_TRACE_DIR) {
-      await browserDisconnectProbe(apiPort, process.env.BROWSER_TRACE_DIR);
+      await browserDisconnectProbe(apiPort, process.env.BROWSER_TRACE_DIR, async () => {
+        // This control is available only to the opt-in test harness. Restart
+        // exactly the two children created by this test, keeping the databases,
+        // dispatcher and loopback proxy alive for the browser's current session.
+        await stopChild(happyWorker);
+        await stopChild(api);
+        api = spawn(process.execPath, ["--import", "tsx", "src/api.ts"], { cwd: root, env: baseEnv, stdio: "ignore" });
+        happyWorker = spawn(process.execPath, ["--import", "tsx", "src/worker.ts"], { cwd: root, env: baseEnv, stdio: "ignore" });
+        children.push(api, happyWorker);
+        await waitHttp(`http://127.0.0.1:${apiPort}/api/health`);
+      });
     }
     const another = async () => {
       const created = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
@@ -652,13 +672,16 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
   }
 });
 
-async function browserDisconnectProbe(apiPort: number, dir: string): Promise<void> {
+async function browserDisconnectProbe(apiPort: number, dir: string, restart: () => Promise<void>): Promise<void> {
   const trace: { after: number; seqs: number[] }[] = [];
   let dropped = false;
+  let trackedPath: string | undefined;
   const types: string[] = [];
   const proxy = createHttpServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    const isEvents = /^\/api\/jobs\/[^/]+\/events$/u.test(url.pathname);
+    const eventPath = /^\/api\/jobs\/[^/]+\/events$/u.test(url.pathname);
+    if (eventPath && !trackedPath) trackedPath = url.pathname;
+    const isEvents = eventPath && url.pathname === trackedPath;
     const item = isEvents ? { after: Number(url.searchParams.get("after") ?? 0), seqs: [] as number[] } : null;
     if (item) trace.push(item);
     const upstream = httpRequest({ hostname: "127.0.0.1", port: apiPort, path: req.url, method: req.method, headers: { ...req.headers, host: `127.0.0.1:${apiPort}` } }, (incoming) => {
@@ -694,7 +717,15 @@ async function browserDisconnectProbe(apiPort: number, dir: string): Promise<voi
   writeFileSync(path.join(dir, "ready.json"), JSON.stringify({ port: typeof address === "object" && address ? address.port : 0 }));
   try {
     const deadline = Date.now() + 240_000;
-    while (!existsSync(path.join(dir, "done")) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 200));
+    let restarted = false;
+    while (!existsSync(path.join(dir, "done")) && Date.now() < deadline) {
+      if (!restarted && existsSync(path.join(dir, "restart"))) {
+        await restart();
+        restarted = true;
+        writeFileSync(path.join(dir, "restarted"), "ok");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
     assert.ok(existsSync(path.join(dir, "done")), "browser probe timed out");
     assert.ok(dropped && trace.length >= 2 && trace[1]!.after > 0, JSON.stringify(trace));
     const sequences = trace.flatMap((item) => item.seqs);

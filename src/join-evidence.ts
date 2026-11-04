@@ -23,6 +23,8 @@ export interface JoinEvidencePlan {
   dateColumn: string;
   /** Expanded proof for a strictly reviewed preaggregated query. */
   coarse?: boolean;
+  /** Bounded aggregate receipts; not an immutable data snapshot. */
+  aggregateProof?: boolean;
 }
 
 export interface VerifiedJoinValue {
@@ -58,10 +60,18 @@ const quote = (value: string) => `'${value}'`;
  * this proof's strictly enumerated subset. Call the normal authorization and
  * freshness checks as well; this function does not grant access. */
 export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[]): JoinEvidencePlan | null {
-  return buildJoinEvidence(sql, fact, dimension, joins, false);
+  return buildJoinEvidence(sql, fact, dimension, joins, false, false);
 }
 
-function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[], coarse: boolean): JoinEvidencePlan | null {
+/** Alternative proof for coarse CTEs with large fact populations. The database
+ * checks complete-group cardinality and emits bounded dimension observations;
+ * the application does not fetch or recompute every contributing fact row. */
+export function prepareJoinAggregateEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[]): JoinEvidencePlan | null {
+  const plan = buildJoinEvidence(sql, fact, dimension, joins, false, true);
+  return plan?.coarse ? plan : null;
+}
+
+function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[], coarse: boolean, aggregateProof: boolean): JoinEvidencePlan | null {
   try {
     const series = fact.series;
     if (!series || series.prediction_mode !== "observed_only" || series.predicted_column || dimension.series || fact.timezone !== dimension.timezone || !fact.grain || [...fact.grain].sort().join("|") !== [series.date_column, ...series.dimensions].sort().join("|")) return null;
@@ -76,7 +86,7 @@ function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContr
       const groupFields = Array.isArray(rewrittenGroup?.columns) ? rewrittenGroup.columns : [];
       const groupsDate = groupFields.some((value) => object(value)?.type === "column_ref" && object(value)?.column === series.date_column);
       const isCoarse = groupsDate || JSON.stringify([...preaggregated.grain].sort()) !== JSON.stringify([...fact.grain].sort());
-      const proof = buildJoinEvidence(preaggregated.sql, fact, dimension, joins, isCoarse);
+      const proof = buildJoinEvidence(preaggregated.sql, fact, dimension, joins, isCoarse, aggregateProof);
       return proof ? { ...proof, originalSql: parsed.sql } : null;
     }
     if (ast.with || ast._next || ast.having || ast.limit || ast.distinct || ast.options || ast.for_update || ast.window || !Array.isArray(ast.from) || ast.from.length !== 2) return null;
@@ -167,7 +177,7 @@ function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContr
     for (const name of Object.keys(dimensionFilters)) fields.set(`dimension.${name}`, { table: "dimension", column: name });
     const proofFields = [...fields.values()]; const metricFields = [...new Set(metrics.map((metric) => metric.column))];
     const filteredDimension = Object.keys(dimensionFilters).length > 0;
-    if (filteredDimension && dimColumns.has(DIMENSION_COUNT)) return null;
+    if ((filteredDimension || aggregateProof) && dimColumns.has(DIMENSION_COUNT)) return null;
     // Keep physical types inside the tuple so the response metadata can be
     // checked against contracts for the actual execution, not just an earlier
     // DESCRIBE that may race a schema change.
@@ -177,10 +187,20 @@ function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContr
     // unfiltered rows inside the dimension subquery before the outer WHERE.
     // A window preserves every row, so even when proof fails the returned
     // query rows retain the original JOIN's multiplicity and SQL semantics.
-    if (filteredDimension) proof.push(`${da}.${DIMENSION_COUNT}`);
-    selections.push(`groupArray(${coarse ? 10001 : 367})(tuple(${proof.join(", ")})) AS ${PROOF}`);
+    if (filteredDimension && !aggregateProof) proof.push(`${da}.${DIMENSION_COUNT}`);
+    if (aggregateProof) {
+      // Exact unique fact grain and unfiltered dimension multiplicity are
+      // computed in ClickHouse over *all* contributing rows, without sampling.
+      // The bounded set contains only join keys / visible dimension values.
+      // The sample tuple preserves the physical result types for schema checks.
+      const grain = [series.date_column, ...series.dimensions].map((name) => `${fa}.${name}`);
+      const dimFields = proofFields.filter((field) => field.table === "dimension");
+      const observations = [...relation.keys.map((key) => `${fa}.${key}`), ...dimFields.map((field) => `${da}.${field.column}`)];
+      const missing = `isNull(${da}.${relation.keys[0]})`;
+      selections.push(`tuple(count(), uniqExact(tuple(${grain.join(", ")})), countIf(${missing}), countIf(ifNull(${da}.${DIMENSION_COUNT}, 0) > 1), ${metricFields.map((name) => `countIf(isNull(${fa}.${name}))`).join(", ")}, groupUniqArray(10001)(tuple(${observations.join(", ")})), any(tuple(${proof.join(", ")}))) AS ${PROOF}`);
+    } else selections.push(`groupArray(${coarse ? 10001 : 367})(tuple(${proof.join(", ")})) AS ${PROOF}`);
     const on = relation.keys.map((key) => `${fa}.${key} = ${da}.${key}`).join(" AND ");
-    const dimensionFrom = filteredDimension
+    const dimensionFrom = filteredDimension || aggregateProof
       ? `(SELECT ${[...relation.keys, ...proofFields.filter((field) => field.table === "dimension" && !relation.keys.includes(field.column)).map((field) => field.column), `count() OVER (PARTITION BY ${relation.keys.join(", ")}) AS ${DIMENSION_COUNT}`].join(", ")} FROM ${dimension.table})`
       : dimension.table;
     const groupSql = groupFields.length ? ` GROUP BY ${groupFields.map((col) => `${col!.table === "fact" ? fa : da}.${col!.column}`).join(", ")}` : "";
@@ -197,7 +217,7 @@ function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContr
       }
       orderSql = ` ORDER BY ${order.join(", ")}`;
     }
-    return { originalSql: parsed.sql, executionSql: `SELECT ${selections.join(", ")} FROM ${fact.table} AS ${fa} ${joinType === "left" ? "LEFT JOIN" : "INNER JOIN"} ${dimensionFrom} AS ${da} ON ${on} WHERE ${conditions.join(" AND ")}${groupSql}${orderSql}`, fact: fact.table, dimension: dimension.table, joinType, joinKeys: [...relation.keys], range: { start, end, timezone: fact.timezone }, factFilters, dimensionFilters, groups, metrics, proofFields, expectedDates: dates, dateColumn: series.date_column, ...(coarse ? { coarse: true } : {}) };
+    return { originalSql: parsed.sql, executionSql: `SELECT ${selections.join(", ")} FROM ${fact.table} AS ${fa} ${joinType === "left" ? "LEFT JOIN" : "INNER JOIN"} ${dimensionFrom} AS ${da} ON ${on} WHERE ${conditions.join(" AND ")}${groupSql}${orderSql}`, fact: fact.table, dimension: dimension.table, joinType, joinKeys: [...relation.keys], range: { start, end, timezone: fact.timezone }, factFilters, dimensionFilters, groups, metrics, proofFields, expectedDates: dates, dateColumn: series.date_column, ...(coarse ? { coarse: true } : {}), ...(aggregateProof ? { aggregateProof: true } : {}) };
   } catch { return null; }
 }
 
@@ -229,8 +249,15 @@ export function verifyJoinExecutionSchema(plan: JoinEvidencePlan, fact: DataCont
   };
   const expected = [lookup(fact, fact.series.date_column), ...metricFields.map((name) => lookup(fact, name)), ...plan.proofFields.map((item) => item.table === "fact" ? lookup(fact, item.column) : plan.joinType === "left" ? nullable(lookup(dimension, item.column)) : lookup(dimension, item.column))];
   if (expected.some((item) => !item) || !resultTypes[PROOF]) return false;
-  if (Object.keys(plan.dimensionFilters).length) expected.push("UInt64");
+  if (Object.keys(plan.dimensionFilters).length && !plan.aggregateProof) expected.push("UInt64");
   const normalize = (value: string) => value.replace(/\s/gu, "").toLowerCase().replace(/lowcardinality\(([^()]*)\)/gu, "$1");
+  if (plan.aggregateProof) {
+    const keys = plan.joinKeys.map((key) => lookup(fact, key));
+    const dimensionFields = plan.proofFields.filter((field) => field.table === "dimension").map((field) => plan.joinType === "left" ? nullable(lookup(dimension, field.column)) : lookup(dimension, field.column));
+    if ([...keys, ...dimensionFields].some((value) => !value)) return false;
+    const components = ["UInt64", "UInt64", "UInt64", "UInt64", ...metricFields.map(() => "UInt64"), `Array(Tuple(${[...keys, ...dimensionFields].join(",")}))`, `Tuple(${expected.join(",")})`];
+    return normalize(resultTypes[PROOF]!) === normalize(`Tuple(${components.join(",")})`);
+  }
   return normalize(resultTypes[PROOF]!) === normalize(`Array(Tuple(${expected.join(",")}))`);
 }
 
@@ -240,6 +267,7 @@ export function verifyJoinExecutionSchema(plan: JoinEvidencePlan, fact: DataCont
  * rather than inflating a sum. Empty/missing groups never become zeros. */
 export function verifyJoinEvidence(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>): VerifiedJoinValue[] | null {
   if (!rows.length || !plan.expectedDates.length) return null;
+  if (plan.aggregateProof) return verifyJoinAggregateEvidence(plan, rows);
   const metrics = [...new Set(plan.metrics.map((item) => item.column))];
   const verified: VerifiedJoinValue[] = []; const seen = new Set<string>();
   // A duplicate dimension key may map the same fact to *different* labels.
@@ -321,6 +349,7 @@ export function verifyJoinEvidence(plan: JoinEvidencePlan, rows: Array<Record<st
  * does not itself grant access or declare those values fresh. */
 export function joinDimensionObservations(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>): JoinDimensionObservation[] | null {
   if (!verifyJoinEvidence(plan, rows)) return null;
+  if (plan.aggregateProof) return aggregateDimensionObservations(plan, rows);
   const metricCount = new Set(plan.metrics.map((metric) => metric.column)).size;
   const dimensionFields = plan.proofFields.flatMap((field, index) => field.table === "dimension" ? [{ column: field.column, index }] : []);
   const keyFields = plan.joinKeys.map((key) => dimensionFields.find((field) => field.column === key));
@@ -347,6 +376,7 @@ export function joinDimensionObservations(plan: JoinEvidencePlan, rows: Array<Re
 export function joinMissingDimensionKeys(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>): Array<Record<string, string>> | null {
   if (!verifyJoinEvidence(plan, rows)) return null;
   if (plan.joinType !== "left") return [];
+  if (plan.aggregateProof) return aggregateMissingDimensionKeys(plan, rows);
   const metricCount = new Set(plan.metrics.map((metric) => metric.column)).size;
   const indexOf = (table: "fact" | "dimension", key: string) => plan.proofFields.findIndex((field) => field.table === table && field.column === key);
   const missing = new Map<string, Record<string, string>>();
@@ -360,6 +390,100 @@ export function joinMissingDimensionKeys(plan: JoinEvidencePlan, rows: Array<Rec
       if (tuple[1 + metricCount + di] !== null) unmatched = false;
     }
     if (unmatched) missing.set(JSON.stringify(plan.joinKeys.map((key) => keys[key])), keys);
+  }
+  return [...missing.values()];
+}
+
+/** Bounded receipts from a full database aggregate. They prove neither data
+ * completeness nor an atomic snapshot with any separate publication query. */
+function aggregateReceipt(plan: JoinEvidencePlan, row: Record<string, unknown>): { count: number; unmatched: number; observations: unknown[][] } | null {
+  const fields = [...new Set(plan.metrics.map((metric) => metric.column))];
+  const proof = row[PROOF];
+  if (!Array.isArray(proof) || proof.length !== 6 + fields.length) return null;
+  const count = (value: unknown): number | null => {
+    if (!(typeof value === "string" && /^\d{1,15}$/u.test(value) || typeof value === "number" && Number.isSafeInteger(value) && value >= 0)) return null;
+    const n = Number(value); return Number.isSafeInteger(n) ? n : null;
+  };
+  const total = count(proof[0]); const unique = count(proof[1]); const unmatched = count(proof[2]); const repeatedDimension = count(proof[3]);
+  if (total === null || total < 1 || unique !== total || unmatched === null || unmatched > total || repeatedDimension !== 0 || plan.joinType === "inner" && unmatched !== 0 || fields.some((_, i) => count(proof[4 + i]) !== 0)) return null;
+  const observations = proof[4 + fields.length]; const sample = proof[5 + fields.length];
+  if (!Array.isArray(observations) || !observations.length || observations.length > 10_000 || !Array.isArray(sample) || sample.length !== 1 + fields.length + plan.proofFields.length || typeof sample[0] !== "string" || !plan.expectedDates.includes(sample[0])) return null;
+  const dimFields = plan.proofFields.filter((field) => field.table === "dimension");
+  for (const tuple of observations) {
+    if (!Array.isArray(tuple) || tuple.length !== plan.joinKeys.length + dimFields.length) return null;
+    const keys = tuple.slice(0, plan.joinKeys.length);
+    if (keys.some((key: unknown) => typeof key !== "string" || !key || key.length > 200)) return null;
+    const dims = tuple.slice(plan.joinKeys.length);
+    const isMissing = dims.every((value: unknown) => value === null);
+    if (isMissing ? plan.joinType !== "left" : dims.some((value: unknown) => typeof value !== "string" || value.length > 200)) return null;
+    for (const [i, field] of dimFields.entries()) {
+      const value = dims[i]; const keyIndex = plan.joinKeys.indexOf(field.column);
+      if (keyIndex >= 0 && !isMissing && value !== keys[keyIndex]) return null;
+      const filter = plan.dimensionFilters[field.column];
+      if (filter !== undefined && value !== filter) return null;
+      const group = plan.groups.find((entry) => entry.table === "dimension" && entry.column === field.column);
+      if (group && value !== row[group.output]) return null;
+    }
+    for (const [i, key] of plan.joinKeys.entries()) {
+      const group = plan.groups.find((entry) => entry.table === "fact" && entry.column === key);
+      if (group && row[group.output] !== keys[i]) return null;
+      const filter = plan.factFilters[key]; if (filter !== undefined && filter !== keys[i]) return null;
+    }
+  }
+  return { count: total, unmatched, observations };
+}
+
+function verifyJoinAggregateEvidence(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>): VerifiedJoinValue[] | null {
+  const values: VerifiedJoinValue[] = []; const seen = new Set<string>();
+  for (const row of rows) {
+    const proof = aggregateReceipt(plan, row); if (!proof) return null;
+    const group: Record<string, string | null> = {};
+    for (const field of plan.groups) {
+      const value = row[field.output];
+      if (!(typeof value === "string" && value.length > 0 && value.length <= 200) && !(plan.joinType === "left" && field.table === "dimension" && value === null)) return null;
+      if (field.table === "fact" && field.column === plan.dateColumn && (typeof value !== "string" || !plan.expectedDates.includes(value))) return null;
+      group[`${field.table === "fact" ? plan.fact : plan.dimension}.${field.column}`] = value;
+    }
+    const key = JSON.stringify(group); if (seen.has(key)) return null; seen.add(key);
+    for (const metric of plan.metrics) {
+      const actual = row[metric.output];
+      if (!(typeof actual === "string" || typeof actual === "number" && Number.isSafeInteger(actual)) || metric.precision !== undefined && metric.operation === "sum" && typeof actual !== "string") return null;
+      const value = sumDecimalStrings([String(actual)], metric.operation === "sum" ? metric.scale ?? 0 : 0);
+      if (value === null || metric.operation === "count_nonnull" && value !== String(proof.count)) return null;
+      values.push({ fact: plan.fact, dimension: plan.dimension, column: metric.column, operation: metric.operation, value, unit: metric.unit, description: metric.description, group, unmatched_rows: proof.unmatched, factFilters: plan.factFilters, dimensionFilters: plan.dimensionFilters, range: plan.range });
+    }
+  }
+  return values;
+}
+
+function aggregateDimensionObservations(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>): JoinDimensionObservation[] | null {
+  const unique = new Map<string, JoinDimensionObservation>();
+  const dimFields = plan.proofFields.filter((field) => field.table === "dimension");
+  for (const row of rows) {
+    const receipt = aggregateReceipt(plan, row); if (!receipt) return null;
+    for (const tuple of receipt.observations) {
+      const dims = tuple.slice(plan.joinKeys.length);
+      if (dims.every((value) => value === null)) continue;
+      const keys = Object.fromEntries(plan.joinKeys.map((key, i) => [key, tuple[i] as string]));
+      for (const [i, field] of dimFields.entries()) {
+        const value = dims[i]; if (typeof value !== "string") return null;
+        const observation = { keys, column: field.column, value };
+        unique.set(JSON.stringify([plan.joinKeys.map((key) => keys[key]), field.column, value]), observation);
+      }
+    }
+  }
+  return [...unique.values()];
+}
+
+function aggregateMissingDimensionKeys(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>): Array<Record<string, string>> | null {
+  const missing = new Map<string, Record<string, string>>();
+  for (const row of rows) {
+    const receipt = aggregateReceipt(plan, row); if (!receipt) return null;
+    for (const tuple of receipt.observations) {
+      if (!tuple.slice(plan.joinKeys.length).every((value) => value === null)) continue;
+      const keys = Object.fromEntries(plan.joinKeys.map((key, i) => [key, tuple[i] as string]));
+      missing.set(JSON.stringify(plan.joinKeys.map((key) => keys[key])), keys);
+    }
   }
   return [...missing.values()];
 }

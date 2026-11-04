@@ -126,6 +126,9 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成收入成本比")) return scripted(turn, ratioSteps);
   if (latest.includes("合成多渠道收入成本比")) return scripted(turn, groupedRatioSteps);
   if (latest.includes("合成分组对齐")) return scripted(turn, alignmentSteps);
+  if (latest.includes("合成未声明反向比率")) return scripted(turn, (ids) => coarseChannelRatioSteps(ids, true));
+  if (latest.includes("合成十万行渠道日期")) return scripted(turn, largeJoinSteps);
+  if (latest.includes("合成渠道关联比率")) return scripted(turn, coarseChannelRatioSteps);
   if (latest.includes("合成粗粒度渠道关联")) return scripted(turn, coarseChannelJoinSteps);
   if (latest.includes("合成粗粒度金额关联")) return scripted(turn, coarsePaymentJoinSteps);
   if (latest.includes("合成混合聚合明细")) return scripted(turn, mixedFactSteps);
@@ -150,6 +153,15 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("日本") && (hasBase || latest.includes("雾帆"))) return scripted(turn, japanSteps);
   if (latest.includes("连表")) return scripted(turn, unsafeJoinSteps);
   return scripted(turn, defaultSteps);
+}
+
+function coarseChannelRatioSteps(ids: string[], reverse = false) {
+  const steps = coarseChannelJoinSteps(ids);
+  steps[3] = { id: "coarse_channel_ratio", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: [
+    { op: "divide", left: reverse ? "cost_total" : "revenue_total", right: reverse ? "revenue_total" : "cost_total", as: "ratio" },
+    { op: "sort", keys: [{ column: "ratio", direction: "asc", nulls: "last" }] },
+  ] } }) };
+  return steps;
 }
 
 function coarseChannelJoinSteps(ids: string[]) {
@@ -188,6 +200,17 @@ function mixedFactSteps(ids: string[]) {
 
 /** The contract and rows for this case exist only in the isolated integration
  * test. Its script exercises Pi's HTTP/tool protocol, not model reasoning. */
+function largeJoinSteps(ids: string[]) {
+  const sql = "WITH p AS (SELECT f.event_date AS day, f.channel_id AS channel, SUM(f.new_users) AS subtotal FROM fact_fox_daily_install f WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-09' AND f.title_id = 'big_demo' AND f.platform = 'android' GROUP BY f.event_date, f.channel_id) SELECT p.day AS day, p.channel AS channel, d.channel_name AS label, SUM(p.subtotal) AS total FROM p INNER JOIN dim_fox_channel d ON p.channel = d.channel_id GROUP BY p.day, p.channel, d.channel_name ORDER BY p.day, p.channel";
+  return [
+    { id: "large_join_fact_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "large_join_dim_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.dim_fox_channel" }) },
+    { id: "large_join_query", name: "query", arguments: JSON.stringify({ sql }) },
+    { id: "large_join_transform", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: [{ op: "group", by: [], aggregates: [{ op: "sum", column: "total", as: "all_total" }] }] } }) },
+    { id: "large_join_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
 function nullableCountrySteps(ids: string[]) {
   const where = "event_date = '2026-10-08' AND title_id = 'null_demo' AND platform = 'android' AND channel_id = 'mist_ads'";
   return [

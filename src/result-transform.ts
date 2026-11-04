@@ -7,6 +7,8 @@ export interface ResultColumn {
   unit: string;
   label: string;
   scale?: number;
+  /** Host-generated lineage for a verified, observed JOIN SUM; aliases do not grant it. */
+  metric?: { table: string; column: string; operation: "sum" };
 }
 export interface ResultTable { columns: ResultColumn[]; rows: Array<Record<string, ResultValue>> }
 export type ComparisonOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
@@ -25,6 +27,7 @@ export function fitsResultCalculationBytes(value: unknown): boolean {
 export type TransformStep =
   | ({ op: "filter"; column: string } & ({ comparison: ComparisonOp; value: string | boolean | null; other_column?: never } | { comparison: ComparisonOp; other_column: string; value?: never } | { comparison: "is_null" | "is_not_null"; value?: never; other_column?: never }))
   | { op: "compare"; left: string; right: string; comparison: ComparisonOp; as: string }
+  | { op: "divide"; left: string; right: string; as: string }
   | { op: "sort"; keys: Array<{ column: string; direction: "asc" | "desc"; nulls: "first" | "last" }> }
   | { op: "group"; by: string[]; aggregates: Array<{ op: "count_all" | "count" | "sum" | "min" | "max"; column?: string; as: string }> };
 
@@ -32,7 +35,7 @@ const namePattern = /^[a-z_][a-z0-9_]{0,63}$/u;
 const comparisons = new Set<ComparisonOp>(["eq", "ne", "lt", "le", "gt", "ge"]);
 
 /** Returns null for malformed instructions, incompatible units or overflow. */
-export function transformResult(input: ResultTable, steps: TransformStep[]): ResultTable | null {
+export function transformResult(input: ResultTable, steps: TransformStep[], authorizeDivide?: (left: ResultColumn, right: ResultColumn) => boolean): ResultTable | null {
   if (!Array.isArray(steps) || steps.length < 1 || steps.length > RESULT_TRANSFORM_MAX_STEPS || !validTable(input)) return null;
   let table: ResultTable = { columns: input.columns.map((c) => ({ ...c })), rows: input.rows.map((r) => ({ ...r })) };
   for (const step of steps) {
@@ -59,6 +62,18 @@ export function transformResult(input: ResultTable, steps: TransformStep[]): Res
       const output: ResultColumn = { name: step.as, type: "boolean", unit: "布尔值", label: `比较（${left.label} ${step.comparison} ${right.label}）` };
       table.columns.push(output);
       table.rows = table.rows.map((row) => ({ ...row, [step.as]: compare(row[left.name]!, row[right.name]!, left, step.comparison) }));
+    } else if (step.op === "divide") {
+      const left = column(step.left); const right = column(step.right);
+      if (!left || !right || left.type !== "decimal" || right.type !== "decimal" || !validName(step.as, table.columns) || !authorizeDivide?.(left, right)) return null;
+      const output: ResultColumn = { name: step.as, type: "decimal", scale: 18, unit: left.unit === right.unit ? "比值" : `(${left.unit})/(${right.unit})`, label: `（${left.label} / ${right.label}）` };
+      const rows: Array<Record<string, ResultValue>> = [];
+      for (const row of table.rows) {
+        const x = row[left.name]; const y = row[right.name];
+        const value = x === null || y === null ? null : divide(x as string, y as string);
+        if (value === undefined) return null;
+        rows.push({ ...row, [step.as]: value });
+      }
+      table.columns.push(output); table.rows = rows;
     } else if (step.op === "sort") {
       if (!Array.isArray(step.keys) || !step.keys.length || step.keys.length > 8 || step.keys.some((key) => !column(key.column) || !["asc", "desc"].includes(key.direction) || !["first", "last"].includes(key.nulls))) return null;
       table.rows = table.rows.map((row, index) => ({ row, index })).sort((a, b) => {
@@ -81,7 +96,7 @@ export function transformResult(input: ResultTable, steps: TransformStep[]): Res
         if ((agg.op === "min" || agg.op === "max") && field?.type === "boolean") return null;
         outputs.push(agg.op === "count" || agg.op === "count_all"
           ? { name: agg.as, type: "decimal", unit: "结果行", label: agg.op === "count_all" ? "输入结果行数" : `${field!.label} 的非 NULL 结果行数`, scale: 0 }
-          : { ...field!, name: agg.as, label: `${field!.label} 的${{ sum: "合计", min: "最小值", max: "最大值" }[agg.op as "sum" | "min" | "max"]}` });
+          : { ...field!, metric: undefined, name: agg.as, label: `${field!.label} 的${{ sum: "合计", min: "最小值", max: "最大值" }[agg.op as "sum" | "min" | "max"]}` });
       }
       const groups = new Map<string, Array<Record<string, ResultValue>>>();
       for (const row of table.rows) {
@@ -184,4 +199,20 @@ function sum(values: string[], scale: number): string | undefined {
   if (digits.length > 76) return undefined;
   const padded = digits.padStart(scale + 1, "0");
   return `${negative ? "-" : ""}${scale ? `${padded.slice(0, -scale)}.${padded.slice(-scale)}` : padded}`;
+}
+
+/** Exact fixed-scale division, with halves rounded away from zero. */
+function divide(left: string, right: string): string | null | undefined {
+  const a = decimal(left); const b = decimal(right);
+  if (!a || !b) return undefined;
+  if (b.n === 0n) return null;
+  const numerator = a.n * 10n ** BigInt(18 + b.scale);
+  const denominator = b.n * 10n ** BigInt(a.scale);
+  const negative = (numerator < 0n) !== (denominator < 0n);
+  const x = numerator < 0n ? -numerator : numerator;
+  const y = denominator < 0n ? -denominator : denominator;
+  const magnitude = (x * 2n + y) / (2n * y);
+  if (magnitude.toString().length > 76) return undefined;
+  const digits = magnitude.toString().padStart(19, "0");
+  return `${negative && magnitude !== 0n ? "-" : ""}${digits.slice(0, -18)}.${digits.slice(-18)}`;
 }
