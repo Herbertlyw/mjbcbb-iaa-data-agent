@@ -68,6 +68,9 @@ const HARBORLIGHT_QUESTIONS = [
   { id: "cte-left", label: "预聚合未匹配", text: "合成 CTE 左关联未匹配：保留 2026-10-06 到 2026-10-12 的虚构产品。" },
   { id: "null-cross", label: "空值跨事实", text: "合成空值跨事实：按地区和渠道比较 2026-10-09 收入和新增的缺失。" },
   { id: "partial-null-cross", label: "部分空值比率", text: "合成部分空值跨事实：比较 2026-10-08 到 2026-10-09 收入和新增。" },
+  { id: "cross-resource-difference", label: "收入减成本", text: "合成跨资源收入减成本：按国家和渠道比较 2026-10-08 的收入和成本。" },
+  { id: "layered-filter", label: "多层过滤关联", text: "合成多层过滤产品：统计 2026-10-06 到 2026-10-08 的收入和成本。" },
+  { id: "large-channel-days", label: "十万行（大样本模式）", text: "合成十万行渠道日期：查询 2026-10-06 到 2026-10-09 四天两个渠道的新增。" },
 ] as const;
 
 export function demoForScenario(harborlight: boolean, fixtureToday?: string) {

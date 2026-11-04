@@ -1,7 +1,7 @@
 import { isCalendarDate } from "./config.js";
 import { assertJoinKeys, parseReadonlySql, rewritePreaggregatedDimensionJoin } from "./sql.js";
 import { sumDecimalStrings } from "./exact-arithmetic.js";
-import type { DataContract, JoinConstraint } from "./types.js";
+import type { CoverageReport, DataContract, JoinConstraint } from "./types.js";
 
 /** Narrow one-fact/one-dimension JOIN whose aggregate can be recomputed from
  * the rows captured by the *same* ClickHouse SELECT. This is not an immutable
@@ -25,6 +25,8 @@ export interface JoinEvidencePlan {
   coarse?: boolean;
   /** Bounded aggregate receipts; not an immutable data snapshot. */
   aggregateProof?: boolean;
+  /** Exact finite contract scope; absent on legacy or open-ended evidence. */
+  coverageExpectedRows?: number;
 }
 
 export interface VerifiedJoinValue {
@@ -60,18 +62,70 @@ const quote = (value: string) => `'${value}'`;
  * this proof's strictly enumerated subset. Call the normal authorization and
  * freshness checks as well; this function does not grant access. */
 export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[]): JoinEvidencePlan | null {
-  return buildJoinEvidence(sql, fact, dimension, joins, false, false);
+  return buildJoinEvidence(sql, fact, dimension, joins, false, false, false);
 }
 
 /** Alternative proof for coarse CTEs with large fact populations. The database
  * checks complete-group cardinality and emits bounded dimension observations;
  * the application does not fetch or recompute every contributing fact row. */
 export function prepareJoinAggregateEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[]): JoinEvidencePlan | null {
-  const plan = buildJoinEvidence(sql, fact, dimension, joins, false, true);
+  const plan = buildJoinEvidence(sql, fact, dimension, joins, false, true, false);
   return plan?.coarse ? plan : null;
 }
 
-function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[], coarse: boolean, aggregateProof: boolean): JoinEvidencePlan | null {
+/** Coverage is admitted only for a finite contract-declared Cartesian scope.
+ * Its proof is a new SQL shape, so historical aggregate receipts stay readable. */
+export function prepareJoinCoverageEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[]): JoinEvidencePlan | null {
+  const plan = buildJoinEvidence(sql, fact, dimension, joins, false, true, true);
+  return plan?.coarse && plan.coverageExpectedRows !== undefined ? plan : null;
+}
+
+/** A closed expectation is trusted contract metadata, not model-provided
+ * labels. Each unfixed series dimension must declare its entire finite domain.
+ * All forms are validated before being interpolated into generated SQL. */
+function closedCoverageScope(series: NonNullable<DataContract["series"]>, filters: Record<string, string>, alias: string, days: number): { expected: number; predicate: string } | null {
+  const domains = series.coverage_domains ?? {};
+  if (!domains || typeof domains !== "object" || Array.isArray(domains) || !Array.isArray(series.dimensions) || !series.dimensions.length || new Set(series.dimensions).size !== series.dimensions.length || !Number.isSafeInteger(days) || days < 1 || days > 366) return null;
+  if (Object.keys(domains).some((key) => !series.dimensions.includes(key))) return null;
+  let expected = days;
+  const predicates: string[] = [];
+  for (const name of series.dimensions) {
+    if (!IDENT.test(name) || ["__proto__", "constructor", "prototype"].includes(name)) return null;
+    const raw = Object.hasOwn(domains, name) ? object(domains[name]) : null;
+    const filter = Object.hasOwn(filters, name) ? filters[name] : undefined;
+    if (!raw) { if (filter === undefined) return null; continue; }
+    const keys = Object.keys(raw).sort();
+    let cardinality: number; let contains: (value: string) => boolean; let predicate: string;
+    if (keys.join(",") === "values") {
+      const values = raw.values;
+      if (!Array.isArray(values) || !values.length || values.length > 1000 || values.some((item) => typeof item !== "string" || !LITERAL.test(item)) || new Set(values).size !== values.length) return null;
+      cardinality = values.length; contains = (value) => values.includes(value);
+      predicate = `ifNull(${alias}.${name} IN (${values.map(quote).join(", ")}), 0)`;
+    } else if (keys.join(",") === "end,prefix,start") {
+      const { prefix, start, end } = raw;
+      if (typeof prefix !== "string" || !/^[A-Za-z_][A-Za-z0-9_]{0,31}$/u.test(prefix) || !Number.isSafeInteger(start) || !Number.isSafeInteger(end) || Number(start) < 0 || Number(end) < Number(start) || Number(end) > 1_000_000) return null;
+      const lo = Number(start); const hi = Number(end); cardinality = hi - lo + 1;
+      contains = (value) => {
+        if (!value.startsWith(prefix)) return false;
+        const suffix = value.slice(prefix.length);
+        if (!/^(0|[1-9]\d*)$/u.test(suffix) || suffix.length > 7) return false;
+        const n = Number(suffix); return n >= lo && n <= hi;
+      };
+      const suffix = `substring(${alias}.${name}, ${prefix.length + 1})`;
+      const numeric = `toUInt64OrNull(${suffix})`;
+      predicate = `ifNull((startsWith(${alias}.${name}, '${prefix}') AND ${numeric} BETWEEN ${lo} AND ${hi} AND toString(${numeric}) = ${suffix}), 0)`;
+    } else return null;
+    if (filter !== undefined) { if (!contains(filter)) return null; }
+    else {
+      expected *= cardinality;
+      if (!Number.isSafeInteger(expected) || expected > 5_000_000) return null;
+      predicates.push(predicate);
+    }
+  }
+  return { expected, predicate: predicates.length ? predicates.join(" AND ") : "1" };
+}
+
+function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[], coarse: boolean, aggregateProof: boolean, coverageProof: boolean): JoinEvidencePlan | null {
   try {
     const series = fact.series;
     if (!series || series.prediction_mode !== "observed_only" || series.predicted_column || dimension.series || fact.timezone !== dimension.timezone || !fact.grain || [...fact.grain].sort().join("|") !== [series.date_column, ...series.dimensions].sort().join("|")) return null;
@@ -86,7 +140,7 @@ function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContr
       const groupFields = Array.isArray(rewrittenGroup?.columns) ? rewrittenGroup.columns : [];
       const groupsDate = groupFields.some((value) => object(value)?.type === "column_ref" && object(value)?.column === series.date_column);
       const isCoarse = groupsDate || JSON.stringify([...preaggregated.grain].sort()) !== JSON.stringify([...fact.grain].sort());
-      const proof = buildJoinEvidence(preaggregated.sql, fact, dimension, joins, isCoarse, aggregateProof);
+      const proof = buildJoinEvidence(preaggregated.sql, fact, dimension, joins, isCoarse, aggregateProof, coverageProof);
       return proof ? { ...proof, originalSql: parsed.sql } : null;
     }
     if (ast.with || ast._next || ast.having || ast.limit || ast.distinct || ast.options || ast.for_update || ast.window || !Array.isArray(ast.from) || ast.from.length !== 2) return null;
@@ -177,6 +231,10 @@ function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContr
     for (const name of Object.keys(dimensionFilters)) fields.set(`dimension.${name}`, { table: "dimension", column: name });
     const proofFields = [...fields.values()]; const metricFields = [...new Set(metrics.map((metric) => metric.column))];
     const filteredDimension = Object.keys(dimensionFilters).length > 0;
+    // Dimension predicates can exclude an unknown part of the declared fact
+    // domain. A complete Cartesian expectation is valid only without them.
+    const closedCoverage = coverageProof && !filteredDimension ? closedCoverageScope(series, factFilters, fa, dates.length) : null;
+    if (coverageProof && !closedCoverage) return null;
     if ((filteredDimension || aggregateProof) && dimColumns.has(DIMENSION_COUNT)) return null;
     // Keep physical types inside the tuple so the response metadata can be
     // checked against contracts for the actual execution, not just an earlier
@@ -197,7 +255,8 @@ function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContr
       const dimFields = proofFields.filter((field) => field.table === "dimension");
       const observations = [...relation.keys.map((key) => `${fa}.${key}`), ...dimFields.map((field) => `${da}.${field.column}`)];
       const missing = `isNull(${da}.${relation.keys[0]})`;
-      selections.push(`tuple(count(), uniqExact(tuple(${grain.join(", ")})), countIf(${missing}), countIf(ifNull(${da}.${DIMENSION_COUNT}, 0) > 1), ${metricFields.map((name) => `countIf(isNull(${fa}.${name}))`).join(", ")}, groupUniqArray(10001)(tuple(${observations.join(", ")})), any(tuple(${proof.join(", ")}))) AS ${PROOF}`);
+      const coverageExtra = closedCoverage ? `, countIf(NOT (${closedCoverage.predicate})), groupUniqArrayIf(367)(${fa}.${series.date_column}, ${metricFields.map((name) => `ifNull(${fa}.${name} = 0, 0)`).join(" OR ")})` : "";
+      selections.push(`tuple(count(), uniqExact(tuple(${grain.join(", ")})), countIf(${missing}), countIf(ifNull(${da}.${DIMENSION_COUNT}, 0) > 1), ${metricFields.map((name) => `countIf(isNull(${fa}.${name}))`).join(", ")}, groupUniqArray(10001)(tuple(${observations.join(", ")})), any(tuple(${proof.join(", ")}))${coverageExtra}) AS ${PROOF}`);
     } else selections.push(`groupArray(${coarse ? 10001 : 367})(tuple(${proof.join(", ")})) AS ${PROOF}`);
     const on = relation.keys.map((key) => `${fa}.${key} = ${da}.${key}`).join(" AND ");
     const dimensionFrom = filteredDimension || aggregateProof
@@ -217,7 +276,7 @@ function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContr
       }
       orderSql = ` ORDER BY ${order.join(", ")}`;
     }
-    return { originalSql: parsed.sql, executionSql: `SELECT ${selections.join(", ")} FROM ${fact.table} AS ${fa} ${joinType === "left" ? "LEFT JOIN" : "INNER JOIN"} ${dimensionFrom} AS ${da} ON ${on} WHERE ${conditions.join(" AND ")}${groupSql}${orderSql}`, fact: fact.table, dimension: dimension.table, joinType, joinKeys: [...relation.keys], range: { start, end, timezone: fact.timezone }, factFilters, dimensionFilters, groups, metrics, proofFields, expectedDates: dates, dateColumn: series.date_column, ...(coarse ? { coarse: true } : {}), ...(aggregateProof ? { aggregateProof: true } : {}) };
+    return { originalSql: parsed.sql, executionSql: `SELECT ${selections.join(", ")} FROM ${fact.table} AS ${fa} ${joinType === "left" ? "LEFT JOIN" : "INNER JOIN"} ${dimensionFrom} AS ${da} ON ${on} WHERE ${conditions.join(" AND ")}${groupSql}${orderSql}`, fact: fact.table, dimension: dimension.table, joinType, joinKeys: [...relation.keys], range: { start, end, timezone: fact.timezone }, factFilters, dimensionFilters, groups, metrics, proofFields, expectedDates: dates, dateColumn: series.date_column, ...(coarse ? { coarse: true } : {}), ...(aggregateProof ? { aggregateProof: true } : {}), ...(closedCoverage ? { coverageExpectedRows: closedCoverage.expected } : {}) };
   } catch { return null; }
 }
 
@@ -255,7 +314,7 @@ export function verifyJoinExecutionSchema(plan: JoinEvidencePlan, fact: DataCont
     const keys = plan.joinKeys.map((key) => lookup(fact, key));
     const dimensionFields = plan.proofFields.filter((field) => field.table === "dimension").map((field) => plan.joinType === "left" ? nullable(lookup(dimension, field.column)) : lookup(dimension, field.column));
     if ([...keys, ...dimensionFields].some((value) => !value)) return false;
-    const components = ["UInt64", "UInt64", "UInt64", "UInt64", ...metricFields.map(() => "UInt64"), `Array(Tuple(${[...keys, ...dimensionFields].join(",")}))`, `Tuple(${expected.join(",")})`];
+    const components = ["UInt64", "UInt64", "UInt64", "UInt64", ...metricFields.map(() => "UInt64"), `Array(Tuple(${[...keys, ...dimensionFields].join(",")}))`, `Tuple(${expected.join(",")})`, ...(plan.coverageExpectedRows !== undefined ? ["UInt64", `Array(${lookup(fact, fact.series.date_column)})`] : [])];
     return normalize(resultTypes[PROOF]!) === normalize(`Tuple(${components.join(",")})`);
   }
   return normalize(resultTypes[PROOF]!) === normalize(`Array(Tuple(${expected.join(",")}))`);
@@ -396,10 +455,10 @@ export function joinMissingDimensionKeys(plan: JoinEvidencePlan, rows: Array<Rec
 
 /** Bounded receipts from a full database aggregate. They prove neither data
  * completeness nor an atomic snapshot with any separate publication query. */
-function aggregateReceipt(plan: JoinEvidencePlan, row: Record<string, unknown>): { count: number; unmatched: number; observations: unknown[][] } | null {
+function aggregateReceipt(plan: JoinEvidencePlan, row: Record<string, unknown>): { count: number; unmatched: number; observations: unknown[][]; outOfDomain?: number; zeroDates?: string[] } | null {
   const fields = [...new Set(plan.metrics.map((metric) => metric.column))];
   const proof = row[PROOF];
-  if (!Array.isArray(proof) || proof.length !== 6 + fields.length) return null;
+  if (!Array.isArray(proof) || proof.length !== 6 + fields.length + (plan.coverageExpectedRows !== undefined ? 2 : 0)) return null;
   const count = (value: unknown): number | null => {
     if (!(typeof value === "string" && /^\d{1,15}$/u.test(value) || typeof value === "number" && Number.isSafeInteger(value) && value >= 0)) return null;
     const n = Number(value); return Number.isSafeInteger(n) ? n : null;
@@ -430,7 +489,30 @@ function aggregateReceipt(plan: JoinEvidencePlan, row: Record<string, unknown>):
       const filter = plan.factFilters[key]; if (filter !== undefined && filter !== keys[i]) return null;
     }
   }
+  if (plan.coverageExpectedRows !== undefined) {
+    const outOfDomain = count(proof[6 + fields.length]); const zeroDates = proof[7 + fields.length];
+    if (outOfDomain === null || outOfDomain > total || !Array.isArray(zeroDates) || zeroDates.length > plan.expectedDates.length || new Set(zeroDates).size !== zeroDates.length || zeroDates.some((date: unknown) => typeof date !== "string" || !plan.expectedDates.includes(date))) return null;
+    return { count: total, unmatched, observations, outOfDomain, zeroDates };
+  }
   return { count: total, unmatched, observations };
+}
+
+/** The expected Cartesian domain is taken only from explicit SQL equality and
+ * validated current contract domains. A matching distinct-grain count proves
+ * every member of that finite domain occurred in the same JOIN observation.
+ * It says nothing about unenumerated business objects or a database snapshot. */
+export function joinClosedCoverage(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>): CoverageReport | null {
+  if (plan.coverageExpectedRows === undefined || !verifyJoinEvidence(plan, rows)) return null;
+  let count = 0; const zeros = new Set<string>();
+  for (const row of rows) {
+    const receipt = aggregateReceipt(plan, row);
+    if (!receipt || receipt.outOfDomain !== 0 || !receipt.zeroDates) return null;
+    count += receipt.count;
+    if (!Number.isSafeInteger(count) || count > plan.coverageExpectedRows) return null;
+    for (const date of receipt.zeroDates) zeros.add(date);
+  }
+  if (count !== plan.coverageExpectedRows) return null;
+  return { status: "known", reason: "已按当前契约的封闭维度域及查询等值筛选，核对每个预期业务键和日期；未声明的对象不在此证明范围内。", table: plan.fact, expected_days: plan.expectedDates.length, absent_dates: [], null_dates: [], zero_dates: [...zeros].sort(), predicted_dates: [], actual_dates: [...plan.expectedDates], unknown_prediction_dates: [], groups: [] };
 }
 
 function verifyJoinAggregateEvidence(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>): VerifiedJoinValue[] | null {

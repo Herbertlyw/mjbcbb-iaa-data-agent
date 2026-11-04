@@ -1,5 +1,6 @@
 /** Transform only complete, already verified rows. Values are decimal strings;
  * no calculation here converts a numeric input through JavaScript Number. */
+import { arithmeticUnit, type ArithmeticOp } from "./exact-arithmetic.js";
 export type ResultValue = string | boolean | null;
 export interface ResultColumn {
   name: string;
@@ -27,7 +28,7 @@ export function fitsResultCalculationBytes(value: unknown): boolean {
 export type TransformStep =
   | ({ op: "filter"; column: string } & ({ comparison: ComparisonOp; value: string | boolean | null; other_column?: never } | { comparison: ComparisonOp; other_column: string; value?: never } | { comparison: "is_null" | "is_not_null"; value?: never; other_column?: never }))
   | { op: "compare"; left: string; right: string; comparison: ComparisonOp; as: string }
-  | { op: "divide"; left: string; right: string; as: string }
+  | { op: ArithmeticOp; left: string; right: string; as: string }
   | { op: "sort"; keys: Array<{ column: string; direction: "asc" | "desc"; nulls: "first" | "last" }> }
   | { op: "group"; by: string[]; aggregates: Array<{ op: "count_all" | "count" | "sum" | "min" | "max"; column?: string; as: string }> };
 
@@ -35,7 +36,7 @@ const namePattern = /^[a-z_][a-z0-9_]{0,63}$/u;
 const comparisons = new Set<ComparisonOp>(["eq", "ne", "lt", "le", "gt", "ge"]);
 
 /** Returns null for malformed instructions, incompatible units or overflow. */
-export function transformResult(input: ResultTable, steps: TransformStep[], authorizeDivide?: (left: ResultColumn, right: ResultColumn) => boolean): ResultTable | null {
+export function transformResult(input: ResultTable, steps: TransformStep[], authorizeArithmetic?: (left: ResultColumn, right: ResultColumn, op: ArithmeticOp) => boolean): ResultTable | null {
   if (!Array.isArray(steps) || steps.length < 1 || steps.length > RESULT_TRANSFORM_MAX_STEPS || !validTable(input)) return null;
   let table: ResultTable = { columns: input.columns.map((c) => ({ ...c })), rows: input.rows.map((r) => ({ ...r })) };
   for (const step of steps) {
@@ -62,14 +63,20 @@ export function transformResult(input: ResultTable, steps: TransformStep[], auth
       const output: ResultColumn = { name: step.as, type: "boolean", unit: "布尔值", label: `比较（${left.label} ${step.comparison} ${right.label}）` };
       table.columns.push(output);
       table.rows = table.rows.map((row) => ({ ...row, [step.as]: compare(row[left.name]!, row[right.name]!, left, step.comparison) }));
-    } else if (step.op === "divide") {
+    } else if (["add", "subtract", "multiply", "divide"].includes(step.op)) {
+      // Narrow explicitly for direct callers that bypass the Pi schema.
+      if (!(step.op === "add" || step.op === "subtract" || step.op === "multiply" || step.op === "divide")) return null;
       const left = column(step.left); const right = column(step.right);
-      if (!left || !right || left.type !== "decimal" || right.type !== "decimal" || !validName(step.as, table.columns) || !authorizeDivide?.(left, right)) return null;
-      const output: ResultColumn = { name: step.as, type: "decimal", scale: 18, unit: left.unit === right.unit ? "比值" : `(${left.unit})/(${right.unit})`, label: `（${left.label} / ${right.label}）` };
+      if (!left || !right || left.type !== "decimal" || right.type !== "decimal" || !validName(step.as, table.columns) || !authorizeArithmetic?.(left, right, step.op)) return null;
+      const unit = arithmeticUnit(step.op, left.unit, right.unit);
+      const scale = step.op === "divide" ? 18 : step.op === "multiply" ? left.scale! + right.scale! : Math.max(left.scale!, right.scale!);
+      if (!unit || scale > 38) return null;
+      const symbol = { add: "+", subtract: "−", multiply: "×", divide: "/" }[step.op];
+      const output: ResultColumn = { name: step.as, type: "decimal", scale, unit, label: `（${left.label} ${symbol} ${right.label}）` };
       const rows: Array<Record<string, ResultValue>> = [];
       for (const row of table.rows) {
         const x = row[left.name]; const y = row[right.name];
-        const value = x === null || y === null ? null : divide(x as string, y as string);
+        const value = x === null || y === null ? null : step.op === "divide" ? divide(x as string, y as string) : arithmetic(step.op, x as string, y as string, scale);
         if (value === undefined) return null;
         rows.push({ ...row, [step.as]: value });
       }
@@ -135,6 +142,24 @@ export function transformResult(input: ResultTable, steps: TransformStep[], auth
     if (!validTable(table)) return null;
   }
   return table;
+}
+
+/** Exact fixed-scale non-division arithmetic, bounded before returning. */
+function arithmetic(op: "add" | "subtract" | "multiply", left: string, right: string, scale: number): string | undefined {
+  const a = decimal(left); const b = decimal(right);
+  if (!a || !b || a.scale > scale || b.scale > scale) return undefined;
+  let n: bigint;
+  if (op === "multiply") {
+    if (a.scale + b.scale > scale) return undefined;
+    n = a.n * b.n * 10n ** BigInt(scale - a.scale - b.scale);
+  } else {
+    const x = a.n * 10n ** BigInt(scale - a.scale); const y = b.n * 10n ** BigInt(scale - b.scale);
+    n = op === "add" ? x + y : x - y;
+  }
+  const sign = n < 0n ? "-" : ""; const digits = (n < 0n ? -n : n).toString();
+  if (digits.length > 76) return undefined;
+  const padded = digits.padStart(scale + 1, "0");
+  return scale ? `${sign}${padded.slice(0, -scale)}.${padded.slice(-scale)}` : `${sign}${padded}`;
 }
 
 function validName(name: unknown, columns: ResultColumn[]): name is string { return typeof name === "string" && namePattern.test(name) && !["__proto__", "constructor", "prototype"].includes(name) && !columns.some((c) => c.name === name); }

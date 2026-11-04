@@ -68,6 +68,26 @@ test("受授权分组比率定点除法：正负半数远离零，NULL 和零分
   assert.equal(filtered?.rows[0]?.n, "1");
 });
 
+test("授权四则按列标度精确运算，混合标度、负值和空值不经浮点", () => {
+  const input: ResultTable = { columns: [
+    { name: "a", type: "decimal", unit: "USD", label: "收入", scale: 2 },
+    { name: "b", type: "decimal", unit: "USD", label: "成本", scale: 3 },
+  ], rows: [{ a: "90071992547409.91", b: "0.099" }, { a: "-0.01", b: "0.005" }, { a: null, b: "0.000" }] };
+  const authorize = () => true;
+  for (const op of ["add", "subtract", "multiply"] as const) {
+    assert.equal(transformResult(input, [{ op, left: "a", right: "b", as: "x" }]), null, "必须有宿主授权");
+  }
+  const added = transformResult(input, [{ op: "add", left: "a", right: "b", as: "x" }], authorize);
+  assert.deepEqual(added?.rows.map((row) => row.x), ["90071992547410.009", "-0.005", null]);
+  const diff = transformResult(input, [{ op: "subtract", left: "a", right: "b", as: "x" }], authorize);
+  assert.deepEqual(diff?.rows.map((row) => row.x), ["90071992547409.811", "-0.015", null]);
+  const product = transformResult(input, [{ op: "multiply", left: "a", right: "b", as: "x" }], authorize);
+  assert.deepEqual(product?.rows.map((row) => row.x), ["8917127262193.58109", "-0.00005", null]);
+  assert.equal(product?.columns.find((column) => column.name === "x")?.unit, "(USD)×(USD)");
+  const mismatched = structuredClone(input); mismatched.columns[1]!.unit = "人";
+  assert.equal(transformResult(mismatched, [{ op: "subtract", left: "a", right: "b", as: "x" }], authorize), null);
+});
+
 test("参考计算模块：NULL 谓词、列比较筛选和等值十进制分组", () => {
   const missing = transformResult(fixture, [{ op: "filter", column: "amount", comparison: "is_null" }]);
   assert.deepEqual(missing?.rows.map((row) => row.country), ["US", "JP"]);

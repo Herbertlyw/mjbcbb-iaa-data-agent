@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
-import { promisify } from "node:util";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -13,8 +10,8 @@ import { probeClickHouseAndPublish } from "../src/freshness.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import { createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
 import { analyst, bindTables, withRuntime } from "./helpers.js";
+import { isolatedDocker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
 
-const exec = promisify(execFile);
 const root = fileURLToPath(new URL("..", import.meta.url));
 const knowledge = loadKnowledge(path.join(root, "knowledge", "harborlight"));
 const fact = knowledge.contract_by_table.get("fact_fox_daily_install")!.contract!;
@@ -45,16 +42,12 @@ test("JOIN 证明规划只接受可核对完整粒度和登记键的 SQL", () =>
 });
 
 test("隔离 ClickHouse 在同次 JOIN 读取中证明产品和渠道分组，并拒绝重复键及篡改", async () => {
-  const portServer = createServer();
-  await new Promise<void>((resolve) => portServer.listen(0, "127.0.0.1", resolve));
-  const address = portServer.address(); assert.ok(address && typeof address === "object"); const port = address.port;
-  await new Promise<void>((resolve, reject) => portServer.close((error) => error ? reject(error) : resolve()));
   const name = `dataagent-join-${randomUUID()}`; const password = randomBytes(20).toString("hex");
-  const url = `http://127.0.0.1:${port}`;
-  let created = false;
+  const ownedContainers: string[] = [];
   try {
-    await exec("docker", ["run", "--pull=never", "-d", "--name", name, "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", `127.0.0.1:${port}:8123`, "-e", `CLICKHOUSE_PASSWORD=${password}`, "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"]);
-    created = true;
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", name, "--label", `dataagent.test.run=${name}`, "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", "127.0.0.1::8123", "-e", `CLICKHOUSE_PASSWORD=${password}`, "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"], name, name, ownedContainers);
+    const port = await loopbackPort(name, 8123);
+    const url = `http://127.0.0.1:${port}`;
     const deadline = Date.now() + 45_000;
     while (true) {
       try { const response = await fetch(`${url}/ping`); if (response.ok) break; } catch { /* container still starting */ }
@@ -246,6 +239,6 @@ test("隔离 ClickHouse 在同次 JOIN 读取中证明产品和渠道分组，�
       } finally { await reader.close(); }
     } finally { await client.close(); }
   } finally {
-    if (created) await exec("docker", ["rm", "-f", name]);
+    for (const owned of ownedContainers) await isolatedDocker(["rm", "-f", owned]);
   }
 });

@@ -126,7 +126,10 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成收入成本比")) return scripted(turn, ratioSteps);
   if (latest.includes("合成多渠道收入成本比")) return scripted(turn, groupedRatioSteps);
   if (latest.includes("合成分组对齐")) return scripted(turn, alignmentSteps);
+  if (latest.includes("合成跨资源收入减成本")) return scripted(turn, crossResourceDifferenceSteps);
   if (latest.includes("合成未声明反向比率")) return scripted(turn, (ids) => coarseChannelRatioSteps(ids, true));
+  if (latest.includes("合成多层过滤产品")) return scripted(turn, layeredFilterSteps);
+  if (latest.includes("合成日期函数查询")) return scripted(turn, dateFunctionSteps);
   if (latest.includes("合成十万行渠道日期")) return scripted(turn, largeJoinSteps);
   if (latest.includes("合成渠道关联比率")) return scripted(turn, coarseChannelRatioSteps);
   if (latest.includes("合成粗粒度渠道关联")) return scripted(turn, coarseChannelJoinSteps);
@@ -153,6 +156,39 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("日本") && (hasBase || latest.includes("雾帆"))) return scripted(turn, japanSteps);
   if (latest.includes("连表")) return scripted(turn, unsafeJoinSteps);
   return scripted(turn, defaultSteps);
+}
+
+function crossResourceDifferenceSteps(ids: string[]) {
+  const where = "event_date = '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios'";
+  return [
+    { id: "difference_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "difference_revenue", name: "query", arguments: JSON.stringify({ sql: `SELECT country_code, channel_id, SUM(amount_usd) AS total FROM fact_fox_daily_payment WHERE ${where} GROUP BY country_code, channel_id` }) },
+    { id: "difference_cost", name: "query", arguments: JSON.stringify({ sql: `SELECT country_code, channel_id, SUM(cost_usd) AS total FROM fact_fox_daily_payment WHERE ${where} GROUP BY country_code, channel_id` }) },
+    { id: "difference_align", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "subtract", keys: ["country_code", "channel_id"], left: { resource_id: ids[0] ?? "", cell: "total" }, right: { resource_id: ids[1] ?? "", cell: "total" } } }) },
+    { id: "difference_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+function dateFunctionSteps(ids: string[]) {
+  const where = "event_date >= toDate('2026-10-06') AND event_date <= toDate('2026-10-08') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'JP' AND channel_id = 'mist_ads'";
+  return [
+    { id: "date_function_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "date_function_detail", name: "query", arguments: JSON.stringify({ sql: `SELECT event_date,title_id,platform,country_code,channel_id,new_users FROM fact_fox_daily_install WHERE ${where}` }) },
+    { id: "date_function_aggregate", name: "query", arguments: JSON.stringify({ sql: `SELECT SUM(new_users) AS total FROM fact_fox_daily_install WHERE ${where}` }) },
+    { id: "date_function_calc", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "new_users", as: "total" }] }) },
+    { id: "date_function_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+function layeredFilterSteps(ids: string[]) {
+  const sql = "WITH a AS (SELECT f.title_id AS id, f.channel_id AS ch, SUM(f.amount_usd) AS amount, SUM(f.cost_usd) AS cost FROM fact_fox_daily_payment f WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-08' AND f.platform = 'ios' AND f.country_code = 'US' GROUP BY f.title_id, f.channel_id), b AS (SELECT id AS item, ch AS chn, amount AS price, cost AS c FROM a WHERE id = 'paper_lantern'), c AS (SELECT item AS product, chn AS chan, price AS revenue, c AS cost2 FROM b WHERE chn = 'mist_ads') SELECT p.product, p.chan, d.title_name AS label, SUM(p.revenue) AS total, SUM(p.cost2) AS expense FROM c p LEFT JOIN dim_fox_title d ON p.product = d.title_id GROUP BY p.product, p.chan, d.title_name ORDER BY p.product";
+  return [
+    { id: "layered_filter_fact_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "layered_filter_dimension_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.dim_fox_title" }) },
+    { id: "layered_filter_query", name: "query", arguments: JSON.stringify({ sql }) },
+    { id: "layered_filter_transform", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: [{ op: "group", by: [], aggregates: [{ op: "sum", column: "total", as: "all_total" }] }] } }) },
+    { id: "layered_filter_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
 }
 
 function coarseChannelRatioSteps(ids: string[], reverse = false) {

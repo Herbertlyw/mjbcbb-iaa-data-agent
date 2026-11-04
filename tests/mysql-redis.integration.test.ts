@@ -19,6 +19,7 @@ import { loadKnowledge } from "../src/knowledge.js";
 import { bindTables } from "./helpers.js";
 import type { AnalysisRecord } from "../src/types.js";
 import { stopProcess } from "./process-control.js";
+import { isolatedDocker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const password = randomBytes(18).toString("hex");
@@ -31,9 +32,9 @@ const redisName = `lumenfox-it-${suffix}-redis`;
 
 test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢复", async () => {
   await assertLocalImages();
-  const mysqlPort = await freePort();
-  const redisPort = await freePort();
-  const apiPort = await freePort();
+  let mysqlPort = 0;
+  let redisPort = 0;
+  let apiPort = 0;
   const dir = mkdtempSync(path.join(tmpdir(), "lumenfox-it-"));
   const databasePath = path.join(dir, "business.sqlite");
   const freshnessPath = path.join(dir, "freshness.json");
@@ -51,13 +52,13 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
   const store = () => AsyncMysqlStateStore.open(connection);
   let authority: AsyncMysqlStateStore | undefined;
   let other: AsyncMysqlStateStore | undefined;
-  let mysqlCreated = false;
-  let redisCreated = false;
+  const ownedContainers: string[] = [];
   try {
-    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", mysqlName, "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${password}`, "-e", `MYSQL_DATABASE=${database}`, "-e", `MYSQL_USER=${user}`, "-e", `MYSQL_PASSWORD=${password}`, "mysql:8.0.32", "--bind-address=0.0.0.0", "--skip-log-bin"], password);
-    mysqlCreated = true;
-    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", redisName, "--tmpfs", "/data:rw,size=64m", "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", password], password);
-    redisCreated = true;
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", mysqlName, "--label", `dataagent.test.run=${suffix}`, "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", "127.0.0.1::3306", "-e", `MYSQL_ROOT_PASSWORD=${password}`, "-e", `MYSQL_DATABASE=${database}`, "-e", `MYSQL_USER=${user}`, "-e", `MYSQL_PASSWORD=${password}`, "mysql:8.0.32", "--bind-address=0.0.0.0", "--skip-log-bin"], mysqlName, suffix, ownedContainers);
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", redisName, "--label", `dataagent.test.run=${suffix}`, "--tmpfs", "/data:rw,size=64m", "-p", "127.0.0.1::6379", "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", password], redisName, suffix, ownedContainers);
+    [mysqlPort, redisPort] = await Promise.all([loopbackPort(mysqlName, 3306), loopbackPort(redisName, 6379)]);
+    apiPort = await freePort();
+    connection.port = mysqlPort;
     await waitForMysql(mysqlPort);
     await waitForRedis(redisPort);
     authority = await store();
@@ -603,8 +604,7 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
     await authority?.close();
     await other?.close();
     for (const child of children) await stopProcess(child);
-    if (mysqlCreated) await runQuiet("docker", ["rm", "-f", mysqlName], password).catch(() => undefined);
-    if (redisCreated) await runQuiet("docker", ["rm", "-f", redisName], password).catch(() => undefined);
+    for (const name of ownedContainers.reverse()) await isolatedDocker(["rm", "-f", name]).catch(() => undefined);
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -799,18 +799,9 @@ async function assertLocalImages() {
   await runQuiet("docker", ["image", "inspect", "redis:6.2"], password);
 }
 
-function runQuiet(command: string, args: string[], secret: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "ignore", "pipe"] });
-    let err = "";
-    child.stderr.on("data", (chunk: Buffer) => {
-      err += chunk.toString();
-    });
-    child.on("exit", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error((err || `${command} exit ${code}`).replaceAll(secret, "[secret]").slice(0, 400)));
-    });
-  });
+async function runQuiet(command: string, args: string[], _secret: string): Promise<void> {
+  if (command !== "docker") throw new Error("unexpected_test_command");
+  await isolatedDocker(args);
 }
 
 function freePort(): Promise<number> {

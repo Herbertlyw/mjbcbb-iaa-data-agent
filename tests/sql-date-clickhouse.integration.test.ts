@@ -1,39 +1,29 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
-import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { clickHouseCommand, clickHouseInsert, clickHouseQuery, createClickHouseClient } from "../src/clickhouse-client.js";
 import { probeClickHouseAndPublish } from "../src/freshness.js";
 import { createRuntime } from "../src/runtime.js";
 import { createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
 import { bindTables } from "./helpers.js";
+import { isolatedDocker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
 
-const run = promisify(execFile);
 const knowledgeDir = fileURLToPath(new URL("../knowledge/harborlight/", import.meta.url));
-async function docker(args: string[]): Promise<void> {
-  try { await run("docker", args); } catch { throw new Error("isolated container operation failed"); }
-}
 
 test("隔离 ClickHouse：日期等值及 BETWEEN 按实际查询与覆盖交付", async () => {
   const name = `lumenfox-sqldate-${randomUUID()}`;
   const adminPassword = randomBytes(16).toString("hex");
   const readerPassword = randomBytes(16).toString("hex");
   const dir = mkdtempSync(path.join(tmpdir(), "lumenfox-sqldate-"));
-  const port = await new Promise<number>((resolve, reject) => {
-    const socket = createServer(); socket.on("error", reject);
-    socket.listen(0, "127.0.0.1", () => { const address = socket.address(); if (!address || typeof address === "string") return reject(new Error("ephemeral port unavailable")); socket.close((error) => error ? reject(error) : resolve(address.port)); });
-  });
-  const url = `http://127.0.0.1:${port}`;
-  let created = false;
+  const ownedContainers: string[] = [];
   try {
-    await docker(["run", "--pull=never", "-d", "--name", name, "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", `127.0.0.1:${port}:8123`, "-e", `CLICKHOUSE_PASSWORD=${adminPassword}`, "-e", "CLICKHOUSE_DB=harborlight", "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"]);
-    created = true;
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", name, "--label", `dataagent.test.run=${name}`, "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", "127.0.0.1::8123", "-e", `CLICKHOUSE_PASSWORD=${adminPassword}`, "-e", "CLICKHOUSE_DB=harborlight", "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"], name, name, ownedContainers);
+    const port = await loopbackPort(name, 8123);
+    const url = `http://127.0.0.1:${port}`;
     const deadline = Date.now() + 60_000;
     while (true) {
       try { if ((await fetch(url, { signal: AbortSignal.timeout(1000) })).ok) break; } catch { /* container is starting */ }
@@ -78,7 +68,7 @@ test("隔离 ClickHouse：日期等值及 BETWEEN 按实际查询与覆盖交付
       } finally { await reader.close(); }
     } finally { await admin.close(); }
   } finally {
-    if (created) await docker(["rm", "-f", name]).catch(() => undefined);
+    for (const owned of ownedContainers) await isolatedDocker(["rm", "-f", owned]).catch(() => undefined);
     rmSync(dir, { recursive: true, force: true });
   }
 });

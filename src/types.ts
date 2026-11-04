@@ -56,8 +56,13 @@ export interface DataContract {
     predicted_column?: string | null;
     prediction_mode?: "observed_only";
     prediction_values?: { actual: number; predicted: number };
+    /** Explicitly closed expected domain for a dimension. Absent means unknown,
+     * not an empty set; consumers must validate every value and bound. */
+    coverage_domains?: Record<string, { values: string[] } | { prefix: string; start: number; end: number }>;
   };
-  derived_metrics?: Array<{ id: string; label: string; operation: "divide"; numerator: string; denominator: string; prediction: "actual_only"; unit: string }>;
+  /** numerator and denominator identify the ordered left/right operands for
+   * all operations, retained for backwards-compatible contract files. */
+  derived_metrics?: Array<{ id: string; label: string; operation: import("./exact-arithmetic.js").ArithmeticOp; numerator: string; denominator: string; prediction: "actual_only"; unit: string }>;
   columns: ContractColumn[];
   sensitive_columns: string[];
   grain?: string[];

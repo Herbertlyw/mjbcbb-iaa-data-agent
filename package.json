@@ -14,7 +14,7 @@
     "start:freshness": "tsx src/freshness-probe.ts",
     "demo:stack": "tsx scripts/local-isolated-stack.ts",
     "seed:clickhouse": "tsx src/seed-clickhouse.ts",
-    "test": "node --import tsx --import ./tests/test-clock.mjs --test tests/*.test.ts",
+    "test": "node --import tsx --import ./tests/test-clock.mjs --test --test-concurrency=2 tests/*.test.ts",
     "typecheck": "tsc --noEmit",
     "knowledge-check": "tsx src/knowledge-doctor.ts",
     "export-diagrams": "ruby scripts/重新导出架构图.rb",

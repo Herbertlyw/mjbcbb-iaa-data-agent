@@ -2,6 +2,16 @@ import type { VerifiedAggregate } from "./aggregate-evidence.js";
 
 export type ArithmeticOp = "add" | "subtract" | "multiply" | "divide";
 
+/** Units are host-derived, never supplied by a model. Directed operations
+ * still require a matching contract declaration for different metrics. */
+export function arithmeticUnit(op: ArithmeticOp, left: string, right: string): string | null {
+  if (!left || !right || left === "契约未声明" || right === "契约未声明") return null;
+  if (op === "add" || op === "subtract") return left === right ? left : null;
+  if (op === "multiply") return `(${left})×(${right})`;
+  if (op === "divide") return left === right ? "比值" : `(${left})/(${right})`;
+  return null;
+}
+
 /** A real observed zero can be encoded as an integer or exact Decimal. */
 export function isExactZero(value: unknown): boolean {
   return value === 0 || typeof value === "string" && /^-?0+(?:\.0+)?$/u.test(value);

@@ -15,6 +15,7 @@ import { MysqlFreshnessStore } from "../src/mysql-freshness.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import { createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
 import { startFakeOpenAI } from "./openai-fake-server.js";
+import { isolatedDocker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const sourceKnowledgeDir = path.join(root, "knowledge", "harborlight");
@@ -23,10 +24,6 @@ const question = "纸灯 在 2026-10-06 到 2026-10-12（美国、iOS、雾帆�
 
 test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未知派发不会被重试", async () => {
   const fake = await startFakeOpenAI(token);
-  const clickhousePort = await freePort();
-  const mysqlPort = await freePort();
-  const redisPort = await freePort();
-  const apiPort = await freePort();
   const adminPassword = randomBytes(12).toString("hex");
   const readerPassword = randomBytes(12).toString("hex");
   const statePassword = randomBytes(12).toString("hex");
@@ -47,12 +44,13 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       assert.ok(dimension); dimension.type = "Nullable(String)"; dimension.nullable = true;
       writeFileSync(file, JSON.stringify(contract));
     }
-    await docker(["run", "--pull=never", "-d", "--name", names[0], "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", `127.0.0.1:${clickhousePort}:8123`, "-e", `CLICKHOUSE_PASSWORD=${adminPassword}`, "-e", "CLICKHOUSE_DB=harborlight", "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"]);
-    createdContainers.push(names[0]!);
-    await docker(["run", "--pull=never", "-d", "--name", names[1], "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${statePassword}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${statePassword}`, "mysql:8.0.32"]);
-    createdContainers.push(names[1]!);
-    await docker(["run", "--pull=never", "-d", "--name", names[2], "--tmpfs", "/data:rw,size=64m", "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", statePassword]);
-    createdContainers.push(names[2]!);
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", names[0]!, "--label", `dataagent.test.run=${suffix}`, "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", "127.0.0.1::8123", "-e", `CLICKHOUSE_PASSWORD=${adminPassword}`, "-e", "CLICKHOUSE_DB=harborlight", "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"], names[0]!, suffix, createdContainers);
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", names[1]!, "--label", `dataagent.test.run=${suffix}`, "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", "127.0.0.1::3306", "-e", `MYSQL_ROOT_PASSWORD=${statePassword}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${statePassword}`, "mysql:8.0.32"], names[1]!, suffix, createdContainers);
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", names[2]!, "--label", `dataagent.test.run=${suffix}`, "--tmpfs", "/data:rw,size=64m", "-p", "127.0.0.1::6379", "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", statePassword], names[2]!, suffix, createdContainers);
+    const clickhousePort = await loopbackPort(names[0]!, 8123);
+    const mysqlPort = await loopbackPort(names[1]!, 3306);
+    const redisPort = await loopbackPort(names[2]!, 6379);
+    const apiPort = await freePort();
     const clickhouseUrl = `http://127.0.0.1:${clickhousePort}`;
     await waitHttp(clickhouseUrl);
     const bootstrap = createClickHouseClient({ url: clickhouseUrl, username: "default", password: adminPassword, database: "default", maxRowsToRead: 5_000_000, timeoutSeconds: 30 }, false);
@@ -89,6 +87,8 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     await clickHouseInsert(admin, "fact_fox_cohort_payback", data.cohortPayback);
     await clickHouseInsert(admin, "fact_fox_experiment_arm", data.arms);
     await clickHouseInsert(admin, "fact_fox_experiment_metric", data.experimentMetrics);
+    const dateEndpoints = await clickHouseQuery(admin, "SELECT toString(toDate('1970-01-01')) AS first_day, toString(toDate('2149-06-06')) AS last_day");
+    assert.deepEqual(dateEndpoints, [{ first_day: "1970-01-01", last_day: "2149-06-06" }]);
     await clickHouseCommand(admin, `CREATE USER IF NOT EXISTS fox_reader IDENTIFIED BY '${readerPassword}'`);
     await clickHouseCommand(admin, "GRANT SELECT ON harborlight.* TO fox_reader");
     await admin.close();
@@ -527,7 +527,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.match(coarseSource.sql ?? "", /^WITH p AS /); assert.match(coarseSource.executed_sql ?? "", /groupArray/);
     assert.notEqual(coarseSource.executed_sql, coarseSource.sql); assert.equal(coarseSource.execution_settings?.join_use_nulls, true);
     assert.ok(coarseSource.execution_id); assert.equal(coarseSource.freshness_receipts?.length, 2);
-    assert.equal(coarseSource.contract_revisions?.fact_fox_daily_payment, "contract.fact_fox_daily_payment-r3");
+    assert.equal(coarseSource.contract_revisions?.fact_fox_daily_payment, "contract.fact_fox_daily_payment-r4");
     assert.equal(coarseSource.contract_revisions?.dim_fox_title, "contract.dim_fox_title-r2");
     const coarseHash = coarse.analysis?.resource_hashes?.[String(coarseSource.resource_id)]; assert.ok(coarseHash);
     const coarsePage = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${coarseSession}/resources/${coarseSource.resource_id}?offset=0&limit=100&resource_hash=${coarseHash}`);
@@ -535,6 +535,52 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     const coarseResource = await coarsePage.json() as { resource: { session_id: string; job_id: string; execution_id: string } };
     assert.equal(coarseResource.resource.session_id, coarseSession); assert.equal(coarseResource.resource.job_id, coarse.job_id);
     assert.equal(coarseResource.resource.execution_id, coarseSource.execution_id);
+    const layeredSession = await createSyntheticSession();
+    const layered = await postQuestion(apiPort, layeredSession, "合成多层过滤产品：按产品与渠道统计收入和成本。");
+    assert.equal(layered.status, "completed", `${JSON.stringify(layered.error)} ${layered.analysis?.answer ?? ""}`);
+    // Independent fixed-point sums over the original synthetic rows:
+    // 90071992547409.91 + .09 + 1.00, and .10 + .03 + 2.00.
+    assert.match(layered.analysis?.answer ?? "", /JOIN 求和 90071992547411\.00；单位 USD/);
+    assert.match(layered.analysis?.answer ?? "", /JOIN 求和 2\.13；单位 USD/);
+    assert.match(layered.analysis?.answer ?? "", /的合计=90071992547411\.00（USD）/);
+    const layeredSource = layered.analysis?.sources?.[0]; assert.ok(layeredSource);
+    assert.equal(layeredSource.engine, "clickhouse-local");
+    assert.match(layeredSource.sql ?? "", /FROM a WHERE id = 'paper_lantern'/);
+    assert.match(layeredSource.sql ?? "", /FROM b WHERE chn = 'mist_ads'/);
+    assert.match(layeredSource.executed_sql ?? "", /title_id = 'paper_lantern'/);
+    assert.match(layeredSource.executed_sql ?? "", /channel_id = 'mist_ads'/);
+    assert.notEqual(layeredSource.sql, layeredSource.executed_sql);
+    assert.equal(layeredSource.freshness_receipts?.length, 2);
+    assert.equal(layered.events.filter((event) => event.type === "job_finished").length, 1);
+    const layeredHash = layered.analysis?.resource_hashes?.[String(layeredSource.resource_id)]; assert.ok(layeredHash);
+    const layeredPage = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${layeredSession}/resources/${layeredSource.resource_id}?offset=0&limit=100&resource_hash=${layeredHash}`);
+    assert.equal(layeredPage.status, 200);
+    const layeredResource = await layeredPage.json() as { resource: { session_id: string; job_id: string; execution_id: string } };
+    assert.equal(layeredResource.resource.session_id, layeredSession);
+    assert.equal(layeredResource.resource.job_id, layered.job_id);
+    assert.equal(layeredResource.resource.execution_id, layeredSource.execution_id);
+    const dateSession = await createSyntheticSession();
+    const dateFunction = await postQuestion(apiPort, dateSession, "合成日期函数查询：纸灯日本 iOS 雾帆的三日新增。");
+    assert.equal(dateFunction.status, "completed", `${JSON.stringify(dateFunction.error)} ${dateFunction.analysis?.answer ?? ""}`);
+    // Three independently seeded Japanese daily observations of 10 each.
+    assert.match(dateFunction.analysis?.answer ?? "", /合计 30；单位 人/);
+    assert.match(dateFunction.analysis?.answer ?? "", /数据库求和 30；单位 人/);
+    assert.equal(dateFunction.analysis?.sources?.length, 2);
+    for (const source of dateFunction.analysis?.sources ?? []) {
+      assert.equal(source.engine, "clickhouse-local");
+      assert.match(source.sql ?? "", /toDate\('2026-10-06'\)/);
+      assert.equal(source.sql, source.executed_sql);
+      assert.equal(source.freshness_receipts?.length, 1);
+      assert.ok(source.execution_id);
+      const hash: string | undefined = dateFunction.analysis?.resource_hashes?.[String(source.resource_id)]; assert.ok(hash);
+      const page: Response = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${dateSession}/resources/${source.resource_id}?offset=0&limit=100&resource_hash=${hash}`);
+      assert.equal(page.status, 200);
+      const saved = await page.json() as { resource: { session_id: string; job_id: string; execution_id: string } };
+      assert.equal(saved.resource.session_id, dateSession);
+      assert.equal(saved.resource.job_id, dateFunction.job_id);
+      assert.equal(saved.resource.execution_id, source.execution_id);
+    }
+    assert.equal(dateFunction.events.filter((event) => event.type === "job_finished").length, 1);
     const channelCoarse = await postQuestion(apiPort, await createSyntheticSession(), "合成粗粒度渠道关联：按渠道统计美国收入和成本。");
     assert.equal(channelCoarse.status, "completed", `${JSON.stringify(channelCoarse.error)} ${channelCoarse.analysis?.answer ?? ""} events=${JSON.stringify(channelCoarse.events)}`);
     // Independent rows: mist_ads has (1.00, 2.00), pebble_net has
@@ -555,6 +601,15 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     const inverseRatio = await postQuestion(apiPort, await createSyntheticSession(), "合成未声明反向比率：按渠道比较成本和收入。");
     assert.ok(inverseRatio.events.some((event) => event.type === "tool_finished" && event.payload.tool_name === "calculate_session_cells" && event.payload.is_error === true));
     assert.doesNotMatch(inverseRatio.analysis?.answer ?? "", /=2\.000000000000000000（比值）/);
+    const difference = await postQuestion(apiPort, await createSyntheticSession(), "合成跨资源收入减成本：分别查询后按国家和渠道对齐。");
+    assert.equal(difference.status, "completed", `${JSON.stringify(difference.error)} ${difference.analysis?.answer ?? ""}`);
+    // Independent fixture arithmetic: JP 3−2=1; US mist 1−2=−1;
+    // US pebble 6−3=3. Both resources are separate persisted queries.
+    assert.match(difference.analysis?.answer ?? "", /channel_id=mist_ads，country_code=JP[^\n]*结果 1\.00 USD/);
+    assert.match(difference.analysis?.answer ?? "", /channel_id=mist_ads，country_code=US[^\n]*结果 -1\.00 USD/);
+    assert.match(difference.analysis?.answer ?? "", /channel_id=pebble_net，country_code=US[^\n]*结果 3\.00 USD/);
+    assert.equal(difference.analysis?.sources?.length, 2);
+    assert.notEqual(difference.analysis?.sources?.[0]?.resource_id, difference.analysis?.sources?.[1]?.resource_id);
     const preaggregatedLeft = await postQuestion(apiPort, await createSyntheticSession(), "合成 CTE 左关联未匹配：保留虚构产品。");
     assert.equal(preaggregatedLeft.status, "completed", `${JSON.stringify(preaggregatedLeft.error)} ${preaggregatedLeft.analysis?.answer ?? ""}`);
     assert.match(preaggregatedLeft.analysis?.answer ?? "", new RegExp(`JOIN 求和 ${preaggregatedExpected.zz_known}`));
@@ -667,7 +722,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
   } finally {
     for (const child of children) if (child.exitCode === null) child.kill("SIGKILL");
     await fake.close();
-    if (createdContainers.length) await docker(["rm", "-f", ...createdContainers]).catch(() => undefined);
+    if (createdContainers.length) await isolatedDocker(["rm", "-f", ...createdContainers]).catch(() => undefined);
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -743,13 +798,6 @@ function stopChild(child: ChildProcess) {
     if (child.exitCode !== null || child.signalCode !== null) return resolve();
     child.once("exit", () => resolve());
     child.kill("SIGKILL");
-  });
-}
-
-function docker(args: string[]) {
-  return new Promise<void>((resolve, reject) => {
-    const child = spawn("docker", args, { stdio: "ignore" });
-    child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`docker ${code}`))));
   });
 }
 

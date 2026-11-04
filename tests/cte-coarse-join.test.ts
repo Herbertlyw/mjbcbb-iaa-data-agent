@@ -1,7 +1,6 @@
+import { isolatedDocker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { promisify } from "node:util";
 import test from "node:test";
 import { loadKnowledge } from "../src/knowledge.js";
 import { assertJoinKeys, guardSql, SqlRejected } from "../src/sql.js";
@@ -45,11 +44,10 @@ test("粗粒度多指标只沿契约来源、日期与登记键放行", () => {
 });
 
 test("隔离 ClickHouse：粗粒度多 Decimal、日期分组、折叠多渠道和左侧缺维证明", async () => {
-  const exec = promisify(execFile); const name = `dataagent-coarse-${randomUUID()}`; const password = randomBytes(20).toString("hex"); let created = false;
-  const docker = async (args: string[]) => { try { return (await exec("docker", args)).stdout; } catch { throw new Error("isolated_container_operation_failed"); } };
+  const name = `dataagent-coarse-${randomUUID()}`; const password = randomBytes(20).toString("hex"); const ownedContainers: string[] = [];
   try {
-    await docker(["run", "--pull=never", "-d", "--name", name, "--label", `dataagent.test.run=${name}`, "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", "127.0.0.1::8123", "-e", `CLICKHOUSE_PASSWORD=${password}`, "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"]); created = true;
-    const port = Number(/^127\.0\.0\.1:(\d+)\s*$/u.exec(await docker(["port", name, "8123/tcp"]))?.[1]); assert.ok(port > 0);
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", name, "--label", `dataagent.test.run=${name}`, "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", "127.0.0.1::8123", "-e", `CLICKHOUSE_PASSWORD=${password}`, "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"], name, name, ownedContainers);
+    const port = await loopbackPort(name, 8123); assert.ok(port > 0);
     const url = `http://127.0.0.1:${port}`; const deadline = Date.now() + 45_000;
     while (true) { try { if ((await fetch(`${url}/ping`, { signal: AbortSignal.timeout(1000) })).ok) break; } catch {} if (Date.now() > deadline) throw new Error("isolated_clickhouse_start_timeout"); await new Promise((resolve) => setTimeout(resolve, 250)); }
     const ch = createClickHouseClient({ url, username: "default", password, database: "default", maxRowsToRead: 1_000_000, timeoutSeconds: 10 }, false);
@@ -73,5 +71,5 @@ test("隔离 ClickHouse：粗粒度多 Decimal、日期分组、折叠多渠道�
         }
       }
     } finally { await ch.close(); }
-  } finally { if (created) await docker(["rm", "-f", name]).catch(() => undefined); }
+  } finally { for (const owned of ownedContainers) await isolatedDocker(["rm", "-f", owned]).catch(() => undefined); }
 });

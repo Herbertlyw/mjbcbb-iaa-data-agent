@@ -1,3 +1,4 @@
+import { isolatedDocker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
@@ -53,18 +54,15 @@ test("预聚合可以使用受约束的粗粒度，但不能隐藏敏感字段�
 });
 
 test("隔离 ClickHouse 实际执行 CTE 与证明查询的可见结果一致", async () => {
-  const { promisify } = await import("node:util");
-  const { execFile } = await import("node:child_process");
   const { randomBytes, randomUUID } = await import("node:crypto");
   const { createClickHouseClient, clickHouseCommand, clickHouseInsert, clickHouseQueryBounded } = await import("../src/clickhouse-client.js");
   const { createTableSql, smallWarehouse, WAREHOUSE_TABLES } = await import("../src/warehouse.js");
   const { verifyJoinEvidence, verifyJoinExecutionSchema } = await import("../src/join-evidence.js");
-  const execute = promisify(execFile); const name = `dataagent-cte-${randomUUID()}`; const password = randomBytes(20).toString("hex");
-  const docker = async (args: string[]) => { try { return (await execute("docker", args)).stdout; } catch { throw new Error("isolated_docker_operation_failed"); } };
-  let created = false;
+  const name = `dataagent-cte-${randomUUID()}`; const password = randomBytes(20).toString("hex");
+  const ownedContainers: string[] = [];
   try {
-    await docker(["run", "--pull=never", "-d", "--name", name, "--label", `dataagent.test.run=${name}`, "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", "127.0.0.1::8123", "-e", `CLICKHOUSE_PASSWORD=${password}`, "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"]); created = true;
-    const port = Number(/^127\.0\.0\.1:(\d+)\s*$/u.exec(await docker(["port", name, "8123/tcp"]))?.[1]); assert.ok(port > 0);
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", name, "--label", `dataagent.test.run=${name}`, "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", "127.0.0.1::8123", "-e", `CLICKHOUSE_PASSWORD=${password}`, "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"], name, name, ownedContainers);
+    const port = await loopbackPort(name, 8123); assert.ok(port > 0);
     const url = `http://127.0.0.1:${port}`; const deadline = Date.now() + 45_000;
     while (true) {
       try { if ((await fetch(`${url}/ping`, { signal: AbortSignal.timeout(1000) })).ok) break; } catch { /* starting */ }
@@ -91,5 +89,5 @@ test("隔离 ClickHouse 实际执行 CTE 与证明查询的可见结果一致", 
         if (sql.includes("'ZZ'")) assert.equal(values.find((v) => v.value === "21")?.unmatched_rows, 7);
       }
     } finally { await client.close(); }
-  } finally { if (created) await docker(["rm", "-f", name]).catch(() => undefined); }
+  } finally { for (const owned of ownedContainers) await isolatedDocker(["rm", "-f", owned]).catch(() => undefined); }
 });

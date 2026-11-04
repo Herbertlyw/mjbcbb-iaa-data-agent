@@ -6,6 +6,24 @@ import path from "node:path";
 import { analyst, bindTables, withRuntime } from "./helpers.js";
 import type { TransformResource } from "../src/types.js";
 
+test("完整明细按业务日期和国家全键对齐并递归交付", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_date_alignment");
+    const sql = "SELECT event_date, country_code, new_users FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads'";
+    const left = await runtime.tools.query(session.session_id, { sql }); const right = await runtime.tools.query(session.session_id, { sql });
+    assert.ok(left.ok && right.ok, JSON.stringify({ left, right })); if (!left.ok || !right.ok) return;
+    const result = await runtime.tools.calculateSessionCells(session.session_id, { align: { op: "subtract", keys: ["event_date", "country_code"], left: { resource_id: String(left.resource_id), cell: "new_users" }, right: { resource_id: String(right.resource_id), cell: "new_users" } } });
+    assert.ok(result.ok, JSON.stringify(result)); if (!result.ok) return;
+    const rows = result.rows as Array<{ group: { event_date: string; country_code: string }; result: { value: string } }>;
+    assert.ok(rows.some((row) => row.group.event_date === "2026-10-06" && row.group.country_code === "US" && row.result.value === "0"));
+    assert.ok(rows.some((row) => row.group.event_date === "2026-10-08" && row.group.country_code === "US" && row.result.value === "0"));
+    const delivered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(left.resource_id), String(right.resource_id), String(result.resource_id)] });
+    assert.ok(delivered.ok, JSON.stringify(delivered));
+    if (delivered.ok) assert.match(String(delivered.answer), /event_date=2026-10-06/);
+  });
+});
+
 test("完整明细与数据库分组 SUM 可按契约键对齐并递归复核", async () => {
   await withRuntime({}, async (runtime) => {
     const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]);

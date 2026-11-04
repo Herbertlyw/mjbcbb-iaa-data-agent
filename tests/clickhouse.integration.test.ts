@@ -19,6 +19,7 @@ import { resolveTurn } from "../src/turn.js";
 import { bulkInstalls, chunks, createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
 import { bindTables } from "./helpers.js";
 import { verifyDatabaseAggregates } from "../src/aggregate-evidence.js";
+import { isolatedDocker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const knowledgeDir = path.join(root, "knowledge", "harborlight");
@@ -37,23 +38,22 @@ test("Harborlight 表卡驱动槽位，不把 SQLite 表名写进这条链", () 
 });
 
 test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进程", async () => {
-  const port = await freePort();
   const dir = mkdtempSync(path.join(tmpdir(), "lumenfox-ch-"));
   const freshnessPath = path.join(dir, "freshness.json");
-  const url = `http://127.0.0.1:${port}`;
-  let containerCreated = false;
+  const ownedContainers: string[] = [];
   try {
-    await runQuiet("docker", [
-      "run", "--pull=never", "-d", "--name", container,
+    await runOwnedContainer([
+      "run", "--pull=never", "-d", "--name", container, "--label", `dataagent.test.run=${container}`,
       "--tmpfs", "/var/lib/clickhouse:rw,size=512m",
       "--ulimit", "nofile=262144:262144",
-      "-p", `127.0.0.1:${port}:8123`,
+      "-p", "127.0.0.1::8123",
       "-e", `CLICKHOUSE_PASSWORD=${adminPassword}`,
       "-e", "CLICKHOUSE_DB=harborlight",
       "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1",
       "clickhouse/clickhouse-server:24.8.14.39",
-    ], adminPassword);
-    containerCreated = true;
+    ], container, container, ownedContainers);
+    const port = await loopbackPort(container, 8123);
+    const url = `http://127.0.0.1:${port}`;
     await waitForHttp(url);
     const bootstrap = createClickHouseClient({
       url, username: "default", password: adminPassword, database: "default", maxRowsToRead: 5_000_000, timeoutSeconds: 30,
@@ -240,7 +240,7 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
     }
     await runSplitProcess(url, freshnessPath, dir, port);
   } finally {
-    if (containerCreated) await runQuiet("docker", ["rm", "-f", container], adminPassword).catch(() => undefined);
+    for (const name of ownedContainers.reverse()) await isolatedDocker(["rm", "-f", name]).catch(() => undefined);
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -513,21 +513,18 @@ async function verifyEvidenceLineage(runtime: ReturnType<typeof createRuntime>, 
 }
 
 async function runSplitProcess(clickhouseUrl: string, freshnessPath: string, dir: string, clickhousePort: number) {
-  const mysqlPort = await freePort();
-  const redisPort = await freePort();
-  const apiPort = await freePort();
   const suffix = randomUUID();
   const mysqlName = `lumenfox-ch-mysql-${suffix}`;
   const redisName = `lumenfox-ch-redis-${suffix}`;
-  let mysqlCreated = false;
-  let redisCreated = false;
+  const ownedContainers: string[] = [];
   const statePassword = randomBytes(12).toString("hex");
   const children: ChildProcess[] = [];
   try {
-    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", mysqlName, "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${statePassword}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${statePassword}`, "mysql:8.0.32"], statePassword);
-    mysqlCreated = true;
-    await runQuiet("docker", ["run", "--pull=never", "-d", "--name", redisName, "--tmpfs", "/data:rw,size=64m", "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", statePassword], statePassword);
-    redisCreated = true;
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", mysqlName, "--label", `dataagent.test.run=${suffix}`, "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", "127.0.0.1::3306", "-e", `MYSQL_ROOT_PASSWORD=${statePassword}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${statePassword}`, "mysql:8.0.32"], mysqlName, suffix, ownedContainers);
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", redisName, "--label", `dataagent.test.run=${suffix}`, "--tmpfs", "/data:rw,size=64m", "-p", "127.0.0.1::6379", "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", statePassword], redisName, suffix, ownedContainers);
+    const mysqlPort = await loopbackPort(mysqlName, 3306);
+    const redisPort = await loopbackPort(redisName, 6379);
+    const apiPort = await freePort();
     const env = {
       PATH: process.env.PATH ?? "",
       SIMULATED_TODAY: "2026-10-29",
@@ -762,8 +759,7 @@ async function runSplitProcess(clickhouseUrl: string, freshnessPath: string, dir
     for (const child of children) {
       if (child.exitCode === null) child.kill("SIGKILL");
     }
-    if (mysqlCreated) await runQuiet("docker", ["rm", "-f", mysqlName], statePassword).catch(() => undefined);
-    if (redisCreated) await runQuiet("docker", ["rm", "-f", redisName], statePassword).catch(() => undefined);
+    for (const name of ownedContainers.reverse()) await isolatedDocker(["rm", "-f", name]).catch(() => undefined);
   }
 }
 

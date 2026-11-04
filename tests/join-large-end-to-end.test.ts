@@ -12,21 +12,24 @@ import { freshnessManifest, probeClickHouseFreshness } from "../src/freshness.js
 import { MysqlFreshnessStore } from "../src/mysql-freshness.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import { createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
+import { largeSyntheticInstallSql } from "../src/synthetic-large.js";
 import { startFakeOpenAI } from "./openai-fake-server.js";
+import { isolatedDocker as docker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
 
 const root = process.cwd();
 const fixtureToken = "fictional-loopback-token";
 
 test("十万行经 Pi 假服务、MySQL、Redis 和 ClickHouse 交付聚合观察", { timeout: 180_000 }, async () => {
   const fake = await startFakeOpenAI(fixtureToken);
-  const [chPort, mysqlPort, redisPort, apiPort] = await Promise.all(Array.from({ length: 4 }, freePort));
   const pass = randomBytes(18).toString("hex"); const run = `dataagent-large-e2e-${randomUUID()}`;
   const names = [run + "-ch", run + "-mysql", run + "-redis"]; const created: string[] = [];
   const dir = mkdtempSync(path.join(tmpdir(), "dataagent-large-e2e-")); const children: ChildProcess[] = [];
   try {
-    await docker(["run", "--pull=never", "-d", "--name", names[0]!, "--label", `dataagent.test.run=${run}`, "--tmpfs", "/var/lib/clickhouse:rw,size=768m", "--ulimit", "nofile=262144:262144", "-p", `127.0.0.1:${chPort}:8123`, "-e", `CLICKHOUSE_PASSWORD=${pass}`, "-e", "CLICKHOUSE_DB=harborlight", "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"]); created.push(names[0]!);
-    await docker(["run", "--pull=never", "-d", "--name", names[1]!, "--label", `dataagent.test.run=${run}`, "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${pass}`, "-e", "MYSQL_DATABASE=large_it", "-e", "MYSQL_USER=large_it", "-e", `MYSQL_PASSWORD=${pass}`, "mysql:8.0.32"]); created.push(names[1]!);
-    await docker(["run", "--pull=never", "-d", "--name", names[2]!, "--label", `dataagent.test.run=${run}`, "--tmpfs", "/data:rw,size=64m", "-p", `127.0.0.1:${redisPort}:6379`, "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", pass]); created.push(names[2]!);
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", names[0]!, "--label", `dataagent.test.run=${run}`, "--tmpfs", "/var/lib/clickhouse:rw,size=768m", "--ulimit", "nofile=262144:262144", "-p", "127.0.0.1::8123", "-e", `CLICKHOUSE_PASSWORD=${pass}`, "-e", "CLICKHOUSE_DB=harborlight", "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"], names[0]!, run, created);
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", names[1]!, "--label", `dataagent.test.run=${run}`, "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", "127.0.0.1::3306", "-e", `MYSQL_ROOT_PASSWORD=${pass}`, "-e", "MYSQL_DATABASE=large_it", "-e", "MYSQL_USER=large_it", "-e", `MYSQL_PASSWORD=${pass}`, "mysql:8.0.32"], names[1]!, run, created);
+    await runOwnedContainer(["run", "--pull=never", "-d", "--name", names[2]!, "--label", `dataagent.test.run=${run}`, "--tmpfs", "/data:rw,size=64m", "-p", "127.0.0.1::6379", "redis:6.2", "redis-server", "--bind", "0.0.0.0", "--protected-mode", "yes", "--requirepass", pass], names[2]!, run, created);
+    const [chPort, mysqlPort, redisPort] = await Promise.all([loopbackPort(names[0]!, 8123), loopbackPort(names[1]!, 3306), loopbackPort(names[2]!, 6379)]);
+    const apiPort = await freePort();
     const url = `http://127.0.0.1:${chPort}`; await waitHttp(url); await waitMysql(mysqlPort, pass);
     const ch = createClickHouseClient({ url, username: "default", password: pass, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 30 }, false);
     for (const table of WAREHOUSE_TABLES) await clickHouseCommand(ch, createTableSql(table));
@@ -34,7 +37,7 @@ test("十万行经 Pi 假服务、MySQL、Redis 和 ClickHouse 交付聚合观�
     for (const [table, rows] of Object.entries({ dim_fox_title: data.titles, dim_fox_channel: data.channels, fact_fox_daily_install: data.installs, fact_fox_daily_active: data.active, fact_fox_daily_payment: data.payments, fact_fox_ad_receipt: data.revenue, fact_fox_daily_spend: data.spend, fact_fox_retention_cohort: data.retention, fact_fox_cohort_payback: data.cohortPayback, fact_fox_experiment_arm: data.arms, fact_fox_experiment_metric: data.experimentMetrics })) await clickHouseInsert<unknown>(ch, table, rows);
     // For each day, odd values 1..24999 sum to 156250000 and even
     // values 2..25000 sum to 156262500; four days total 1250050000.
-    await clickHouseCommand(ch, `INSERT INTO fact_fox_daily_install SELECT toDate('2026-10-06') + toUInt16(number % 4), 'big_demo', 'android', concat('S', toString(intDiv(number, 4))), if(intDiv(number, 4) % 2 = 0, 'mist_ads', 'pebble_net'), toInt32(intDiv(number, 4) + 1), NULL FROM numbers(100000)`);
+    await clickHouseCommand(ch, largeSyntheticInstallSql());
     await clickHouseCommand(ch, `CREATE USER IF NOT EXISTS fox_reader IDENTIFIED BY '${pass}'`);
     await clickHouseCommand(ch, "GRANT SELECT ON harborlight.* TO fox_reader");
     const knowledgeDir = path.join(root, "knowledge", "harborlight");
@@ -87,7 +90,6 @@ test("十万行经 Pi 假服务、MySQL、Redis 和 ClickHouse 交付聚合观�
   }
 });
 
-function docker(args: string[]) { return new Promise<void>((resolve, reject) => { const child = spawn("docker", args, { stdio: "ignore" }); child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`docker ${code}`))); }); }
 function freePort() { return new Promise<number>((resolve, reject) => { const server = createServer(); server.listen(0, "127.0.0.1", () => { const address = server.address(); server.close(() => resolve(typeof address === "object" && address ? address.port : 0)); }); server.on("error", reject); }); }
 async function waitHttp(url: string) { const deadline = Date.now() + 90_000; while (Date.now() < deadline) { try { const result = await fetch(url); if (result.status < 500) return; } catch {} await new Promise((resolve) => setTimeout(resolve, 250)); } throw new Error("local_http_not_ready"); }
 async function waitMysql(port: number, password: string) { const deadline = Date.now() + 90_000; while (Date.now() < deadline) { try { const db = await mysql.createConnection({ host: "127.0.0.1", port, user: "large_it", password, database: "large_it" }); await db.end(); return; } catch {} await new Promise((resolve) => setTimeout(resolve, 400)); } throw new Error("local_mysql_not_ready"); }

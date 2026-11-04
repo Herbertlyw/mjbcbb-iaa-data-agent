@@ -12,6 +12,7 @@ import { freshnessManifest, probeClickHouseFreshness } from "../src/freshness.js
 import { loadKnowledge } from "../src/knowledge.js";
 import { MysqlFreshnessStore } from "../src/mysql-freshness.js";
 import { syntheticDayShift } from "../src/synthetic-clock.js";
+import { largeSyntheticInstallSql } from "../src/synthetic-large.js";
 import { createTableSql, rollingWarehouse, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
 import { startFakeOpenAI } from "../tests/openai-fake-server.js";
 
@@ -20,8 +21,9 @@ import { startFakeOpenAI } from "../tests/openai-fake-server.js";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const args = process.argv.slice(2);
 const rolling = args.includes("--rolling");
+const large = args.includes("--large");
 const dates = args.filter((arg) => arg.startsWith("--today="));
-if (args.some((arg) => arg !== "--rolling" && !arg.startsWith("--today=")) || dates.length > 1 || args.filter((arg) => arg === "--rolling").length > 1 || (dates.length && !rolling)) throw new Error("用法：npm run demo:stack -- [--rolling [--today=YYYY-MM-DD]]");
+if (args.some((arg) => arg !== "--rolling" && arg !== "--large" && !arg.startsWith("--today=")) || dates.length > 1 || args.filter((arg) => arg === "--rolling").length > 1 || args.filter((arg) => arg === "--large").length > 1 || (dates.length && !rolling)) throw new Error("用法：npm run demo:stack -- [--large] [--rolling [--today=YYYY-MM-DD]]");
 const testToday = dates[0]?.slice("--today=".length);
 if (dates.length && !testToday) throw new Error("测试日期不能为空");
 const fixtureToday = rolling ? (testToday || currentCalendarDate({ simulatedToday: "" }, "America/Los_Angeles")) : "2026-10-29";
@@ -131,6 +133,7 @@ try {
     const data = rolling ? rollingWarehouse({ simulatedToday: fixtureToday }) : smallWarehouse();
     const tables = { dim_fox_title: data.titles, dim_fox_channel: data.channels, fact_fox_daily_install: data.installs, fact_fox_daily_active: data.active, fact_fox_daily_payment: data.payments, fact_fox_ad_receipt: data.revenue, fact_fox_daily_spend: data.spend, fact_fox_retention_cohort: data.retention, fact_fox_cohort_payback: data.cohortPayback, fact_fox_experiment_arm: data.arms, fact_fox_experiment_metric: data.experimentMetrics };
     for (const [table, rows] of Object.entries(tables)) await clickHouseInsert<unknown>(admin, table, rows);
+    if (large) await clickHouseCommand(admin, largeSyntheticInstallSql(fixtureToday));
     await clickHouseCommand(admin, `CREATE USER fox_reader IDENTIFIED BY '${readerPassword}'`);
     await clickHouseCommand(admin, "GRANT SELECT ON harborlight.* TO fox_reader");
   } finally { await admin.close(); }
@@ -157,6 +160,7 @@ try {
   await waitUntil(async () => (await fetch(`http://127.0.0.1:${apiPort}/api/health`, { signal: AbortSignal.timeout(1000) })).ok, "API");
   console.log(`\n本机演示：http://127.0.0.1:${apiPort}`);
   console.log(`${rolling ? "滚动" : "固定日期"}合成数据；Pi 连接脚本化的本机假服务，不是真实模型。按 Ctrl+C 停止并清理本轮资源。`);
+  if (large) console.log("已在本轮临时数据库生成 100,000 行合成安装数据（big_demo）。");
   if (rolling && !testToday) console.log("跨业务日后旧 freshness 不能继续使用；请停止并重新启动以生成新样本和发布。 ");
   await stopped;
 } catch (error) {

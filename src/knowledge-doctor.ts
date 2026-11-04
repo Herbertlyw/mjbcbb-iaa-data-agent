@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { isCalendarDate, repoRoot } from "./config.js";
+import { arithmeticUnit } from "./exact-arithmetic.js";
 import { loadKnowledge } from "./knowledge.js";
 import { parseReadonlySql } from "./sql.js";
 import type { KnowledgeBase } from "./types.js";
@@ -57,8 +58,8 @@ export function diagnoseKnowledge(root = path.join(repoRoot(), "knowledge", "lum
           return source?.series?.metrics.includes(column) ? source.columns.find((item) => item.name === column) : undefined;
         };
         const numerator = resolve(metric.numerator); const denominator = resolve(metric.denominator);
-        const expectedUnit = numerator?.unit && denominator?.unit ? numerator.unit === denominator.unit ? "比值" : `(${numerator.unit})/(${denominator.unit})` : null;
-        if (!numerator || !denominator || metric.operation !== "divide" || metric.prediction !== "actual_only" || !expectedUnit || metric.unit !== expectedUnit) issues.push({ code: "derived_metric_invalid", message: `${contract.table} 的派生指标 ${metric.id} 缺少合法来源字段或匹配单位` });
+        const expectedUnit = numerator?.unit && denominator?.unit ? arithmeticUnit(metric.operation, numerator.unit, denominator.unit) : null;
+        if (!numerator || !denominator || metric.prediction !== "actual_only" || !expectedUnit || metric.unit !== expectedUnit) issues.push({ code: "derived_metric_invalid", message: `${contract.table} 的派生指标 ${metric.id} 缺少合法来源字段或匹配单位` });
       }
     }
     if (asset.contract?.grain) {
