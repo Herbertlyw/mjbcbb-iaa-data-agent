@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { GlobalBudget } from "../src/global-budget.js";
@@ -11,6 +11,15 @@ import { stopProcess } from "./process-control.js";
 
 const token = "fictional-local-fixture";
 const settings = { PI_BASE_URL: "http://127.0.0.1:43123/v1", PI_MODEL: "synthetic-model", PI_API_KEY: token, PI_CONTEXT_WINDOW: "64000", PI_MAX_OUTPUT_TOKENS: "512" };
+
+test("隔离栈在创建容器前拒绝无效的知识读取预算", () => {
+  const result = spawnSync(process.execPath, ["--import", "tsx", "scripts/local-isolated-stack.ts"], {
+    cwd: path.resolve("."), env: { PATH: process.env.PATH ?? "", MAX_ASSET_READ_BYTES: "invalid" }, encoding: "utf8",
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /MAX_ASSET_READ_BYTES/u);
+  assert.doesNotMatch(result.stdout, /创建独立/u);
+});
 
 test("本机模型配置不探测服务，拒绝远程、URL 凭据和不完整预算", () => {
   assert.equal(demoLocalModel(settings).PI_PROTOCOL_SCRIPT, "");

@@ -31,6 +31,11 @@ const statements = `
     bindings_json LONGTEXT NOT NULL,
     created_at VARCHAR(40) NOT NULL
   ) ENGINE=InnoDB;
+  CREATE TABLE IF NOT EXISTS session_asset_budgets (
+    session_id VARCHAR(64) PRIMARY KEY,
+    used_bytes BIGINT NOT NULL,
+    max_bytes BIGINT NOT NULL
+  ) ENGINE=InnoDB;
   CREATE TABLE IF NOT EXISTS messages (
     message_id VARCHAR(64) PRIMARY KEY,
     session_id VARCHAR(64) NOT NULL,
@@ -221,6 +226,7 @@ async function dispatch(op, args) {
   if (op === "getTurnBudget") return getTurnBudget(args[0]);
   if (op === "reserveRevision") return reserveRevision(args[0], args[1], args[2]);
   if (op === "reserveToolCall") return reserveToolCall(args[0], args[1], args[2]);
+  if (op === "reserveAssetRead") return reserveAssetRead(args[0], args[1], args[2], args[3]);
   if (op === "saveProviderPayload") return saveProviderPayload(args[0]);
   if (op === "listProviderPayloads") return listProviderPayloads(args[0], args[1]);
   if (op === "readProviderPayload") return readProviderPayload(args[0]);
@@ -712,6 +718,30 @@ async function reserveToolCall(sessionId, lease, maxCalls) {
       WHERE job_id = ? AND tool_call_count < LEAST(tool_call_limit, ?)`, [lease.jobId, maxCalls]);
     return updated.affectedRows === 1 ? "ok" : "budget_exhausted";
   });
+}
+
+async function reserveAssetRead(sessionId, lease, bytes, maxBytes) {
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || !Number.isSafeInteger(maxBytes) || maxBytes < 0) return "lost";
+  try { return await transaction(async (conn) => {
+    if (lease) { try { await assertExecutionLease(conn, sessionId, lease); } catch { return "lost"; } }
+    const [sessions] = await conn.query("SELECT session_id FROM sessions WHERE session_id = ? FOR UPDATE", [sessionId]);
+    if (!sessions[0]) return "lost";
+    // Acquiring the session/budget locks may have taken longer than the lease.
+    // Recheck with database time after waiting; the job row stays locked.
+    if (lease) { try { await assertExecutionLease(conn, sessionId, lease); } catch { return "lost"; } }
+    await conn.query("INSERT IGNORE INTO session_asset_budgets (session_id, used_bytes, max_bytes) VALUES (?, 0, ?)", [sessionId, maxBytes]);
+    if (lease) { try { await assertExecutionLease(conn, sessionId, lease); } catch { throw new Error("asset_read_lease_expired"); } }
+    const [updated] = await conn.query("UPDATE session_asset_budgets SET used_bytes = used_bytes + ? WHERE session_id = ? AND used_bytes + ? <= LEAST(max_bytes, ?)", [bytes, sessionId, bytes, maxBytes]);
+    // An existing budget row can itself be locked by another transaction;
+    // roll back even an executed UPDATE if the lease expired while waiting.
+    if (lease) { try { await assertExecutionLease(conn, sessionId, lease); } catch { throw new Error("asset_read_lease_expired"); } }
+    // MySQL can report zero changed rows for a valid zero-byte page.
+    if (bytes === 0) {
+      const [rows] = await conn.query("SELECT used_bytes, max_bytes FROM session_asset_budgets WHERE session_id = ?", [sessionId]);
+      return Number(rows[0]?.used_bytes) <= Math.min(Number(rows[0]?.max_bytes), maxBytes) ? "ok" : "budget_exhausted";
+    }
+    return updated.affectedRows === 1 ? "ok" : "budget_exhausted";
+  }); } catch (error) { if (error?.message === "asset_read_lease_expired") return "lost"; throw error; }
 }
 
 async function getTurnBudget(jobId) {

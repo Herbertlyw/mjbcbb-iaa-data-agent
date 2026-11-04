@@ -103,6 +103,7 @@ export interface StateStore {
   getTurnBudget(jobId: string): TurnBudgetRecord | null;
   reserveRevision(jobId: string, owner: string, fence: number): { ok: true; count: number } | { ok: false; count: number };
   reserveToolCall(sessionId: string, lease: ExecutionLease, maxCalls: number): "ok" | "budget_exhausted" | "lost";
+  reserveAssetRead(sessionId: string, lease: ExecutionLease | undefined, bytes: number, maxBytes: number): "ok" | "budget_exhausted" | "lost";
   saveProviderPayload(input: ProviderPayloadWrite): boolean;
   listProviderPayloads(jobId: string, actorId: string): ProviderPayloadSummary[];
   readProviderPayload(input: ProviderPayloadRead): ProviderPayloadPage | null;
@@ -267,6 +268,11 @@ export class SqliteStateStore implements StateStore {
         slots_json TEXT,
         bindings_json TEXT NOT NULL,
         created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS session_asset_budgets (
+        session_id TEXT PRIMARY KEY,
+        used_bytes INTEGER NOT NULL,
+        max_bytes INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS messages (
         message_id TEXT PRIMARY KEY,
@@ -826,6 +832,17 @@ export class SqliteStateStore implements StateStore {
       this.db.prepare("UPDATE jobs SET tool_call_limit = COALESCE(tool_call_limit, ?) WHERE job_id = ?").run(maxCalls, lease.jobId);
       const updated = this.db.prepare(`UPDATE jobs SET tool_call_count = tool_call_count + 1
         WHERE job_id = ? AND tool_call_count < MIN(tool_call_limit, ?)`).run(lease.jobId, maxCalls);
+      return updated.changes === 1 ? "ok" : "budget_exhausted";
+    });
+  }
+
+  reserveAssetRead(sessionId: string, lease: ExecutionLease | undefined, bytes: number, maxBytes: number): "ok" | "budget_exhausted" | "lost" {
+    if (!Number.isSafeInteger(bytes) || bytes < 0 || !Number.isSafeInteger(maxBytes) || maxBytes < 0) return "lost";
+    return this.transaction(() => {
+      if (lease) { try { this.assertExecutionLease(sessionId, lease); } catch { return "lost"; } }
+      if (!this.db.prepare("SELECT session_id FROM sessions WHERE session_id = ?").get(sessionId)) return "lost";
+      this.db.prepare("INSERT OR IGNORE INTO session_asset_budgets (session_id, used_bytes, max_bytes) VALUES (?, 0, ?)").run(sessionId, maxBytes);
+      const updated = this.db.prepare("UPDATE session_asset_budgets SET used_bytes = used_bytes + ? WHERE session_id = ? AND used_bytes + ? <= MIN(max_bytes, ?)").run(bytes, sessionId, bytes, maxBytes);
       return updated.changes === 1 ? "ok" : "budget_exhausted";
     });
   }

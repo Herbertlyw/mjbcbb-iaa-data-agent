@@ -8,6 +8,7 @@ import test from "node:test";
 import mysql from "mysql2/promise";
 import { openRuntime } from "./helpers.js";
 import type { ProviderStepBegin } from "../src/state-store.js";
+import { AsyncMysqlStateStore } from "../src/async-mysql-state-store.js";
 
 test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围栏不会放宽额度", async () => {
   const password = randomBytes(12).toString("hex");
@@ -37,6 +38,16 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
     const job = await runtime.jobs.submitForSessionAsync(session.session_id, "预算争抢", "budget-key");
     const claim = (await state.call("claimJob", job.job_id, "worker-a", Date.now(), 60_000));
     assert.ok(claim);
+    const lease = { jobId: job.job_id, owner: "worker-a", fence: claim.fence };
+    const assetRaces = await Promise.all([state.call("reserveAssetRead", session.session_id, lease, 5, 9), state.call("reserveAssetRead", session.session_id, lease, 5, 9)]);
+    assert.deepEqual(assetRaces.sort(), ["budget_exhausted", "ok"]);
+    assert.equal(await state.call("reserveAssetRead", session.session_id, { ...lease, fence: claim.fence - 1 }, 1, 9), "lost");
+    assert.equal(await state.call("reserveAssetRead", session.session_id, lease, 0, 9), "ok");
+    assert.equal(await state.call("reserveAssetRead", session.session_id, lease, 5, 100), "budget_exhausted");
+    assert.equal(await state.call("reserveAssetRead", session.session_id, lease, 4, 9), "ok");
+    const reopenedState = await AsyncMysqlStateStore.open({ host: "127.0.0.1", port, user: "lumenfox_it", password, database: "lumenfox_it" });
+    try { assert.equal(await reopenedState.call("reserveAssetRead", session.session_id, lease, 1, 9), "budget_exhausted"); }
+    finally { await reopenedState.close(); }
     const connection = { host: "127.0.0.1", port, user: "lumenfox_it", password, database: "lumenfox_it" };
     const input = (stepId: string): ProviderStepBegin => ({
       stepId,
@@ -174,6 +185,50 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
     assert.equal(step?.settlement, "held_unknown");
     assert.equal(step?.input_tokens, null);
     assert.notEqual(winner, "");
+    const takeoverSession = await runtime.sessions.createAsync("analyst");
+    const takeoverJob = await runtime.jobs.submitForSessionAsync(takeoverSession.session_id, "知识预算接管", "asset-takeover");
+    const first = await state.call("claimJob", takeoverJob.job_id, "asset-a", Date.now(), 800); assert.ok(first);
+    const oldLease = { jobId: takeoverJob.job_id, owner: "asset-a", fence: first.fence };
+    assert.equal(await state.call("reserveAssetRead", takeoverSession.session_id, oldLease, 2, 5), "ok");
+    await new Promise((resolve) => setTimeout(resolve, 950));
+    assert.equal(await state.call("reserveAssetRead", takeoverSession.session_id, oldLease, 1, 5), "lost", "租约过期但尚未接管时也不能写入");
+    const second = await state.call("claimJob", takeoverJob.job_id, "asset-b", Date.now(), 10_000); assert.ok(second);
+    assert.ok(second.fence > first.fence);
+    assert.equal(await state.call("reserveAssetRead", takeoverSession.session_id, oldLease, 1, 5), "lost");
+    const newLease = { jobId: takeoverJob.job_id, owner: "asset-b", fence: second.fence };
+    assert.equal(await state.call("reserveAssetRead", takeoverSession.session_id, newLease, 3, 5), "ok");
+    assert.equal(await state.call("reserveAssetRead", takeoverSession.session_id, newLease, 1, 5), "budget_exhausted");
+    const slowSession = await runtime.sessions.createAsync("analyst");
+    const slowJob = await runtime.jobs.submitForSessionAsync(slowSession.session_id, "知识预算锁等待", "asset-lock");
+    const slowClaim = await state.call("claimJob", slowJob.job_id, "asset-slow", Date.now(), 800); assert.ok(slowClaim);
+    const slowLease = { jobId: slowJob.job_id, owner: "asset-slow", fence: slowClaim.fence };
+    const locker = await mysql.createConnection(connection);
+    try {
+      await locker.beginTransaction();
+      await locker.query("SELECT session_id FROM sessions WHERE session_id = ? FOR UPDATE", [slowSession.session_id]);
+      const pending = state.call("reserveAssetRead", slowSession.session_id, slowLease, 1, 1);
+      await new Promise((resolve) => setTimeout(resolve, 950));
+      await locker.commit();
+      assert.equal(await pending, "lost", "锁等待期间过期不能用旧时钟写入");
+    } finally { await locker.end(); }
+    const successor = await state.call("claimJob", slowJob.job_id, "asset-next", Date.now(), 10_000); assert.ok(successor);
+    assert.equal(await state.call("reserveAssetRead", slowSession.session_id, { jobId: slowJob.job_id, owner: "asset-next", fence: successor.fence }, 5, 5), "ok", "旧执行者不能留下上限或占额");
+    const lockedBudgetSession = await runtime.sessions.createAsync("analyst");
+    const lockedBudgetJob = await runtime.jobs.submitForSessionAsync(lockedBudgetSession.session_id, "知识预算行锁等待", "asset-row-lock");
+    const lockedClaim = await state.call("claimJob", lockedBudgetJob.job_id, "asset-row-a", Date.now(), 800); assert.ok(lockedClaim);
+    const lockedLease = { jobId: lockedBudgetJob.job_id, owner: "asset-row-a", fence: lockedClaim.fence };
+    assert.equal(await state.call("reserveAssetRead", lockedBudgetSession.session_id, lockedLease, 0, 5), "ok");
+    const rowLocker = await mysql.createConnection(connection);
+    try {
+      await rowLocker.beginTransaction();
+      await rowLocker.query("SELECT session_id FROM session_asset_budgets WHERE session_id = ? FOR UPDATE", [lockedBudgetSession.session_id]);
+      const pending = state.call("reserveAssetRead", lockedBudgetSession.session_id, lockedLease, 1, 5);
+      await new Promise((resolve) => setTimeout(resolve, 950));
+      await rowLocker.commit();
+      assert.equal(await pending, "lost", "预算行锁等待后过期必须回滚已执行写入");
+    } finally { await rowLocker.end(); }
+    const rowSuccessor = await state.call("claimJob", lockedBudgetJob.job_id, "asset-row-b", Date.now(), 10_000); assert.ok(rowSuccessor);
+    assert.equal(await state.call("reserveAssetRead", lockedBudgetSession.session_id, { jobId: lockedBudgetJob.job_id, owner: "asset-row-b", fence: rowSuccessor.fence }, 5, 5), "ok");
     await runtime.close({ abandon: true });
   } finally {
     const label = await dockerOutput(["inspect", "--format", '{{index .Config.Labels "dataagent.test.run"}}', name]).catch(() => "");

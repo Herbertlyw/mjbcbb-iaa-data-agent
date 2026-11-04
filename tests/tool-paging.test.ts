@@ -78,6 +78,23 @@ test("批量阅读逐资产分页、错误隔离和契约字段续页", async ()
   });
 });
 
+test("批量读取全部失败时报告真实原因，空页不冒充权限失败", async () => {
+  await withRuntime({ maxAssetReadBytes: 1 }, async (runtime) => {
+    const session = analyst(runtime);
+    const asset = runtime.knowledge.by_id.get("metric.new_users"); assert.ok(asset);
+    const expired = await runtime.tools.readAssets(session.session_id, { requests: [{ asset_id: asset.asset_id, body_offset: 1, expected_content_hash: "stale" }] });
+    assert.equal(expired.ok, false); if (!expired.ok) assert.equal(expired.code, "asset_version_changed");
+    const missing = await runtime.tools.readAssets(session.session_id, { asset_ids: ["metric.synthetic_missing"] });
+    assert.equal(missing.ok, false); if (!missing.ok) assert.equal(missing.code, "asset_not_found");
+    const mixed = await runtime.tools.readAssets(session.session_id, { requests: [{ asset_id: asset.asset_id, body_offset: 1, expected_content_hash: "stale" }, { asset_id: "metric.synthetic_missing" }] });
+    assert.equal(mixed.ok, false); if (!mixed.ok) assert.equal(mixed.code, "asset_batch_failed");
+    const empty = await runtime.tools.readAssets(session.session_id, { asset_ids: [] });
+    assert.equal(empty.ok, true); if (empty.ok) assert.deepEqual(empty.results, []);
+    const malformed = await runtime.tools.readAssets(session.session_id, { asset_ids: "not-an-array" } as unknown as { asset_ids: string[] });
+    assert.equal(malformed.ok, false); if (!malformed.ok) assert.equal(malformed.code, "invalid_asset_page");
+  });
+});
+
 test("查询预览分页不截断完整资源，SQL LIMIT 不冒充完整总体", async () => {
   await withRuntime({}, async (runtime) => {
     const session = analyst(runtime);

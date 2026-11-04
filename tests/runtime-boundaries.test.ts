@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { loadConfig, repoRoot } from "../src/config.js";
 import { assertJoinKeys, guardSql, SqlRejected, type TableRule } from "../src/sql.js";
 import { SessionStore } from "../src/session.js";
+import { SqliteStateStore } from "../src/state-store.js";
 import { domainTools } from "../src/agent.js";
 import type { AnalysisRecord } from "../src/types.js";
 import { probeClickHouseAndPublish } from "../src/freshness.js";
@@ -176,6 +177,85 @@ test("空正文和多字节正文的分页边界与读取预算", async () => {
     const invalid = await runtime.tools.readAsset(session.session_id, { asset_id: asset.asset_id, body_offset: 4, expected_content_hash: "fixture-version" });
     assert.equal(invalid.ok, false);
     if (!invalid.ok) assert.equal(invalid.code, "invalid_asset_page");
+  });
+});
+
+test("知识正文预算写入会话状态，重开后不重置并对 Unicode 按字节计数", async () => {
+  await withRuntime({ maxAssetReadBytes: 9 }, async (runtime) => {
+    const session = analyst(runtime);
+    const asset = runtime.knowledge.by_id.get("metric.new_users"); assert.ok(asset);
+    asset.body = "汉🙂字"; asset.content_hash = "synthetic-version";
+    const page = await runtime.tools.readAsset(session.session_id, { asset_id: asset.asset_id, body_limit: 2 });
+    assert.equal(page.ok, true);
+    const reopened = new SqliteStateStore(runtime.config.stateDatabasePath);
+    try {
+      assert.equal(reopened.reserveAssetRead(session.session_id, undefined, 0, 9), "ok");
+      assert.equal(reopened.reserveAssetRead(session.session_id, undefined, 3, 9), "budget_exhausted");
+      assert.equal(reopened.reserveAssetRead(session.session_id, undefined, 2, 9), "ok");
+      assert.equal(reopened.reserveAssetRead(session.session_id, undefined, 1, 100), "budget_exhausted", "提高配置不能重置已保存的会话上限");
+      assert.equal(reopened.reserveAssetRead("missing-session", undefined, 1, 9), "lost");
+    } finally { reopened.close(); }
+  });
+});
+
+test("搜索匹配正文片段计入会话预算，不能通过重复搜索绕过额度", async () => {
+  await withRuntime({ maxAssetReadBytes: 9 }, async (runtime) => {
+    const session = analyst(runtime);
+    const asset = runtime.knowledge.by_id.get("metric.new_users"); assert.ok(asset);
+    asset.body = "汉🙂字"; asset.content_hash = "synthetic-version";
+    const blocked = await runtime.tools.searchAssets(session.session_id, { query: "汉🙂" });
+    assert.equal(blocked.ok, false);
+    if (!blocked.ok) assert.equal(blocked.code, "asset_read_budget_exceeded");
+    assert.equal("hits" in blocked, false);
+    const full = await runtime.tools.readAsset(session.session_id, { asset_id: asset.asset_id, body_limit: 2 });
+    assert.equal(full.ok, true, "失败预留不应占用预算");
+    const again = await runtime.tools.searchAssets(session.session_id, { query: "汉🙂" });
+    assert.equal(again.ok, false);
+    if (!again.ok) assert.equal(again.code, "asset_read_budget_exceeded");
+  });
+});
+
+test("知识正文预算提交期间取消时不交付正文且不返还已经占用的额度", async () => {
+  await withRuntime({ maxAssetReadBytes: 9 }, async (runtime) => {
+    const session = analyst(runtime);
+    const asset = runtime.knowledge.by_id.get("metric.new_users"); assert.ok(asset);
+    asset.body = "汉🙂字"; asset.content_hash = "synthetic-version";
+    let entered!: () => void; let release!: () => void;
+    const ready = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const original = runtime.sessions.reserveAssetRead.bind(runtime.sessions);
+    runtime.sessions.reserveAssetRead = async (...args) => { const outcome = await original(...args); entered(); await gate; return outcome; };
+    const controller = new AbortController();
+    try {
+      const pending = runtime.tools.readAsset(session.session_id, { asset_id: asset.asset_id, body_limit: 2 }, controller.signal);
+      await ready; controller.abort(); release();
+      const result = await pending;
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.code, "tool_cancelled");
+      assert.equal("body" in result, false);
+      assert.equal(await original(session.session_id, 3, 9), "budget_exhausted");
+    } finally { release(); }
+  });
+});
+
+test("知识正文预算等待期间资产版本变化不会交付旧页", async () => {
+  await withRuntime({ maxAssetReadBytes: 20 }, async (runtime) => {
+    const session = analyst(runtime);
+    const asset = runtime.knowledge.by_id.get("metric.new_users"); assert.ok(asset);
+    asset.body = "旧正文"; asset.content_hash = "synthetic-old";
+    let entered!: () => void; let release!: () => void;
+    const ready = new Promise<void>((resolve) => { entered = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const original = runtime.sessions.reserveAssetRead.bind(runtime.sessions);
+    runtime.sessions.reserveAssetRead = async (...args) => { const outcome = await original(...args); entered(); await gate; return outcome; };
+    try {
+      const pending = runtime.tools.readAsset(session.session_id, { asset_id: asset.asset_id });
+      await ready; asset.body = "新正文"; asset.content_hash = "synthetic-new"; release();
+      const result = await pending;
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.code, "asset_version_changed");
+      assert.equal("body" in result, false);
+    } finally { release(); }
   });
 });
 

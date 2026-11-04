@@ -14,6 +14,7 @@ export class SessionStore {
   private readonly activeJobs = new Map<string, string>();
   private readonly activeLeases = new Map<string, ExecutionLease>();
   private readonly uncertainToolBudget = new Set<string>();
+  private readonly uncertainAssetBudget = new Set<string>();
   private revisionFn: ((jobId: string) => Promise<number | "lost" | "memory">) | null = null;
 
   setRevisionFn(fn: (jobId: string) => Promise<number | "lost" | "memory">): void {
@@ -33,6 +34,19 @@ export class SessionStore {
       // A timeout can have committed the reservation. Stop this executor's
       // further tool dispatches rather than guessing that it was rolled back.
       this.uncertainToolBudget.add(lease.jobId);
+      return "lost";
+    }
+  }
+
+  async reserveAssetRead(sessionId: string, bytes: number, maxBytes: number): Promise<"ok" | "budget_exhausted" | "lost"> {
+    if (this.uncertainAssetBudget.has(sessionId)) return "lost";
+    const lease = this.activeLeases.get(sessionId);
+    try {
+      return this.asyncState ? await (await this.asyncState()).call("reserveAssetRead", sessionId, lease, bytes, maxBytes) : this.state.reserveAssetRead(sessionId, lease, bytes, maxBytes);
+    } catch {
+      // The reservation may have committed. Do not return this page or
+      // dispatch another reservation from this executor after uncertainty.
+      this.uncertainAssetBudget.add(sessionId);
       return "lost";
     }
   }

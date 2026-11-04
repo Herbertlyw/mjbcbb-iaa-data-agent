@@ -80,7 +80,6 @@ function previewRows<T>(rows: T[], limit: number): T[] {
 }
 
 export class ToolService {
-  private readonly assetBytesRead = new Map<string, number>();
   private readonly configuredScanLimit: number;
 
   constructor(private readonly ctx: ToolContext) { this.configuredScanLimit = ctx.config.clickhouseMaxRowsToRead; }
@@ -135,6 +134,19 @@ export class ToolService {
         ...(asset.table ? { table: asset.table } : {}),
       };
     });
+    // Search excerpts are also knowledge body. Count the exact bytes before
+    // returning them so repeated searches cannot bypass the read budget.
+    const excerptBytes = hits.reduce((sum, hit) => sum + (typeof hit.match_excerpt === "string" ? Buffer.byteLength(hit.match_excerpt) : 0), 0);
+    if (excerptBytes) {
+      const excerptSources = hits.filter((hit) => typeof hit.match_excerpt === "string").map((hit) => ({ id: hit.asset_id, hash: hit.content_hash, body: this.ctx.knowledge.by_id.get(hit.asset_id)?.body }));
+      const reserved = await this.ctx.sessions.reserveAssetRead(sessionId, excerptBytes, this.ctx.config.maxAssetReadBytes);
+      if (reserved === "lost") return fail("asset_read_budget_outcome_unknown", "知识正文预算或当前任务租约无法确认，搜索片段未返回；不会自动重试。");
+      if (reserved === "budget_exhausted") return fail("asset_read_budget_exceeded", "本次会话的知识正文读取超过上限，搜索片段没有返回。");
+      if (signal?.aborted) return fail("tool_cancelled", "工具已取消");
+      const current = await this.ctx.sessions.requireAsync(sessionId);
+      if (current.role !== session.role || current.actor_id !== session.actor_id || excerptSources.some((source) => { const asset = this.ctx.knowledge.by_id.get(source.id); return !asset || asset.content_hash !== source.hash || asset.body !== source.body; }) || !await validateKnowledgeSources(this.ctx.knowledge, excerptSources.map((source) => source.id))) return fail("knowledge_source_changed", "知识来源或读取权限已变化，请重新加载后搜索。");
+      if (signal?.aborted) return fail("tool_cancelled", "工具已取消");
+    }
     return {
       ok: true,
       hits,
@@ -161,16 +173,25 @@ export class ToolService {
     if ((offset > 0 && !input.expected_content_hash) || (input.expected_content_hash && input.expected_content_hash !== decision.asset.content_hash)) {
       return fail("asset_version_changed", "续读必须携带第一页的内容哈希；版本不一致时请从头读取。");
     }
-    const characters = Array.from(decision.asset.body);
+    const originalHash = decision.asset.content_hash;
+    const originalBody = decision.asset.body;
+    const characters = Array.from(originalBody);
     if (offset > characters.length) return fail("invalid_asset_page", "正文偏移超出资产长度。");
     const body = characters.slice(offset, offset + limit).join("");
     const next = offset + Array.from(body).length;
-    const used = this.assetBytesRead.get(sessionId) ?? 0;
     const bodyBytes = Buffer.byteLength(body);
-    if (used + bodyBytes > this.ctx.config.maxAssetReadBytes) {
+    const reservation = await this.ctx.sessions.reserveAssetRead(sessionId, bodyBytes, this.ctx.config.maxAssetReadBytes);
+    if (reservation === "lost") return fail("asset_read_budget_outcome_unknown", "知识正文预算或当前任务租约无法确认，正文未返回；不会自动重试。", { asset_id: decision.asset.asset_id });
+    if (reservation === "budget_exhausted") {
       return fail("asset_read_budget_exceeded", "本次会话的知识正文读取超过上限。正文不会返回，也不能据此形成正式结论。", { asset_id: decision.asset.asset_id });
     }
-    this.assetBytesRead.set(sessionId, used + bodyBytes);
+    // A cancellation during the asynchronous reservation must not release
+    // the committed budget or deliver the page to the abandoned model call.
+    if (signal?.aborted) return fail("tool_cancelled", "工具已取消");
+    const confirmed = await this.authorizeRead(sessionId, decision.asset.asset_id);
+    if (!confirmed.ok) return confirmed;
+    if (confirmed.asset.content_hash !== originalHash || confirmed.asset.body !== originalBody) return fail("asset_version_changed", "正文读取期间资产发生变化，请从头读取。", { asset_id: decision.asset.asset_id });
+    if (signal?.aborted) return fail("tool_cancelled", "工具已取消");
     return {
       ok: true,
       asset_id: decision.asset.asset_id,
@@ -193,6 +214,7 @@ export class ToolService {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
     if (input.asset_ids && input.requests) return fail("invalid_asset_page", "请只提供资产 ID 列表或逐项读取请求。");
+    if (input.asset_ids !== undefined && (!Array.isArray(input.asset_ids) || input.asset_ids.some((id) => typeof id !== "string"))) return fail("invalid_asset_page", "资产 ID 列表必须由字符串组成。");
     const requests = input.requests ?? (input.asset_ids ?? []).map((asset_id) => ({ asset_id }));
     const offset = input.offset ?? 0; const limit = input.limit ?? 50;
     if (!Array.isArray(requests) || requests.length > 100 || !Number.isInteger(offset) || offset < 0 || offset > requests.length || !Number.isInteger(limit) || limit < 1 || limit > 100) return fail("invalid_asset_page", "批量读取最多 100 项，偏移与页大小须在有效范围。");
@@ -204,11 +226,13 @@ export class ToolService {
       results.push({ ...result, asset_id: request.asset_id });
     }
     const anyOk = results.some((item) => item.ok);
-    if (!anyOk) {
+    if (results.length && !anyOk) {
+      const failures = results.filter((item): item is typeof item & ToolFailure => !item.ok);
+      const sameCode = failures.length === results.length && failures.every((item) => item.code === failures[0]?.code);
       return {
         ok: false,
-        code: "asset_not_authorized",
-        message: "这些资产都没有读取许可",
+        code: sameCode ? failures[0]!.code : "asset_batch_failed",
+        message: sameCode ? failures[0]!.message : "批量读取没有成功项；请查看每项的错误原因。",
         results,
         offset,
         limit,

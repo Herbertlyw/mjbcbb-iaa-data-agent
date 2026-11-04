@@ -135,7 +135,7 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "search_assets",
       label: "搜索资产",
-      description: "按关键词发现资产卡片。结果不含正文，也不授予读取或查询权限。",
+      description: "按关键词发现资产卡片；可读取的资产可能附带简短匹配片段，不能代替完整正文，也不授予读取或查询权限。",
       parameters: Type.Object({
         query: Type.String({ description: "搜索词" }),
         kinds: Type.Optional(Type.Array(Type.String(), { description: "可选的资产类型过滤" })),

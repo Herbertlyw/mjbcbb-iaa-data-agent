@@ -27,6 +27,8 @@ const rolling = args.includes("--rolling");
 const large = args.includes("--large");
 const localModel = args.includes("--local-model");
 const deepseek = args.includes("--deepseek");
+const assetReadBytes = Number(process.env.MAX_ASSET_READ_BYTES ?? "200000");
+if (!Number.isSafeInteger(assetReadBytes) || assetReadBytes < 0) throw new Error("MAX_ASSET_READ_BYTES 必须是非负安全整数。");
 const dates = args.filter((arg) => arg.startsWith("--today="));
 if (args.some((arg) => arg !== "--rolling" && arg !== "--large" && arg !== "--local-model" && arg !== "--deepseek" && !arg.startsWith("--today=")) || dates.length > 1 || args.filter((arg) => arg === "--rolling").length > 1 || args.filter((arg) => arg === "--large").length > 1 || args.filter((arg) => arg === "--local-model").length > 1 || args.filter((arg) => arg === "--deepseek").length > 1 || (localModel && deepseek) || (dates.length && !rolling)) throw new Error("用法：npm run demo:stack -- [--large] [--local-model | --deepseek] [--rolling [--today=YYYY-MM-DD]]");
 // Explicit opt-in only. Validate before starting containers; do not probe the
@@ -171,7 +173,7 @@ try {
     FRESHNESS_PATH: path.join(dir, "freshness.json"), DATABASE_PATH: path.join(dir, "unused.sqlite"), RESEED_DATABASE: "false", PUBLISH_FRESHNESS_ON_START: "false",
     MYSQL_HOST: "127.0.0.1", MYSQL_PORT: String(mysqlPort), MYSQL_USER: "lumenfox_it", MYSQL_PASSWORD: password, MYSQL_DATABASE: "lumenfox_it",
     REDIS_HOST: "127.0.0.1", REDIS_PORT: String(redisPort), REDIS_PASSWORD: password, REDIS_QUEUE_KEY: `dataagent:stack:${id}`,
-    MODEL_MODE: "pi", ...model, ...(deepseek ? { DEEPSEEK_BUDGET_ID: budgetId, DEEPSEEK_BUDGET_MAX_REQUESTS: String(budgetRequests), DEEPSEEK_BUDGET_MAX_TOKENS: String(budgetTokens) } : {}), RECOVERY_MS: "600", LEASE_MS: "4000", MAX_MODEL_CALLS: deepseek ? "10" : "24", MAX_KNOWN_TOKENS: deepseek ? "120000" : "200000", JOB_TIMEOUT_MS: deepseek ? "120000" : "60000",
+    MODEL_MODE: "pi", ...model, ...(deepseek ? { DEEPSEEK_BUDGET_ID: budgetId, DEEPSEEK_BUDGET_MAX_REQUESTS: String(budgetRequests), DEEPSEEK_BUDGET_MAX_TOKENS: String(budgetTokens) } : {}), MAX_ASSET_READ_BYTES: String(assetReadBytes), RECOVERY_MS: "600", LEASE_MS: "4000", MAX_MODEL_CALLS: deepseek ? "10" : "24", MAX_KNOWN_TOKENS: deepseek ? "120000" : "200000", JOB_TIMEOUT_MS: deepseek ? "120000" : "60000",
   };
   launch("src/api.ts", env); launch("src/dispatcher.ts", env); launch("src/worker.ts", env);
   await waitUntil(async () => (await fetch(`http://127.0.0.1:${apiPort}/api/health`, { signal: AbortSignal.timeout(1000) })).ok, "API");
