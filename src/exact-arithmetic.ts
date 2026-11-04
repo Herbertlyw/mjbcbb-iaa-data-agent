@@ -1,6 +1,11 @@
 import type { VerifiedAggregate } from "./aggregate-evidence.js";
 
 export type ArithmeticOp = "add" | "subtract" | "multiply" | "divide";
+
+/** A real observed zero can be encoded as an integer or exact Decimal. */
+export function isExactZero(value: unknown): boolean {
+  return value === 0 || typeof value === "string" && /^-?0+(?:\.0+)?$/u.test(value);
+}
 export interface ArithmeticValue {
   value: string | null;
   scale: number;

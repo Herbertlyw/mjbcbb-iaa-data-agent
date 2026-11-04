@@ -33,10 +33,13 @@ test("完整粒度 CTE 和派生表的预聚合可证明等价，JOIN 保留未�
   } finally { db.close(); }
 });
 
-test("预聚合不得隐藏敏感字段、修改粒度或从未投影的列取值", () => {
+test("预聚合可以使用受约束的粗粒度，但不能隐藏敏感字段或使用非契约粒度", () => {
   const incomplete = cte.replace(", f.platform, f.country_code, f.channel_id, SUM", ", f.platform, f.country_code, SUM").replace(", f.platform, f.country_code, f.channel_id) SELECT", ", f.platform, f.country_code) SELECT");
-  assert.throws(() => assertJoinKeys(incomplete, knowledge.joins, grains, joinOptions), SqlRejected);
-  assert.equal(prepareJoinEvidence(incomplete, fact, dim, knowledge.joins), null);
+  assert.doesNotThrow(() => assertJoinKeys(incomplete, knowledge.joins, grains, joinOptions));
+  assert.ok(prepareJoinEvidence(incomplete, fact, dim, knowledge.joins));
+  const invalidGrain = cte.replace("f.channel_id, SUM", "f.channel_id, f.new_users, SUM").replace("f.country_code, f.channel_id) SELECT", "f.country_code, f.channel_id, f.new_users) SELECT");
+  assert.throws(() => assertJoinKeys(invalidGrain, knowledge.joins, grains, joinOptions), (e: unknown) => e instanceof SqlRejected && e.code === "join_grain_mismatch");
+  assert.equal(prepareJoinEvidence(invalidGrain, fact, dim, knowledge.joins), null);
   const sensitive = cte.replace("f.channel_id, SUM", "f.channel_id, f.device_token, SUM").replace("f.country_code, f.channel_id) SELECT", "f.country_code, f.channel_id, f.device_token) SELECT");
   assert.throws(() => guardSql(sensitive, rules), (e: unknown) => e instanceof SqlRejected && e.code === "sensitive_field");
   assert.throws(() => guardSql(cte.replace("SUM(f.new_users) AS subtotal", "SUM(f.device_token) AS subtotal"), rules), (e: unknown) => e instanceof SqlRejected && e.code === "sensitive_field");

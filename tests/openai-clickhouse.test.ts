@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -17,7 +17,7 @@ import { createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehou
 import { startFakeOpenAI } from "./openai-fake-server.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
-const knowledgeDir = path.join(root, "knowledge", "harborlight");
+const sourceKnowledgeDir = path.join(root, "knowledge", "harborlight");
 const token = "fictional-loopback-token";
 const question = "纸灯 在 2026-10-06 到 2026-10-12（美国、iOS、雾帆）的新增用户是多少？";
 
@@ -34,8 +34,19 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
   const names = [`lumenfox-oai-ch-${suffix}`, `lumenfox-oai-mysql-${suffix}`, `lumenfox-oai-redis-${suffix}`];
   const createdContainers: string[] = [];
   const dir = mkdtempSync(path.join(tmpdir(), "lumenfox-oai-"));
+  const knowledgeDir = path.join(dir, "knowledge");
   const children: ChildProcess[] = [];
   try {
+    cpSync(sourceKnowledgeDir, knowledgeDir, { recursive: true });
+    // These schema variants belong only to this integration run. They model an
+    // explicitly nullable business dimension; the shipped contracts stay intact.
+    for (const name of ["fact_fox_daily_install", "fact_fox_daily_payment"]) {
+      const file = path.join(knowledgeDir, "contracts", `${name}.json`);
+      const contract = JSON.parse(readFileSync(file, "utf8"));
+      const dimension = contract.columns.find((column: { name: string }) => column.name === "country_code");
+      assert.ok(dimension); dimension.type = "Nullable(String)"; dimension.nullable = true;
+      writeFileSync(file, JSON.stringify(contract));
+    }
     await docker(["run", "--pull=never", "-d", "--name", names[0], "--tmpfs", "/var/lib/clickhouse:rw,size=512m", "--ulimit", "nofile=262144:262144", "-p", `127.0.0.1:${clickhousePort}:8123`, "-e", `CLICKHOUSE_PASSWORD=${adminPassword}`, "-e", "CLICKHOUSE_DB=harborlight", "-e", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1", "clickhouse/clickhouse-server:24.8.14.39"]);
     createdContainers.push(names[0]!);
     await docker(["run", "--pull=never", "-d", "--name", names[1], "--tmpfs", "/var/lib/mysql:rw,size=1g", "-p", `127.0.0.1:${mysqlPort}:3306`, "-e", `MYSQL_ROOT_PASSWORD=${statePassword}`, "-e", "MYSQL_DATABASE=lumenfox_it", "-e", "MYSQL_USER=lumenfox_it", "-e", `MYSQL_PASSWORD=${statePassword}`, "mysql:8.0.32"]);
@@ -48,13 +59,30 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     await clickHouseCommand(bootstrap, "CREATE DATABASE IF NOT EXISTS harborlight");
     await bootstrap.close();
     const admin = createClickHouseClient({ url: clickhouseUrl, username: "default", password: adminPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 30 }, false);
-    for (const table of WAREHOUSE_TABLES) await clickHouseCommand(admin, createTableSql(table));
+    for (const table of WAREHOUSE_TABLES) {
+      const nullable = ["fact_fox_daily_install", "fact_fox_daily_payment"].includes(table.table);
+      const sql = createTableSql(table);
+      await clickHouseCommand(admin, nullable ? sql.replace("country_code LowCardinality(String)", "country_code Nullable(String)") + " SETTINGS allow_nullable_key = 1" : sql);
+    }
     const data = smallWarehouse();
     await clickHouseInsert(admin, "dim_fox_title", data.titles);
     await clickHouseInsert(admin, "dim_fox_channel", data.channels);
     await clickHouseInsert(admin, "fact_fox_daily_install", data.installs);
     await clickHouseInsert(admin, "fact_fox_daily_active", data.active);
     await clickHouseInsert(admin, "fact_fox_daily_payment", data.payments);
+    const nullBase = { event_date: "2026-10-08", title_id: "null_demo", platform: "android", channel_id: "mist_ads" };
+    await clickHouseInsert(admin, "fact_fox_daily_install", [
+      { ...nullBase, country_code: null, new_users: 5, device_token: null },
+      { ...nullBase, country_code: "NULL", new_users: 10, device_token: null },
+      { ...nullBase, country_code: "ZERO", new_users: 0, device_token: null },
+      { ...nullBase, country_code: "RIGHT_ONLY", new_users: 3, device_token: null },
+    ]);
+    await clickHouseInsert(admin, "fact_fox_daily_payment", [
+      { ...nullBase, country_code: null, amount_usd: "10.00", cost_usd: "1.00" },
+      { ...nullBase, country_code: "NULL", amount_usd: "40.00", cost_usd: "2.00" },
+      { ...nullBase, country_code: "ZERO", amount_usd: "1.00", cost_usd: "1.00" },
+      { ...nullBase, country_code: "LEFT_ONLY", amount_usd: "8.00", cost_usd: "1.00" },
+    ]);
     await clickHouseInsert(admin, "fact_fox_ad_receipt", data.revenue);
     await clickHouseInsert(admin, "fact_fox_daily_spend", data.spend);
     await clickHouseInsert(admin, "fact_fox_retention_cohort", data.retention);
@@ -421,6 +449,48 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(partialUs?.status, "partial_nulls");
     assert.match(partialCross.analysis?.answer ?? "", /仅非 NULL 部分，不能代表完整分组/);
     assert.match(partialCross.analysis?.answer ?? "", /0\.008333333333333333/);
+    const nullableSession = await createSyntheticSession();
+    const nullable = await postQuestion(apiPort, nullableSession, "合成可空地区对齐：比较虚构产品的收入和新增。");
+    assert.equal(nullable.status, "partial", `${JSON.stringify(nullable.error)} ${nullable.analysis?.answer ?? ""} ${JSON.stringify(nullable.events)}`);
+    const nullableRows = nullable.analysis?.alignment_results?.[0]?.rows ?? [];
+    const nullKey = nullableRows.find((row) => row.group.country_code === null);
+    const literalKey = nullableRows.find((row) => row.group.country_code === "NULL");
+    assert.equal(nullableRows.length, 5);
+    assert.equal(nullKey?.status, "matched"); assert.equal(nullKey?.result?.value, "2.000000000000000000");
+    assert.equal(literalKey?.status, "matched"); assert.equal(literalKey?.result?.value, "4.000000000000000000");
+    assert.equal(nullableRows.find((row) => row.group.country_code === "ZERO")?.status, "zero_divisor");
+    assert.equal(nullableRows.find((row) => row.group.country_code === "LEFT_ONLY")?.status, "missing_right");
+    assert.equal(nullableRows.find((row) => row.group.country_code === "RIGHT_ONLY")?.status, "missing_left");
+    assert.match(nullable.analysis?.answer ?? "", /NULL 键作为独立分组/);
+    assert.equal(nullable.analysis?.sources?.length, 2);
+    for (const source of nullable.analysis?.sources ?? []) {
+      assert.equal(source.engine, "clickhouse-local"); assert.equal(source.freshness_receipts?.length, 1); assert.ok(source.execution_id);
+      const hash: string | undefined = nullable.analysis?.resource_hashes?.[String(source.resource_id)]; assert.ok(hash);
+      const response: Response = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${nullableSession}/resources/${source.resource_id}?offset=0&limit=100&resource_hash=${hash}`);
+      assert.equal(response.status, 200);
+      const foreign: Response = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${nullableSession}/resources/${source.resource_id}?offset=0&limit=100&resource_hash=${hash}`, { headers: { "x-demo-actor": "demo-viewer" } });
+      assert.equal(foreign.status, 404, "其他模拟主体不能读取资源");
+      const page = await response.json() as { resource: { session_id: string; job_id: string; rows: Array<{ country_code: string | null }> } };
+      assert.equal(page.resource.session_id, nullableSession); assert.equal(page.resource.job_id, nullable.job_id);
+      assert.ok(page.resource.rows.some((row) => row.country_code === null));
+      assert.ok(page.resource.rows.some((row) => row.country_code === "NULL"));
+    }
+    const nullableId = nullable.analysis?.alignment_results?.[0]?.resource_id; assert.ok(nullableId);
+    const nullableDb = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password: statePassword, database: "lumenfox_it" });
+    try {
+      const [rows] = await nullableDb.query("SELECT body_json FROM resources WHERE resource_id = ?", [nullableId]);
+      const saved = JSON.parse(String((rows as Array<{ body_json: string }>)[0]?.body_json)) as { session_id: string; job_id: string; rows: typeof nullableRows };
+      assert.equal(saved.session_id, nullableSession); assert.equal(saved.job_id, nullable.job_id);
+      assert.ok(saved.rows.some((row) => row.group.country_code === null));
+      assert.ok(saved.rows.some((row) => row.group.country_code === "NULL"));
+    } finally { await nullableDb.end(); }
+    const mixed = await postQuestion(apiPort, await createSyntheticSession(), "合成混合聚合明细：比较收入分组与新增明细。");
+    assert.equal(mixed.status, "partial", `${JSON.stringify(mixed.error)} ${mixed.analysis?.answer ?? ""} ${JSON.stringify(mixed.events)}`);
+    const mixedRows = mixed.analysis?.alignment_results?.[0]?.rows ?? [];
+    assert.equal(mixedRows.find((row) => row.group.country_code === "JP" && row.group.channel_id === "mist_ads")?.result?.value, "0.300000000000000000");
+    assert.equal(mixedRows.find((row) => row.group.country_code === "US" && row.group.channel_id === "mist_ads")?.result?.value, "0.008333333333333333");
+    assert.equal(mixedRows.find((row) => row.group.country_code === "US" && row.group.channel_id === "pebble_net")?.status, "missing_right");
+    assert.equal(mixed.analysis?.sources?.length, 2);
     const cte = await postQuestion(apiPort, await createSyntheticSession(), "合成 CTE 查询：纸灯日本七日新增。");
     assert.equal(cte.status, "completed", `${JSON.stringify(cte.error)} ${cte.analysis?.answer ?? ""}`);
     assert.match(cte.analysis?.answer ?? "", /70/);
@@ -441,6 +511,40 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.ok(preaggregated.analysis?.sources?.[0]?.executed_sql);
     assert.equal(preaggregated.analysis?.sources?.[0]?.execution_settings?.join_use_nulls, true);
     assert.equal(preaggregated.analysis?.sources?.[0]?.freshness_receipts?.length, 2);
+    const coarseSession = await createSyntheticSession();
+    const coarse = await postQuestion(apiPort, coarseSession, "合成粗粒度金额关联：按产品统计三日收入和成本。");
+    assert.equal(coarse.status, "completed", `${JSON.stringify(coarse.error)} ${coarse.analysis?.answer ?? ""} events=${JSON.stringify(coarse.events)}`);
+    // Independent sums from the synthetic input rows: 90071992547409.91 +
+    // 0.09 + 1.00 = 90071992547411.00; 0.10 + 0.03 + 2.00 = 2.13.
+    assert.match(coarse.analysis?.answer ?? "", /JOIN 求和 90071992547411\.00；单位 USD/);
+    assert.match(coarse.analysis?.answer ?? "", /JOIN 求和 2\.13；单位 USD/);
+    assert.match(coarse.analysis?.answer ?? "", /dim_fox_title\.title_name=纸灯/);
+    assert.match(coarse.analysis?.answer ?? "", /的合计=90071992547411\.00（USD）/);
+    assert.match(coarse.analysis?.answer ?? "", /的合计=2\.13（USD）/);
+    assert.equal(coarse.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === "calculate_session_cells").length, 1);
+    const coarseSource = coarse.analysis?.sources?.[0]; assert.ok(coarseSource);
+    assert.equal(coarseSource.engine, "clickhouse-local");
+    assert.match(coarseSource.sql ?? "", /^WITH p AS /); assert.match(coarseSource.executed_sql ?? "", /groupArray/);
+    assert.notEqual(coarseSource.executed_sql, coarseSource.sql); assert.equal(coarseSource.execution_settings?.join_use_nulls, true);
+    assert.ok(coarseSource.execution_id); assert.equal(coarseSource.freshness_receipts?.length, 2);
+    assert.equal(coarseSource.contract_revisions?.fact_fox_daily_payment, "contract.fact_fox_daily_payment-r3");
+    assert.equal(coarseSource.contract_revisions?.dim_fox_title, "contract.dim_fox_title-r2");
+    const coarseHash = coarse.analysis?.resource_hashes?.[String(coarseSource.resource_id)]; assert.ok(coarseHash);
+    const coarsePage = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${coarseSession}/resources/${coarseSource.resource_id}?offset=0&limit=100&resource_hash=${coarseHash}`);
+    assert.equal(coarsePage.status, 200);
+    const coarseResource = await coarsePage.json() as { resource: { session_id: string; job_id: string; execution_id: string } };
+    assert.equal(coarseResource.resource.session_id, coarseSession); assert.equal(coarseResource.resource.job_id, coarse.job_id);
+    assert.equal(coarseResource.resource.execution_id, coarseSource.execution_id);
+    const channelCoarse = await postQuestion(apiPort, await createSyntheticSession(), "合成粗粒度渠道关联：按渠道统计美国收入和成本。");
+    assert.equal(channelCoarse.status, "completed", `${JSON.stringify(channelCoarse.error)} ${channelCoarse.analysis?.answer ?? ""} events=${JSON.stringify(channelCoarse.events)}`);
+    // Independent rows: mist_ads has (1.00, 2.00), pebble_net has
+    // (6.00, 3.00), so their totals are 7.00 revenue and 5.00 cost.
+    assert.match(channelCoarse.analysis?.answer ?? "", /dim_fox_channel\.channel_name=雾帆/);
+    assert.match(channelCoarse.analysis?.answer ?? "", /dim_fox_channel\.channel_name=卵石/);
+    assert.match(channelCoarse.analysis?.answer ?? "", /的合计=7\.00（USD）/);
+    assert.match(channelCoarse.analysis?.answer ?? "", /的合计=5\.00（USD）/);
+    assert.equal(channelCoarse.analysis?.sources?.[0]?.engine, "clickhouse-local");
+    assert.equal(channelCoarse.analysis?.sources?.[0]?.freshness_receipts?.length, 2);
     const preaggregatedLeft = await postQuestion(apiPort, await createSyntheticSession(), "合成 CTE 左关联未匹配：保留虚构产品。");
     assert.equal(preaggregatedLeft.status, "completed", `${JSON.stringify(preaggregatedLeft.error)} ${preaggregatedLeft.analysis?.answer ?? ""}`);
     assert.match(preaggregatedLeft.analysis?.answer ?? "", new RegExp(`JOIN 求和 ${preaggregatedExpected.zz_known}`));
@@ -676,7 +780,7 @@ async function waitJob(port: number, jobId: string) {
       job_id: string;
       error?: { code?: string; message?: string };
       usage?: { input_tokens: number | null; usage_source?: string };
-      analysis?: { status?: string; answer?: string; resource_hashes?: Record<string, string>; analysis_declaration?: { provenance?: string }; alignment_results?: Array<{ rows: Array<{ group: Record<string,string|null>; status: string }> }>; sources?: Array<{ engine?: string; resource_id?: string; execution_id?: string; sql?: string; executed_sql?: string; execution_settings?: { join_use_nulls?: boolean }; observed_at?: string; freshness_receipts?: unknown[]; total_rows?: number; rows?: unknown[]; preview_has_more?: boolean }> };
+      analysis?: { status?: string; answer?: string; resource_hashes?: Record<string, string>; analysis_declaration?: { provenance?: string }; alignment_results?: Array<{ resource_id?: string; rows: Array<{ group: Record<string,string|null>; status: string; result?: { value: string | null } | null }> }>; sources?: Array<{ engine?: string; resource_id?: string; execution_id?: string; sql?: string; executed_sql?: string; execution_settings?: { join_use_nulls?: boolean }; contract_revisions?: Record<string, string>; observed_at?: string; freshness_receipts?: unknown[]; total_rows?: number; rows?: unknown[]; preview_has_more?: boolean }> };
       events: Array<{ type: string; payload: Record<string, unknown> }>;
     };
     if (!["queued", "running"].includes(job.status)) return job;

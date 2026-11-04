@@ -6,6 +6,27 @@ import path from "node:path";
 import { analyst, bindTables, withRuntime } from "./helpers.js";
 import type { TransformResource } from "../src/types.js";
 
+test("完整明细与数据库分组 SUM 可按契约键对齐并递归复核", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_mixed_alignment");
+    const where = (day: string) => `event_date = '${day}' AND product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads'`;
+    const left = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, country_code, new_users FROM daily_installs WHERE ${where("2026-10-06")}` });
+    const right = await runtime.tools.query(session.session_id, { sql: `SELECT country_code, SUM(new_users) AS total FROM daily_installs WHERE ${where("2026-10-08")} GROUP BY country_code` });
+    assert.ok(left.ok && right.ok, JSON.stringify({ left, right })); if (!left.ok || !right.ok) return;
+    const aligned = await runtime.tools.calculateSessionCells(session.session_id, { align: { op: "subtract", keys: ["country_code"], left: { resource_id: String(left.resource_id), cell: "new_users" }, right: { resource_id: String(right.resource_id), cell: "total" } } });
+    assert.ok(aligned.ok, JSON.stringify(aligned)); if (!aligned.ok) return;
+    assert.deepEqual((aligned.rows as Array<{ group: { country_code: string }; result: { value: string } }>).map((row) => [row.group.country_code, row.result.value]), [["JP", "0"], ["US", "25"]]);
+    const transformed = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(aligned.resource_id), steps: [{ op: "filter", column: "result_value", comparison: "gt", value: "0" }, { op: "group", by: [], aggregates: [{ op: "sum", column: "result_value", as: "sum" }] }] } });
+    assert.ok(transformed.ok, JSON.stringify(transformed)); if (!transformed.ok) return;
+    const answer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(left.resource_id), String(right.resource_id), String(transformed.resource_id)] });
+    assert.ok(answer.ok, JSON.stringify(answer)); if (answer.ok) { assert.equal(answer.status, "completed"); assert.match(String(answer.answer), /的合计=25（人）/); }
+    runtime.sessions.setActiveJob(session.session_id, "other_job");
+    const stale = await runtime.tools.calculateSessionCells(session.session_id, { align: { op: "subtract", keys: ["country_code"], left: { resource_id: String(left.resource_id), cell: "new_users" }, right: { resource_id: String(right.resource_id), cell: "total" } } });
+    assert.equal(stale.ok, false);
+  });
+});
+
 test("已出现分组全部匹配也不能抹去输入缺日期，递归变换仍为部分完成", async () => {
   const root = mkdtempSync(path.join(tmpdir(), "synthetic-gapped-alignment-"));
   try {
@@ -61,6 +82,11 @@ test("完整资源按 NULL 键对齐并与字符串 NULL 区分；部分 NULL �
       const partial = rows.find((row) => row.group.country_code === "XX"); assert.ok(partial); assert.equal(partial.status, "partial_nulls"); assert.equal(partial.left_count, 2); assert.equal(partial.left_null_count, 1); assert.equal(partial.result?.value, "1.000000000000000000");
       const delivered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [left, right, String(result.resource_id)] });
       assert.equal(delivered.ok, true); if (delivered.ok) { assert.equal(delivered.status, "partial"); assert.match(String(delivered.answer), /NULL 键作为独立分组/); assert.match(String(delivered.answer), /仅非 NULL 部分/); assert.match(String(delivered.answer), /country_code=NULL（空键）/); assert.match(String(delivered.answer), /country_code="NULL"（字符串）/); }
+      const display = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: left, steps: [{ op: "sort", keys: [{ column: "country_code", direction: "asc", nulls: "first" }] }] } });
+      assert.equal(display.ok, true); if (display.ok) {
+        const rendered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [left, String(display.resource_id)] });
+        assert.equal(rendered.ok, true); if (rendered.ok) { assert.match(String(rendered.answer), /=NULL（空值）/); assert.match(String(rendered.answer), /="NULL"（字符串）/); }
+      }
       const transformed = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(result.resource_id), steps: [{ op: "filter", column: "country_code", comparison: "is_null" }, { op: "group", by: [], aggregates: [{ op: "count_all", as: "number_of_groups" }] }] } });
       assert.equal(transformed.ok, true, JSON.stringify(transformed));
       if (transformed.ok) {

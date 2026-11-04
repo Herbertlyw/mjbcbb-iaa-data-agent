@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { analyst, bindTables, withRuntime } from "./helpers.js";
 import type { ArithmeticRef, ArithmeticResource } from "../src/types.js";
-import { computeArithmetic, type ArithmeticValue } from "../src/exact-arithmetic.js";
+import { computeArithmetic, isExactZero, type ArithmeticValue } from "../src/exact-arithmetic.js";
 
 test("定点除法 18 位、半数远离零以及大数不经过浮点", () => {
   const value = (amount: string): ArithmeticValue => ({ value: amount, scale: 0, unit: "人", basis: { table: "synthetic", column: "count", operation: "sum", unit: "人", prediction: "actual", timezone: "UTC" }, scopes: [{ filters: { region: "A" }, start: "2026-01-01", end: "2026-01-01" }] });
@@ -15,6 +15,8 @@ test("定点除法 18 位、半数远离零以及大数不经过浮点", () => {
   assert.equal(computeArithmetic("divide", revenue, cost, true)?.value, "3.000000000000000000");
   const otherCountry = { ...cost, scopes: [{ ...cost.scopes[0]!, filters: { region: "B" } }] };
   assert.equal(computeArithmetic("divide", revenue, otherCountry, true), null, "不同指标必须使用相同范围");
+  for (const observed of [0, "0", "0.00", "-0.000"]) assert.equal(isExactZero(observed), true);
+  for (const missing of [null, "", "0.01", "1e-9", "NULL"]) assert.equal(isExactZero(missing), false);
 });
 
 test("引用明细行和整列时绑定执行号、范围及当前任务", async () => {

@@ -126,6 +126,10 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成收入成本比")) return scripted(turn, ratioSteps);
   if (latest.includes("合成多渠道收入成本比")) return scripted(turn, groupedRatioSteps);
   if (latest.includes("合成分组对齐")) return scripted(turn, alignmentSteps);
+  if (latest.includes("合成粗粒度渠道关联")) return scripted(turn, coarseChannelJoinSteps);
+  if (latest.includes("合成粗粒度金额关联")) return scripted(turn, coarsePaymentJoinSteps);
+  if (latest.includes("合成混合聚合明细")) return scripted(turn, mixedFactSteps);
+  if (latest.includes("合成可空地区对齐")) return scripted(turn, nullableCountrySteps);
   if (latest.includes("合成部分空值跨事实")) return scripted(turn, (ids) => rawNullCrossFactSteps(ids, true));
   if (latest.includes("合成空值跨事实")) return scripted(turn, rawNullCrossFactSteps);
   if (latest.includes("合成明细跨事实")) return scripted(turn, rawCrossFactSteps);
@@ -146,6 +150,54 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("日本") && (hasBase || latest.includes("雾帆"))) return scripted(turn, japanSteps);
   if (latest.includes("连表")) return scripted(turn, unsafeJoinSteps);
   return scripted(turn, defaultSteps);
+}
+
+function coarseChannelJoinSteps(ids: string[]) {
+  const sql = "WITH p AS (SELECT f.channel_id AS channel, SUM(f.amount_usd) AS revenue, SUM(f.cost_usd) AS cost FROM fact_fox_daily_payment f WHERE f.event_date >= '2026-10-08' AND f.event_date <= '2026-10-08' AND f.title_id = 'paper_lantern' AND f.platform = 'ios' AND f.country_code = 'US' GROUP BY f.channel_id) SELECT p.channel AS channel, d.channel_name AS label, SUM(p.revenue) AS revenue_total, SUM(p.cost) AS cost_total FROM p INNER JOIN dim_fox_channel d ON p.channel = d.channel_id GROUP BY p.channel, d.channel_name ORDER BY p.channel";
+  return [
+    { id: "coarse_channel_payment_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "coarse_channel_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.dim_fox_channel" }) },
+    { id: "coarse_channel_query", name: "query", arguments: JSON.stringify({ sql }) },
+    { id: "coarse_channel_transform", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: [{ op: "sort", keys: [{ column: "revenue_total", direction: "desc", nulls: "last" }] }, { op: "group", by: [], aggregates: [{ op: "sum", column: "revenue_total", as: "revenue_sum" }, { op: "sum", column: "cost_total", as: "cost_sum" }] }] } }) },
+    { id: "coarse_channel_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+function coarsePaymentJoinSteps(ids: string[]) {
+  const sql = "WITH p AS (SELECT f.title_id AS product_id, SUM(f.amount_usd) AS revenue, SUM(f.cost_usd) AS cost FROM fact_fox_daily_payment f WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-08' AND f.title_id = 'paper_lantern' AND f.platform = 'ios' AND f.country_code = 'US' AND f.channel_id = 'mist_ads' GROUP BY f.title_id) SELECT p.product_id AS product, d.title_name AS label, SUM(p.revenue) AS revenue_total, SUM(p.cost) AS cost_total FROM p LEFT JOIN dim_fox_title d ON p.product_id = d.title_id GROUP BY p.product_id, d.title_name ORDER BY p.product_id";
+  return [
+    { id: "coarse_payment_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "coarse_title_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.dim_fox_title" }) },
+    { id: "coarse_payment_query", name: "query", arguments: JSON.stringify({ sql }) },
+    { id: "coarse_payment_transform", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: [{ op: "sort", keys: [{ column: "revenue_total", direction: "desc", nulls: "last" }] }, { op: "group", by: [], aggregates: [{ op: "sum", column: "revenue_total", as: "revenue_sum" }, { op: "sum", column: "cost_total", as: "cost_sum" }] }] } }) },
+    { id: "coarse_payment_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+function mixedFactSteps(ids: string[]) {
+  const where = "event_date = '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios'";
+  return [
+    { id: "mixed_payment_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "mixed_install_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "mixed_amount", name: "query", arguments: JSON.stringify({ sql: `SELECT country_code, channel_id, SUM(amount_usd) AS total FROM fact_fox_daily_payment WHERE ${where} GROUP BY country_code, channel_id` }) },
+    { id: "mixed_users", name: "query", arguments: JSON.stringify({ sql: `SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE ${where}` }) },
+    { id: "mixed_align", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "divide", keys: ["country_code", "channel_id"], left: { resource_id: ids[0] ?? "", cell: "total" }, right: { resource_id: ids[1] ?? "", cell: "new_users" } } }) },
+    { id: "mixed_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+/** The contract and rows for this case exist only in the isolated integration
+ * test. Its script exercises Pi's HTTP/tool protocol, not model reasoning. */
+function nullableCountrySteps(ids: string[]) {
+  const where = "event_date = '2026-10-08' AND title_id = 'null_demo' AND platform = 'android' AND channel_id = 'mist_ads'";
+  return [
+    { id: "nullable_payment_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "nullable_install_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "nullable_amount", name: "query", arguments: JSON.stringify({ sql: `SELECT event_date,title_id,platform,country_code,channel_id,amount_usd FROM fact_fox_daily_payment WHERE ${where}` }) },
+    { id: "nullable_users", name: "query", arguments: JSON.stringify({ sql: `SELECT event_date,title_id,platform,country_code,channel_id,new_users FROM fact_fox_daily_install WHERE ${where}` }) },
+    { id: "nullable_align", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "divide", keys: ["country_code"], left: { resource_id: ids[0] ?? "", cell: "amount_usd" }, right: { resource_id: ids[1] ?? "", cell: "new_users" } } }) },
+    { id: "nullable_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
 }
 
 function preaggregatedTitleSteps(ids: string[], unmatched: boolean) {

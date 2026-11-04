@@ -46,3 +46,27 @@ test("缺单元、重复、伪造口径、跨范围与字段冲突均拒绝", ()
   const wrongValue = values.map((item, i) => i === 0 ? { ...item, value: "NaN" } : item);
   assert.equal(joinResultTable(plan, wrongValue, fact, dim), null);
 });
+
+test("已核验 JOIN 的业务日期分组保留日期语义并拒绝超范围", () => {
+  const dated = structuredClone(plan);
+  dated.groups.push({ table: "fact", column: "event_date", output: "business_day" });
+  const groups = values.map((value) => ({ ...value, group: { ...value.group, [`${fact.table}.event_date`]: "2026-10-06" } }));
+  const table = joinResultTable(dated, groups, fact, dim); assert.ok(table);
+  assert.equal(table.columns.find((column) => column.name === "business_day")?.label, `${fact.table}.event_date`);
+  assert.equal(table.rows[0]?.business_day, "2026-10-06");
+  assert.equal(joinResultTable(dated, groups.map((value) => ({ ...value, group: { ...value.group, [`${fact.table}.event_date`]: "2026-10-30" } })), fact, dim), null);
+  assert.equal(joinResultTable(dated, groups.map((value) => ({ ...value, group: { ...value.group, [`${fact.table}.event_date`]: "2026-02-30" } })), fact, dim), null);
+});
+
+test("已验证的 Decimal JOIN 结果保留精度和契约单位", () => {
+  const payment = knowledge.contract_by_table.get("fact_fox_daily_payment")!.contract!;
+  const decimalPlan = structuredClone(plan); decimalPlan.fact = payment.table;
+  const metric = payment.columns.find((column) => column.name === "amount_usd")!;
+  decimalPlan.metrics = [{ column: "amount_usd", output: "amount", operation: "sum", unit: "USD", description: metric.description, precision: 18, scale: 2 }];
+  const decimalValues = values.filter((value) => value.operation === "sum").map((value, index) => ({ ...value, fact: payment.table, column: "amount_usd", unit: "USD", description: metric.description, group: Object.fromEntries(Object.entries(value.group).map(([key, part]) => [key.replace(fact.table, payment.table), part])), value: index ? "0.05" : "90071992547411.00" }));
+  const table = joinResultTable(decimalPlan, decimalValues, payment, dim); assert.ok(table);
+  assert.equal(table.rows[0]?.amount, "90071992547411.00"); assert.equal(table.rows[1]?.amount, "0.05");
+  assert.equal(table.columns.find((column) => column.name === "amount")?.scale, 2);
+  const badPlan = structuredClone(decimalPlan); badPlan.metrics[0]!.scale = 3;
+  assert.equal(joinResultTable(badPlan, decimalValues, payment, dim), null);
+});

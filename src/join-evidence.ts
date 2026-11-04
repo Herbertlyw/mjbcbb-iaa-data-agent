@@ -1,5 +1,6 @@
 import { isCalendarDate } from "./config.js";
 import { assertJoinKeys, parseReadonlySql, rewritePreaggregatedDimensionJoin } from "./sql.js";
+import { sumDecimalStrings } from "./exact-arithmetic.js";
 import type { DataContract, JoinConstraint } from "./types.js";
 
 /** Narrow one-fact/one-dimension JOIN whose aggregate can be recomputed from
@@ -16,9 +17,12 @@ export interface JoinEvidencePlan {
   factFilters: Record<string, string>;
   dimensionFilters: Record<string, string>;
   groups: Array<{ table: "fact" | "dimension"; column: string; output: string }>;
-  metrics: Array<{ column: string; output: string; operation: "sum" | "count_nonnull"; unit: string; description: string }>;
+  metrics: Array<{ column: string; output: string; operation: "sum" | "count_nonnull"; unit: string; description: string; scale?: number; precision?: number }>;
   proofFields: Array<{ table: "fact" | "dimension"; column: string }>;
   expectedDates: string[];
+  dateColumn: string;
+  /** Expanded proof for a strictly reviewed preaggregated query. */
+  coarse?: boolean;
 }
 
 export interface VerifiedJoinValue {
@@ -54,6 +58,10 @@ const quote = (value: string) => `'${value}'`;
  * this proof's strictly enumerated subset. Call the normal authorization and
  * freshness checks as well; this function does not grant access. */
 export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[]): JoinEvidencePlan | null {
+  return buildJoinEvidence(sql, fact, dimension, joins, false);
+}
+
+function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[], coarse: boolean): JoinEvidencePlan | null {
   try {
     const series = fact.series;
     if (!series || series.prediction_mode !== "observed_only" || series.predicted_column || dimension.series || fact.timezone !== dimension.timezone || !fact.grain || [...fact.grain].sort().join("|") !== [series.date_column, ...series.dimensions].sort().join("|")) return null;
@@ -61,8 +69,14 @@ export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: 
     const ast = parsed.ast;
     const preaggregated = rewritePreaggregatedDimensionJoin(ast);
     if (preaggregated) {
-      if (preaggregated.fact !== fact.table || JSON.stringify([...preaggregated.grain].sort()) !== JSON.stringify([...fact.grain].sort())) return null;
-      const proof = prepareJoinEvidence(preaggregated.sql, fact, dimension, joins);
+      if (preaggregated.fact !== fact.table || !preaggregated.grain.length || preaggregated.grain.some((field) => !fact.grain!.includes(field))) return null;
+      // Keep the historical proof SQL unchanged for full-grain CTEs so old
+      // receipts remain readable; coarser queries need a larger proof budget.
+      const rewrittenGroup = object(parseReadonlySql(preaggregated.sql).ast.groupby);
+      const groupFields = Array.isArray(rewrittenGroup?.columns) ? rewrittenGroup.columns : [];
+      const groupsDate = groupFields.some((value) => object(value)?.type === "column_ref" && object(value)?.column === series.date_column);
+      const isCoarse = groupsDate || JSON.stringify([...preaggregated.grain].sort()) !== JSON.stringify([...fact.grain].sort());
+      const proof = buildJoinEvidence(preaggregated.sql, fact, dimension, joins, isCoarse);
       return proof ? { ...proof, originalSql: parsed.sql } : null;
     }
     if (ast.with || ast._next || ast.having || ast.limit || ast.distinct || ast.options || ast.for_update || ast.window || !Array.isArray(ast.from) || ast.from.length !== 2) return null;
@@ -119,9 +133,9 @@ export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: 
     const groupNode = object(ast.groupby); const groupList = groupNode && Array.isArray(groupNode.columns) ? groupNode.columns : [];
     if (groupList.length > 4) return null;
     const groupFields = groupList.map(field);
-    if (groupFields.some((item) => !item || item.table === "fact" && !series.dimensions.includes(item.column))) return null;
+    if (groupFields.some((item) => !item || item.table === "fact" && !series.dimensions.includes(item.column) && !(coarse && item.column === series.date_column))) return null;
     if (new Set(groupFields.map((item) => `${item?.table}.${item?.column}`)).size !== groupFields.length) return null;
-    if (!series.dimensions.every((item) => Object.hasOwn(factFilters, item) || groupFields.some((group) => group?.table === "fact" && group.column === item))) return null;
+    if (!coarse && !series.dimensions.every((item) => Object.hasOwn(factFilters, item) || groupFields.some((group) => group?.table === "fact" && group.column === item))) return null;
     const groups: JoinEvidencePlan["groups"] = []; const metrics: JoinEvidencePlan["metrics"] = []; const selections: string[] = []; const outputs = new Set<string>();
     for (const raw of Array.isArray(ast.columns) ? ast.columns : []) {
       const item = object(raw); const expr = object(item?.expr); if (!item || !expr) return null;
@@ -135,8 +149,14 @@ export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: 
       const fn = typeof expr.name === "string" ? expr.name.toLowerCase() : ""; const args = object(expr.args); const metric = field(args?.expr);
       if (expr.type !== "aggr_func" || expr.over || !["sum", "count"].includes(fn) || !args || args.distinct || !metric || metric.table !== "fact" || !series.metrics.includes(metric.column) || typeof item.as !== "string" || !IDENT.test(item.as) || outputs.has(item.as) || item.as === PROOF) return null;
       const declared = fact.columns.find((column) => column.name === metric.column);
-      if (!declared?.unit || !/^(?:nullable\()?\s*u?int(?:8|16|32)\s*\)?$/iu.test(declared.type)) return null;
-      outputs.add(item.as); metrics.push({ column: metric.column, output: item.as, operation: fn === "sum" ? "sum" : "count_nonnull", unit: fn === "sum" ? declared.unit : "行", description: declared.description });
+      if (!declared?.unit) return null;
+      const integer = /^(?:nullable\()?\s*u?int(?:8|16|32)\s*\)?$/iu.test(declared.type);
+      const decimal = /^(?:nullable\()?\s*decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*\)?$/iu.exec(declared.type);
+      // Existing integer queries keep the original proof shape and metadata.
+      // Decimal is admitted only on this reviewed preaggregation path; exact
+      // values and types are checked again in the captured result tuple.
+      if (!integer && !(coarse && decimal && Number(decimal[1]) >= 1 && Number(decimal[1]) <= 28 && Number(decimal[2]) <= Number(decimal[1]))) return null;
+      outputs.add(item.as); metrics.push({ column: metric.column, output: item.as, operation: fn === "sum" ? "sum" : "count_nonnull", unit: fn === "sum" ? declared.unit : "行", description: declared.description, ...(decimal ? { scale: Number(decimal[2]), precision: Number(decimal[1]) } : {}) });
       selections.push(`${fn.toUpperCase()}(${fa}.${metric.column}) AS ${item.as}`);
     }
     if (!metrics.length || groups.length !== groupFields.length || new Set(groups.map((item) => `${item.table}.${item.column}`)).size !== groupFields.length || !groupFields.every((field) => groups.some((item) => item.table === field?.table && item.column === field.column)) || !Array.isArray(ast.columns)) return null;
@@ -158,7 +178,7 @@ export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: 
     // A window preserves every row, so even when proof fails the returned
     // query rows retain the original JOIN's multiplicity and SQL semantics.
     if (filteredDimension) proof.push(`${da}.${DIMENSION_COUNT}`);
-    selections.push(`groupArray(367)(tuple(${proof.join(", ")})) AS ${PROOF}`);
+    selections.push(`groupArray(${coarse ? 10001 : 367})(tuple(${proof.join(", ")})) AS ${PROOF}`);
     const on = relation.keys.map((key) => `${fa}.${key} = ${da}.${key}`).join(" AND ");
     const dimensionFrom = filteredDimension
       ? `(SELECT ${[...relation.keys, ...proofFields.filter((field) => field.table === "dimension" && !relation.keys.includes(field.column)).map((field) => field.column), `count() OVER (PARTITION BY ${relation.keys.join(", ")}) AS ${DIMENSION_COUNT}`].join(", ")} FROM ${dimension.table})`
@@ -177,7 +197,7 @@ export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: 
       }
       orderSql = ` ORDER BY ${order.join(", ")}`;
     }
-    return { originalSql: parsed.sql, executionSql: `SELECT ${selections.join(", ")} FROM ${fact.table} AS ${fa} ${joinType === "left" ? "LEFT JOIN" : "INNER JOIN"} ${dimensionFrom} AS ${da} ON ${on} WHERE ${conditions.join(" AND ")}${groupSql}${orderSql}`, fact: fact.table, dimension: dimension.table, joinType, joinKeys: [...relation.keys], range: { start, end, timezone: fact.timezone }, factFilters, dimensionFilters, groups, metrics, proofFields, expectedDates: dates };
+    return { originalSql: parsed.sql, executionSql: `SELECT ${selections.join(", ")} FROM ${fact.table} AS ${fa} ${joinType === "left" ? "LEFT JOIN" : "INNER JOIN"} ${dimensionFrom} AS ${da} ON ${on} WHERE ${conditions.join(" AND ")}${groupSql}${orderSql}`, fact: fact.table, dimension: dimension.table, joinType, joinKeys: [...relation.keys], range: { start, end, timezone: fact.timezone }, factFilters, dimensionFilters, groups, metrics, proofFields, expectedDates: dates, dateColumn: series.date_column, ...(coarse ? { coarse: true } : {}) };
   } catch { return null; }
 }
 
@@ -226,11 +246,12 @@ export function verifyJoinEvidence(plan: JoinEvidencePlan, rows: Array<Record<st
   // Per-group date checks alone would accept each label independently, so
   // enforce uniqueness of the complete fact grain across every result group.
   const seenFactGrains = new Set<string>();
-  const factFieldIndexes = plan.proofFields.flatMap((field, index) => field.table === "fact" ? [index] : []);
+  const daysByGrain = new Map<string, Set<string>>();
+  const factFieldIndexes = plan.proofFields.flatMap((field, index) => field.table === "fact" && field.column !== plan.dateColumn ? [index] : []);
   if (!factFieldIndexes.length) return null;
   for (const row of rows) {
     const tuples = row[PROOF];
-    if (!Array.isArray(tuples) || tuples.length !== plan.expectedDates.length) return null;
+    if (!Array.isArray(tuples) || (plan.coarse ? tuples.length < 1 || tuples.length > 10_000 : tuples.length !== plan.expectedDates.length)) return null;
     const group: Record<string, string | null> = {};
     for (const item of plan.groups) {
       const value = row[item.output];
@@ -238,10 +259,10 @@ export function verifyJoinEvidence(plan: JoinEvidencePlan, rows: Array<Record<st
       group[`${item.table === "fact" ? plan.fact : plan.dimension}.${item.column}`] = value;
     }
     const key = JSON.stringify(group); if (seen.has(key)) return null; seen.add(key);
-    const dates = new Set<string>(); const sums = new Map(metrics.map((metric) => [metric, 0n])); let unmatchedRows = 0;
+    const dates = new Set<string>(); const inputs = new Map(metrics.map((metric) => [metric, [] as string[]])); let unmatchedRows = 0;
     for (const tuple of tuples) {
       const filteredDimension = Object.keys(plan.dimensionFilters).length > 0;
-      if (!Array.isArray(tuple) || tuple.length !== 1 + metrics.length + plan.proofFields.length + Number(filteredDimension) || typeof tuple[0] !== "string" || !plan.expectedDates.includes(tuple[0]) || dates.has(tuple[0])) return null;
+      if (!Array.isArray(tuple) || tuple.length !== 1 + metrics.length + plan.proofFields.length + Number(filteredDimension) || typeof tuple[0] !== "string" || !plan.expectedDates.includes(tuple[0]) || (!plan.coarse && dates.has(tuple[0]))) return null;
       if (filteredDimension && tuple.at(-1) !== 1 && tuple.at(-1) !== "1") return null;
       dates.add(tuple[0]);
       const dimensionValues = plan.proofFields.flatMap((field, index) => field.table === "dimension" ? [tuple[1 + metrics.length + index]] : []);
@@ -250,20 +271,31 @@ export function verifyJoinEvidence(plan: JoinEvidencePlan, rows: Array<Record<st
       if (unmatched) unmatchedRows += 1;
       for (const [index, metric] of metrics.entries()) {
         const value = tuple[1 + index];
-        if (!(typeof value === "string" && /^-?\d{1,11}$/u.test(value) || typeof value === "number" && Number.isSafeInteger(value) && Math.abs(value) <= 4_294_967_295)) return null;
-        sums.set(metric, sums.get(metric)! + BigInt(value as string | number));
+        const declared = plan.metrics.find((item) => item.column === metric)!;
+        if (declared.precision !== undefined) {
+          if (typeof value !== "string" || !/^-?\d+(?:\.\d+)?$/u.test(value)) return null;
+          const [whole, fraction = ""] = value.replace(/^-/, "").split(".");
+          if (fraction.length > declared.scale! || whole!.length > declared.precision - declared.scale!) return null;
+        } else if (!(typeof value === "string" && /^-?\d{1,11}$/u.test(value) || typeof value === "number" && Number.isSafeInteger(value) && Math.abs(value) <= 4_294_967_295)) return null;
+        inputs.get(metric)!.push(String(value));
       }
       for (const [index, field] of plan.proofFields.entries()) {
         const value = tuple[1 + metrics.length + index];
         if (typeof value !== "string" && !(unmatched && field.table === "dimension" && value === null)) return null;
+        if (field.table === "fact" && field.column === plan.dateColumn && value !== tuple[0]) return null;
         const filtered = (field.table === "fact" ? plan.factFilters : plan.dimensionFilters)[field.column];
         if (filtered !== undefined && value !== filtered) return null;
         const selected = plan.groups.find((item) => item.table === field.table && item.column === field.column);
         if (selected && row[selected.output] !== value) return null;
       }
-      const factGrain = JSON.stringify([tuple[0], ...factFieldIndexes.map((index) => tuple[1 + metrics.length + index])]);
+      const population = JSON.stringify(factFieldIndexes.map((index) => tuple[1 + metrics.length + index]));
+      const factGrain = JSON.stringify([tuple[0], population]);
       if (seenFactGrains.has(factGrain)) return null;
       seenFactGrains.add(factGrain);
+      if (plan.coarse) {
+        const days = daysByGrain.get(population) ?? new Set<string>();
+        days.add(tuple[0]); daysByGrain.set(population, days);
+      }
       for (const key of plan.joinKeys) {
         const factIndex = plan.proofFields.findIndex((field) => field.table === "fact" && field.column === key);
         const dimensionIndex = plan.proofFields.findIndex((field) => field.table === "dimension" && field.column === key);
@@ -271,12 +303,16 @@ export function verifyJoinEvidence(plan: JoinEvidencePlan, rows: Array<Record<st
       }
     }
     for (const metric of plan.metrics) {
-      const expected = metric.operation === "sum" ? sums.get(metric.column)!.toString() : String(tuples.length);
+      const expected = metric.operation === "sum" ? sumDecimalStrings(inputs.get(metric.column)!, metric.scale ?? 0) : String(tuples.length);
       const actual = row[metric.output];
-      if (!(typeof actual === "string" && /^-?\d+$/u.test(actual) || typeof actual === "number" && Number.isSafeInteger(actual)) || BigInt(actual as string | number).toString() !== expected) return null;
+      if (expected === null || (metric.operation === "sum" && metric.precision !== undefined && typeof actual !== "string") || !(typeof actual === "string" || typeof actual === "number" && Number.isSafeInteger(actual)) || sumDecimalStrings([String(actual)], metric.operation === "sum" ? metric.scale ?? 0 : 0) !== expected) return null;
       verified.push({ fact: plan.fact, dimension: plan.dimension, column: metric.column, operation: metric.operation, value: expected, unit: metric.unit, description: metric.description, group, unmatched_rows: unmatchedRows, factFilters: plan.factFilters, dimensionFilters: plan.dimensionFilters, range: plan.range });
     }
   }
+  // If a dimension was folded away by the CTE, check every *observed* full
+  // fact-grain population across the complete date interval. A missing day
+  // cannot be hidden by other populations or by an outer date GROUP BY.
+  if (plan.coarse && [...daysByGrain.values()].some((days) => days.size !== plan.expectedDates.length || plan.expectedDates.some((date) => !days.has(date)))) return null;
   return verified;
 }
 

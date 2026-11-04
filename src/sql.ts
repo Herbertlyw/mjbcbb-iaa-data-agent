@@ -118,7 +118,7 @@ export function assertJoinKeys(rawSql: string, joins: RegisteredJoin[], grains: 
   const preaggregated = rewritePreaggregatedDimensionJoin(parsed.ast);
   if (preaggregated) {
     const grain = grains.get(preaggregated.fact);
-    if (!grain?.length || JSON.stringify([...grain].sort()) !== JSON.stringify([...preaggregated.grain].sort())) throw new SqlRejected("join_grain_mismatch", "预聚合必须保留完整的事实契约粒度。");
+    if (!grain?.length || !preaggregated.grain.length || preaggregated.grain.some((field) => !grain.includes(field))) throw new SqlRejected("join_grain_mismatch", "预聚合只能使用事实契约粒度中的字段。");
     assertJoinKeys(preaggregated.sql, joins, grains, options);
     return;
   }
@@ -247,9 +247,9 @@ export function guardSql(rawSql: string, rules: TableRule[], dialect: "sqlite" |
   return { sql: parsed.sql, tables: parsed.tables, columns, time_range: { start, end }, equalities: equalityFilters(parsed.ast.where) };
 }
 
-/** Strict algebraic form used only for a full-grain SUM then dimension JOIN.
- * This is not authorization. The caller must check the resulting physical SQL,
- * full contracted grain, registered join keys, and actual captured tuples. */
+/** A guarded algebraic rewrite of one preaggregated fact and a dimension.
+ * It establishes no authority by itself: the caller must recheck every
+ * physical column, contracted grain, JOIN key and actual captured tuple. */
 export function rewritePreaggregatedDimensionJoin(ast: Record<string, unknown>): { sql: string; fact: string; grain: string[] } | null {
   try {
     if (ast._next || ast.distinct || ast.options || ast.where || ast.having || ast.limit || ast.window || ast.for_update || !Array.isArray(ast.from) || ast.from.length !== 2 || !Array.isArray(ast.columns)) return null;
@@ -267,40 +267,53 @@ export function rewritePreaggregatedDimensionJoin(ast: Record<string, unknown>):
     const physical = asRecord(inner.from[0]);
     if (!physical || physical.expr || physical.db || physical.join || typeof physical.table !== "string") return null;
     const fact = physical.table; const fa = String(physical.as || fact);
-    if (![fact, fa, alias].every((s) => /^[a-z_][a-z0-9_]*$/u.test(s))) return null;
-    const plain = (node: unknown): string | null => { const x = asRecord(node); return x?.type === "column_ref" && !x.collate && typeof x.column === "string" && /^[a-z_][a-z0-9_]*$/u.test(x.column) && (!x.table || x.table === fa) ? x.column : null; };
+    const ident = (s: string) => /^[a-z_][a-z0-9_]*$/u.test(s) && !["__proto__", "prototype", "constructor"].includes(s);
+    if (![fact, fa, alias].every(ident)) return null;
+    const plain = (node: unknown): string | null => { const x = asRecord(node); return x?.type === "column_ref" && !x.collate && typeof x.column === "string" && ident(x.column) && (!x.table || x.table === fa) ? x.column : null; };
     const groupBy = asRecord(inner.groupby);
     if (!groupBy || Object.keys(groupBy).some((key) => key !== "columns")) return null;
     const groups = groupBy.columns;
     if (!Array.isArray(groups) || !groups.length || groups.some((g) => !plain(g))) return null;
     const grain = groups.map((g) => plain(g)!);
     if (new Set(grain).size !== grain.length) return null;
-    const selected: string[] = []; let subtotal = ""; let metric = "";
+    const selected = new Map<string, string>(); const metrics = new Map<string, string>();
     for (const raw of inner.columns) {
       const entry = asRecord(raw); const expr = asRecord(entry?.expr); const col = plain(expr);
       if (!entry || !expr) return null;
-      if (col) { if (entry.as && entry.as !== col) return null; selected.push(col); continue; }
+      const name = String(entry.as || col || "");
+      if (!ident(name) || selected.has(name) || metrics.has(name)) return null;
+      if (col) { selected.set(name, col); continue; }
       const args = asRecord(expr.args); const arg = plain(args?.expr);
-      if (subtotal || expr.type !== "aggr_func" || String(expr.name).toLowerCase() !== "sum" || expr.over || !args || args.distinct || args.orderby || !arg || typeof entry.as !== "string" || !/^[a-z_][a-z0-9_]*$/u.test(entry.as)) return null;
-      subtotal = entry.as; metric = arg;
+      if (expr.type !== "aggr_func" || String(expr.name).toLowerCase() !== "sum" || expr.over || !args || args.distinct || args.orderby || !arg || !entry.as) return null;
+      metrics.set(name, arg);
     }
-    if (!subtotal || grain.includes(subtotal) || selected.length !== grain.length || new Set(selected).size !== selected.length || [...selected].sort().join("|") !== [...grain].sort().join("|")) return null;
-    const output = structuredClone(ast); let subtotalUses = 0; let aggregates = 0; let invalid = false;
+    if (!metrics.size || metrics.size > 8 || selected.size !== grain.length || new Set(selected.values()).size !== selected.size || [...selected.values()].sort().join("|") !== [...grain].sort().join("|")) return null;
+    const output = structuredClone(ast); const used = new Set<string>();
     for (const raw of output.columns as unknown[]) {
       const entry = asRecord(raw); const expr = asRecord(entry?.expr);
-      if (!expr) return null;
-      if (expr.type === "column_ref") { if (expr.table === alias && !grain.includes(String(expr.column))) return null; continue; }
+      if (!entry || !expr) return null;
+      if (expr.type === "column_ref") {
+        if (expr.table === alias) {
+          const old = String(expr.column); const column = selected.get(old); if (!column) return null;
+          expr.column = column; if (!entry.as && old !== column) entry.as = old;
+        }
+        continue;
+      }
       const args = asRecord(expr.args); const arg = asRecord(args?.expr);
-      if (expr.type !== "aggr_func" || String(expr.name).toLowerCase() !== "sum" || expr.over || !args || args.distinct || args.orderby || arg?.type !== "column_ref" || arg.table !== alias || arg.column !== subtotal) return null;
-      arg.column = metric; aggregates++;
+      const subtotal = typeof arg?.column === "string" ? arg.column : "";
+      if (expr.type !== "aggr_func" || String(expr.name).toLowerCase() !== "sum" || expr.over || !args || args.distinct || args.orderby || arg?.type !== "column_ref" || arg.table !== alias || !metrics.has(subtotal) || used.has(subtotal)) return null;
+      arg.column = metrics.get(subtotal)!; used.add(subtotal);
     }
-    if (aggregates !== 1) return null;
-    for (const field of [ast.columns, ast.groupby, ast.orderby, right.on]) walkShallow(field, (node) => {
+    if (used.size !== metrics.size) return null;
+    let invalid = false;
+    // In group/ordering/join predicates only projected keys are permitted.
+    // Metric aliases may occur solely as the SUM arguments handled above.
+    for (const field of [output.groupby, output.orderby, asRecord((output.from as unknown[])[1])?.on]) walkShallow(field, (node) => {
       if (node.type !== "column_ref" || node.table !== alias) return;
-      if (node.column === subtotal) subtotalUses++;
-      else if (typeof node.column !== "string" || !grain.includes(node.column)) invalid = true;
+      const column = typeof node.column === "string" ? selected.get(node.column) : undefined;
+      if (!column) invalid = true; else node.column = column;
     });
-    if (invalid || subtotalUses !== 1) return null;
+    if (invalid) return null;
     const where = structuredClone(inner.where);
     walkShallow(where, (node) => { if (node.type === "column_ref") { if (node.table && node.table !== fa) invalid = true; node.table = alias; } });
     if (invalid) return null;

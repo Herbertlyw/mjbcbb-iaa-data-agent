@@ -24,8 +24,8 @@ function page() {
     send(seq: number, type: string) { this.onmessage?.({ data: JSON.stringify({ seq, type, payload: {} }), lastEventId: String(seq) }); }
   }
   const context = vm.createContext({ document, EventSource: MockSource, setTimeout: (fn: () => void) => { timers.push(fn); } });
-  vm.runInContext(script.replace(/^\s*initialize\(\);\s*$/mu, "") + "\nglobalThis.testApi = { state, listen, renderCalculationTables };", context);
-  const api = context.testApi as { state: { jobId: string | null; lastSeq: number }; listen: (id: string) => void; renderCalculationTables: (analysis: unknown) => string };
+  vm.runInContext(script.replace(/^\s*initialize\(\);\s*$/mu, "") + "\nglobalThis.testApi = { state, listen, renderCalculationTables, displayCell };", context);
+  const api = context.testApi as { state: { jobId: string | null; lastSeq: number }; listen: (id: string) => void; renderCalculationTables: (analysis: unknown) => string; displayCell: (value: unknown) => unknown };
   return { api, timers, sources: MockSource.instances };
 }
 
@@ -48,6 +48,11 @@ test("页面展示经核验的变换、NULL 对齐状态及绑定哈希的续页
   assert.match(html, /已核验的结果变换/); assert.match(html, /&lt;script&gt;/); assert.doesNotMatch(html, /<script>/);
   assert.match(html, /country_code=NULL/); assert.match(html, /部分 NULL/); assert.match(html, /来源覆盖不完整/); assert.match(html, /0 人/);
   assert.match(html, /data-hash="valid-hash"/); assert.match(html, /data-hash="second-hash"/);
+  const keys = api.renderCalculationTables({ alignment_results: [{ resource_id: "z", spec: { op: "divide", left: { resource_id: "a" }, right: { resource_id: "b" } }, rows: [{ group: { country_code: null }, status: "matched" }, { group: { country_code: "NULL" }, status: "zero_divisor" }] }] });
+  assert.match(keys, /country_code=NULL（空键）/);
+  assert.match(keys, /country_code=&quot;NULL&quot;（字符串）/);
+  assert.equal(api.displayCell(null), "NULL（空值）");
+  assert.equal(api.displayCell("NULL"), '"NULL"（字符串）');
 });
 
 test("事件缺号后从最后连续序号续读", () => {

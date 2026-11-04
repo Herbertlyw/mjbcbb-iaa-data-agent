@@ -284,12 +284,16 @@
       return String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
     }
 
+    function displayCell(value) {
+      return value === null ? "NULL（空值）" : value === "NULL" ? '"NULL"（字符串）' : value;
+    }
+
     function renderCalculationTables(analysis) {
       const more = (id, count, shown, hash) => count > shown && hash ? `<p class="muted">显示 ${shown}/${escapeHtml(count)} 行。</p><button class="secondary calculation-next" data-resource="${escapeHtml(id)}" data-hash="${escapeHtml(hash)}" data-offset="${shown}">加载更多计算行</button>` : "";
       const transforms = (analysis.transform_results || []).map((item) => {
         const columns = item.result.columns;
         const rows = item.result.rows.slice(0, 20);
-        return `<div class="source calculation" data-kind="transform"><strong>已核验的结果变换</strong><p class="muted">计算资源 ${escapeHtml(item.resource_id)} · 输入 ${escapeHtml(item.source_resource_id)}</p><table><thead><tr>${columns.map((column) => `<th>${escapeHtml(column.label)}（${escapeHtml(column.unit)}）</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${columns.map((column) => `<td>${escapeHtml(row[column.name] === null ? "NULL" : row[column.name])}</td>`).join("")}</tr>`).join("")}</tbody></table>${more(item.resource_id, item.total_rows ?? rows.length, rows.length, analysis.resource_hashes?.[item.resource_id])}</div>`;
+        return `<div class="source calculation" data-kind="transform"><strong>已核验的结果变换</strong><p class="muted">计算资源 ${escapeHtml(item.resource_id)} · 输入 ${escapeHtml(item.source_resource_id)}</p><table><thead><tr>${columns.map((column) => `<th>${escapeHtml(column.label)}（${escapeHtml(column.unit)}）</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${columns.map((column) => `<td>${escapeHtml(displayCell(row[column.name]))}</td>`).join("")}</tr>`).join("")}</tbody></table>${more(item.resource_id, item.total_rows ?? rows.length, rows.length, analysis.resource_hashes?.[item.resource_id])}</div>`;
       }).join("");
       const alignments = (analysis.alignment_results || []).map((item) => {
         const rows = item.rows.slice(0, 20);
@@ -300,8 +304,8 @@
 
     function alignmentRowHtml(row, incomplete) {
       const names = { matched: "已匹配", missing_left: "缺少左侧", missing_right: "缺少右侧", null_input: "全 NULL", partial_nulls: "部分 NULL", zero_divisor: "除数为零", empty_inputs: "无输入" };
-      const value = (item) => item ? `${item.value === null ? "NULL" : item.value} ${item.unit || ""}` : "—";
-      const group = Object.entries(row.group).map(([key, part]) => `${key}=${part === null ? "NULL" : part}`).join("，") || "总体";
+      const value = (item) => item ? `${displayCell(item.value)} ${item.unit || ""}` : "—";
+      const group = Object.entries(row.group).map(([key, part]) => `${key}=${part === null ? "NULL（空键）" : part === "NULL" ? '"NULL"（字符串）' : part}`).join("，") || "总体";
       const counts = (side) => Number.isSafeInteger(row[`${side}_count`]) ? `（${row[`${side}_count`]} 行，${row[`${side}_null_count`] ?? "?"} 行 NULL）` : "";
       return `<tr><td>${escapeHtml(group)}</td><td>${escapeHtml(value(row.left) + counts("left"))}</td><td>${escapeHtml(value(row.right) + counts("right"))}</td><td>${escapeHtml(value(row.result))}</td><td>${escapeHtml((names[row.status] || "不可验证") + (incomplete ? "（来源覆盖不完整）" : ""))}</td></tr>`;
     }
@@ -326,7 +330,7 @@
       const limits = analysis.limitations.map((item) => `<li>${escapeHtml(item)}</li>`).join("");
       const sources = analysis.sources.map((source) => {
         const head = source.rows[0] ? Object.keys(source.rows[0]) : [];
-        const rows = source.rows.slice(0, 20).map((row) => `<tr>${head.map((key) => `<td>${escapeHtml(row[key] === null ? "NULL" : row[key])}</td>`).join("")}</tr>`).join("");
+        const rows = source.rows.slice(0, 20).map((row) => `<tr>${head.map((key) => `<td>${escapeHtml(displayCell(row[key]))}</td>`).join("")}</tr>`).join("");
         return `<div class="source">
           <strong>${escapeHtml(source.tables.join(", "))}</strong>
           <p class="muted">${source.evidence_eligible ? "当前证据" : "证据不可验证，未展示结果行"}。提交的查询：${escapeHtml(source.sql || "")}</p>
@@ -346,7 +350,7 @@
         <p>待解决问题：${escapeHtml((record.declaration.unresolved_questions || []).join("；") || "无")}</p>
         <p>假设：${escapeHtml((record.declaration.assumptions || []).join("；") || "无")}</p>
         ${(record.declaration.source_excerpts || []).map((item) => `<p>当前可读知识中的逐字摘录（不证明适用性）：${escapeHtml(item.asset_id)} · ${escapeHtml(item.quote)}</p>`).join("")}
-        ${(record.verified_cells || []).map((item) => `<p>已核对的保存结果单元（不代表完整总体）：${escapeHtml(item.field)} = ${escapeHtml(item.value === null ? "NULL" : item.value)} ${escapeHtml(item.unit)} · 行 ${escapeHtml(item.row)} · ${escapeHtml(item.resource_id)}</p>`).join("")}</details>` : "";
+        ${(record.verified_cells || []).map((item) => `<p>已核对的保存结果单元（不代表完整总体）：${escapeHtml(item.field)} = ${escapeHtml(displayCell(item.value))} ${escapeHtml(item.unit)} · 行 ${escapeHtml(item.row)} · ${escapeHtml(item.resource_id)}</p>`).join("")}</details>` : "";
       resultEl.innerHTML = `
         <p class="muted">${escapeHtml(job.user_text)}</p>
         <p class="muted">模型 ${escapeHtml(job.model_id || "未记录")} · 档位 ${escapeHtml(job.reasoning || "未记录")}</p>
@@ -368,7 +372,7 @@
           if (state.sessionId !== sessionId || state.jobId !== jobId || !button.isConnected) return;
           const table = button.closest(".source").querySelector("table");
           const headings = [...table.querySelectorAll("thead th")].map((item) => item.textContent);
-          const rows = page.resource.rows.map((row) => `<tr>${headings.map((key) => `<td>${escapeHtml(row[key] === null ? "NULL" : row[key])}</td>`).join("")}</tr>`).join("");
+          const rows = page.resource.rows.map((row) => `<tr>${headings.map((key) => `<td>${escapeHtml(displayCell(row[key]))}</td>`).join("")}</tr>`).join("");
           table.querySelector("tbody").insertAdjacentHTML("beforeend", rows);
           if (page.has_more) button.dataset.offset = String(page.next_row_offset);
           else button.textContent = "已显示全部保存行";
@@ -383,7 +387,7 @@
           const page = await apiJson(`/api/sessions/${encodeURIComponent(sessionId)}/resources/${encodeURIComponent(button.dataset.resource)}?${params}`);
           if (state.sessionId !== sessionId || state.jobId !== jobId || !button.isConnected) return;
           const container = button.closest(".calculation"); const table = container.querySelector("table");
-          const rows = container.dataset.kind === "alignment" ? page.resource.rows.map((row) => alignmentRowHtml(row, container.dataset.coverageIncomplete === "true")).join("") : page.resource.result.rows.map((row) => `<tr>${page.resource.result.columns.map((column) => `<td>${escapeHtml(row[column.name] === null ? "NULL" : row[column.name])}</td>`).join("")}</tr>`).join("");
+          const rows = container.dataset.kind === "alignment" ? page.resource.rows.map((row) => alignmentRowHtml(row, container.dataset.coverageIncomplete === "true")).join("") : page.resource.result.rows.map((row) => `<tr>${page.resource.result.columns.map((column) => `<td>${escapeHtml(displayCell(row[column.name]))}</td>`).join("")}</tr>`).join("");
           table.querySelector("tbody").insertAdjacentHTML("beforeend", rows);
           if (page.has_more) button.dataset.offset = String(page.next_row_offset);
           else button.textContent = "已显示全部保存行";

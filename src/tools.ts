@@ -6,7 +6,7 @@ import { plainRows } from "./database.js";
 import { verifyCell, type CellOperation, type VerifiedCell } from "./evidence.js";
 import { compareVerifiedIntegers, type VerifiedComparison } from "./evidence-comparison.js";
 import { compareDecimalAggregates, type AggregateComparison } from "./aggregate-comparison.js";
-import { computeArithmetic, fromAggregate, sumDecimalStrings, type ArithmeticOp, type ArithmeticValue } from "./exact-arithmetic.js";
+import { computeArithmetic, fromAggregate, isExactZero, sumDecimalStrings, type ArithmeticOp, type ArithmeticValue } from "./exact-arithmetic.js";
 import { verifyDecimalCell, type VerifiedDecimalCell } from "./decimal-cell-evidence.js";
 import { verifyDatabaseAggregates, type VerifiedAggregate } from "./aggregate-evidence.js";
 import { joinDimensionObservations, joinMissingDimensionKeys, prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema, type JoinEvidencePlan, type VerifiedJoinValue } from "./join-evidence.js";
@@ -712,16 +712,32 @@ export class ToolService {
     return { rows, hashes, leaves: [...new Set(inputs.map(({ source }) => source.resource_id))], partial: false };
   }
 
-  /** Both sides are complete direct projections, loaded through hash-bound
-   * pages and re-authorized on every calculation and delivery. */
-  private async resolveCompleteRawAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication, inputs: Array<{ source: QueryResource; contract: DataContract }>): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
+  /** Each side is a complete direct projection or a verified database SUM;
+   * both are re-authorized and hash-bound on calculation and delivery. */
+  private async resolveCompleteRawAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication, inputs: Array<{ source: QueryResource; contract: DataContract; aggregates: VerifiedAggregate[] | null }>): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
     const keys = spec.keys;
     if (!Array.isArray(keys) || !keys.length || keys.length > 3 || new Set(keys).size !== keys.length || keys.some((key) => !/^[a-z_][a-z0-9_]{0,63}$/u.test(key))) return null;
     const prepared: Array<{ input: CompleteKeyedInput; make: (value: string | null, values: ReadonlyArray<ResultValue>) => ArithmeticValue | null; filters: Record<string,string>; source: QueryResource; partial: boolean }> = [];
     for (let i = 0; i < inputs.length; i++) {
-      const { source, contract } = inputs[i]!; const ref = i === 0 ? spec.left : spec.right;
+      const { source, contract, aggregates } = inputs[i]!; const ref = i === 0 ? spec.left : spec.right;
       const evidence = this.evidenceSource(session, source); const series = contract.series;
       if (!evidence || !series || series.prediction_mode !== "observed_only" || series.predicted_column || source.coverage.unknown_prediction_dates.length || source.coverage.predicted_dates.length) return null;
+      if (aggregates?.length) {
+        const first = aggregates[0]!;
+        const orderedKeys = [...keys].sort();
+        if (first.operation !== "sum" || !series.metrics.includes(first.column) || JSON.stringify(Object.keys(first.group).sort()) !== JSON.stringify(orderedKeys) || !series.dimensions.every((key) => keys.includes(key) || Object.hasOwn(first.filters, key)) || keys.some((key) => !series.dimensions.includes(key) || Object.hasOwn(first.filters, key)) || aggregates.some((item) => item.operation !== "sum" || item.table !== first.table || item.column !== first.column || item.output_column !== first.output_column || item.unit !== first.unit || item.scale !== first.scale || stableHashes(item.filters) !== stableHashes(first.filters) || JSON.stringify(Object.keys(item.group).sort()) !== JSON.stringify(orderedKeys))) return null;
+        const table = aggregateTable(aggregates);
+        if (!table) return null;
+        const normalized: ResultTable = { ...table, columns: table.columns.map((column) => keys.includes(column.name) ? { ...column, unit: `维度 ${column.name}` } : column) };
+        const make = (value: string | null, values: ReadonlyArray<ResultValue>): ArithmeticValue | null => {
+          if (values.some((v) => typeof v !== "string")) return null;
+          const filters: Record<string, string | null> = { ...first.filters };
+          keys.forEach((key, index) => { filters[key] = values[index] as string; });
+          return { value, scale: first.scale, unit: first.unit, basis: { table: first.table, column: first.column, operation: "sum", unit: first.unit, prediction: first.prediction, timezone: first.range.timezone }, scopes: [{ filters, start: first.range.start, end: first.range.end }] };
+        };
+        prepared.push({ input: { table: normalized, valueColumn: ref.cell, keyColumns: keys, valueForGroup: make }, make, filters: first.filters, source, partial: false });
+        continue;
+      }
       const shape = verifyCell(evidence, contract, { op: "count_rows", as: "shape" }, source.rows.length);
       const projections = parseReadonlySql(evidence.sql).ast.columns;
       if (!shape || !Array.isArray(projections)) return null;
@@ -1678,7 +1694,7 @@ function joinCoverage(plan: JoinEvidencePlan, rows: Array<Record<string, unknown
   const metricCount = new Set(plan.metrics.map((item) => item.column)).size;
   const zeros = new Set<string>();
   for (const row of rows) for (const tuple of row.__da_join_proof as unknown[][]) {
-    if (tuple.slice(1, 1 + metricCount).some((value) => value === 0 || value === "0")) zeros.add(String(tuple[0]));
+    if (tuple.slice(1, 1 + metricCount).some(isExactZero)) zeros.add(String(tuple[0]));
   }
   return { status: "known", reason: "本次 JOIN 查询捕获的已出现分组按完整事实粒度逐日验证；未出现的分组不补零。", table: plan.fact, expected_days: plan.expectedDates.length, absent_dates: [], null_dates: [], zero_dates: [...zeros].sort(), predicted_dates: [], actual_dates: [...plan.expectedDates], unknown_prediction_dates: [], groups: [] };
 }
@@ -1838,7 +1854,10 @@ function renderTransform(resource: TransformResource, input: ResultTable, result
   if (!result.rows.length) lines.push("变换后无结果行；不补零。");
   let shown = 0; let bytes = 0;
   for (const row of result.rows.slice(0, 100)) {
-    const line = result.columns.map((column) => `${column.label}=${row[column.name] === null ? "NULL" : String(row[column.name])}（${column.unit}）`).join("；") + "。";
+    const line = result.columns.map((column) => {
+      const value = row[column.name];
+      return `${column.label}=${value === null ? "NULL（空值）" : value === "NULL" ? '"NULL"（字符串）' : String(value)}（${column.unit}）`;
+    }).join("；") + "。";
     const size = Buffer.byteLength(line); if (bytes + size > 32_000) break;
     lines.push(line); bytes += size; shown += 1;
   }

@@ -409,9 +409,11 @@ export function emitHarborlightKnowledge(root: string): void {
     },
   }, null, 2));
   writeFileSync(path.join(root, "joins.json"), JSON.stringify({
-    revision: "joins-harborlight-r1",
+    revision: "joins-harborlight-r2",
     simulated: true,
     joins: [
+      { join_id: "join.title_payment", tables: ["dim_fox_title", "fact_fox_daily_payment"], keys: ["title_id"], note: "合成产品维度到收入及成本。" },
+      { join_id: "join.channel_payment", tables: ["dim_fox_channel", "fact_fox_daily_payment"], keys: ["channel_id"], note: "合成渠道维度到收入及成本。" },
       { join_id: "join.title_install", tables: ["dim_fox_title", "fact_fox_daily_install"], keys: ["title_id"], note: "产品维度到新增。" },
       { join_id: "join.channel_install", tables: ["dim_fox_channel", "fact_fox_daily_install"], keys: ["channel_id"], note: "渠道维度到新增。" },
       { join_id: "join.install_active", tables: ["fact_fox_daily_install", "fact_fox_daily_active"], keys: ["event_date", "title_id", "platform", "country_code", "channel_id"], note: "同一粒度。" },
