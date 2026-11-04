@@ -1,6 +1,6 @@
 {
   "asset_id": "contract.fact_fox_ad_receipt",
-  "revision": "contract.fact_fox_ad_receipt-r2",
+  "revision": "contract.fact_fox_ad_receipt-r3",
   "table": "fact_fox_ad_receipt",
   "engine": "clickhouse-local",
   "simulated": true,
@@ -26,9 +26,18 @@
       "revenue_usd"
     ],
     "predicted_column": "is_predicted",
-    "prediction_values": { "actual": 0, "predicted": 1 }
+    "prediction_values": {
+      "actual": 0,
+      "predicted": 1
+    }
   },
-  "grain": ["event_date", "title_id", "platform", "country_code", "placement"],
+  "grain": [
+    "event_date",
+    "title_id",
+    "platform",
+    "country_code",
+    "placement"
+  ],
   "columns": [
     {
       "name": "event_date",
@@ -38,17 +47,17 @@
     {
       "name": "title_id",
       "type": "LowCardinality(String)",
-      "description": "虚构产品"
+      "description": "虚构产品 合成示例：纸灯对应 paper_lantern，玻璃鲦对应 glass_minnow；示例不是封闭枚举，也不保证每张事实表都有各产品数据。"
     },
     {
       "name": "platform",
       "type": "LowCardinality(String)",
-      "description": "平台"
+      "description": "平台 平台值区分大小写；合成示例为小写 ios、android，并非封闭枚举。"
     },
     {
       "name": "country_code",
       "type": "LowCardinality(String)",
-      "description": "地区"
+      "description": "地区 合成地区示例为 US（美国）、JP（日本）、DE（德国），并非封闭枚举，也不保证每张事实表都有各地区数据。"
     },
     {
       "name": "placement",
@@ -56,7 +65,8 @@
       "description": "虚构广告位"
     },
     {
-      "name": "revenue_usd", "unit": "USD",
+      "name": "revenue_usd",
+      "unit": "USD",
       "type": "Nullable(Float64)",
       "description": "变现金额。NULL 是缺失，0 是真实零。",
       "nullable": true,

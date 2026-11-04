@@ -583,7 +583,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.match(coarseSource.sql ?? "", /^WITH p AS /); assert.match(coarseSource.executed_sql ?? "", /groupArray/);
     assert.notEqual(coarseSource.executed_sql, coarseSource.sql); assert.equal(coarseSource.execution_settings?.join_use_nulls, true);
     assert.ok(coarseSource.execution_id); assert.equal(coarseSource.freshness_receipts?.length, 2);
-    assert.equal(coarseSource.contract_revisions?.fact_fox_daily_payment, "contract.fact_fox_daily_payment-r4");
+    assert.equal(coarseSource.contract_revisions?.fact_fox_daily_payment, "contract.fact_fox_daily_payment-r5");
     assert.equal(coarseSource.contract_revisions?.dim_fox_title, "contract.dim_fox_title-r2");
     const coarseHash = coarse.analysis?.resource_hashes?.[String(coarseSource.resource_id)]; assert.ok(coarseHash);
     const coarsePage = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${coarseSession}/resources/${coarseSource.resource_id}?offset=0&limit=100&resource_hash=${coarseHash}`);

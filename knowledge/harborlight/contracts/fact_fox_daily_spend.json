@@ -1,6 +1,6 @@
 {
   "asset_id": "contract.fact_fox_daily_spend",
-  "revision": "contract.fact_fox_daily_spend-r2",
+  "revision": "contract.fact_fox_daily_spend-r3",
   "table": "fact_fox_daily_spend",
   "engine": "clickhouse-local",
   "simulated": true,
@@ -28,10 +28,21 @@
       "payback_usd"
     ],
     "predicted_column": "is_predicted",
-    "prediction_values": { "actual": 0, "predicted": 1 }
+    "prediction_values": {
+      "actual": 0,
+      "predicted": 1
+    }
   },
   "derived_metrics": [
-    { "id": "roi", "label": "实际 ROI", "operation": "divide", "numerator": "payback_usd", "denominator": "spend_usd", "prediction": "actual_only", "unit": "比值" }
+    {
+      "id": "roi",
+      "label": "实际 ROI",
+      "operation": "divide",
+      "numerator": "payback_usd",
+      "denominator": "spend_usd",
+      "prediction": "actual_only",
+      "unit": "比值"
+    }
   ],
   "columns": [
     {
@@ -42,25 +53,26 @@
     {
       "name": "title_id",
       "type": "LowCardinality(String)",
-      "description": "title_id 维度"
+      "description": "title_id 维度 合成示例：纸灯对应 paper_lantern，玻璃鲦对应 glass_minnow；示例不是封闭枚举，也不保证每张事实表都有各产品数据。"
     },
     {
       "name": "platform",
       "type": "LowCardinality(String)",
-      "description": "platform 维度"
+      "description": "platform 维度 平台值区分大小写；合成示例为小写 ios、android，并非封闭枚举。"
     },
     {
       "name": "country_code",
       "type": "LowCardinality(String)",
-      "description": "country_code 维度"
+      "description": "country_code 维度 合成地区示例为 US（美国）、JP（日本）、DE（德国），并非封闭枚举，也不保证每张事实表都有各地区数据。"
     },
     {
       "name": "channel_id",
       "type": "LowCardinality(String)",
-      "description": "channel_id 维度"
+      "description": "channel_id 维度 合成示例：雾帆对应 mist_ads，卵石对应 pebble_net；示例不是封闭枚举，也不保证每张事实表都有各渠道数据。"
     },
     {
-      "name": "spend_usd", "unit": "USD",
+      "name": "spend_usd",
+      "unit": "USD",
       "type": "Nullable(Float64)",
       "description": "投放成本。NULL 不是 0。",
       "nullable": true,
@@ -68,7 +80,8 @@
       "zero_means": "观测到的真实零"
     },
     {
-      "name": "payback_usd", "unit": "USD",
+      "name": "payback_usd",
+      "unit": "USD",
       "type": "Nullable(Float64)",
       "description": "当日回收。预测行不进入实际 ROI。",
       "nullable": true,

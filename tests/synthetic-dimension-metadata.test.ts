@@ -21,3 +21,15 @@ test("合成新增契约中的维度示例与实际数据和维表一致，且�
   for (const row of data.titles) { assert.ok(description("title_id").includes(row.title_id)); assert.ok(description("title_id").includes(row.title_name)); }
   for (const row of data.channels) { assert.ok(description("channel_id").includes(row.channel_id)); assert.ok(description("channel_id").includes(row.channel_name)); }
 });
+
+test("各事实表均说明合成维度编码、大小写及非封闭范围", () => {
+  const knowledge = loadKnowledge(path.join(repoRoot(), "knowledge", "harborlight"));
+  for (const asset of knowledge.assets.filter((item) => item.kind === "data_contract" && item.table?.startsWith("fact_"))) {
+    const contract = asset.contract; assert.ok(contract);
+    for (const column of contract.columns.filter((item) => ["title_id", "platform", "country_code", "channel_id"].includes(item.name))) {
+      const required = column.name === "title_id" ? ["paper_lantern", "纸灯"] : column.name === "platform" ? ["ios", "android"] : column.name === "country_code" ? ["US", "JP", "DE"] : ["mist_ads", "雾帆"];
+      for (const value of required) assert.ok(column.description.includes(value), `${asset.asset_id}.${column.name}: ${value}`);
+      assert.match(column.description, /(?:并非|不是)封闭枚举/u);
+    }
+  }
+});

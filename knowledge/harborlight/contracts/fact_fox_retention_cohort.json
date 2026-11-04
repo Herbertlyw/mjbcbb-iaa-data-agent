@@ -1,6 +1,6 @@
 {
   "asset_id": "contract.fact_fox_retention_cohort",
-  "revision": "contract.fact_fox_retention_cohort-r2",
+  "revision": "contract.fact_fox_retention_cohort-r3",
   "table": "fact_fox_retention_cohort",
   "engine": "clickhouse-local",
   "simulated": true,
@@ -37,17 +37,17 @@
     {
       "name": "title_id",
       "type": "LowCardinality(String)",
-      "description": "title_id 维度"
+      "description": "title_id 维度 合成示例：纸灯对应 paper_lantern，玻璃鲦对应 glass_minnow；示例不是封闭枚举，也不保证每张事实表都有各产品数据。"
     },
     {
       "name": "platform",
       "type": "LowCardinality(String)",
-      "description": "platform 维度"
+      "description": "platform 维度 平台值区分大小写；合成示例为小写 ios、android，并非封闭枚举。"
     },
     {
       "name": "country_code",
       "type": "LowCardinality(String)",
-      "description": "country_code 维度"
+      "description": "country_code 维度 合成地区示例为 US（美国）、JP（日本）、DE（德国），并非封闭枚举，也不保证每张事实表都有各地区数据。"
     },
     {
       "name": "day_n",
@@ -55,7 +55,8 @@
       "description": "留存日龄"
     },
     {
-      "name": "retained_users", "unit": "人",
+      "name": "retained_users",
+      "unit": "人",
       "type": "Nullable(Int32)",
       "description": "留存人数。NULL 不是 0。",
       "nullable": true,
