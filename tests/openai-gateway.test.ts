@@ -1,15 +1,35 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadConfig, type AppConfig } from "../src/config.js";
+import { fetchLoopbackOnly } from "../src/openai-gateway.js";
 import { analyst, ask, openRuntime, waitForJob, withRuntime } from "./helpers.js";
 import { startFakeOpenAI } from "./openai-fake-server.js";
 import type { ProviderStepBegin, ProviderStepDecision, ProviderStepSettle } from "../src/state-store.js";
 
 const token = "fictional-loopback-token";
+
+test("本机供应商请求禁止重定向及非回环目标", async () => {
+  let redirectedRequests = 0;
+  const destination = createServer((_request, response) => { redirectedRequests++; response.end(); });
+  await new Promise<void>((resolve) => destination.listen(0, "127.0.0.1", resolve));
+  const port = (destination.address() as AddressInfo).port;
+  const redirect = createServer((_request, response) => { response.writeHead(302, { location: `http://127.0.0.1:${port}/v1` }); response.end(); });
+  await new Promise<void>((resolve) => redirect.listen(0, "127.0.0.1", resolve));
+  try {
+    const redirectPort = (redirect.address() as AddressInfo).port;
+    await assert.rejects(fetchLoopbackOnly(`http://127.0.0.1:${redirectPort}/v1`, { redirect: "follow" }));
+    assert.equal(redirectedRequests, 0);
+    await assert.rejects(fetchLoopbackOnly("http://192.0.2.1:1234/v1"), /remote_dispatch_disabled/);
+  } finally {
+    await Promise.all([new Promise<void>((resolve) => redirect.close(() => resolve())), new Promise<void>((resolve) => destination.close(() => resolve()))]);
+  }
+});
 
 test("异步供应商账本必须先预留再派发，结算落定前不执行工具", async () => {
   const fake = await startFakeOpenAI(token);
@@ -49,6 +69,8 @@ test("openai-compatible 缺少配置、远程地址或未知参数时失败，�
   assert.throws(() => loadConfig(gateway({ piBaseUrl: "" })), /PI_BASE_URL/);
   assert.throws(() => loadConfig(gateway({ piApiKey: "" })), /PI_API_KEY/);
   assert.throws(() => loadConfig(gateway({ piBaseUrl: "https://example.com/v1" })), /远程 HTTPS 供应商默认关闭/);
+  assert.throws(() => loadConfig(gateway({ piBaseUrl: "http://name:password@127.0.0.1:1234/v1" })), /只允许/);
+  assert.throws(() => loadConfig(gateway({ piBaseUrl: "http://127.0.0.1:1234/v1?token=fake" })), /只允许/);
   assert.throws(() => loadConfig(gateway({ piReasoning: "ultra" })), /PI_REASONING/);
   const previous = process.env.PI_UNSUPPORTED_PARAM;
   process.env.PI_UNSUPPORTED_PARAM = "temperature-extra";
@@ -58,6 +80,21 @@ test("openai-compatible 缺少配置、远程地址或未知参数时失败，�
     if (previous === undefined) delete process.env.PI_UNSUPPORTED_PARAM;
     else process.env.PI_UNSUPPORTED_PARAM = previous;
   }
+});
+
+test("未标脚本的本机服务用量只标记为服务自报，仍由账本结算", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: "" }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "纸灯 在 2026-10-06 到 2026-10-12（美国、iOS、雾帆）的新增用户是多少？");
+      assert.equal(job.usage?.usage_source, "reported");
+      assert.ok((job.usage?.input_tokens ?? 0) > 0);
+      const steps = runtime.state.listProviderSteps(job.job_id);
+      assert.ok(steps.length > 0 && steps.every((step) => step.usage_source === "reported" && step.settlement === "settled"));
+      assert.equal(runtime.config.protocolScript, "");
+    });
+  } finally { await fake.close(); }
 });
 
 test("本地假 HTTP 服务经 Pi SDK 适配器处理错误、缺用量和非法工具参数", async () => {

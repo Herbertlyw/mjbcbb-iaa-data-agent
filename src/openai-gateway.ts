@@ -83,7 +83,7 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
       const physical = { ...model, api: "openai-completions" as const, baseUrl: config.piBaseUrl, provider: "openai-compatible" };
       let stream;
       try {
-        stream = openAICompletions(physical as Model<"openai-completions">, context, options);
+        stream = openAICompletions(physical as Model<"openai-completions">, context, { ...options, fetch: fetchLoopbackOnly, maxRetries: 0 });
       } catch (error) {
         const settled = await ledger.state.settleProviderStep({
           stepId,
@@ -110,7 +110,7 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
       }
       if (!terminal) throw new Error("provider_outcome_unknown");
       const message = await stream.result();
-      await settleFromMessage(ledger, stepId, started, message);
+      await settleFromMessage(ledger, stepId, started, message, config.protocolScript ? "simulated" : "reported");
       outer.push(terminal);
       outer.end(message);
       })().catch((error: unknown) => {
@@ -133,23 +133,33 @@ export function estimateContextTokens(context: unknown): { tokens: number; sourc
 
 export function assertDispatchTarget(baseUrl: string): void {
   const url = new URL(baseUrl);
-  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1") {
+  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port || url.username || url.password || url.search || url.hash) {
     throw new Error("remote_dispatch_disabled");
   }
 }
 
+// Validate every actual HTTP request as well as the configured base URL. In
+// particular, an otherwise valid local service must not redirect a request
+// (and its authorization header) to an uncontrolled destination.
+export const fetchLoopbackOnly: typeof fetch = async (input, init) => {
+  const address = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  assertDispatchTarget(address);
+  return globalThis.fetch(input, { ...init, redirect: "error" });
+};
+
 export function usageFromSteps(steps: ProviderStepRecord[]): {
   input_tokens: number | null;
   output_tokens: number | null;
-  usage_source: "simulated" | "unknown";
+  usage_source: "simulated" | "reported" | "unknown";
 } {
-  if (steps.length === 0 || steps.some((step) => step.usage_source !== "simulated" || step.input_tokens === null || step.output_tokens === null)) {
+  const source = steps[0]?.usage_source;
+  if (source === undefined || source === "unknown" || steps.some((step) => step.usage_source !== source || step.input_tokens === null || step.output_tokens === null)) {
     return { input_tokens: null, output_tokens: null, usage_source: "unknown" };
   }
   return {
     input_tokens: steps.reduce((sum, step) => sum + (step.input_tokens ?? 0), 0),
     output_tokens: steps.reduce((sum, step) => sum + (step.output_tokens ?? 0), 0),
-    usage_source: "simulated",
+    usage_source: source,
   };
 }
 
@@ -177,7 +187,7 @@ export function safeProviderError(error: unknown): { code: string; message: stri
   return { code: "provider_error", message: "供应商请求失败。日志不包含密钥、请求头或用户原文。" };
 }
 
-async function settleFromMessage(ledger: ProviderLedger, stepId: string, started: number, message: AssistantMessage): Promise<void> {
+async function settleFromMessage(ledger: ProviderLedger, stepId: string, started: number, message: AssistantMessage, source: "simulated" | "reported"): Promise<void> {
   const sawUsage = message.usage.input > 0 || message.usage.output > 0 || message.usage.totalTokens > 0;
   const failed = message.stopReason === "error" || message.stopReason === "aborted";
   const recorded = await ledger.state.saveProviderPayload({
@@ -189,7 +199,7 @@ async function settleFromMessage(ledger: ProviderLedger, stepId: string, started
     owner: ledger.owner,
     fence: ledger.fence,
     kind: "response",
-    body: JSON.stringify({ format: "metadata-only", failed, usage_source: sawUsage ? "simulated" : "unknown" }),
+    body: JSON.stringify({ format: "metadata-only", failed, usage_source: sawUsage ? source : "unknown" }),
   });
   if (!recorded) throw new Error("provider_fence_rejected");
   const settled = await ledger.state.settleProviderStep({
@@ -200,7 +210,7 @@ async function settleFromMessage(ledger: ProviderLedger, stepId: string, started
     status: failed ? "error" : "completed",
     inputTokens: sawUsage ? message.usage.input : null,
     outputTokens: sawUsage ? message.usage.output : null,
-    usageSource: sawUsage ? "simulated" : "unknown",
+    usageSource: sawUsage ? source : "unknown",
     durationMs: Date.now() - started,
     errorCode: failed ? safeProviderError(new Error(message.errorMessage || message.stopReason)).code : null,
   });

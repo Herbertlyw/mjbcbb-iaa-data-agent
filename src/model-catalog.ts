@@ -51,7 +51,9 @@ export function modelCatalog(config: AppConfig): ModelCatalog {
       enabled: true,
       context_window: config.piContextWindow,
       max_output_tokens: config.piMaxOutputTokens,
-      verified_here: true,
+      // A configured endpoint/model has not itself been verified. Protocol
+      // tests of the adapter do not establish the service's capabilities.
+      verified_here: false,
     });
   }
   return {

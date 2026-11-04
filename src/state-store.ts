@@ -135,7 +135,7 @@ export interface ProviderStepSettle {
   status: "completed" | "error" | "outcome_unknown";
   inputTokens: number | null;
   outputTokens: number | null;
-  usageSource: "simulated" | "unknown";
+  usageSource: "simulated" | "reported" | "unknown";
   durationMs: number | null;
   errorCode: string | null;
 }
@@ -151,7 +151,7 @@ export interface ProviderStepRecord {
   status: "dispatched" | "completed" | "error" | "outcome_unknown";
   input_tokens: number | null;
   output_tokens: number | null;
-  usage_source: "simulated" | "unknown";
+  usage_source: "simulated" | "reported" | "unknown";
   duration_ms: number | null;
   error_code: string | null;
   estimated_input: number;
@@ -759,7 +759,7 @@ export class SqliteStateStore implements StateStore {
         return { ok: false, code: "provider_fence_rejected" };
       }
       const known = input.status === "completed"
-        && input.usageSource === "simulated"
+        && (input.usageSource === "simulated" || input.usageSource === "reported")
         && input.inputTokens !== null
         && input.outputTokens !== null
         && input.inputTokens + input.outputTokens > 0;
@@ -772,10 +772,10 @@ export class SqliteStateStore implements StateStore {
         ).run(Number(step.reserved_total), input.inputTokens, input.outputTokens, input.jobId);
         this.db.prepare(
           `UPDATE provider_steps
-           SET status = 'completed', settlement = 'settled', input_tokens = ?, output_tokens = ?, usage_source = 'simulated',
+           SET status = 'completed', settlement = 'settled', input_tokens = ?, output_tokens = ?, usage_source = ?,
                duration_ms = ?, error_code = NULL
            WHERE step_id = ? AND settlement = 'pending'`,
-        ).run(input.inputTokens, input.outputTokens, input.durationMs, input.stepId);
+        ).run(input.inputTokens, input.outputTokens, input.usageSource, input.durationMs, input.stepId);
         return { ok: true, code: "settled" };
       }
       this.db.prepare(

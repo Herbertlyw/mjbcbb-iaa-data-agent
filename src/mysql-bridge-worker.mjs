@@ -647,7 +647,7 @@ async function settleProviderStep(input) {
     }
     const [budgets] = await conn.query("SELECT job_id FROM turn_budgets WHERE job_id = ? FOR UPDATE", [input.jobId]);
     if (!budgets[0]) return { ok: false, code: "step_missing" };
-    const known = input.status === "completed" && input.usageSource === "simulated" && input.inputTokens !== null && input.outputTokens !== null && input.inputTokens + input.outputTokens > 0;
+    const known = input.status === "completed" && ["simulated", "reported"].includes(input.usageSource) && input.inputTokens !== null && input.outputTokens !== null && input.inputTokens + input.outputTokens > 0;
     if (known) {
       await conn.query(
         `UPDATE turn_budgets
@@ -658,10 +658,10 @@ async function settleProviderStep(input) {
       );
       await conn.query(
         `UPDATE provider_steps
-         SET status = 'completed', settlement = 'settled', input_tokens = ?, output_tokens = ?, usage_source = 'simulated',
+         SET status = 'completed', settlement = 'settled', input_tokens = ?, output_tokens = ?, usage_source = ?,
              duration_ms = ?, error_code = NULL
          WHERE step_id = ? AND settlement = 'pending'`,
-        [input.inputTokens, input.outputTokens, input.durationMs, input.stepId],
+        [input.inputTokens, input.outputTokens, input.usageSource, input.durationMs, input.stepId],
       );
       return { ok: true, code: "settled" };
     }

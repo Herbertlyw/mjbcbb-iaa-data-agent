@@ -114,6 +114,12 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
     assert.equal(after?.settled_input, 21);
     assert.equal(after?.settled_output, 9);
     assert.equal(after?.reserved_tokens, 0);
+    assert.equal((await state.call("beginProviderStep", input("step_reported"))).ok, true);
+    const reported = { stepId: "step_reported", jobId: job.job_id, owner: "worker-a", fence: claim.fence, status: "completed" as const, inputTokens: 10, outputTokens: 5, usageSource: "reported" as const, durationMs: 5, errorCode: null };
+    assert.equal((await state.call("settleProviderStep", reported)).code, "settled");
+    assert.equal((await state.call("settleProviderStep", reported)).code, "idempotent");
+    assert.equal((await state.call("settleProviderStep", { ...reported, usageSource: "simulated" })).code, "settlement_conflict");
+    assert.equal((await state.call("listProviderSteps", job.job_id)).find((item) => item.step_id === "step_reported")?.usage_source, "reported");
     const heldBegin = (await state.call("beginProviderStep", input("step_hold")));
     assert.equal(heldBegin.ok, true, heldBegin.code);
     const missing = (await state.call("settleProviderStep", {

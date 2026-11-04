@@ -526,7 +526,7 @@
       } else if (health.protocol_scripted) {
         banner.textContent = "Pi 会话：本机脚本假模型，仅用于协议演示，不具备真实模型的自主分析能力。";
       } else if (health.remote_dispatch === false) {
-        banner.textContent = "Pi 会话：只向 127.0.0.1 派发已验证的 openai-completions。这不是外部供应商联调，远程 HTTPS 默认关闭。";
+        banner.textContent = "Pi 会话：使用用户配置的 127.0.0.1 OpenAI 兼容服务；服务和模型能力尚未验证。远程派发关闭。";
       } else {
         banner.textContent = "Pi 会话：模型由服务端目录决定。没有密钥时不会改回演示结果。";
       }

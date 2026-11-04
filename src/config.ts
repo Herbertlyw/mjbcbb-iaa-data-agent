@@ -215,7 +215,7 @@ export function validateModelProvider(config: AppConfig): void {
   if (url.protocol === "https:") {
     throw new Error("远程 HTTPS 供应商默认关闭。本构建只允许本机假服务，不会向外网派发。");
   }
-  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port) {
+  if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port || url.username || url.password || url.search || url.hash) {
     throw new Error("未开启远程配置时，只允许 http://127.0.0.1 的端口。不会改用 faux。");
   }
 }
