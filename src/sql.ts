@@ -115,6 +115,13 @@ export interface JoinGuardOptions { leftJoinDimensions?: ReadonlySet<string> }
 
 export function assertJoinKeys(rawSql: string, joins: RegisteredJoin[], grains: Map<string, string[]> = new Map(), options: JoinGuardOptions = {}): void {
   const parsed = parseReadonlySql(rawSql);
+  const preaggregated = rewritePreaggregatedDimensionJoin(parsed.ast);
+  if (preaggregated) {
+    const grain = grains.get(preaggregated.fact);
+    if (!grain?.length || JSON.stringify([...grain].sort()) !== JSON.stringify([...preaggregated.grain].sort())) throw new SqlRejected("join_grain_mismatch", "预聚合必须保留完整的事实契约粒度。");
+    assertJoinKeys(preaggregated.sql, joins, grains, options);
+    return;
+  }
   // Walk every SELECT, including CTEs, derived tables, scalar subqueries and UNION arms.
   // A derived relation used as a JOIN operand remains unsupported because its
   // output-column lineage and grain cannot yet be proved from the contracts.
@@ -189,6 +196,18 @@ function assertSelectJoinKeys(statement: Record<string, unknown>, joins: Registe
 
 export function guardSql(rawSql: string, rules: TableRule[], dialect: "sqlite" | "clickhouse" = "sqlite"): GuardedSql {
   const parsed = parseReadonlySql(rawSql, dialect);
+  const preaggregated = rewritePreaggregatedDimensionJoin(parsed.ast);
+  if (preaggregated) {
+    const factRule = rules.find((rule) => rule.table === preaggregated.fact);
+    if (!factRule) throw new SqlRejected("unknown_table", "预聚合事实表不在本次绑定中。");
+    for (const field of preaggregated.grain) {
+      if (factRule.sensitive_columns.includes(field)) throw new SqlRejected("sensitive_field", "预聚合粒度包含敏感字段。");
+      if (!factRule.allowed_columns.includes(field)) throw new SqlRejected("column_not_in_contract", "预聚合粒度包含未授权字段。");
+    }
+    const checked = guardSql(preaggregated.sql, rules, dialect);
+    if (checked.tables.length !== parsed.tables.length || parsed.tables.some((table) => !checked.tables.includes(table))) throw new SqlRejected("join_structure_unsupported", "预聚合来源不一致。");
+    return { ...checked, sql: parsed.sql, tables: parsed.tables };
+  }
   const ruleByTable = new Map(rules.map((rule) => [rule.table, rule]));
   for (const table of parsed.tables) {
     if (!ruleByTable.has(table)) throw new SqlRejected("unknown_table", `表 ${table} 不在本次绑定中`);
@@ -226,6 +245,70 @@ export function guardSql(rawSql: string, rules: TableRule[], dialect: "sqlite" |
     else if (ranges.length > 1) throw new SqlRejected("time_range_ambiguous", "多层查询的日期范围不一致，无法绑定单一证据范围。");
   }
   return { sql: parsed.sql, tables: parsed.tables, columns, time_range: { start, end }, equalities: equalityFilters(parsed.ast.where) };
+}
+
+/** Strict algebraic form used only for a full-grain SUM then dimension JOIN.
+ * This is not authorization. The caller must check the resulting physical SQL,
+ * full contracted grain, registered join keys, and actual captured tuples. */
+export function rewritePreaggregatedDimensionJoin(ast: Record<string, unknown>): { sql: string; fact: string; grain: string[] } | null {
+  try {
+    if (ast._next || ast.distinct || ast.options || ast.where || ast.having || ast.limit || ast.window || ast.for_update || !Array.isArray(ast.from) || ast.from.length !== 2 || !Array.isArray(ast.columns)) return null;
+    const left = asRecord(ast.from[0]); const right = asRecord(ast.from[1]);
+    if (!left || !right || right.expr || right.db || typeof right.table !== "string" || !["INNER JOIN", "LEFT JOIN"].includes(String(right.join))) return null;
+    let inner: Record<string, unknown> | undefined; let alias: string;
+    if (Array.isArray(ast.with) && ast.with.length === 1 && typeof left.table === "string" && !left.expr) {
+      const entry = asRecord(ast.with[0]); const name = cteName(entry);
+      if (!name || entry?.columns || left.table !== name) return null;
+      inner = nestedSelect(entry); alias = String(left.as || left.table);
+    } else if (!ast.with && left.expr && typeof left.as === "string") {
+      inner = asRecord(asRecord(left.expr)?.ast); alias = left.as;
+    } else return null;
+    if (!inner || inner.with || inner._next || inner.distinct || inner.options || inner.having || inner.orderby || inner.limit || inner.window || inner.for_update || !inner.where || !Array.isArray(inner.from) || inner.from.length !== 1 || !Array.isArray(inner.columns)) return null;
+    const physical = asRecord(inner.from[0]);
+    if (!physical || physical.expr || physical.db || physical.join || typeof physical.table !== "string") return null;
+    const fact = physical.table; const fa = String(physical.as || fact);
+    if (![fact, fa, alias].every((s) => /^[a-z_][a-z0-9_]*$/u.test(s))) return null;
+    const plain = (node: unknown): string | null => { const x = asRecord(node); return x?.type === "column_ref" && !x.collate && typeof x.column === "string" && /^[a-z_][a-z0-9_]*$/u.test(x.column) && (!x.table || x.table === fa) ? x.column : null; };
+    const groupBy = asRecord(inner.groupby);
+    if (!groupBy || Object.keys(groupBy).some((key) => key !== "columns")) return null;
+    const groups = groupBy.columns;
+    if (!Array.isArray(groups) || !groups.length || groups.some((g) => !plain(g))) return null;
+    const grain = groups.map((g) => plain(g)!);
+    if (new Set(grain).size !== grain.length) return null;
+    const selected: string[] = []; let subtotal = ""; let metric = "";
+    for (const raw of inner.columns) {
+      const entry = asRecord(raw); const expr = asRecord(entry?.expr); const col = plain(expr);
+      if (!entry || !expr) return null;
+      if (col) { if (entry.as && entry.as !== col) return null; selected.push(col); continue; }
+      const args = asRecord(expr.args); const arg = plain(args?.expr);
+      if (subtotal || expr.type !== "aggr_func" || String(expr.name).toLowerCase() !== "sum" || expr.over || !args || args.distinct || args.orderby || !arg || typeof entry.as !== "string" || !/^[a-z_][a-z0-9_]*$/u.test(entry.as)) return null;
+      subtotal = entry.as; metric = arg;
+    }
+    if (!subtotal || grain.includes(subtotal) || selected.length !== grain.length || new Set(selected).size !== selected.length || [...selected].sort().join("|") !== [...grain].sort().join("|")) return null;
+    const output = structuredClone(ast); let subtotalUses = 0; let aggregates = 0; let invalid = false;
+    for (const raw of output.columns as unknown[]) {
+      const entry = asRecord(raw); const expr = asRecord(entry?.expr);
+      if (!expr) return null;
+      if (expr.type === "column_ref") { if (expr.table === alias && !grain.includes(String(expr.column))) return null; continue; }
+      const args = asRecord(expr.args); const arg = asRecord(args?.expr);
+      if (expr.type !== "aggr_func" || String(expr.name).toLowerCase() !== "sum" || expr.over || !args || args.distinct || args.orderby || arg?.type !== "column_ref" || arg.table !== alias || arg.column !== subtotal) return null;
+      arg.column = metric; aggregates++;
+    }
+    if (aggregates !== 1) return null;
+    for (const field of [ast.columns, ast.groupby, ast.orderby, right.on]) walkShallow(field, (node) => {
+      if (node.type !== "column_ref" || node.table !== alias) return;
+      if (node.column === subtotal) subtotalUses++;
+      else if (typeof node.column !== "string" || !grain.includes(node.column)) invalid = true;
+    });
+    if (invalid || subtotalUses !== 1) return null;
+    const where = structuredClone(inner.where);
+    walkShallow(where, (node) => { if (node.type === "column_ref") { if (node.table && node.table !== fa) invalid = true; node.table = alias; } });
+    if (invalid) return null;
+    output.with = null; output.where = where;
+    (output.from as unknown[])[0] = { db: null, table: fact, as: alias };
+    const sql = unquoteProofIdentifiers(new loaded.Parser().sqlify(output, { database: "sqlite" }));
+    return sql ? { sql, fact, grain } : null;
+  } catch { return null; }
 }
 
 export interface SingleSourceProjectionLineage {

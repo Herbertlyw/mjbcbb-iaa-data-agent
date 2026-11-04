@@ -1,5 +1,5 @@
 import { isCalendarDate } from "./config.js";
-import { assertJoinKeys, parseReadonlySql } from "./sql.js";
+import { assertJoinKeys, parseReadonlySql, rewritePreaggregatedDimensionJoin } from "./sql.js";
 import type { DataContract, JoinConstraint } from "./types.js";
 
 /** Narrow one-fact/one-dimension JOIN whose aggregate can be recomputed from
@@ -59,6 +59,12 @@ export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: 
     if (!series || series.prediction_mode !== "observed_only" || series.predicted_column || dimension.series || fact.timezone !== dimension.timezone || !fact.grain || [...fact.grain].sort().join("|") !== [series.date_column, ...series.dimensions].sort().join("|")) return null;
     const parsed = parseReadonlySql(sql);
     const ast = parsed.ast;
+    const preaggregated = rewritePreaggregatedDimensionJoin(ast);
+    if (preaggregated) {
+      if (preaggregated.fact !== fact.table || JSON.stringify([...preaggregated.grain].sort()) !== JSON.stringify([...fact.grain].sort())) return null;
+      const proof = prepareJoinEvidence(preaggregated.sql, fact, dimension, joins);
+      return proof ? { ...proof, originalSql: parsed.sql } : null;
+    }
     if (ast.with || ast._next || ast.having || ast.limit || ast.distinct || ast.options || ast.for_update || ast.window || !Array.isArray(ast.from) || ast.from.length !== 2) return null;
     const left = object(ast.from[0]); const right = object(ast.from[1]);
     if (!left || !right || left.table !== fact.table || right.table !== dimension.table || left.db || right.db || left.expr || right.expr || !["INNER JOIN", "LEFT JOIN"].includes(String(right.join))) return null;
