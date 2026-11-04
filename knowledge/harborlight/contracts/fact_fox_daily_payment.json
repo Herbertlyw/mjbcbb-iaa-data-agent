@@ -1,6 +1,6 @@
 {
   "asset_id": "contract.fact_fox_daily_payment",
-  "revision": "contract.fact_fox_daily_payment-r2",
+  "revision": "contract.fact_fox_daily_payment-r3",
   "table": "fact_fox_daily_payment",
   "engine": "clickhouse-local",
   "simulated": true,
@@ -11,7 +11,10 @@
   "must_filter": ["event_date"],
   "grain": ["event_date", "title_id", "platform", "country_code", "channel_id"],
   "series": { "date_column": "event_date", "dimensions": ["title_id", "platform", "country_code", "channel_id"], "metrics": ["amount_usd", "cost_usd"], "predicted_column": null, "prediction_mode": "observed_only" },
-  "derived_metrics": [{ "id": "synthetic_return_ratio", "label": "合成收入与成本比", "operation": "divide", "numerator": "amount_usd", "denominator": "cost_usd", "prediction": "actual_only", "unit": "比值" }],
+  "derived_metrics": [
+    { "id": "synthetic_return_ratio", "label": "合成收入与成本比", "operation": "divide", "numerator": "amount_usd", "denominator": "cost_usd", "prediction": "actual_only", "unit": "比值" },
+    { "id": "synthetic_amount_per_install", "label": "同范围收入与新增数之比（非用户归因）", "operation": "divide", "numerator": "fact_fox_daily_payment.amount_usd", "denominator": "fact_fox_daily_install.new_users", "prediction": "actual_only", "unit": "(USD)/(人)" }
+  ],
   "columns": [
     { "name": "event_date", "type": "Date", "description": "洛杉矶业务日期。" },
     { "name": "title_id", "type": "LowCardinality(String)", "description": "虚构产品标识。" },

@@ -307,7 +307,8 @@
         const rows = source.rows.slice(0, 20).map((row) => `<tr>${head.map((key) => `<td>${escapeHtml(row[key] === null ? "NULL" : row[key])}</td>`).join("")}</tr>`).join("");
         return `<div class="source">
           <strong>${escapeHtml(source.tables.join(", "))}</strong>
-          <p class="muted">${source.evidence_eligible ? "当前证据" : "证据不可验证，未展示结果行"}。${escapeHtml(source.sql || "")}</p>
+          <p class="muted">${source.evidence_eligible ? "当前证据" : "证据不可验证，未展示结果行"}。提交的查询：${escapeHtml(source.sql || "")}</p>
+          ${source.executed_sql && source.executed_sql !== source.sql ? `<details><summary>实际执行的查询及设置</summary><p class="muted">${escapeHtml(source.executed_sql)}</p><p class="muted">${source.execution_settings?.join_use_nulls ? "关联未匹配值保留 NULL" : ""}</p></details>` : ""}
           <p class="muted">${escapeHtml(source.evidence_eligible ? coverageText(source) : "覆盖与新鲜度未作为当前有效证据使用。")}</p>
           <p class="muted">${escapeHtml(source.engine || "本地合成库")} · ${escapeHtml(source.time_range.start)} 到 ${escapeHtml(source.time_range.end)} · ${escapeHtml(source.time_range.timezone)} · ${source.complete_population ? "结果未截断" : "源结果受限制，不是完整总体"} · 契约 ${Object.entries(source.contract_revisions || {}).map(([table, revision]) => `${escapeHtml(table)}@${escapeHtml(revision)}`).join(", ")}</p>
           ${source.execution_id || source.observed_at ? `<p class="muted">${source.execution_id ? `执行 ID：${escapeHtml(source.execution_id)}` : ""}${source.observed_at ? ` · 查询结果保存时间：${escapeHtml(source.observed_at)}` : ""}${source.data_capture_hash ? ` · 捕获内容指纹：${escapeHtml(source.data_capture_hash)}（不是不可变版本或签名）` : ""}</p>` : ""}

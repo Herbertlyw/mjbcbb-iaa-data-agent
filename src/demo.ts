@@ -54,6 +54,11 @@ const HARBORLIGHT_QUESTIONS = [
   { id: "grouped-ratio", label: "多渠道比率", text: "合成多渠道收入成本比：按国家和渠道对齐 2026-10-08 收入与成本。" },
   { id: "alignment", label: "跨期分组变换", text: "合成分组对齐：按国家对照 2026-10-06 与 2026-10-08 的新增，并筛选、排序及求和下降组。" },
   { id: "large-transform", label: "完整分页计算", text: "合成完整分页：统计 2026-10-06 纸灯 Android 雾帆各虚构地区的新增总数。" },
+  { id: "thousand-transform", label: "千行完整计算", text: "合成千行完整计算：统计 2026-10-08 玻璃鲦 Android 卵石各虚构地区的新增总数。" },
+  { id: "cross-fact", label: "跨事实表比率", text: "合成跨事实比率：按国家和渠道比较 2026-10-08 纸灯 iOS 的收入和新增人数。" },
+  { id: "raw-cross-fact", label: "明细对齐比率", text: "合成明细跨事实：按国家和渠道对齐 2026-10-08 纸灯收入及新增明细。" },
+  { id: "cte", label: "CTE 查询", text: "合成 CTE 查询：纸灯日本 2026-10-06 到 2026-10-12 新增。" },
+  { id: "left-title", label: "未匹配的产品", text: "合成左关联产品：保留 2026-10-06 到 2026-10-12 未匹配产品。" },
 ] as const;
 
 export function demoForScenario(harborlight: boolean, fixtureToday?: string) {

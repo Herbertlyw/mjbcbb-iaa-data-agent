@@ -48,7 +48,17 @@ export function diagnoseKnowledge(root = path.join(repoRoot(), "knowledge", "lum
         }
       }
       for (const metric of contract.derived_metrics ?? []) {
-        if (!columns.has(metric.numerator) || !columns.has(metric.denominator) || !metric.unit) issues.push({ code: "derived_metric_invalid", message: `${contract.table} 的派生指标 ${metric.id} 缺少来源字段或单位` });
+        const resolve = (reference: string) => {
+          if (typeof reference !== "string") return undefined;
+          const parts = reference.split(".");
+          if (parts.length > 2 || parts.some((part) => !/^[a-z_][a-z0-9_]*$/u.test(part))) return undefined;
+          const source = parts.length === 1 ? contract : knowledge.contract_by_table.get(parts[0]!)?.contract;
+          const column = parts.at(-1)!;
+          return source?.series?.metrics.includes(column) ? source.columns.find((item) => item.name === column) : undefined;
+        };
+        const numerator = resolve(metric.numerator); const denominator = resolve(metric.denominator);
+        const expectedUnit = numerator?.unit && denominator?.unit ? numerator.unit === denominator.unit ? "比值" : `(${numerator.unit})/(${denominator.unit})` : null;
+        if (!numerator || !denominator || metric.operation !== "divide" || metric.prediction !== "actual_only" || !expectedUnit || metric.unit !== expectedUnit) issues.push({ code: "derived_metric_invalid", message: `${contract.table} 的派生指标 ${metric.id} 缺少合法来源字段或匹配单位` });
       }
     }
     if (asset.contract?.grain) {

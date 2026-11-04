@@ -10,6 +10,7 @@ export interface JoinEvidencePlan {
   executionSql: string;
   fact: string;
   dimension: string;
+  joinType: "inner" | "left";
   joinKeys: string[];
   range: { start: string; end: string; timezone: string };
   factFilters: Record<string, string>;
@@ -28,7 +29,9 @@ export interface VerifiedJoinValue {
   value: string;
   unit: string;
   description: string;
-  group: Record<string, string>;
+  group: Record<string, string | null>;
+  /** Count of captured fact rows lacking a dimension match in this group. */
+  unmatched_rows: number;
   factFilters: Record<string, string>;
   dimensionFilters: Record<string, string>;
   range: JoinEvidencePlan["range"];
@@ -58,12 +61,13 @@ export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: 
     const ast = parsed.ast;
     if (ast.with || ast._next || ast.having || ast.limit || ast.distinct || ast.options || ast.for_update || ast.window || !Array.isArray(ast.from) || ast.from.length !== 2) return null;
     const left = object(ast.from[0]); const right = object(ast.from[1]);
-    if (!left || !right || left.table !== fact.table || right.table !== dimension.table || left.db || right.db || left.expr || right.expr || right.join !== "INNER JOIN") return null;
+    if (!left || !right || left.table !== fact.table || right.table !== dimension.table || left.db || right.db || left.expr || right.expr || !["INNER JOIN", "LEFT JOIN"].includes(String(right.join))) return null;
+    const joinType = right.join === "LEFT JOIN" ? "left" : "inner";
     const fa = String(left.as || fact.table); const da = String(right.as || dimension.table);
     if (!IDENT.test(fa) || !IDENT.test(da) || fa === da || !IDENT.test(fact.table) || !IDENT.test(dimension.table)) return null;
     const relation = joins.find((item) => item.tables.length === 2 && item.tables.includes(fact.table) && item.tables.includes(dimension.table));
     if (!relation || !relation.keys.length || !dimension.grain || [...relation.keys].sort().join("|") !== [...dimension.grain].sort().join("|") || relation.keys.some((key) => !series.dimensions.includes(key))) return null;
-    assertJoinKeys(sql, joins, new Map([[fact.table, [series.date_column, ...series.dimensions]], [dimension.table, dimension.grain]]));
+    assertJoinKeys(sql, joins, new Map([[fact.table, [series.date_column, ...series.dimensions]], [dimension.table, dimension.grain]]), { leftJoinDimensions: new Set([dimension.table]) });
     const factColumns = new Set(fact.columns.map((col) => col.name)); const dimColumns = new Set(dimension.columns.map((col) => col.name));
     // Proof tuples introduce reads beyond SELECT projections. They must be
     // independently authorized even if outer SQL checks already inspected
@@ -100,7 +104,7 @@ export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: 
       conditions.push(`${col.table === "fact" ? fa : da}.${col.column} ${op} ${quote(value.value)}`);
       return true;
     };
-    if (!where(ast.where) || !start || !end || start > end) return null;
+    if (!where(ast.where) || !start || !end || start > end || (joinType === "left" && Object.keys(dimensionFilters).length)) return null;
     const dates: string[] = [];
     for (let current = Date.parse(`${start}T00:00:00Z`), last = Date.parse(`${end}T00:00:00Z`); current <= last; current += 86_400_000) {
       if (dates.length >= 366) return null;
@@ -167,7 +171,7 @@ export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: 
       }
       orderSql = ` ORDER BY ${order.join(", ")}`;
     }
-    return { originalSql: parsed.sql, executionSql: `SELECT ${selections.join(", ")} FROM ${fact.table} AS ${fa} INNER JOIN ${dimensionFrom} AS ${da} ON ${on} WHERE ${conditions.join(" AND ")}${groupSql}${orderSql}`, fact: fact.table, dimension: dimension.table, joinKeys: [...relation.keys], range: { start, end, timezone: fact.timezone }, factFilters, dimensionFilters, groups, metrics, proofFields, expectedDates: dates };
+    return { originalSql: parsed.sql, executionSql: `SELECT ${selections.join(", ")} FROM ${fact.table} AS ${fa} ${joinType === "left" ? "LEFT JOIN" : "INNER JOIN"} ${dimensionFrom} AS ${da} ON ${on} WHERE ${conditions.join(" AND ")}${groupSql}${orderSql}`, fact: fact.table, dimension: dimension.table, joinType, joinKeys: [...relation.keys], range: { start, end, timezone: fact.timezone }, factFilters, dimensionFilters, groups, metrics, proofFields, expectedDates: dates };
   } catch { return null; }
 }
 
@@ -192,7 +196,12 @@ export function verifyJoinExecutionSchema(plan: JoinEvidencePlan, fact: DataCont
   if (fact.table !== plan.fact || dimension.table !== plan.dimension || !fact.series) return false;
   const lookup = (contract: DataContract, column: string) => contract.columns.find((item) => item.name === column)?.type;
   const metricFields = [...new Set(plan.metrics.map((item) => item.column))];
-  const expected = [lookup(fact, fact.series.date_column), ...metricFields.map((name) => lookup(fact, name)), ...plan.proofFields.map((item) => lookup(item.table === "fact" ? fact : dimension, item.column))];
+  const nullable = (type: string | undefined) => {
+    if (!type) return type;
+    const unwrapped = type.replace(/^LowCardinality\((.*)\)$/iu, "$1");
+    return /^Nullable\(/iu.test(unwrapped) ? unwrapped : `Nullable(${unwrapped})`;
+  };
+  const expected = [lookup(fact, fact.series.date_column), ...metricFields.map((name) => lookup(fact, name)), ...plan.proofFields.map((item) => item.table === "fact" ? lookup(fact, item.column) : plan.joinType === "left" ? nullable(lookup(dimension, item.column)) : lookup(dimension, item.column))];
   if (expected.some((item) => !item) || !resultTypes[PROOF]) return false;
   if (Object.keys(plan.dimensionFilters).length) expected.push("UInt64");
   const normalize = (value: string) => value.replace(/\s/gu, "").toLowerCase().replace(/lowcardinality\(([^()]*)\)/gu, "$1");
@@ -216,19 +225,23 @@ export function verifyJoinEvidence(plan: JoinEvidencePlan, rows: Array<Record<st
   for (const row of rows) {
     const tuples = row[PROOF];
     if (!Array.isArray(tuples) || tuples.length !== plan.expectedDates.length) return null;
-    const group: Record<string, string> = {};
+    const group: Record<string, string | null> = {};
     for (const item of plan.groups) {
       const value = row[item.output];
-      if (typeof value !== "string" || !value || value.length > 200) return null;
+      if (!(typeof value === "string" && Boolean(value) && value.length <= 200) && !(plan.joinType === "left" && item.table === "dimension" && value === null)) return null;
       group[`${item.table === "fact" ? plan.fact : plan.dimension}.${item.column}`] = value;
     }
     const key = JSON.stringify(group); if (seen.has(key)) return null; seen.add(key);
-    const dates = new Set<string>(); const sums = new Map(metrics.map((metric) => [metric, 0n]));
+    const dates = new Set<string>(); const sums = new Map(metrics.map((metric) => [metric, 0n])); let unmatchedRows = 0;
     for (const tuple of tuples) {
       const filteredDimension = Object.keys(plan.dimensionFilters).length > 0;
       if (!Array.isArray(tuple) || tuple.length !== 1 + metrics.length + plan.proofFields.length + Number(filteredDimension) || typeof tuple[0] !== "string" || !plan.expectedDates.includes(tuple[0]) || dates.has(tuple[0])) return null;
       if (filteredDimension && tuple.at(-1) !== 1 && tuple.at(-1) !== "1") return null;
       dates.add(tuple[0]);
+      const dimensionValues = plan.proofFields.flatMap((field, index) => field.table === "dimension" ? [tuple[1 + metrics.length + index]] : []);
+      const unmatched = plan.joinType === "left" && dimensionValues.length > 0 && dimensionValues.every((value) => value === null);
+      if (!unmatched && dimensionValues.some((value) => typeof value !== "string")) return null;
+      if (unmatched) unmatchedRows += 1;
       for (const [index, metric] of metrics.entries()) {
         const value = tuple[1 + index];
         if (!(typeof value === "string" && /^-?\d{1,11}$/u.test(value) || typeof value === "number" && Number.isSafeInteger(value) && Math.abs(value) <= 4_294_967_295)) return null;
@@ -236,7 +249,7 @@ export function verifyJoinEvidence(plan: JoinEvidencePlan, rows: Array<Record<st
       }
       for (const [index, field] of plan.proofFields.entries()) {
         const value = tuple[1 + metrics.length + index];
-        if (typeof value !== "string") return null;
+        if (typeof value !== "string" && !(unmatched && field.table === "dimension" && value === null)) return null;
         const filtered = (field.table === "fact" ? plan.factFilters : plan.dimensionFilters)[field.column];
         if (filtered !== undefined && value !== filtered) return null;
         const selected = plan.groups.find((item) => item.table === field.table && item.column === field.column);
@@ -248,14 +261,14 @@ export function verifyJoinEvidence(plan: JoinEvidencePlan, rows: Array<Record<st
       for (const key of plan.joinKeys) {
         const factIndex = plan.proofFields.findIndex((field) => field.table === "fact" && field.column === key);
         const dimensionIndex = plan.proofFields.findIndex((field) => field.table === "dimension" && field.column === key);
-        if (factIndex < 0 || dimensionIndex < 0 || tuple[1 + metrics.length + factIndex] !== tuple[1 + metrics.length + dimensionIndex]) return null;
+        if (factIndex < 0 || dimensionIndex < 0 || (!unmatched && tuple[1 + metrics.length + factIndex] !== tuple[1 + metrics.length + dimensionIndex])) return null;
       }
     }
     for (const metric of plan.metrics) {
       const expected = metric.operation === "sum" ? sums.get(metric.column)!.toString() : String(tuples.length);
       const actual = row[metric.output];
       if (!(typeof actual === "string" && /^-?\d+$/u.test(actual) || typeof actual === "number" && Number.isSafeInteger(actual)) || BigInt(actual as string | number).toString() !== expected) return null;
-      verified.push({ fact: plan.fact, dimension: plan.dimension, column: metric.column, operation: metric.operation, value: expected, unit: metric.unit, description: metric.description, group, factFilters: plan.factFilters, dimensionFilters: plan.dimensionFilters, range: plan.range });
+      verified.push({ fact: plan.fact, dimension: plan.dimension, column: metric.column, operation: metric.operation, value: expected, unit: metric.unit, description: metric.description, group, unmatched_rows: unmatchedRows, factFilters: plan.factFilters, dimensionFilters: plan.dimensionFilters, range: plan.range });
     }
   }
   return verified;
@@ -272,6 +285,9 @@ export function joinDimensionObservations(plan: JoinEvidencePlan, rows: Array<Re
   if (keyFields.some((field) => !field)) return null;
   const unique = new Map<string, JoinDimensionObservation>();
   for (const row of rows) for (const tuple of row[PROOF] as unknown[][]) {
+    // No dimension row was captured for this fact key. Its absence must be
+    // checked separately against the complete published dimension snapshot.
+    if (keyFields.every((field) => tuple[1 + metricCount + field!.index] === null)) continue;
     const keys = Object.fromEntries(keyFields.map((field) => [field!.column, tuple[1 + metricCount + field!.index] as string]));
     for (const field of dimensionFields) {
       const value = tuple[1 + metricCount + field.index];
@@ -281,4 +297,27 @@ export function joinDimensionObservations(plan: JoinEvidencePlan, rows: Array<Re
     }
   }
   return [...unique.values()];
+}
+
+/** Fact keys whose LEFT JOIN did not match. The caller must prove each key is
+ * absent from the current, valid complete dimension publication; null alone
+ * cannot distinguish an unchanged dimension from a stale publication. */
+export function joinMissingDimensionKeys(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>): Array<Record<string, string>> | null {
+  if (!verifyJoinEvidence(plan, rows)) return null;
+  if (plan.joinType !== "left") return [];
+  const metricCount = new Set(plan.metrics.map((metric) => metric.column)).size;
+  const indexOf = (table: "fact" | "dimension", key: string) => plan.proofFields.findIndex((field) => field.table === table && field.column === key);
+  const missing = new Map<string, Record<string, string>>();
+  for (const row of rows) for (const tuple of row[PROOF] as unknown[][]) {
+    const keys: Record<string, string> = {};
+    let unmatched = true;
+    for (const key of plan.joinKeys) {
+      const fi = indexOf("fact", key), di = indexOf("dimension", key);
+      if (fi < 0 || di < 0 || typeof tuple[1 + metricCount + fi] !== "string") return null;
+      keys[key] = tuple[1 + metricCount + fi] as string;
+      if (tuple[1 + metricCount + di] !== null) unmatched = false;
+    }
+    if (unmatched) missing.set(JSON.stringify(plan.joinKeys.map((key) => keys[key])), keys);
+  }
+  return [...missing.values()];
 }

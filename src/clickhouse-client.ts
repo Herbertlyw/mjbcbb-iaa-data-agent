@@ -35,6 +35,9 @@ export function createClickHouseClient(config: ClickHouseConfig, readonly: boole
       // Decimal JSON numbers would be rounded by JSON.parse before evidence
       // validation. Keep their exact base-10 representation end to end.
       output_format_json_quote_decimals: 1,
+      // LEFT JOIN must expose an unmatched right-hand key as SQL NULL, not
+      // ClickHouse's type default. This is host-controlled, not model SQL.
+      join_use_nulls: 1,
     },
   });
 }
@@ -48,7 +51,7 @@ export async function clickHouseQuery(client: ClickHouseClient, sql: string, sig
 /** Read a bounded complete result, or stop after observing the first row over
  * either limit. A truncated result's count is only a lower bound. */
 export async function clickHouseQueryBounded(client: ClickHouseClient, sql: string, maxRows: number, maxBytes: number, signal?: AbortSignal): Promise<{ rows: Array<Record<string, unknown>>; column_types: Record<string, string>; observed_rows: number; truncated: boolean; query_id: string }> {
-  const result = await client.query({ query: sql, format: "JSONCompactEachRowWithNamesAndTypes", abort_signal: signal, clickhouse_settings: { max_block_size: "1024" } });
+  const result = await client.query({ query: sql, format: "JSONCompactEachRowWithNamesAndTypes", abort_signal: signal, clickhouse_settings: { max_block_size: "1024", join_use_nulls: 1 } });
   const rows: Array<Record<string, unknown>> = []; let names: string[] | null = null; let types: string[] | null = null; let bytes = 2; let observed = 0; let truncated = false;
   try {
     outer: for await (const chunk of result.stream<unknown[]>()) {

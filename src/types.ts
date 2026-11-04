@@ -217,10 +217,12 @@ export interface QueryResource {
   simulated: true;
   elapsed_ms?: number;
   execution_id?: string;
+  execution_settings?: { join_use_nulls: true };
   column_types?: Record<string, string>;
   scan_limit?: number;
   decimal_types?: Record<string, string>;
   sql: string;
+  executed_sql?: string;
   tables: string[];
   contract_revisions: Record<string, string>;
   asset_hashes: Record<string, string>;
@@ -310,9 +312,11 @@ export type SessionResource = QueryResource | CalculationResource | ArithmeticRe
 export interface AnalysisSource {
   resource_id: string;
   execution_id?: string;
+  execution_settings?: { join_use_nulls: true };
   observed_at?: string;
   data_capture_hash?: string;
   sql: string;
+  executed_sql?: string;
   tables: string[];
   contract_revisions: Record<string, string>;
   asset_hashes: Record<string, string>;

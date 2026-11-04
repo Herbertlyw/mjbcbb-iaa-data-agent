@@ -9,10 +9,10 @@ import { compareDecimalAggregates, type AggregateComparison } from "./aggregate-
 import { computeArithmetic, fromAggregate, sumDecimalStrings, type ArithmeticOp, type ArithmeticValue } from "./exact-arithmetic.js";
 import { verifyDecimalCell, type VerifiedDecimalCell } from "./decimal-cell-evidence.js";
 import { verifyDatabaseAggregates, type VerifiedAggregate } from "./aggregate-evidence.js";
-import { joinDimensionObservations, prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema, type JoinEvidencePlan, type VerifiedJoinValue } from "./join-evidence.js";
+import { joinDimensionObservations, joinMissingDimensionKeys, prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema, type JoinEvidencePlan, type VerifiedJoinValue } from "./join-evidence.js";
 import { fitsResultCalculationBytes, RESULT_CALCULATION_MAX_ROWS, RESULT_CALCULATION_MAX_BYTES, transformResult, type ResultColumn, type ResultTable, type ResultValue, type TransformStep } from "./result-transform.js";
 import { alignAggregates, type AlignedRow, type AlignmentSpec } from "./result-alignment.js";
-import { dimensionSnapshotMatches, freshnessManifest, freshnessPeriodKey, matchesFreshnessManifest, readPublication, type FreshnessPublication } from "./freshness.js";
+import { dimensionSnapshotMatches, dimensionSnapshotStatusValid, freshnessManifest, freshnessPeriodKey, matchesFreshnessManifest, readPublication, type FreshnessPublication } from "./freshness.js";
 import type { MysqlFreshnessStore } from "./mysql-freshness.js";
 import { canQueryTable, canRead, contractValidity, tableGrain, validateKnowledgeSources } from "./knowledge.js";
 import { newId, type SessionRecord, type SessionStore } from "./session.js";
@@ -34,7 +34,7 @@ import type {
   TransformResource,
 } from "./types.js";
 import { clickHouseColumns, clickHouseColumnTypes, clickHouseQueryBounded } from "./clickhouse-client.js";
-import { assertJoinKeys, guardSql, parseReadonlySql, SqlRejected, type TableRule } from "./sql.js";
+import { assertJoinKeys, guardSql, inspectSingleSourceProjection, parseReadonlySql, SqlRejected, type TableRule } from "./sql.js";
 import type { ClickHouseClient } from "@clickhouse/client";
 import type { DatabaseSync } from "node:sqlite";
 
@@ -354,7 +354,11 @@ export class ToolService {
     }
     try {
       const grains = new Map(guarded.tables.map((table) => [table, tableGrain(this.ctx.knowledge, table)]));
-      assertJoinKeys(sql, this.ctx.knowledge.joins, grains);
+      const leftJoinDimensions = new Set(guarded.tables.filter((table) => {
+        const contract = this.ctx.knowledge.contract_by_table.get(table)?.contract;
+        return Boolean(contract && !contract.series && contract.must_filter.length === 0 && contract.grain?.length && canQueryTable(this.ctx.knowledge, session.role, table));
+      }));
+      assertJoinKeys(sql, this.ctx.knowledge.joins, grains, { leftJoinDimensions });
     } catch (error) {
       if (error instanceof SqlRejected) return fail(error.code, error.message);
       throw error;
@@ -397,21 +401,21 @@ export class ToolService {
     let rows: Array<Record<string, unknown>>;
     let bounded: Awaited<ReturnType<typeof clickHouseQueryBounded>> | null = null;
     let joinProof: PrivateJoinProof | undefined;
+    const executedSql = joinPlan?.executionSql ?? guarded.sql;
     const started = Date.now();
     try {
       if (this.ctx.businessEngine === "clickhouse") {
         if (!this.ctx.clickhouse) throw new Error("clickhouse_unavailable");
-        bounded = await clickHouseQueryBounded(this.ctx.clickhouse, joinPlan?.executionSql ?? guarded.sql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
+        bounded = await clickHouseQueryBounded(this.ctx.clickhouse, executedSql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
         if (joinPlan && joinFact && joinDimension) {
           const captured = bounded.rows;
           const types = bounded.column_types;
           const cleanRows = captured.map(({ __da_join_proof: _proof, ...row }) => row);
           const { __da_join_proof: _proofType, ...cleanTypes } = types;
           if (!bounded.truncated && verifyJoinExecutionSchema(joinPlan, joinFact, joinDimension, types) && verifyJoinEvidence(joinPlan, captured) && Buffer.byteLength(JSON.stringify({ captured, cleanRows, types })) <= this.ctx.config.maxResultBytes) {
-            const observations = joinDimensionObservations(joinPlan, captured);
             const dimensionState = published.tables[joinDimension.table];
-            if (!observations || observations.some((item) => !dimensionSnapshotMatches(dimensionState, joinDimension.table, item.keys, item.column, item.value))) return fail("dimension_snapshot_mismatch", "本次关联捕获的维表值不符合当前权威发布，未保存可交付结果。");
-            joinProof = { rows: captured, column_types: types, capture_hash: joinCaptureHash(guarded.sql, bounded.query_id, captured, types) };
+            if (!joinDimensionMatchesPublication(joinPlan, captured, dimensionState)) return fail("dimension_snapshot_mismatch", "本次关联捕获的维表值或缺失键不符合当前权威发布，未保存可交付结果。");
+            joinProof = { rows: captured, column_types: types, capture_hash: joinCaptureHash(guarded.sql, executedSql, bounded.query_id, captured, types) };
           }
           bounded.rows = cleanRows;
           bounded.column_types = cleanTypes;
@@ -434,7 +438,8 @@ export class ToolService {
     }
     let coverage;
     try {
-      coverage = joinPlan && joinProof ? joinCoverage(joinPlan, joinProof.rows) : await this.coverageForTables(guarded.sql, guarded.tables, guarded.time_range, bindings, signal);
+      const projection = inspectSingleSourceProjection(guarded.sql, guarded.tables.map((table) => this.ruleFor(session, table)));
+      coverage = joinPlan && joinProof ? joinCoverage(joinPlan, joinProof.rows) : await this.coverageForTables(projection?.proof_sql ?? guarded.sql, guarded.tables, guarded.time_range, bindings, signal);
     } catch {
       if (signal?.aborted) return fail("query_cancelled", "查询已取消");
       return fail("coverage_query_failed", "覆盖统计无法完成，查询结果没有保存。");
@@ -469,11 +474,12 @@ export class ToolService {
       engine: this.ctx.businessEngine === "clickhouse" ? "clickhouse-local" : "sqlite-local",
       elapsed_ms: elapsedMs,
       execution_id: bounded?.query_id ?? newId("exec"),
-      ...(bounded ? { column_types: bounded.column_types } : {}),
+      ...(bounded ? { column_types: bounded.column_types, execution_settings: { join_use_nulls: true as const } } : {}),
       ...(this.ctx.businessEngine === "clickhouse" ? { scan_limit: this.configuredScanLimit } : {}),
       ...(Object.keys(decimalTypes).length ? { decimal_types: decimalTypes } : {}),
       simulated: true,
       sql: guarded.sql,
+      executed_sql: executedSql,
       tables: guarded.tables,
       contract_revisions: Object.fromEntries(bindings.map((binding) => [binding.table, binding.contract_revision])),
       asset_hashes: Object.fromEntries(bindings.map((binding) => [binding.asset_id, binding.content_hash])),
@@ -501,6 +507,7 @@ export class ToolService {
       ok: true,
       resource_id: resource.resource_id,
       sql: resource.sql,
+      executed_sql: resource.executed_sql,
       tables: resource.tables,
       contract_revisions: resource.contract_revisions,
       asset_hashes: resource.asset_hashes,
@@ -518,6 +525,7 @@ export class ToolService {
       simulated: true,
       engine: resource.engine,
       execution_id: resource.execution_id ?? null,
+      execution_settings: resource.execution_settings ?? null,
       column_types: resource.column_types ?? null,
       elapsed_ms: resource.elapsed_ms,
       columns: resource.columns,
@@ -635,10 +643,15 @@ export class ToolService {
       const rightContract = this.ctx.knowledge.contract_by_table.get(b.table)?.contract;
       const aSeries = leftContract?.series; const bSeries = rightContract?.series;
       const keys = (items: string[]) => JSON.stringify([...items].sort());
-      const equalGrain = leftContract && rightContract && aSeries && bSeries && aSeries.date_column === bSeries.date_column && keys(aSeries.dimensions) === keys(bSeries.dimensions) && keys(tableGrain(this.ctx.knowledge, a.table)) === keys(tableGrain(this.ctx.knowledge, b.table));
+      const equalGrain = leftContract && rightContract && aSeries && bSeries && aSeries.date_column === bSeries.date_column && keys(aSeries.dimensions) === keys(bSeries.dimensions) && keys(tableGrain(this.ctx.knowledge, a.table)) === keys(tableGrain(this.ctx.knowledge, b.table)) && [aSeries.date_column, ...aSeries.dimensions].every((name) => {
+        const leftType = leftContract.columns.find((column) => column.name === name)?.type.replace(/\s/gu, "").toLowerCase();
+        const rightType = rightContract.columns.find((column) => column.name === name)?.type.replace(/\s/gu, "").toLowerCase();
+        return Boolean(leftType && leftType === rightType);
+      });
       const metric = (table: string, field: string, name: string) => name === `${table}.${field}` || name === field && a.table === b.table;
       const definitions = [...(leftContract?.derived_metrics ?? []), ...(a.table === b.table ? [] : rightContract?.derived_metrics ?? [])];
-      declared = Boolean(equalGrain && op === "divide" && a.operation === "sum" && b.operation === "sum" && a.prediction === "actual_observed_only" && b.prediction === a.prediction && a.timezone === b.timezone && a.unit === b.unit && a.unit !== "契约未声明" && definitions.some((item) => item.operation === op && item.prediction === "actual_only" && item.unit === "比值" && metric(a.table, a.column, item.numerator) && metric(b.table, b.column, item.denominator)));
+      const expectedUnit = a.unit === b.unit ? "比值" : `(${a.unit})/(${b.unit})`;
+      declared = Boolean(equalGrain && op === "divide" && a.operation === "sum" && b.operation === "sum" && a.prediction === "actual_observed_only" && b.prediction === a.prediction && a.timezone === b.timezone && a.unit && b.unit && a.unit !== "契约未声明" && b.unit !== "契约未声明" && definitions.some((item) => item.operation === op && item.prediction === "actual_only" && item.unit === expectedUnit && metric(a.table, a.column, item.numerator) && metric(b.table, b.column, item.denominator)));
     }
     return computeArithmetic(op, left, right, declared);
   }
@@ -682,7 +695,7 @@ export class ToolService {
       const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, ref.resource_id);
       if (!found.ok || found.resource.kind !== "query_result" || found.resource.job_id !== jobId) return null;
       const source = found.resource; const contract = this.arithmeticContract(session, source, publication);
-      const aggregates = contract && verifyDatabaseAggregates(source, contract)?.filter((item) => item.output_column === ref.cell);
+      const aggregates = contract && (verifyDatabaseAggregates(source, contract)?.filter((item) => item.output_column === ref.cell) ?? await this.groupRawForAlignment(session, jobId, source, contract, ref.cell, spec.keys, publication));
       if (!aggregates?.length) return null;
       inputs.push({ source, aggregates });
     }
@@ -697,6 +710,34 @@ export class ToolService {
     return { rows, hashes, leaves: [...new Set(inputs.map(({ source }) => source.resource_id))] };
   }
 
+  /** Reconstruct grouped sums from all hash-bound pages, never the preview.
+   * Null-bearing inputs are rejected here until partial-null alignment has a
+   * delivery representation; they are not silently treated as zero. */
+  private async groupRawForAlignment(session: SessionRecord, jobId: string, source: QueryResource, contract: DataContract, cell: string, keys: string[], publication: FreshnessPublication): Promise<VerifiedAggregate[] | null> {
+    const evidence = this.evidenceSource(session, source); const series = contract.series;
+    if (!evidence || !series || series.prediction_mode !== "observed_only" || series.predicted_column || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length || !Array.isArray(keys) || !keys.length || keys.length > 3 || new Set(keys).size !== keys.length) return null;
+    const shape = verifyCell(evidence, contract, { op: "count_rows", as: "shape" }, source.rows.length);
+    const projections = parseReadonlySql(evidence.sql).ast.columns;
+    if (!shape || !Array.isArray(projections)) return null;
+    const fields = new Map<string, string>();
+    for (const entry of projections as Array<{ as?: string | null; expr?: { type?: string; column?: string } }>) if (entry.expr?.type === "column_ref" && entry.expr.column) fields.set(entry.as ?? entry.expr.column, entry.expr.column);
+    const field = fields.get(cell); const declared = contract.columns.find((item) => item.name === field);
+    if (!field || !declared?.unit || !series.metrics.includes(field) || keys.some((key) => fields.get(key) !== key || !series.dimensions.includes(key) || Object.hasOwn(shape.filters, key)) || !series.dimensions.every((key) => keys.includes(key) || Object.hasOwn(shape.filters, key))) return null;
+    const checked = await this.resolveTransform(session, jobId, source.resource_id, publication, new Set());
+    const table = checked?.table; const metric = table?.columns.find((column) => column.name === cell);
+    if (!table || !metric || metric.type !== "decimal" || metric.scale === undefined || keys.some((key) => table.columns.find((column) => column.name === key)?.type !== "text") || table.rows.some((row) => row[cell] === null || keys.some((key) => typeof row[key] !== "string"))) return null;
+    const reserved = new Set(table.columns.map((column) => column.name));
+    let sumName = "_alignment_sum"; while (reserved.has(sumName)) sumName += "_";
+    const grouped = transformResult(table, [{ op: "group", by: keys, aggregates: [{ op: "sum", column: cell, as: sumName }] }]);
+    if (!grouped?.rows.length) return null;
+    const output: VerifiedAggregate[] = [];
+    for (const row of grouped.rows) {
+      if (typeof row[sumName] !== "string" || keys.some((key) => typeof row[key] !== "string")) return null;
+      output.push({ source_resource_id: source.resource_id, table: contract.table, column: field, output_column: cell, operation: "sum", value: row[sumName] as string, scale: metric.scale, unit: declared.unit, description: declared.description, filters: shape.filters, group: Object.fromEntries(keys.map((key) => [key, row[key] as string])), range: source.time_range, prediction: "actual_observed_only" });
+    }
+    return output;
+  }
+
   private async resolveTransform(session: SessionRecord, jobId: string, resourceId: string, publication: FreshnessPublication, path: Set<string>): Promise<{ table: ResultTable; hashes: Record<string, string>; leaves: string[]; partial: boolean; partial_reason?: "alignment_incomplete" | "transform_coverage_incomplete" } | null> {
     if (typeof resourceId !== "string" || path.has(resourceId) || path.size >= 8) return null;
     const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, resourceId);
@@ -705,9 +746,10 @@ export class ToolService {
     const ownHash = createHash("sha256").update(JSON.stringify(resource)).digest("hex");
     if (resource.kind === "query_result") {
       const contract = this.arithmeticContract(session, resource, publication);
-      const aggregates = contract && verifyDatabaseAggregates(resource, contract);
+      const evidence = this.evidenceSource(session, resource);
+      const aggregates = contract && evidence && verifyDatabaseAggregates(evidence, contract);
       let table = aggregates && aggregateTable(aggregates);
-      if (!table && contract) {
+      if (!table && contract && evidence) {
         // Read the stored result through the same bounded, hash-bound pages
         // exposed to agents. A mutation between pages invalidates the input.
         const rows: Array<Record<string, unknown>> = [];
@@ -725,7 +767,7 @@ export class ToolService {
           offset = next as number;
         } while (true);
         if (rows.length !== resource.returned_rows || rows.length !== resource.total_rows || resource.total_rows_exact !== true) return null;
-        table = rawResultTable({ ...resource, rows }, contract);
+        table = rawResultTable({ ...evidence, rows }, contract);
       }
       const partial = coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length > 0;
       return table ? { table, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial, ...(partial ? { partial_reason: "transform_coverage_incomplete" as const } : {}) } : null;
@@ -755,16 +797,17 @@ export class ToolService {
     const next = new Set(path); next.add(resource.resource_id);
     if (resource.kind === "query_result") {
       const contract = this.arithmeticContract(session, resource, publication);
-      if (!contract) return null;
+      const evidence = this.evidenceSource(session, resource);
+      if (!contract || !evidence) return null;
       if (ref.row !== undefined || ref.aggregate !== undefined || ref.execution_id !== undefined) {
         if (ref.group || !ref.execution_id || ref.execution_id !== resource.execution_id || (ref.row === undefined) === (ref.aggregate === undefined) || (ref.row !== undefined && (!Number.isSafeInteger(ref.row) || ref.row < 0)) || (ref.aggregate !== undefined && ref.aggregate !== "sum") || coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length) return null;
         const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, new Set());
         const table = checked?.table; const column = table?.columns.find((candidate) => candidate.name === ref.cell);
-        const shape = verifyCell(resource, contract, { op: "count_rows", as: "shape" }, resource.rows.length);
-        const projections = parseReadonlySql(resource.sql).ast.columns;
+        const shape = verifyCell(evidence, contract, { op: "count_rows", as: "shape" }, resource.rows.length);
+        const projections = parseReadonlySql(evidence.sql).ast.columns;
         const projection = Array.isArray(projections) ? projections.find((item) => item && typeof item === "object" && ((item as { as?: string | null; expr?: { column?: string } }).as ?? (item as { expr?: { column?: string } }).expr?.column) === ref.cell) as { expr?: { type?: string; column?: string } } | undefined : undefined;
         const field = projection?.expr?.type === "column_ref" ? projection.expr.column : undefined;
-        if (!checked || !table || !column || column.type !== "decimal" || !shape || !field || !contract.series?.metrics.includes(field) || !contract.columns.find((candidate) => candidate.name === field)?.unit || !rawResultTable(resource, contract)) return null;
+        if (!checked || !table || !column || column.type !== "decimal" || !shape || !field || !contract.series?.metrics.includes(field) || !contract.columns.find((candidate) => candidate.name === field)?.unit || !rawResultTable(evidence, contract)) return null;
         const filters = { ...shape.filters }; let start = resource.time_range.start; let end = resource.time_range.end;
         let value: string | null;
         if (ref.row !== undefined) {
@@ -791,7 +834,7 @@ export class ToolService {
         return { value: exact, hashes: checked.hashes, leaves: checked.leaves };
       }
       const canonical = (group: Record<string, string>) => JSON.stringify(Object.entries(group).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
-      const matching = verifyDatabaseAggregates(resource, contract)?.filter((item) => item.output_column === ref.cell && canonical(item.group) === canonical(ref.group ?? {})) ?? [];
+      const matching = verifyDatabaseAggregates(evidence, contract)?.filter((item) => item.output_column === ref.cell && canonical(item.group) === canonical(ref.group ?? {})) ?? [];
       if (matching.length !== 1) return null;
       return { value: fromAggregate(matching[0]!), hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id] };
     }
@@ -801,10 +844,11 @@ export class ToolService {
       const foundSource = await this.ctx.sessions.lookupResourceAsync(session.session_id, resource.source_resource_id);
       if (!foundSource.ok || foundSource.resource.kind !== "query_result" || foundSource.resource.job_id !== jobId) return null;
       const source = foundSource.resource; const contract = this.arithmeticContract(session, source, publication);
+      const evidence = this.evidenceSource(session, source);
       const operation = resource.operations[ref.cell]; const stored = resource.cells[ref.cell];
-      if (!contract || !operation || operation.op !== "sum" || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length) return null;
-      const decimal = typeof stored === "string" ? verifyDecimalCell(source, contract, operation, stored) : null;
-      const integer = typeof stored === "number" ? verifyCell(source, contract, operation, stored) : null;
+      if (!contract || !evidence || !operation || operation.op !== "sum" || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length) return null;
+      const decimal = typeof stored === "string" ? verifyDecimalCell(evidence, contract, operation, stored) : null;
+      const integer = typeof stored === "number" ? verifyCell(evidence, contract, operation, stored) : null;
       if (!decimal && (!integer || integer.precision !== "exact_integer" || !integer.column || integer.unit === "契约未声明" || !integer.prediction.startsWith("实际（") || integer.excludedNulls)) return null;
       const base = decimal ?? integer!;
       const column = base.column!; const value = String(base.value);
@@ -920,6 +964,7 @@ export class ToolService {
         sources.push({
           resource_id: found.resource.resource_id,
           sql: found.resource.sql,
+          executed_sql: found.resource.executed_sql,
           tables: found.resource.tables,
           contract_revisions: found.resource.contract_revisions,
           asset_hashes: found.resource.asset_hashes,
@@ -933,6 +978,7 @@ export class ToolService {
           simulated: true,
           engine: found.resource.engine,
           ...(found.resource.execution_id ? { execution_id: found.resource.execution_id } : {}),
+          ...(found.resource.execution_settings ? { execution_settings: found.resource.execution_settings } : {}),
           observed_at: found.resource.created_at,
           ...((found.resource as JoinQueryResource).join_proof ? { data_capture_hash: (found.resource as JoinQueryResource).join_proof!.capture_hash } : {}),
           rows: found.resource.rows,
@@ -1005,12 +1051,13 @@ export class ToolService {
     const joinLines: string[] = [];
     for (const source of sources) {
       const original = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === source.resource_id);
+      const evidence = original && this.evidenceSource(session, original);
       const asset = original && original.tables.length === 1 ? this.ctx.knowledge.contract_by_table.get(original.tables[0] ?? "") : undefined;
       const contract = asset?.contract;
       const currentContract = Boolean(original && asset && contract && original.registry_revision === this.ctx.knowledge.registry_revision && original.contract_revisions[contract.table] === contract.revision && original.asset_hashes[asset.asset_id] === asset.content_hash && canQueryTable(this.ctx.knowledge, session.role, contract.table) && !contractValidity(contract, currentCalendarDate(this.ctx.config, contract.timezone)));
       const currentFresh = Boolean(liveFreshness && liveFreshness.valid_until >= currentCalendarDate(this.ctx.config, this.ctx.knowledge.timezone) && source.freshness_receipts.length === source.tables.length && source.tables.every((table) => source.freshness_receipts.some((receipt) => receipt.table === table)) && source.freshness_receipts.every((receipt) => receipt.publication_id === liveFreshness.publication_id && receipt.version === liveFreshness.version && liveFreshness.tables[receipt.table]?.status === "fresh"));
-      const shape = original && contract && verifyCell(original, contract, { op: "count_rows", as: "internal" }, original.rows.length);
-      const databaseAggregates = original && contract && verifyDatabaseAggregates(original, contract);
+      const shape = evidence && contract && verifyCell(evidence, contract, { op: "count_rows", as: "internal" }, evidence.rows.length);
+      const databaseAggregates = evidence && contract && verifyDatabaseAggregates(evidence, contract);
       const joined = original && liveFreshness ? verifyJoinResource(original as JoinQueryResource, session, this.ctx.knowledge, this.ctx.config, liveFreshness) : null;
       if (joined) {
         source.evidence_eligible = true;
@@ -1063,7 +1110,8 @@ export class ToolService {
       for (const ref of input.declaration.result_cells ?? []) {
         const source = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === ref.resource_id);
         const contract = source && source.tables.length === 1 ? this.ctx.knowledge.contract_by_table.get(source.tables[0]!)?.contract : undefined;
-        const table = source && contract && eligible.has(source.resource_id) && source.execution_id === ref.execution_id ? rawResultTable(source, contract) : null;
+        const evidence = source && this.evidenceSource(session, source);
+        const table = evidence && source && contract && eligible.has(source.resource_id) && source.execution_id === ref.execution_id ? rawResultTable(evidence, contract) : null;
         const column = table?.columns.find((item) => item.name === ref.column);
         const row = table?.rows[ref.row];
         if (!source || !table || !column || !row || !Object.hasOwn(row, ref.column)) return fail("analysis_declaration_cell_invalid", "工作记录的结果引用不可验证：必须是当前任务、当前执行号的完整授权直接投影。");
@@ -1078,7 +1126,9 @@ export class ToolService {
     for (const source of sources) {
       if (!source.evidence_eligible || source.engine !== "clickhouse-local" || source.tables.length !== 1 || !source.coverage.observation_hash) continue;
       const contract = this.ctx.knowledge.contract_by_table.get(source.tables[0]!)?.contract;
-      const filters = contract && provenCoverageFilters(source.sql, contract, source.time_range);
+      const original = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === source.resource_id);
+      const evidence = original && this.evidenceSource(session, original);
+      const filters = contract && evidence && provenCoverageFilters(evidence.sql, contract, source.time_range);
       if (!filters) continue;
       const key = JSON.stringify([source.tables[0], source.time_range, Object.entries(filters).sort(([a], [b]) => a.localeCompare(b))]);
       const previous = observed.get(key);
@@ -1094,14 +1144,15 @@ export class ToolService {
     for (const resource of resources) {
       if (resource.kind !== "calculation") continue;
       const original = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === resource.source_resource_id);
+      const evidence = original && this.evidenceSource(session, original);
       const asset = original && original.tables.length === 1 ? this.ctx.knowledge.contract_by_table.get(original.tables[0] ?? "") : undefined;
       const contract = asset?.contract;
       const accepted: VerifiedCell[] = [];
       const acceptedDecimal: VerifiedDecimalCell[] = [];
-      if (original && contract && eligible.has(original.resource_id) && resource.operations) {
+      if (original && evidence && contract && eligible.has(original.resource_id) && resource.operations) {
         for (const [name, operation] of Object.entries(resource.operations)) {
           const stored = resource.cells[name];
-          const cell = typeof stored === "number" ? verifyCell(original, contract, operation, stored) : null;
+          const cell = typeof stored === "number" ? verifyCell(evidence, contract, operation, stored) : null;
           if (cell) {
             accepted.push(cell); verified.push(cell);
             const cells = verifiedByCalculation.get(resource.resource_id) ?? new Map<string, VerifiedCell>();
@@ -1109,7 +1160,7 @@ export class ToolService {
             verifiedByCalculation.set(resource.resource_id, cells);
           }
           else if (typeof stored === "string") {
-            const decimal = verifyDecimalCell(original, contract, operation, stored);
+            const decimal = verifyDecimalCell(evidence, contract, operation, stored);
             if (decimal) { acceptedDecimal.push(decimal); verifiedDecimal.push(decimal); }
             else reasons.push("calculation_lineage_unsupported");
           } else reasons.push("calculation_lineage_unsupported");
@@ -1432,6 +1483,20 @@ export class ToolService {
     return true;
   }
 
+  /** Reconstruct an equivalent proof projection, never the SQL sent to ClickHouse. */
+  private evidenceSource(session: SessionRecord, source: QueryResource): QueryResource | null {
+    try {
+      const ast = parseReadonlySql(source.sql).ast;
+      const from = Array.isArray(ast.from) ? ast.from : [];
+      const nested = Boolean(ast.with || from.some((item) => item && typeof item === "object" && "expr" in item && item.expr));
+      if (!nested) return source;
+      if (source.executed_sql !== source.sql) return null;
+      const proof = inspectSingleSourceProjection(source.sql, source.tables.map((table) => this.ruleFor(session, table)));
+      if (!proof || source.tables.length !== 1 || proof.table !== source.tables[0] || proof.time_range.start !== source.time_range.start || proof.time_range.end !== source.time_range.end) return null;
+      return { ...source, sql: proof.proof_sql };
+    } catch { return null; }
+  }
+
   private ruleFor(session: SessionRecord, table: string): TableRule {
     if (table.startsWith("sqlite_")) throw new SqlRejected("system_table", `系统表 ${table} 不能查询`);
     const contractAsset = this.ctx.knowledge.contract_by_table.get(table);
@@ -1551,17 +1616,28 @@ function verifyJoinResource(resource: JoinQueryResource, session: SessionRecord,
   if (receipts.length !== 2 || resource.tables.some((table) => !receipts.some((receipt) => receipt.table === table && receipt.status === "fresh" && receipt.publication_id === publication.publication_id && receipt.version === publication.version && publication.tables[table]?.status === "fresh"))) return null;
   const plan = prepareJoinEvidence(resource.sql, fact, dimension, knowledge.joins);
   if (!plan || plan.range.start !== resource.time_range.start || plan.range.end !== resource.time_range.end || plan.range.timezone !== resource.time_range.timezone || !verifyJoinExecutionSchema(plan, fact, dimension, resource.join_proof.column_types)) return null;
-  if (resource.join_proof.capture_hash !== joinCaptureHash(resource.sql, resource.execution_id, resource.join_proof.rows, resource.join_proof.column_types)) return null;
+  if (plan.joinType === "left" && resource.execution_settings?.join_use_nulls !== true) return null;
+  if (resource.executed_sql !== plan.executionSql || resource.join_proof.capture_hash !== joinCaptureHash(resource.sql, resource.executed_sql, resource.execution_id, resource.join_proof.rows, resource.join_proof.column_types)) return null;
   const visible = resource.join_proof.rows.map(({ __da_join_proof: _proof, ...row }) => row);
   if (JSON.stringify(visible) !== JSON.stringify(resource.rows)) return null;
   const values = verifyJoinEvidence(plan, resource.join_proof.rows);
-  const observations = values && joinDimensionObservations(plan, resource.join_proof.rows);
-  if (!values || !observations || observations.some((item) => !dimensionSnapshotMatches(publication.tables[dimension.table], dimension.table, item.keys, item.column, item.value))) return null;
+  if (!values || !joinDimensionMatchesPublication(plan, resource.join_proof.rows, publication.tables[dimension.table])) return null;
   return { plan, values };
 }
 
-function joinCaptureHash(sql: string, executionId: string, rows: Array<Record<string, unknown>>, columnTypes: Record<string, string>): string {
-  return createHash("sha256").update(JSON.stringify({ sql, execution_id: executionId, rows, column_types: columnTypes })).digest("hex");
+function joinDimensionMatchesPublication(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>, state: FreshnessPublication["tables"][string] | undefined): boolean {
+  if (!dimensionSnapshotStatusValid(state, plan.dimension) || state.status !== "fresh") return false;
+  if (JSON.stringify(state.key_columns) !== JSON.stringify(plan.joinKeys) || plan.joinKeys.some((name) => !state.snapshot_columns.includes(name))) return false;
+  const observations = joinDimensionObservations(plan, rows);
+  const missing = joinMissingDimensionKeys(plan, rows);
+  if (!observations || !missing || observations.some((item) => !dimensionSnapshotMatches(state, plan.dimension, item.keys, item.column, item.value))) return false;
+  // An unmatched key is meaningful only if the valid current publication also
+  // proves absence; missing or malformed publication is never evidence of it.
+  return missing.every((key) => plan.joinKeys.every((name) => !dimensionSnapshotMatches(state, plan.dimension, key, name, key[name]!)));
+}
+
+function joinCaptureHash(sql: string, executedSql: string, executionId: string, rows: Array<Record<string, unknown>>, columnTypes: Record<string, string>): string {
+  return createHash("sha256").update(JSON.stringify({ sql, executed_sql: executedSql, execution_id: executionId, settings: { join_use_nulls: true }, rows, column_types: columnTypes })).digest("hex");
 }
 
 function joinCoverage(plan: JoinEvidencePlan, rows: Array<Record<string, unknown>>): QueryResource["coverage"] {
@@ -1574,8 +1650,8 @@ function joinCoverage(plan: JoinEvidencePlan, rows: Array<Record<string, unknown
 }
 
 function renderVerifiedJoin(item: VerifiedJoinValue, resourceId: string): string {
-  const fields = (value: Record<string, string>) => Object.entries(value).map(([key, part]) => `${key}=${part}`).join("，") || "无";
-  return `${item.fact}.${item.column}（${item.description}）：已核验 JOIN ${item.operation === "sum" ? "求和" : "非 NULL 计数"} ${item.value}；单位 ${item.unit}；分组 ${fields(item.group)}；事实筛选 ${fields(item.factFilters)}；维表筛选 ${fields(item.dimensionFilters)}；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${resourceId}。结果与维表匹配证明来自同次查询，非跨表原子快照。`;
+  const fields = (value: Record<string, string | null>) => Object.entries(value).map(([key, part]) => `${key}=${part === null ? "NULL（维表未匹配）" : part}`).join("，") || "无";
+  return `${item.fact}.${item.column}（${item.description}）：已核验 JOIN ${item.operation === "sum" ? "求和" : "非 NULL 计数"} ${item.value}；单位 ${item.unit}；分组 ${fields(item.group)}；事实筛选 ${fields(item.factFilters)}；维表筛选 ${fields(item.dimensionFilters)}；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${resourceId}。${item.unmatched_rows ? `未匹配维表 ${item.unmatched_rows} 行，维表字段保留 NULL。` : ""}结果与维表匹配证明来自同次查询，非跨表原子快照。`;
 }
 
 function renderComparison(comparison: VerifiedComparison): string {

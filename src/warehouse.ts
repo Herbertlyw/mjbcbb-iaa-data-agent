@@ -192,6 +192,16 @@ export function smallWarehouse() {
   for (let index = 1; index <= 240; index += 1) {
     installs.push({ event_date: "2026-10-06", title_id: "paper_lantern", platform: "android", country_code: `S${String(index).padStart(3, "0")}`, channel_id: "mist_ads", new_users: index, device_token: null });
   }
+  // Independent larger population: 1..1200 sums to 720600. The fictional
+  // identifiers have no relationship to actual countries or devices.
+  for (let index = 1; index <= 1200; index += 1) {
+    installs.push({ event_date: "2026-10-08", title_id: "glass_minnow", platform: "android", country_code: `Q${String(index).padStart(4, "0")}`, channel_id: "pebble_net", new_users: index, device_token: null });
+  }
+  for (const date of WAREHOUSE_DATES.filter((day) => day >= "2026-10-06" && day <= "2026-10-12")) {
+    installs.push({ event_date: date, title_id: "glass_minnow", platform: "android", country_code: "ZZ", channel_id: "mist_ads", new_users: 10, device_token: null });
+    installs.push({ event_date: date, title_id: "glass_minnow", platform: "android", country_code: "ZZ", channel_id: "unlisted_channel", new_users: 3, device_token: null });
+    installs.push({ event_date: date, title_id: "unknown_title", platform: "android", country_code: "ZZ", channel_id: "mist_ads", new_users: 3, device_token: null });
+  }
   const revenue: RevenueRow[] = [];
   const spend: SpendRow[] = [];
   const payments = WAREHOUSE_DATES.map((date) => ({ event_date: date, title_id: "paper_lantern", platform: "ios", country_code: "US", channel_id: "mist_ads", amount_usd: date === "2026-10-06" ? "90071992547409.91" : date === "2026-10-07" ? "0.09" : date === "2026-10-08" ? "1.00" : date === "2026-10-09" ? null : "0.00", cost_usd: date === "2026-10-06" ? "0.10" : date === "2026-10-07" ? "0.03" : date === "2026-10-08" ? "2.00" : date === "2026-10-09" ? null : "0.00" }));
@@ -333,7 +343,7 @@ export function emitHarborlightKnowledge(root: string): void {
   for (const table of WAREHOUSE_TABLES) {
     const body = {
       asset_id: table.asset_id,
-      revision: `${table.asset_id}-r${table.series || table.table.startsWith("dim_") ? 2 : 1}`,
+      revision: `${table.asset_id}-r${table.table === "fact_fox_daily_payment" ? 3 : table.series || table.table.startsWith("dim_") ? 2 : 1}`,
       table: table.table,
       engine: "clickhouse-local",
       simulated: true,
@@ -342,9 +352,13 @@ export function emitHarborlightKnowledge(root: string): void {
       timezone: "America/Los_Angeles",
       freshness: { as_of: null, status: "unknown", note: "查询只认已发布探测，不认这里的占位。" },
       must_filter: table.date_column ? [table.date_column] : [],
-      ...(table.table.startsWith("dim_") || table.table === "fact_fox_ad_receipt" ? { grain: table.primary_key } : {}),
+      ...(table.table.startsWith("dim_") || table.table === "fact_fox_ad_receipt" || table.table === "fact_fox_daily_payment" ? { grain: table.primary_key } : {}),
       ...(table.series ? { series: { ...table.series, ...(table.series.predicted_column ? { prediction_values: { actual: 0, predicted: 1 } } : { prediction_mode: "observed_only" }) } } : {}),
       ...(table.table === "fact_fox_daily_spend" ? { derived_metrics: [{ id: "roi", label: "实际 ROI", operation: "divide", numerator: "payback_usd", denominator: "spend_usd", prediction: "actual_only", unit: "比值" }] } : {}),
+      ...(table.table === "fact_fox_daily_payment" ? { derived_metrics: [
+        { id: "synthetic_return_ratio", label: "合成收入与成本比", operation: "divide", numerator: "amount_usd", denominator: "cost_usd", prediction: "actual_only", unit: "比值" },
+        { id: "synthetic_amount_per_install", label: "同范围收入与新增数之比（非用户归因）", operation: "divide", numerator: "fact_fox_daily_payment.amount_usd", denominator: "fact_fox_daily_install.new_users", prediction: "actual_only", unit: "(USD)/(人)" },
+      ] } : {}),
       columns: table.columns.map((column) => ({
         name: column.name,
         type: column.chType,
@@ -361,7 +375,7 @@ export function emitHarborlightKnowledge(root: string): void {
       kind: "data_contract",
       title: table.title,
       summary: table.purpose,
-      revision: `${table.asset_id}-r${table.series || table.table.startsWith("dim_") ? 2 : 1}`,
+      revision: `${table.asset_id}-r${table.table === "fact_fox_daily_payment" ? 3 : table.series || table.table.startsWith("dim_") ? 2 : 1}`,
       status: "published",
       discoverable: true,
       table: table.table,

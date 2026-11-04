@@ -6,6 +6,29 @@ import path from "node:path";
 import { analyst, bindTables, withRuntime } from "./helpers.js";
 import type { TransformResource } from "../src/types.js";
 
+test("完整明细按契约键先精确汇总再对齐，NULL 和跨任务资源不能冒充零", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_raw_alignment");
+    const queryDay = async (date: string) => {
+      const result = await runtime.tools.query(session.session_id, { sql: `SELECT event_date, country_code, new_users FROM daily_installs WHERE event_date = '${date}' AND product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads'` });
+      assert.equal(result.ok, true, JSON.stringify(result)); if (!result.ok) throw new Error("query rejected");
+      return String(result.resource_id);
+    };
+    const left = await queryDay("2026-10-06"); const right = await queryDay("2026-10-08");
+    const align = (a: string, b: string) => runtime.tools.calculateSessionCells(session.session_id, { align: { op: "subtract", keys: ["country_code"], left: { resource_id: a, cell: "new_users" }, right: { resource_id: b, cell: "new_users" } } });
+    const result = await align(left, right); assert.equal(result.ok, true, JSON.stringify(result));
+    if (!result.ok) return;
+    assert.deepEqual((result.rows as Array<{ group: { country_code: string }; result: { value: string } }>).map((row) => [row.group.country_code, row.result.value]), [["JP", "0"], ["US", "25"]]);
+    const delivered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [left, right, String(result.resource_id)] });
+    assert.equal(delivered.ok, true); if (delivered.ok) assert.equal(delivered.status, "completed");
+    const nullDay = await queryDay("2026-10-09");
+    const nullResult = await align(left, nullDay); assert.equal(nullResult.ok, false);
+    runtime.sessions.setActiveJob(session.session_id, "job_raw_other");
+    const foreign = await align(left, right); assert.equal(foreign.ok, false);
+  });
+});
+
 test("完整明细按受契约约束的字段分组并能复核交付，其他任务不得引用", async () => {
   await withRuntime({}, async (runtime) => {
     const session = analyst(runtime);

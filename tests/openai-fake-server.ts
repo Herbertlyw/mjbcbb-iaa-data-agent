@@ -126,6 +126,11 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成收入成本比")) return scripted(turn, ratioSteps);
   if (latest.includes("合成多渠道收入成本比")) return scripted(turn, groupedRatioSteps);
   if (latest.includes("合成分组对齐")) return scripted(turn, alignmentSteps);
+  if (latest.includes("合成明细跨事实")) return scripted(turn, rawCrossFactSteps);
+  if (latest.includes("合成 CTE 查询")) return scripted(turn, cteSteps);
+  if (latest.includes("合成左关联产品")) return scripted(turn, leftTitleSteps);
+  if (latest.includes("合成跨事实比率")) return scripted(turn, crossFactRatioSteps);
+  if (latest.includes("合成千行完整计算")) return scripted(turn, thousandTransformSteps);
   if (latest.includes("合成完整分页")) return scripted(turn, largeTransformSteps);
   if (latest.includes("合成产品维表关联")) return scripted(turn, validJoinSteps);
   if (latest.includes("合成渠道维表关联")) return scripted(turn, validChannelJoinSteps);
@@ -136,6 +141,63 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("日本") && (hasBase || latest.includes("雾帆"))) return scripted(turn, japanSteps);
   if (latest.includes("连表")) return scripted(turn, unsafeJoinSteps);
   return scripted(turn, defaultSteps);
+}
+
+function cteSteps(ids: string[]) {
+  const inner = "SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'JP' AND channel_id = 'mist_ads'";
+  return [
+    { id: "cte_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "cte_query", name: "query", arguments: JSON.stringify({ sql: `WITH scoped AS (${inner}) SELECT event_date, new_users FROM scoped` }) },
+    { id: "cte_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "new_users", as: "total" }] }) },
+    { id: "cte_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+function leftTitleSteps(ids: string[]) {
+  const sql = "SELECT f.title_id, d.title_name AS label, SUM(f.new_users) AS total FROM fact_fox_daily_install f LEFT JOIN dim_fox_title d ON f.title_id = d.title_id WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-12' AND f.platform = 'android' AND f.country_code = 'ZZ' AND f.channel_id = 'mist_ads' GROUP BY f.title_id, d.title_name ORDER BY f.title_id";
+  return [
+    { id: "left_fact_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "left_title_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.dim_fox_title" }) },
+    { id: "left_query", name: "query", arguments: JSON.stringify({ sql }) },
+    { id: "left_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+function rawCrossFactSteps(ids: string[]) {
+  const where = "event_date = '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios'";
+  return [
+    { id: "raw_payment_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "raw_install_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "raw_amount", name: "query", arguments: JSON.stringify({ sql: `SELECT event_date, title_id, platform, country_code, channel_id, amount_usd FROM fact_fox_daily_payment WHERE ${where}` }) },
+    { id: "raw_users", name: "query", arguments: JSON.stringify({ sql: `SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE ${where}` }) },
+    { id: "raw_align", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "divide", keys: ["country_code", "channel_id"], left: { resource_id: ids[0] ?? "", cell: "amount_usd" }, right: { resource_id: ids[1] ?? "", cell: "new_users" } } }) },
+    { id: "raw_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+function thousandTransformSteps(ids: string[]) {
+  return [
+    { id: "thousand_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "thousand_query", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM fact_fox_daily_install WHERE event_date = '2026-10-08' AND title_id = 'glass_minnow' AND platform = 'android' AND channel_id = 'pebble_net' ORDER BY country_code", preview_limit: 20 }) },
+    { id: "thousand_transform", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: [
+      { op: "filter", column: "new_users", comparison: "gt", value: "0" },
+      { op: "sort", keys: [{ column: "country_code", direction: "desc", nulls: "last" }] },
+      { op: "group", by: [], aggregates: [{ op: "sum", column: "new_users", as: "total" }, { op: "count_all", as: "count" }] },
+    ] } }) },
+    { id: "thousand_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+function crossFactRatioSteps(ids: string[]) {
+  const where = "event_date = '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios'";
+  return [
+    { id: "cross_fact_payment_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "cross_fact_install_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "cross_fact_amount", name: "query", arguments: JSON.stringify({ sql: `SELECT country_code, channel_id, SUM(amount_usd) AS total FROM fact_fox_daily_payment WHERE ${where} GROUP BY country_code, channel_id` }) },
+    { id: "cross_fact_users", name: "query", arguments: JSON.stringify({ sql: `SELECT country_code, channel_id, SUM(new_users) AS total FROM fact_fox_daily_install WHERE ${where} GROUP BY country_code, channel_id` }) },
+    { id: "cross_fact_align", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "divide", keys: ["country_code", "channel_id"], left: { resource_id: ids[0] ?? "", cell: "total" }, right: { resource_id: ids[1] ?? "", cell: "total" } } }) },
+    { id: "cross_fact_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
 }
 
 function largeTransformSteps(ids: string[]) {
