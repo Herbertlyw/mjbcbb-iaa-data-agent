@@ -12,7 +12,7 @@ export interface CatalogModel {
 
 export interface ModelCatalog {
   remote_https_configured: boolean;
-  dispatch: "loopback-only";
+  dispatch: "loopback-only" | "deepseek-official-https";
   tls_verification: "node-default";
   verified_protocols: string[];
   models: CatalogModel[];
@@ -43,10 +43,10 @@ export function modelCatalog(config: AppConfig): ModelCatalog {
       max_output_tokens: null,
       verified_here: false,
     });
-  } else if (config.piProvider === "openai-compatible" && config.piModel.trim()) {
+  } else if ((config.piProvider === "openai-compatible" || config.piProvider === "deepseek") && config.piModel.trim()) {
     models.push({
       id: config.piModel,
-      provider: "openai-compatible",
+      provider: config.piProvider,
       reasoning: config.enabledReasoning,
       enabled: true,
       context_window: config.piContextWindow,
@@ -58,7 +58,7 @@ export function modelCatalog(config: AppConfig): ModelCatalog {
   }
   return {
     remote_https_configured: config.allowRemoteHttps,
-    dispatch: "loopback-only",
+    dispatch: config.piProvider === "deepseek" && config.allowRemoteHttps && config.piBaseUrl.startsWith("https://api.deepseek.com") ? "deepseek-official-https" : "loopback-only",
     tls_verification: "node-default",
     verified_protocols: ["pi-ai@1.1.0 openai-completions streamed tool calls, only against http://127.0.0.1"],
     models,

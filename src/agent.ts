@@ -193,7 +193,7 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "calculate_session_cells",
       label: "计算会话单元格",
-      description: "汇总当前任务查询资源；可对可证明的聚合资源做定点四则运算或表格变换。正式交付须同时引用所有查询来源。",
+      description: "对当前任务查询资源计算 sum、count_null、count_zero 或 count_rows；也可对可证明的结果进行定点四则、按键对齐和表格变换。计算返回的资源 ID 与输入查询资源 ID 都需在正式交付时引用。",
       parameters: Type.Object({
         resource_id: Type.Optional(Type.String({ description: "当前会话的查询资源 ID" })),
         operations: Type.Optional(Type.Array(
@@ -245,7 +245,7 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "update_analysis",
       label: "更新分析",
-      description: "提交分析建议。服务端会按证据决定完成、部分完成、澄清或失败，模型建议不是终态。",
+      description: "提交分析建议，服务端根据本次任务证据决定终态并生成可信数字，草稿里的数字不会自动交付。明细合计须先用计算工具，并将查询及计算资源 ID 都列入 resource_ids。需要澄清时填写 needs_clarification、clarification_question 和空 resource_ids。declaration、findings、comparisons 均可省略；不确定引用或摘录时不要填写。",
       parameters: Type.Object({
         suggested_status: Type.Union([
           Type.Literal("completed"),
@@ -280,7 +280,13 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
         }))),
       }),
       executionMode: "sequential",
-      execute: async (_toolCallId, params, signal) => pack(await tools.updateAnalysis(sessionId, params as AnalysisInput, signal)),
+      execute: async (_toolCallId, params, signal) => {
+        const result = await tools.updateAnalysis(sessionId, params as AnalysisInput, signal);
+        // A successful submission is the model's explicit completion point.
+        // Pi ends only when every call in the batch requests termination;
+        // rejected candidates remain available for model correction.
+        return { ...pack(result), ...(result.ok ? { terminate: true } : {}) };
+      },
     },
   ];
   return registered.map((tool) => ({

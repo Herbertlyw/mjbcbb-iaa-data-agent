@@ -27,11 +27,13 @@ export const SDK_NAME = "@earendil-works/pi-coding-agent";
 export const SDK_VERSION = "1.1.0";
 
 export const DATA_ANALYSIS_SYSTEM_PROMPT = `你是本地只读数据分析代理。这里的数据和例子都是虚构的合成数据，不是任何公司的生产库。
-先理解问题要的指标、时间范围、粒度、分组和筛选。范围不够时说明需要澄清什么，不要编造查询。
+先理解问题要的指标、时间范围、粒度、分组和筛选。用户没有提供、上下文也无法确定的范围不得用示例或可用日期代替；需要澄清时通过 update_analysis 提交 needs_clarification 和 clarification_question，不要编造查询。
+追问只修改用户明确更改的条件，其他条件沿用可确定的上下文；不能确定时先澄清。
 需要事实时先搜索已发布资产。正文一次读不完就分页阅读，并在查询前读取对应数据契约。
 只有权限、封闭时间范围、粒度和已登记的连接键都成立时，才执行只读查询。不要使用编码、文件或 shell 工具。
 把四件事分开：值为 NULL 的缺失、根本没有行的日期、观测到的真实零、以及预测值。预测不计入实际，缺失和缺行不要补成零。
-通过会话资源回读和计算形成可溯源结论，并写明限制与覆盖。每个正式数字都要引用本次任务的查询或计算结果。
+通过会话资源回读和计算形成可溯源结论，并写明限制与覆盖。每个正式数字都要引用本次任务的查询或计算结果；对明细做合计、计数等计算时先使用 calculate_session_cells，将查询和计算资源一起提交。
+工作记录和摘录是可选的，不能确认引用的字段、执行号或原文时不要填写。草稿简洁即可，服务端会生成经核验的数字和标签。
 证据不足、契约失效、新鲜度不是已发布的新鲜状态、结果被截断或连接不成立时，明确说明不能得出结论。
 完成状态只是建议。服务端会核对主体、会话、任务、契约哈希、新鲜度回执、截断和覆盖。模型草稿里的数字不会自动变成已验证事实。`;
 
@@ -211,7 +213,7 @@ export async function openGovernedSession(input: {
   modelId?: string;
   reasoning?: string;
 }): Promise<GovernedSession> {
-  if (input.config.piProvider !== "faux" && input.config.piProvider !== "openai-compatible") {
+  if (input.config.piProvider !== "faux" && input.config.piProvider !== "openai-compatible" && input.config.piProvider !== "deepseek") {
     throw new SessionSnapshotError("provider_unavailable", "该供应商尚未接入统一派发和预算账本，已禁用。");
   }
   if (input.config.modelMode === "pi" && input.config.piProvider !== "faux" && !input.config.piApiKey) {
@@ -246,10 +248,10 @@ export async function openGovernedSession(input: {
   let model;
   const selectedModel = input.modelId ?? input.config.piModel;
   const selectedReasoning = input.reasoning ?? input.config.piReasoning;
-  if (input.config.piProvider === "openai-compatible") {
+  if (input.config.piProvider === "openai-compatible" || input.config.piProvider === "deepseek") {
     if (!input.ledger) throw new SessionSnapshotError("provider_unavailable", "OpenAI 兼容供应商缺少任务账本。不会改用 faux。");
     registerOpenAICompatible(runtime, { ...input.config, piModel: selectedModel, piReasoning: selectedReasoning }, input.ledger);
-    model = runtime.getModel("openai-compatible", selectedModel);
+    model = runtime.getModel(input.config.piProvider, selectedModel);
   } else if (input.config.piProvider === "faux") {
     const faux = fauxProvider({
       provider: "lumenfox-local",

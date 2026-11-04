@@ -27,19 +27,22 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
     }
     if (method === "GET" && url.pathname === "/api/health") {
       const freshnessHealth = await runtime.freshnessHealth();
+      const deepseekRemote = runtime.config.modelMode === "pi" && runtime.config.piProvider === "deepseek" && runtime.config.allowRemoteHttps && runtime.config.piBaseUrl.startsWith("https://api.deepseek.com");
       send(res, 200, {
         ok: true,
         simulated: true,
         model_mode: runtime.config.modelMode,
-        external_model: runtime.config.modelMode === "pi" && runtime.config.piProvider === "openai-compatible" && !runtime.config.protocolScript ? null : false,
-        model_service: runtime.config.modelMode !== "pi" ? "deterministic-demo" : runtime.config.piProvider === "faux" ? "faux" : runtime.config.protocolScript ? "scripted-loopback" : "configured-loopback-unverified",
-        remote_dispatch: false,
+        external_model: deepseekRemote ? true : runtime.config.modelMode === "pi" && runtime.config.piProvider === "openai-compatible" && !runtime.config.protocolScript ? null : false,
+        model_service: deepseekRemote ? "deepseek-official-unverified" : runtime.config.modelMode !== "pi" ? "deterministic-demo" : runtime.config.piProvider === "faux" ? "faux" : runtime.config.protocolScript ? "scripted-loopback" : "configured-loopback-unverified",
+        remote_dispatch: deepseekRemote,
         model_provider: runtime.config.modelMode === "pi" ? runtime.config.piProvider : "deterministic",
         protocol_scripted: runtime.config.modelMode === "pi" && Boolean(runtime.config.protocolScript),
         language_understanding: runtime.config.modelMode === "pi"
           ? runtime.config.piProvider === "faux"
             ? "faux-local-not-external-model"
-            : runtime.config.piProvider === "openai-compatible"
+            : runtime.config.piProvider === "deepseek"
+              ? "deepseek-chat-completions-unverified"
+              : runtime.config.piProvider === "openai-compatible"
               ? "pi-ai-1.1.0-openai-completions-loopback-only"
               : "configured-provider-not-verified-in-this-build"
           : "slot-compiler",
@@ -64,7 +67,7 @@ async function handle(runtime: Runtime, req: IncomingMessage, res: ServerRespons
           "默认演示进程仍是 SQLite。MySQL、outbox 和 Redis 只在显式的本地隔离模式里运行，不能把 SQLite 测试当成它们的验证。",
           "Redis 只做调度提醒。队列消息不是完成证明，也不是身份证明。",
           "任务执行在崩溃重试时可能再次读取合成库。终态由数据库围栏保证只有一个，外部副作用不是 exactly-once。",
-          "身份只是本地 mock 标记，不是生产认证。没有真实模型或线上联调。",
+          "身份只是本地 mock 标记，不是生产认证；模型配置不代表已完成真实模型能力验证。",
           "远程数据引擎没有实现，新鲜度探测不会连接它们。",
         ],
         crash_recovery: "reclaim-expired-lease",

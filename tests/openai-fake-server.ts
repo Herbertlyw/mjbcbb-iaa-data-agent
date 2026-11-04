@@ -8,13 +8,15 @@ export interface ProtocolObservation {
   sawSystemPrompt: boolean;
   sawToolDefinition: boolean;
   reasoningEffort: string | null;
+  thinkingType: string | null;
+  assistantReasoning: string[];
   authorizationPresent: boolean;
   authorizationMatched: boolean;
   userMessages: string[];
   currentTurnRoles: string[];
 }
 
-export async function startFakeOpenAI(token: string, options: { recordObservations?: boolean; syntheticDateShiftDays?: number } = {}): Promise<{ url: string; observations: ProtocolObservation[]; close: () => Promise<void> }> {
+export async function startFakeOpenAI(token: string, options: { recordObservations?: boolean; syntheticDateShiftDays?: number; deepseekThinking?: boolean; cacheHitTokens?: number } = {}): Promise<{ url: string; observations: ProtocolObservation[]; close: () => Promise<void> }> {
   const dateShift = options.syntheticDateShiftDays ?? 0;
   if (!Number.isSafeInteger(dateShift) || Math.abs(dateShift) > 70_000) throw new Error("invalid_synthetic_clock");
   const observations: ProtocolObservation[] = [];
@@ -27,11 +29,13 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
       const matched = header === `Bearer ${token}`;
       const script = typeof request.headers["x-script"] === "string" ? request.headers["x-script"] : "happy";
       let reasoningEffort: string | null = null;
+      let thinkingType: string | null = null;
       let messages: ProtocolMessage[] = [];
       try {
-        const parsed = JSON.parse(body) as { reasoning_effort?: unknown; messages?: ProtocolMessage[] };
+        const parsed = JSON.parse(body) as { reasoning_effort?: unknown; thinking?: { type?: unknown }; messages?: ProtocolMessage[] };
         messages = Array.isArray(parsed.messages) ? parsed.messages : [];
         reasoningEffort = typeof parsed.reasoning_effort === "string" ? parsed.reasoning_effort : null;
+        thinkingType = typeof parsed.thinking?.type === "string" ? parsed.thinking.type : null;
       } catch {
         reasoningEffort = null;
       }
@@ -42,6 +46,8 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
         sawSystemPrompt: body.includes("先搜索已发布资产"),
         sawToolDefinition: body.includes("\"name\":\"search_assets\"") || body.includes("\"name\": \"search_assets\""),
         reasoningEffort,
+        thinkingType,
+        assistantReasoning: messages.filter((message) => message.role === "assistant" && typeof message.reasoning_content === "string").map((message) => message.reasoning_content!),
         authorizationPresent: header.length > 0,
         authorizationMatched: matched,
         userMessages: messages.filter((message) => message.role === "user").map(messageText),
@@ -55,6 +61,11 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
       if (script === "error") {
         response.writeHead(500, { "content-type": "application/json" });
         response.end(JSON.stringify({ error: { message: "scripted failure" } }));
+        return;
+      }
+      if (script === "rate-limit") {
+        response.writeHead(429, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "fictional rate limit" } }));
         return;
       }
       if (script === "hold") {
@@ -79,19 +90,24 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
       }
       const tail = plainBody.slice(-900);
       if (tail.includes("The messages above are") || tail.includes("Create a concise checkpoint")) {
-        writeTextStream(response, true);
+        writeTextStream(response, true, options.cacheHitTokens);
         return;
       }
       // Only the explicitly scripted fake maps its fixture dates. The actual
       // Pi session and persisted user message always keep the original text.
       const fixtureMessages = dateShift ? JSON.parse(shiftSyntheticDates(JSON.stringify(messages), -dateShift)) as ProtocolMessage[] : messages;
-      const call = script === "bad-args" ? badCall(body) : happyCall(fixtureMessages);
+      const turnTools = currentTurn(fixtureMessages).filter((message) => message.role === "tool");
+      const call = script === "clarify-retry" && turnTools.length === 0
+        ? { id: "call_reject", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: [] }) }
+        : (script === "clarification" && turnTools.length === 0 || script === "clarify-retry" && turnTools.length === 1)
+        ? { id: "call_clarify", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "needs_clarification", draft_answer: "", resource_ids: [], clarification_question: "请说明分析范围。" }) }
+        : script === "bad-args" ? badCall(body) : happyCall(fixtureMessages);
       if (!call) {
-        writeTextStream(response, true);
+        writeTextStream(response, true, options.cacheHitTokens);
         return;
       }
       const turnNumber = messages.filter((message) => message.role === "user").length;
-      writeToolStream(response, { ...call, id: `${call.id}_turn${turnNumber}`, arguments: shiftSyntheticDates(call.arguments, dateShift) }, true);
+      writeToolStream(response, { ...call, id: `${call.id}_turn${turnNumber}`, arguments: shiftSyntheticDates(call.arguments, dateShift) }, true, options.deepseekThinking === true, options.cacheHitTokens);
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -104,7 +120,7 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
   };
 }
 
-interface ProtocolMessage { role: string; content?: unknown; tool_calls?: Array<{ function?: { name?: string } }> }
+interface ProtocolMessage { role: string; content?: unknown; reasoning_content?: string; tool_calls?: Array<{ function?: { name?: string } }> }
 
 function messageText(message: ProtocolMessage): string {
   if (typeof message.content === "string") return message.content;
@@ -563,25 +579,26 @@ function badCall(body: string): { id: string; name: string; arguments: string } 
   return { id: "call_bad", name: "query", arguments: JSON.stringify({ sql: "DROP TABLE fact_fox_daily_install", purpose: "bad" }) };
 }
 
-function writeTextStream(response: ServerResponse, includeUsage = false): void {
+function writeTextStream(response: ServerResponse, includeUsage = false, cacheHitTokens = 0): void {
   response.writeHead(200, { "content-type": "text/event-stream" });
   response.write(`data: ${JSON.stringify(chunkFrame({ role: "assistant", content: "没有" }))}\n\n`);
   response.write(`data: ${JSON.stringify(chunkFrame({ content: "用量。" }))}\n\n`);
   const done: Record<string, unknown> = { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] };
-  if (includeUsage) done.usage = { prompt_tokens: 21, completion_tokens: 9, total_tokens: 30 };
+  if (includeUsage) done.usage = { prompt_tokens: 21, completion_tokens: 9, total_tokens: 30, prompt_cache_hit_tokens: cacheHitTokens };
   response.write(`data: ${JSON.stringify(done)}\n\n`);
   response.end("data: [DONE]\n\n");
 }
 
-function writeToolStream(response: ServerResponse, call: { id: string; name: string; arguments: string }, includeUsage: boolean): void {
+function writeToolStream(response: ServerResponse, call: { id: string; name: string; arguments: string }, includeUsage: boolean, thinking = false, cacheHitTokens = 0): void {
   response.writeHead(200, { "content-type": "text/event-stream" });
   const midpoint = Math.max(1, Math.floor(call.arguments.length / 2));
   const frames = [
     chunkFrame({ role: "assistant", content: "" }),
+    ...(thinking ? [chunkFrame({ reasoning_content: "合成推理片段。" })] : []),
     chunkFrame(toolDelta(call.id, call.name, "")),
     chunkFrame(toolDelta(call.id, undefined, call.arguments.slice(0, midpoint))),
     chunkFrame(toolDelta(call.id, undefined, call.arguments.slice(midpoint))),
-    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], ...(includeUsage ? { usage: { prompt_tokens: 21, completion_tokens: 9, total_tokens: 30 } } : {}) },
+    { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], ...(includeUsage ? { usage: { prompt_tokens: 21, completion_tokens: 9, total_tokens: 30, prompt_cache_hit_tokens: cacheHitTokens } } : {}) },
   ];
   for (const frame of frames) response.write(`data: ${JSON.stringify(frame)}\n\n`);
   response.end("data: [DONE]\n\n");

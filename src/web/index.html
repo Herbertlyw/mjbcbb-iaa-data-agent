@@ -527,6 +527,8 @@
         banner.textContent = "Pi 会话：本机脚本假模型，仅用于协议演示，不具备真实模型的自主分析能力。";
       } else if (health.remote_dispatch === false) {
         banner.textContent = "Pi 会话：使用用户配置的 127.0.0.1 OpenAI 兼容服务；服务和模型能力尚未验证。远程派发关闭。";
+      } else if (health.model_provider === "deepseek") {
+        banner.textContent = "Pi 会话：已配置 DeepSeek 官方服务；问题、授权知识和工具结果会发送给供应商。仅用于合成数据验证。";
       } else {
         banner.textContent = "Pi 会话：模型由服务端目录决定。没有密钥时不会改回演示结果。";
       }

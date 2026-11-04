@@ -6,8 +6,8 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { loadConfig, type AppConfig } from "../src/config.js";
-import { fetchLoopbackOnly } from "../src/openai-gateway.js";
+import { loadConfig, repoRoot, type AppConfig } from "../src/config.js";
+import { fetchDeepSeekOnly, fetchLoopbackOnly } from "../src/openai-gateway.js";
 import { analyst, ask, openRuntime, waitForJob, withRuntime } from "./helpers.js";
 import { startFakeOpenAI } from "./openai-fake-server.js";
 import type { ProviderStepBegin, ProviderStepDecision, ProviderStepSettle } from "../src/state-store.js";
@@ -93,6 +93,121 @@ test("未标脚本的本机服务用量只标记为服务自报，仍由账本�
       const steps = runtime.state.listProviderSteps(job.job_id);
       assert.ok(steps.length > 0 && steps.every((step) => step.usage_source === "reported" && step.settlement === "settled"));
       assert.equal(runtime.config.protocolScript, "");
+    });
+  } finally { await fake.close(); }
+});
+
+test("DeepSeek 方言的流式思考与工具调用在多轮请求中完整回传", async () => {
+  const fake = await startFakeOpenAI(token, { deepseekThinking: true });
+  try {
+    await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "happy", piReasoning: "low", enabledReasoning: ["off", "low"] }), async (runtime) => {
+      const session = analyst(runtime);
+      const first = await ask(runtime, session.session_id, "纸灯 在 2026-10-06 到 2026-10-12（美国、iOS、雾帆）的新增用户是多少？", undefined, { reasoning: "low" });
+      assert.ok(first.events.some((event) => event.type === "tool_started"));
+      const second = await ask(runtime, session.session_id, "那日本呢？", undefined, { reasoning: "low" });
+      assert.ok(second.events.some((event) => event.type === "tool_started"));
+      assert.ok(fake.observations.every((item) => item.thinkingType === "enabled" && item.reasoningEffort === "low"));
+      assert.ok(fake.observations.some((item) => item.assistantReasoning.includes("合成推理片段。")));
+      assert.ok(runtime.state.listProviderSteps(first.job_id).every((step) => step.provider === "deepseek"));
+    });
+  } finally { await fake.close(); }
+});
+
+test("DeepSeek 远程配置必须显式启用并锁定官方地址", () => {
+  const base = gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: "https://api.deepseek.com", allowRemoteHttps: true, deepseekSyntheticOnly: true, knowledgeDir: path.join(repoRoot(), "knowledge", "harborlight"), businessEngine: "clickhouse", clickhouseUrl: "http://127.0.0.1:12345", clickhouseDatabase: "harborlight", clickhouseUser: "fox_reader", stateMode: "mysql", mysqlHost: "127.0.0.1", mysqlPort: 12346, redisHost: "127.0.0.1", redisPort: 12347 });
+  assert.doesNotThrow(() => loadConfig(base));
+  assert.throws(() => loadConfig({ ...base, allowRemoteHttps: false }), /显式启用/);
+  assert.throws(() => loadConfig({ ...base, piBaseUrl: "https://api.deepseek.com.example.invalid" }), /官方 HTTPS/);
+  assert.throws(() => loadConfig({ ...base, piBaseUrl: "https://api.deepseek.com/v1?key=fictional" }), /官方 HTTPS/);
+  assert.throws(() => loadConfig({ ...base, protocolScript: "happy" }), /协议脚本/);
+  assert.throws(() => loadConfig({ ...base, deepseekSyntheticOnly: false }), /隔离合成/);
+  assert.throws(() => loadConfig({ ...base, clickhouseUrl: "http://127.0.0.1:8123" }), /隔离合成/);
+  assert.throws(() => loadConfig({ ...base, mysqlPort: 3306 }), /隔离合成/);
+  assert.throws(() => loadConfig({ ...base, knowledgeDir: path.join(repoRoot(), "knowledge", "lumenfox") }), /隔离合成/);
+});
+
+test("DeepSeek 传输仅接受官方 HTTPS 路径且强制禁止重定向", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (_input, init) => { calls++; assert.equal(init?.redirect, "error"); return new Response("ok"); };
+  try {
+    await fetchDeepSeekOnly("https://api.deepseek.com/chat/completions", { redirect: "follow" });
+    await assert.rejects(fetchDeepSeekOnly("https://api.deepseek.com.example.invalid/chat/completions"), /remote_dispatch_disabled/);
+    await assert.rejects(fetchDeepSeekOnly("https://api.deepseek.com/other"), /remote_dispatch_disabled/);
+    await assert.rejects(fetchDeepSeekOnly("http://127.0.0.1:12345/v1"), /remote_dispatch_disabled/);
+    assert.equal(calls, 1);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test("DeepSeek 非思考模式显式关闭 thinking，错误不回退且无用量保持未知", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "error" }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成问题");
+      assert.equal(job.status, "failed");
+      assert.equal(job.usage?.usage_source, "unknown");
+      assert.equal(fake.observations.length, 1);
+      assert.equal(fake.observations[0]?.thinkingType, "disabled");
+      assert.equal(job.events.some((event) => event.type === "tool_started"), false);
+    });
+  } finally { await fake.close(); }
+});
+
+test("DeepSeek 限流只派发一次并保留未知用量", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "rate-limit" }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成问题");
+      assert.equal(job.status, "failed");
+      assert.equal(job.error?.code, "provider_rate_limited");
+      assert.equal(job.usage?.usage_source, "unknown");
+      assert.equal(fake.observations.length, 1);
+    });
+  } finally { await fake.close(); }
+});
+
+test("DeepSeek 缓存命中的输入 token 仍计入任务预算", async () => {
+  const fake = await startFakeOpenAI(token, { cacheHitTokens: 5 });
+  try {
+    await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "happy" }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成问题");
+      const steps = runtime.state.listProviderSteps(job.job_id);
+      assert.ok(steps.length > 0);
+      assert.ok(steps.every((step) => step.input_tokens === 21 && step.output_tokens === 9));
+      assert.equal(job.usage?.input_tokens, steps.length * 21);
+    });
+  } finally { await fake.close(); }
+});
+
+test("Pi 成功提交候选后结束工具批次，不再派发多余模型请求", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "clarification" }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成问题，范围不清楚。");
+      assert.equal(job.status, "needs_clarification", JSON.stringify(job.error));
+      assert.equal(job.analysis?.clarification_question, "请说明分析范围。");
+      assert.equal(fake.observations.length, 1);
+      assert.equal(runtime.state.listProviderSteps(job.job_id).length, 1);
+      assert.equal(job.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
+    });
+  } finally { await fake.close(); }
+});
+
+test("Pi 拒绝无证据候选后允许模型修订，成功澄清后结束", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "clarify-retry" }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成问题，范围不清楚。");
+      assert.equal(job.status, "needs_clarification", JSON.stringify(job.error));
+      assert.equal(job.analysis?.clarification_question, "请说明分析范围。");
+      const updates = job.events.filter((event) => event.type === "tool_finished" && event.payload.tool_name === "update_analysis");
+      assert.deepEqual(updates.map((event) => event.payload.is_error), [true, false]);
+      assert.equal(fake.observations.length, 2);
     });
   } finally { await fake.close(); }
 });

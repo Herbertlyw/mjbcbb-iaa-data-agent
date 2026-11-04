@@ -496,7 +496,7 @@ export class JobService {
     } else {
       status = analysis.status;
     }
-    const steps = this.host.config.piProvider === "openai-compatible" ? await this.stateCall("listProviderSteps", jobId) : [];
+    const steps = (this.host.config.piProvider === "openai-compatible" || this.host.config.piProvider === "deepseek") ? await this.stateCall("listProviderSteps", jobId) : [];
     if (await this.stateCall("finish", jobId, this.owner, fence, status, analysis, error, measuredUsage(this.host.config.modelMode, this.host.config.piProvider, modelCalls, toolCalls, steps))) await this.publish(jobId);
   }
 
@@ -514,7 +514,7 @@ export class JobService {
     hasAnalysis: () => boolean;
     rememberCandidate: (analysis: AnalysisRecord) => void;
   }): Promise<"ok" | "lost"> {
-    if (this.host.config.piProvider === "openai-compatible") {
+    if ((this.host.config.piProvider === "openai-compatible" || this.host.config.piProvider === "deepseek")) {
       const pending = (await this.stateCall("listProviderSteps", input.jobId)).filter((step) => step.status === "dispatched");
       for (const step of pending) {
         await this.stateCall("settleProviderStep", {
@@ -562,7 +562,7 @@ export class JobService {
         reasoning: selection.reasoning,
         snapshot,
         requireUserText: Boolean(progress),
-        ledger: this.host.config.piProvider === "openai-compatible"
+        ledger: (this.host.config.piProvider === "openai-compatible" || this.host.config.piProvider === "deepseek")
           ? {
               sessionId: input.sessionId,
               jobId: input.jobId,
@@ -738,7 +738,7 @@ export class JobService {
       } else if (decision.action === "prompt") {
         await session.prompt(input.userText, { expandPromptTemplates: false, source: "rpc" });
       }
-      if (this.host.config.piProvider === "openai-compatible") {
+      if ((this.host.config.piProvider === "openai-compatible" || this.host.config.piProvider === "deepseek")) {
         const failedStep = (await this.stateCall("listProviderSteps", input.jobId)).find((step) => step.status === "error");
         if (failedStep) {
           fail({ code: failedStep.error_code ?? "provider_error", message: "供应商请求失败。日志不包含密钥、请求头或用户原文。" });
@@ -833,6 +833,9 @@ function hardFailure(code: string): boolean {
     "provider_error",
     "provider_timeout",
     "provider_auth_rejected",
+    "provider_rate_limited",
+    "provider_balance_insufficient",
+    "provider_invalid_request",
     "provider_cancelled",
     "provider_fence_rejected",
     "token_budget_unknown",
@@ -863,7 +866,7 @@ function measuredUsage(
   toolCalls: number,
   steps: ReturnType<StateStore["listProviderSteps"]> = [],
 ) {
-  if (piProvider === "openai-compatible") {
+  if (piProvider === "openai-compatible" || piProvider === "deepseek") {
     const usage = usageFromSteps(steps);
     return { model_calls: modelCalls, tool_calls: toolCalls, cost: null, ...usage };
   }

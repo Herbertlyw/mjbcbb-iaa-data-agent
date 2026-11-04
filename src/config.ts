@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { realpathSync } from "node:fs";
 
 export interface AppConfig {
   host: string;
@@ -16,6 +17,7 @@ export interface AppConfig {
   maxKnownTokens: number;
   enabledReasoning: string[];
   allowRemoteHttps: boolean;
+  deepseekSyntheticOnly: boolean;
   knowledgeDir: string;
   databasePath: string;
   stateDatabasePath: string;
@@ -89,9 +91,9 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     port: integer("PORT", 4317),
     modelMode,
     piProvider: process.env.PI_PROVIDER || "anthropic",
-    piModel: process.env.PI_MODEL || "",
+    piModel: process.env.PI_MODEL || (process.env.PI_PROVIDER === "deepseek" ? "deepseek-flash" : ""),
     piApiKey: process.env.PI_API_KEY || "",
-    piBaseUrl: process.env.PI_BASE_URL || "",
+    piBaseUrl: process.env.PI_BASE_URL || (process.env.PI_PROVIDER === "deepseek" ? "https://api.deepseek.com" : ""),
     piContextWindow: integer("PI_CONTEXT_WINDOW", 0),
     piMaxOutputTokens: integer("PI_MAX_OUTPUT_TOKENS", 0),
     piReasoning: process.env.PI_REASONING || "off",
@@ -99,6 +101,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     maxKnownTokens: integer("MAX_KNOWN_TOKENS", 200_000),
     enabledReasoning: (process.env.PI_ENABLED_REASONING || "off").split(",").map((item) => item.trim()).filter(Boolean),
     allowRemoteHttps: process.env.PI_ALLOW_REMOTE_HTTPS === "true",
+    deepseekSyntheticOnly: process.env.DEEPSEEK_SYNTHETIC_ONLY === "true",
     knowledgeDir: process.env.KNOWLEDGE_DIR || path.join(repoRoot(), "knowledge", "lumenfox"),
     databasePath: process.env.DATABASE_PATH || path.join(repoRoot(), ".local-runtime", "lumenfox.sqlite"),
     stateDatabasePath: process.env.STATE_DATABASE_PATH || path.join(repoRoot(), ".local-runtime", "state.sqlite"),
@@ -198,7 +201,7 @@ export function validateModelProvider(config: AppConfig): void {
   if (config.piProvider === "anthropic") {
     throw new Error("供应商 anthropic 当前禁用：尚未接入统一派发和预算账本，不会向外网发送请求，也不会改用 faux。");
   }
-  if (config.piProvider !== "openai-compatible") {
+  if (config.piProvider !== "openai-compatible" && config.piProvider !== "deepseek") {
     throw new Error(`未知供应商 ${config.piProvider}。不会改用 faux。`);
   }
   if (!config.piModel.trim()) throw new Error("openai-compatible 需要 PI_MODEL。不会改用 faux。");
@@ -212,6 +215,21 @@ export function validateModelProvider(config: AppConfig): void {
   } catch {
     throw new Error("PI_BASE_URL 不是合法 URL。");
   }
+  if (config.piProvider === "deepseek" && url.origin === "https://api.deepseek.com" && (url.pathname === "/" || url.pathname === "/v1") && !url.username && !url.password && !url.search && !url.hash) {
+    if (!config.allowRemoteHttps || config.protocolScript) throw new Error("DeepSeek 远程派发需要显式启用，且不能启用协议脚本。");
+    let syntheticKnowledge = false;
+    let localClickHouse = false;
+    try {
+      syntheticKnowledge = realpathSync(config.knowledgeDir) === realpathSync(path.join(repoRoot(), "knowledge", "harborlight"));
+      const ch = new URL(config.clickhouseUrl);
+      localClickHouse = ch.protocol === "http:" && ch.hostname === "127.0.0.1" && Boolean(ch.port) && ch.port !== "8123" && !ch.username && !ch.password && !ch.search && !ch.hash;
+    } catch { /* fail closed */ }
+    if (!config.deepseekSyntheticOnly || !syntheticKnowledge || !localClickHouse || config.businessEngine !== "clickhouse" || config.clickhouseDatabase !== "harborlight" || config.clickhouseUser !== "fox_reader" || config.stateMode !== "mysql" || config.mysqlHost !== "127.0.0.1" || config.redisHost !== "127.0.0.1" || config.mysqlPort === 3306 || config.redisPort === 6379) {
+      throw new Error("DeepSeek 远程模式仅允许显式的隔离合成演示配置；请使用 demo:stack -- --deepseek。");
+    }
+    return;
+  }
+  if (config.piProvider === "deepseek" && url.protocol === "https:") throw new Error("DeepSeek 只允许官方 HTTPS 地址。");
   if (url.protocol === "https:") {
     throw new Error("远程 HTTPS 供应商默认关闭。本构建只允许本机假服务，不会向外网派发。");
   }

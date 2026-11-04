@@ -16,8 +16,9 @@ export interface ProviderLedger {
 }
 
 export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfig, ledger: ProviderLedger): void {
-  runtime.registerProvider("openai-compatible", {
-    name: "OpenAI-compatible",
+  const deepseek = config.piProvider === "deepseek";
+  runtime.registerProvider(config.piProvider, {
+    name: deepseek ? "DeepSeek" : "OpenAI-compatible",
     baseUrl: config.piBaseUrl,
     apiKey: config.piApiKey,
     api: "openai-completions",
@@ -27,13 +28,14 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
         id: config.piModel,
         name: config.piModel,
         api: "openai-completions",
-        reasoning: config.enabledReasoning.some((level) => level !== "off"),
+        reasoning: deepseek || config.enabledReasoning.some((level) => level !== "off"),
         thinkingLevelMap: thinkingLevelMap(config.enabledReasoning),
         input: ["text"],
         contextWindow: config.piContextWindow,
         maxTokens: config.piMaxOutputTokens,
         baseUrl: config.piBaseUrl,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        ...(deepseek ? { compat: { thinkingFormat: "deepseek" as const, supportsReasoningEffort: true, requiresReasoningContentOnAssistantMessages: true, maxTokensField: "max_tokens" as const, supportsStore: false } } : {}),
       },
     ],
     streamSimple: (model, context, options) => {
@@ -42,7 +44,7 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
       const stepId = `step_${randomUUID()}`;
       const started = Date.now();
       void (async () => {
-      assertDispatchTarget(config.piBaseUrl);
+      assertDispatchTarget(config.piBaseUrl, deepseek && config.allowRemoteHttps);
       const began = await ledger.state.beginProviderStep({
         stepId,
         sessionId: ledger.sessionId,
@@ -50,7 +52,7 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
         actorId: ledger.actorId,
         owner: ledger.owner,
         fence: ledger.fence,
-        provider: "openai-compatible",
+        provider: config.piProvider,
         model: config.piModel,
         estimatedInput: estimate.tokens,
         reservedOutput: config.piMaxOutputTokens,
@@ -80,10 +82,11 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
         if (!settled.ok) throw new Error(settled.code);
         throw new Error("provider_cancelled");
       }
-      const physical = { ...model, api: "openai-completions" as const, baseUrl: config.piBaseUrl, provider: "openai-compatible" };
+      const physical = { ...model, api: "openai-completions" as const, baseUrl: config.piBaseUrl, provider: config.piProvider };
       let stream;
       try {
-        stream = openAICompletions(physical as Model<"openai-completions">, context, { ...options, fetch: fetchLoopbackOnly, maxRetries: 0 });
+        const transport = deepseek && config.allowRemoteHttps && new URL(config.piBaseUrl).origin === "https://api.deepseek.com" ? fetchDeepSeekOnly : fetchLoopbackOnly;
+        stream = openAICompletions(physical as Model<"openai-completions">, context, { ...options, fetch: transport, maxRetries: 0 });
       } catch (error) {
         const settled = await ledger.state.settleProviderStep({
           stepId,
@@ -131,8 +134,9 @@ export function estimateContextTokens(context: unknown): { tokens: number; sourc
   return { tokens: Math.max(1, Math.ceil(Buffer.byteLength(text, "utf8") / 2)), source: "utf8_byte_estimate" };
 }
 
-export function assertDispatchTarget(baseUrl: string): void {
+export function assertDispatchTarget(baseUrl: string, allowDeepSeek = false): void {
   const url = new URL(baseUrl);
+  if (allowDeepSeek && url.origin === "https://api.deepseek.com" && (url.pathname === "/" || url.pathname === "/v1" || url.pathname === "/chat/completions" || url.pathname === "/v1/chat/completions") && !url.username && !url.password && !url.search && !url.hash) return;
   if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port || url.username || url.password || url.search || url.hash) {
     throw new Error("remote_dispatch_disabled");
   }
@@ -144,6 +148,14 @@ export function assertDispatchTarget(baseUrl: string): void {
 export const fetchLoopbackOnly: typeof fetch = async (input, init) => {
   const address = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
   assertDispatchTarget(address);
+  return globalThis.fetch(input, { ...init, redirect: "error" });
+};
+
+export const fetchDeepSeekOnly: typeof fetch = async (input, init) => {
+  const address = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  const url = new URL(address);
+  if (url.origin !== "https://api.deepseek.com") throw new Error("remote_dispatch_disabled");
+  assertDispatchTarget(address, true);
   return globalThis.fetch(input, { ...init, redirect: "error" });
 };
 
@@ -168,6 +180,9 @@ export function safeProviderError(error: unknown): { code: string; message: stri
   const redacted = raw.replace(/sk-[A-Za-z0-9_-]+/g, "[redacted]").replace(/Bearer\s+\S+/gi, "Bearer [redacted]").replace(/api[_-]?key[^,\s]*/gi, "[redacted]");
   if (/timeout|timed out/i.test(redacted)) return { code: "provider_timeout", message: "供应商请求超时。用量未知，不会记成 0。" };
   if (/401|403|api key|unauthorized/i.test(redacted)) return { code: "provider_auth_rejected", message: "供应商拒绝了认证。密钥不会写入日志。" };
+  if (/\b429\b|rate.limit/i.test(redacted)) return { code: "provider_rate_limited", message: "供应商限流；未自动重试，用量按未知处理。" };
+  if (/\b402\b|insufficient.balance/i.test(redacted)) return { code: "provider_balance_insufficient", message: "供应商报告余额不足；未自动重试。" };
+  if (/\b400\b|bad.request/i.test(redacted)) return { code: "provider_invalid_request", message: "供应商拒绝了请求格式；未记录原始请求或错误正文。" };
   if (/aborted|cancel/i.test(redacted)) return { code: "provider_cancelled", message: "供应商请求已取消。" };
   const known = redacted.match(/provider_outcome_unknown|provider_fence_rejected|token_budget_unknown|budget_exhausted|context_window_exceeded|remote_dispatch_disabled|settlement_conflict|model_not_enabled|reasoning_not_enabled/);
   if (known) {
@@ -177,7 +192,7 @@ export function safeProviderError(error: unknown): { code: string; message: stri
       token_budget_unknown: "已有一次用量不明的调用，预留仍被占用。不会把它记成 0，也不会继续派发。",
       provider_outcome_unknown: "已有一次派发结果不明。不会重试，也不会把用量记成 0。",
       provider_fence_rejected: "调用记录和当前任务围栏不一致，没有改写权威状态。",
-      remote_dispatch_disabled: "本构建只向 127.0.0.1 派发。远程 HTTPS 配置即使被解析，也不会发出连接。",
+      remote_dispatch_disabled: "模型请求目标未获允许；只允许本机回环地址或显式启用的 DeepSeek 官方 HTTPS 地址。",
       settlement_conflict: "结算和已记录的用量冲突，权威记录没有被覆盖。",
       model_not_enabled: "这个模型没有在服务端启用。",
       reasoning_not_enabled: "这个推理档位没有启用。",
@@ -208,7 +223,10 @@ async function settleFromMessage(ledger: ProviderLedger, stepId: string, started
     owner: ledger.owner,
     fence: ledger.fence,
     status: failed ? "error" : "completed",
-    inputTokens: sawUsage ? message.usage.input : null,
+    // pi-ai separates cached tokens from `input`, while DeepSeek's reported
+    // prompt_tokens includes cache hits. Budget the complete prompt, not only
+    // the cache misses, so cached prompts cannot evade the per-task limit.
+    inputTokens: sawUsage ? message.usage.input + message.usage.cacheRead + message.usage.cacheWrite : null,
     outputTokens: sawUsage ? message.usage.output : null,
     usageSource: sawUsage ? source : "unknown",
     durationMs: Date.now() - started,
