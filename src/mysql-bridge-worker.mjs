@@ -1,5 +1,6 @@
 import { parentPort, workerData } from "node:worker_threads";
 import mysql from "mysql2/promise";
+import { cacheUsageFromMetadata } from "./provider-usage-metadata.mjs";
 
 const config = workerData;
 const pool = mysql.createPool({
@@ -541,6 +542,7 @@ async function markOutboxDispatched(outboxId) {
 
 function stepFromRow(row) {
   return {
+    ...cacheUsageFromMetadata(row.response_metadata, row),
     step_id: String(row.step_id),
     session_id: String(row.session_id),
     job_id: String(row.job_id),
@@ -777,7 +779,7 @@ async function readProviderPayload(input) {
 }
 
 async function listProviderSteps(jobId) {
-  const [rows] = await pool.query("SELECT * FROM provider_steps WHERE job_id = ? ORDER BY created_at", [jobId]);
+  const [rows] = await pool.query("SELECT s.*, p.body AS response_metadata FROM provider_steps s LEFT JOIN provider_payloads p ON p.payload_id = CONCAT('res_', s.step_id) AND p.step_id = s.step_id AND p.job_id = s.job_id AND p.session_id = s.session_id AND p.actor_id = s.actor_id AND p.kind = 'response' WHERE s.job_id = ? ORDER BY s.created_at", [jobId]);
   return rows.map(stepFromRow);
 }
 

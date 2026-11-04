@@ -1,0 +1,1 @@
+export function cacheUsageFromMetadata(body: unknown, step: { status: unknown; settlement: unknown; usage_source: unknown; input_tokens: unknown; output_tokens: unknown }): { cache_hit_tokens: number | null; cache_miss_tokens: number | null };

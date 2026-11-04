@@ -313,7 +313,7 @@
     function usageSummary(job) {
       const usage = job.usage;
       if (!usage || !Number.isSafeInteger(usage.model_attempts)) return "";
-      return `<p class="muted">模型尝试至少 ${escapeHtml(usage.model_attempts)} · 可能已派发上限 ${escapeHtml(usage.model_calls)} · 明确未派发 ${escapeHtml(usage.provider_not_dispatched)} · 成功结算 ${escapeHtml(usage.provider_completed)} · 结果或用量未知 ${escapeHtml(usage.provider_outcome_unknown)}。输入 token：${escapeHtml(usage.input_tokens ?? "未知")}；输出 token：${escapeHtml(usage.output_tokens ?? "未知")}；来源：${escapeHtml(usage.usage_source || "未知")}。</p>`;
+      return `<p class="muted">模型尝试至少 ${escapeHtml(usage.model_attempts)} · 可能已派发上限 ${escapeHtml(usage.model_calls)} · 明确未派发 ${escapeHtml(usage.provider_not_dispatched)} · 成功结算 ${escapeHtml(usage.provider_completed)} · 结果或用量未知 ${escapeHtml(usage.provider_outcome_unknown)}。输入 token：${escapeHtml(usage.input_tokens ?? "未知")}；输出 token：${escapeHtml(usage.output_tokens ?? "未知")}；缓存命中：${escapeHtml(usage.cache_hit_tokens ?? "未知")}；缓存未命中：${escapeHtml(usage.cache_miss_tokens ?? "未知")}；来源：${escapeHtml(usage.usage_source || "未知")}。</p>`;
     }
 
     function showJob(job) {

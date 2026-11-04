@@ -235,7 +235,10 @@ test("DeepSeek 缓存命中的输入 token 仍计入任务预算", async () => {
       const steps = runtime.state.listProviderSteps(job.job_id);
       assert.ok(steps.length > 0);
       assert.ok(steps.every((step) => step.input_tokens === 21 && step.output_tokens === 9));
+      assert.ok(steps.every((step) => step.cache_hit_tokens === 5 && step.cache_miss_tokens === null));
       assert.equal(job.usage?.input_tokens, steps.length * 21);
+      assert.equal(job.usage?.cache_hit_tokens, steps.length * 5);
+      assert.equal(job.usage?.cache_miss_tokens, null);
     });
   } finally { await fake.close(); }
 });

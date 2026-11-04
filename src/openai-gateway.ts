@@ -213,17 +213,21 @@ export const fetchDeepSeekOnly: typeof fetch = async (input, init) => {
 export function usageFromSteps(steps: ProviderStepRecord[]): {
   input_tokens: number | null;
   output_tokens: number | null;
+  cache_hit_tokens: number | null;
+  cache_miss_tokens: number | null;
   usage_source: "simulated" | "reported" | "unknown" | "not_dispatched";
 } {
   const sent = steps.filter((step) => step.status !== "not_dispatched");
-  if (!sent.length && steps.length) return { input_tokens: null, output_tokens: null, usage_source: "not_dispatched" };
+  if (!sent.length && steps.length) return { input_tokens: null, output_tokens: null, cache_hit_tokens: null, cache_miss_tokens: null, usage_source: "not_dispatched" };
   const source = sent[0]?.usage_source;
   if (source === undefined || source === "unknown" || sent.some((step) => step.usage_source !== source || step.input_tokens === null || step.output_tokens === null)) {
-    return { input_tokens: null, output_tokens: null, usage_source: "unknown" };
+    return { input_tokens: null, output_tokens: null, cache_hit_tokens: null, cache_miss_tokens: null, usage_source: "unknown" };
   }
   return {
     input_tokens: sent.reduce((sum, step) => sum + (step.input_tokens ?? 0), 0),
     output_tokens: sent.reduce((sum, step) => sum + (step.output_tokens ?? 0), 0),
+    cache_hit_tokens: sent.every((step) => step.cache_hit_tokens != null) ? sent.reduce((sum, step) => sum + (step.cache_hit_tokens ?? 0), 0) : null,
+    cache_miss_tokens: sent.every((step) => step.cache_miss_tokens != null) ? sent.reduce((sum, step) => sum + (step.cache_miss_tokens ?? 0), 0) : null,
     usage_source: source,
   };
 }

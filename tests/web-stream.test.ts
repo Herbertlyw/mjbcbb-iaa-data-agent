@@ -44,9 +44,10 @@ test("旧任务延迟重连不能关闭新任务的事件流", () => {
 
 test("预算拒绝与可能已派发次数在页面分别展示，未知用量不写成零", () => {
   const { api } = page();
-  const html = api.usageSummary({ usage: { model_attempts: 2, model_calls: 1, provider_not_dispatched: 1, provider_completed: 1, provider_outcome_unknown: 0, input_tokens: 4308, output_tokens: 78, usage_source: "reported" } });
+  const html = api.usageSummary({ usage: { model_attempts: 2, model_calls: 1, provider_not_dispatched: 1, provider_completed: 1, provider_outcome_unknown: 0, input_tokens: 4308, output_tokens: 78, cache_hit_tokens: 0, cache_miss_tokens: null, usage_source: "reported" } });
   assert.match(html, /模型尝试至少 2/); assert.match(html, /可能已派发上限 1/); assert.match(html, /明确未派发 1/);
   assert.match(html, /输入 token：4308/);
+  assert.match(html, /缓存命中：0/); assert.match(html, /缓存未命中：未知/);
   const unknown = api.usageSummary({ usage: { model_attempts: 1, model_calls: 0, provider_not_dispatched: 1, provider_completed: 0, provider_outcome_unknown: 0, input_tokens: null, output_tokens: null, usage_source: "not_dispatched" } });
   assert.match(unknown, /输入 token：未知/); assert.doesNotMatch(unknown, /输入 token：0/);
 });

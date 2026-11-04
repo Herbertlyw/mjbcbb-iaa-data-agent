@@ -3,6 +3,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AnalysisRecord, ContractBinding, JobEvent, JobRecord, JobStatus, SessionResource, Slots, TurnResolution } from "./types.js";
 import { isTerminal } from "./types.js";
+import { cacheUsageFromMetadata } from "./provider-usage-metadata.mjs";
 
 export interface StoredSession {
   session_id: string;
@@ -23,6 +24,8 @@ export interface JobUsage {
   tool_calls: number;
   input_tokens: number | null;
   output_tokens: number | null;
+  cache_hit_tokens?: number | null;
+  cache_miss_tokens?: number | null;
   cost: number | null;
   usage_source?: string;
 }
@@ -155,6 +158,8 @@ export interface ProviderStepRecord {
   status: "dispatched" | "completed" | "error" | "outcome_unknown" | "not_dispatched";
   input_tokens: number | null;
   output_tokens: number | null;
+  cache_hit_tokens?: number | null;
+  cache_miss_tokens?: number | null;
   usage_source: "simulated" | "reported" | "unknown";
   duration_ms: number | null;
   error_code: string | null;
@@ -800,7 +805,7 @@ export class SqliteStateStore implements StateStore {
   }
 
   listProviderSteps(jobId: string): ProviderStepRecord[] {
-    return (this.db.prepare("SELECT * FROM provider_steps WHERE job_id = ? ORDER BY created_at").all(jobId) as Array<Record<string, unknown>>).map(stepFromSqlite);
+    return (this.db.prepare("SELECT s.*, p.body AS response_metadata FROM provider_steps s LEFT JOIN provider_payloads p ON p.payload_id = 'res_' || s.step_id AND p.step_id = s.step_id AND p.job_id = s.job_id AND p.session_id = s.session_id AND p.actor_id = s.actor_id AND p.kind = 'response' WHERE s.job_id = ? ORDER BY s.created_at").all(jobId) as Array<Record<string, unknown>>).map(stepFromSqlite);
   }
 
   reserveRevision(jobId: string, owner: string, fence: number): { ok: true; count: number } | { ok: false; count: number } {
@@ -975,6 +980,7 @@ function nullableNumber(value: unknown): number | null {
 
 function stepFromSqlite(row: Record<string, unknown>): ProviderStepRecord {
   return {
+    ...cacheUsageFromMetadata(row.response_metadata, { status: row.status, settlement: row.settlement, usage_source: row.usage_source, input_tokens: row.input_tokens, output_tokens: row.output_tokens }),
     step_id: String(row.step_id),
     session_id: String(row.session_id),
     job_id: String(row.job_id),

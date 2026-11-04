@@ -422,6 +422,8 @@ export interface JobRecord {
     tool_calls: number;
     input_tokens: number | null;
     output_tokens: number | null;
+    cache_hit_tokens?: number | null;
+    cache_miss_tokens?: number | null;
     cost: number | null;
     usage_source?: string;
   } | null;

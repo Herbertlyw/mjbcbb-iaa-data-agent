@@ -71,6 +71,7 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
     assert.equal(budget?.model_calls_reserved, 1);
     const winner = wins[0]?.code === "reserved" ? (raced[0]?.ok ? "step_a" : "step_b") : "step_a";
     const stepId = raced[0]?.ok ? "step_a" : "step_b";
+    assert.equal(await state.call("saveProviderPayload", { payloadId: `res_${stepId}`, stepId, sessionId: session.session_id, actorId: "demo-analyst", jobId: job.job_id, owner: "worker-a", fence: claim.fence, kind: "response", body: JSON.stringify({ format: "metadata-only", failed: false, usage_source: "simulated", input_tokens: 21, output_tokens: 9, cache_hit_tokens: 5, cache_miss_tokens: 16 }) }), true);
     const duplicate = (await state.call("settleProviderStep", {
       stepId,
       jobId: job.job_id,
@@ -84,6 +85,8 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
       errorCode: null,
     }));
     assert.equal(duplicate.ok, true);
+    const cached = (await state.call("listProviderSteps", job.job_id)).find((item) => item.step_id === stepId);
+    assert.equal(cached?.cache_hit_tokens, 5); assert.equal(cached?.cache_miss_tokens, 16);
     const again = (await state.call("settleProviderStep", {
       stepId,
       jobId: job.job_id,
