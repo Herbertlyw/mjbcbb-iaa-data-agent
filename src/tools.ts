@@ -607,11 +607,11 @@ export class ToolService {
       return this.calculateAlignment(sessionId, input.align);
     }
     if (input.transform) {
-      if (input.arithmetic || input.resource_id || input.operations) return fail("invalid_transform", "表格变换须单独提交。");
+      if (input.arithmetic || input.operations || (input.resource_id !== undefined && input.resource_id !== input.transform.resource_id)) return fail("invalid_transform", "表格变换须单独提交；如提供顶层 resource_id，必须与变换输入一致。");
       return this.calculateTransform(sessionId, input.transform);
     }
     if (input.arithmetic) {
-      if (input.resource_id || input.operations) return fail("invalid_arithmetic", "四则运算与单资源汇总须分开提交。");
+      if (input.operations || (input.resource_id !== undefined && (input.resource_id !== input.arithmetic.left?.resource_id || input.resource_id !== input.arithmetic.right?.resource_id))) return fail("invalid_arithmetic", "四则运算与单资源汇总须分开提交；顶层 resource_id 如存在，必须与两个输入一致。");
       return this.calculateArithmetic(sessionId, input.arithmetic);
     }
     if (!Array.isArray(input.operations) || input.operations.length < 1 || input.operations.length > 40) return fail("invalid_calculation", "每次须提供 1 到 40 个计算操作。");
@@ -923,6 +923,13 @@ export class ToolService {
       const contract = this.arithmeticContract(session, resource, publication);
       const evidence = this.evidenceSource(session, resource);
       if (!contract || !evidence) return null;
+      // An ungrouped, independently verified aggregate has exactly one row.
+      // Its stored resource already binds the execution and content hash, so
+      // row 0 can be resolved without trusting a model-supplied execution ID.
+      if (ref.row === 0 && ref.execution_id === undefined && ref.aggregate === undefined && !ref.group && resource.execution_id && resource.rows.length === 1) {
+        const matching = verifyDatabaseAggregates(evidence, contract)?.filter((item) => item.output_column === ref.cell && Object.keys(item.group).length === 0) ?? [];
+        if (matching.length === 1) return { value: fromAggregate(matching[0]!), hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id] };
+      }
       if (ref.row !== undefined || ref.aggregate !== undefined || ref.execution_id !== undefined) {
         if (ref.group || !ref.execution_id || ref.execution_id !== resource.execution_id || (ref.row === undefined) === (ref.aggregate === undefined) || (ref.row !== undefined && (!Number.isSafeInteger(ref.row) || ref.row < 0)) || (ref.aggregate !== undefined && ref.aggregate !== "sum") || coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length) return null;
         const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, new Set());
@@ -1058,6 +1065,7 @@ export class ToolService {
     if (cancelled) return cancelled;
     if (input.declaration !== undefined && !isAnalysisDeclaration(input.declaration)) return fail("invalid_analysis_declaration", "分析工作记录格式或长度不合法。");
     if (typeof input.draft_answer !== "string" || input.draft_answer.length > 32_000 || !Array.isArray(input.resource_ids ?? []) || (input.resource_ids?.length ?? 0) > 40 || input.resource_ids?.some((id) => typeof id !== "string" || id.length > 128) || (input.clarification_question !== undefined && (typeof input.clarification_question !== "string" || input.clarification_question.length > 2000))) return fail("analysis_input_limit", "分析草稿或资源引用超过上限。");
+    if ((input.suggested_status === "needs_clarification" || input.clarification_question !== undefined) && !input.clarification_question?.trim()) return fail("clarification_question_required", "需要澄清时请填写具体的 clarification_question；不要提交空白问题。");
     const session = await this.ctx.sessions.requireAsync(sessionId);
     const jobId = session.active_job_id ?? "";
     const citations: AnalysisRecord["citations"] = [];
@@ -1167,7 +1175,10 @@ export class ToolService {
       status = "failed";
       reasons.push("no_authorized_result");
     }
-    const deliveredFreshness = await this.currentFreshness();
+    // A question with no evidence does not make a data-freshness claim. It
+    // must remain available when the freshness authority is down; any actual
+    // query source still requires the same authoritative revalidation.
+    const deliveredFreshness = sources.length ? await this.currentFreshness() : { ok: true as const, publication: null };
     if (!deliveredFreshness.ok) return deliveredFreshness;
     const liveFreshness = deliveredFreshness.publication;
     const eligible = new Set<string>();
@@ -1817,7 +1828,7 @@ function renderAggregate(item: VerifiedAggregate): string {
 function renderConditionalAggregate(item: VerifiedConditionalAggregate): string {
   const filters = Object.entries(item.filters).map(([key, value]) => `${key}=${value}`).join("，") || "无";
   const group = Object.entries(item.group).map(([key, value]) => `${key}=${value}`).join("，");
-  const condition = item.operation === "count_null" ? "为 NULL" : item.operation === "count_nonnull" ? "非 NULL" : "等于零";
+  const condition = item.operation === "count_null" ? "为 NULL" : item.operation === "count_nonnull" ? "非 NULL" : item.operation === "count_zero" ? "等于零" : `${item.comparison!.operator} ${item.comparison!.threshold}（NULL 不满足条件）`;
   return `${item.table}.${item.column}：数据库条件计数（${condition}）${item.value}；单位 行；实际（契约声明仅观察值）；筛选 ${filters}${group ? `；分组 ${group}` : ""}；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${item.source_resource_id}。${item.coverage_incomplete ? "覆盖不完整，此计数仅描述已观测行；NULL 和未出现的行没有补零。" : "此计数描述查询中已观测的行，未出现的分组没有补零。"}`;
 }
 
@@ -2052,7 +2063,7 @@ function renderAnswer(
   const lines: string[] = [];
   if (status === "partial") lines.push("这个回答不完整。");
   if (status === "completed") lines.push("以下数字由当前任务的已授权查询和计算生成。");
-  if (status === "needs_clarification") lines.push(clarification || "还需要补充问题范围。");
+  if (status === "needs_clarification") lines.push(`需要澄清（以下为模型提出的问题，其中的假设尚未核验）：${clarification || "还需要补充问题范围。"}`);
   if (status === "failed") lines.push(clarification || "这次没有取得可引用的查询结果。");
   const operations: Record<VerifiedCell["operation"], string> = { sum: "非 NULL 值合计", count_null: "值为 NULL 的行数", count_zero: "数值为零的行数", count_rows: "查询结果行数" };
   for (const cell of cells) {

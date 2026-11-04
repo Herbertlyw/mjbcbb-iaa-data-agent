@@ -61,6 +61,17 @@ test("同任务聚合的四则运算可递归复核，零分母、篡改和跨�
       return { resource_id: String(query.resource_id), cell: "total" };
     }
     const a = await day("2026-10-06"); const b = await day("2026-10-08"); const zero = await day("2026-10-07");
+    const singleRow = { ...a, row: 0 };
+    const redundantHint = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: a.resource_id, arithmetic: { op: "subtract", left: singleRow, right: singleRow } });
+    assert.equal(redundantHint.ok, true, JSON.stringify(redundantHint));
+    if (redundantHint.ok) assert.equal((redundantHint.result as { value: string }).value, "0");
+    const conflictingHint = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: b.resource_id, arithmetic: { op: "subtract", left: singleRow, right: singleRow } });
+    assert.equal(conflictingHint.ok, false);
+    if (!conflictingHint.ok) assert.equal(conflictingHint.code, "invalid_arithmetic");
+    const badRow = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: a.resource_id, arithmetic: { op: "subtract", left: { ...singleRow, row: 1 }, right: singleRow } });
+    assert.equal(badRow.ok, false);
+    const badExecution = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: a.resource_id, arithmetic: { op: "subtract", left: { ...singleRow, execution_id: "wrong" }, right: singleRow } });
+    assert.equal(badExecution.ok, false);
     async function calculate(op: "add" | "subtract" | "multiply" | "divide", left: ArithmeticRef, right: ArithmeticRef) {
       const result = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op, left, right } });
       assert.equal(result.ok, true, JSON.stringify(result));

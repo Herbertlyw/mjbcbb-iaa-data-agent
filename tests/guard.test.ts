@@ -4,6 +4,20 @@ import { analyst, bindTables, withRuntime } from "./helpers.js";
 
 const WEEK = "event_date >= '2026-10-06' AND event_date <= '2026-10-12'";
 
+test("不支持的聚合返回可操作的安全提示，不把原 SQL 回显到错误", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    const sql = `SELECT sumIf(new_users, country_code = 'JP') FROM daily_installs WHERE ${WEEK}`;
+    const result = await runtime.tools.query(session.session_id, { sql });
+    assert.equal(result.ok, false);
+    if (result.ok) throw new Error("unexpected authorization");
+    assert.equal(result.code, "dangerous_function");
+    assert.match(result.message, /有界明细后计算/u);
+    assert.doesNotMatch(result.message, /SELECT|2026-10-06/u);
+  });
+});
+
 test("未生效和无效日期的契约均不能用于查询", async () => {
   await withRuntime({ simulatedToday: "2026-10-29" }, async (runtime) => {
     const session = analyst(runtime);

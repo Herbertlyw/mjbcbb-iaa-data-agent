@@ -150,7 +150,12 @@ function auxiliaryProjection(expr: Record<string, unknown>, column: (value: unkn
   const args = object(expr.args);
   if (expr.type === "aggr_func" && typeof expr.name === "string" && expr.name.toLowerCase() === "count" && !args?.distinct && !args?.orderby && object(args?.expr)?.type === "star") return { field: null, operation: "all" };
   const pieces = object(expr.name)?.name;
-  if (expr.type !== "function" || !Array.isArray(pieces) || pieces.length !== 1 || String(object(pieces[0])?.value).toLowerCase() !== "countif" || args?.type !== "expr_list" || !Array.isArray(args.value) || args.value.length !== 1) return null;
+  if (expr.type !== "function" || !Array.isArray(pieces) || pieces.length !== 1 || args?.type !== "expr_list" || !Array.isArray(args.value)) return null;
+  const functionName = String(object(pieces[0])?.value).toLowerCase();
+  // ClickHouse COUNT() is COUNT(*) and returns the number of observed rows.
+  // The caller accepts auxiliary counts only for clickhouse-local results.
+  if (functionName === "count" && args.value.length === 0) return { field: null, operation: "all" };
+  if (functionName !== "countif" || args.value.length !== 1) return null;
   const condition = object(args.value[0]);
   if (!condition) return null;
   const nested = object(condition.name)?.name;

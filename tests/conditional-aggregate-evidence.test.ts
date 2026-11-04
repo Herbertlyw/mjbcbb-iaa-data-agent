@@ -27,6 +27,17 @@ test("条件计数以契约字段和行单位验证 NULL、非 NULL、真实零�
   ]);
 });
 
+test("整数阈值条件计数保留原字段、操作符、分组和范围", () => {
+  const source = sample();
+  source.sql = source.sql.replace("isNull(new_users)", "new_users > 10").replace("new_users = 0", "new_users <= 100").replace("new_users IS NOT NULL", "new_users <> 0");
+  const values = verifyConditionalAggregates(source, contract); assert.ok(values);
+  assert.deepEqual(values.slice(0, 3).map(({ column, operation, comparison, group, unit }) => [column, operation, comparison, group.country_code, unit]), [
+    ["new_users", "count_compare", { operator: ">", threshold: "10" }, "JP", "行"],
+    ["new_users", "count_compare", { operator: "<=", threshold: "100" }, "JP", "行"],
+    ["new_users", "count_compare", { operator: "!=", threshold: "0" }, "JP", "行"],
+  ]);
+});
+
 test("条件计数拒绝未知覆盖、SQL 越权、复杂谓词、伪造分组及不完整结果", () => {
   for (const mutate of [
     (s: QueryResource) => { s.truncated = true; },
@@ -48,7 +59,10 @@ test("条件计数拒绝未知覆盖、SQL 越权、复杂谓词、伪造分组�
     (s: QueryResource) => { s.rows[1] = { ...s.rows[0]! }; },
     (s: QueryResource) => { s.rows[0]!.unexpected = 1; },
     (s: QueryResource) => { s.sql = s.sql.replace("isNull(new_users)", "isNull(device_token)"); },
-    (s: QueryResource) => { s.sql = s.sql.replace("new_users = 0", "new_users > 0"); },
+    (s: QueryResource) => { s.sql = s.sql.replace("new_users = 0", "new_users > 0.1"); },
+    (s: QueryResource) => { s.sql = s.sql.replace("new_users = 0", "new_users > 1.0"); },
+    (s: QueryResource) => { s.sql = s.sql.replace("new_users = 0", "new_users > 1e0"); },
+    (s: QueryResource) => { s.sql = s.sql.replace("new_users = 0", "new_users > 9007199254740993"); },
     (s: QueryResource) => { s.sql = s.sql.replace("new_users = 0", "(new_users = 0 OR new_users IS NULL)"); },
   ]) { const source = sample(); mutate(source); assert.equal(verifyConditionalAggregates(source, contract), null); }
   const absent = sample(); absent.rows.pop(); absent.returned_rows = 1; absent.total_rows = 1; absent.coverage.null_dates = [];

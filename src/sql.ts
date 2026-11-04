@@ -786,7 +786,7 @@ function rejectFunctions(node: unknown): void {
   walk(node, (record) => {
     const name = functionName(record);
     if (!name) return;
-    if (!ALLOWED_FUNCTIONS.has(name)) throw new SqlRejected("dangerous_function", `函数 ${name} 不在允许列表中`);
+    if (!ALLOWED_FUNCTIONS.has(name)) throw new SqlRejected("dangerous_function", `函数 ${name} 不在允许列表中；可使用受限 SUM、COUNT、MIN、MAX、AVG、countIf 或直接字段，必要时查询有界明细后计算。`);
     if (name === "todate" && !clickHouseDateConstant(record)) throw new SqlRejected("unsafe_date_function", "toDate 仅接受一个 ClickHouse Date 范围内的规范日期字符串常量。");
     if ((name === "isnull" || name === "isnotnull") && !directNullFunction(record)) throw new SqlRejected("unsafe_null_function", "空值函数仅允许直接列引用。");
     if (name === "countif" && !safeCountIf(record)) throw new SqlRejected("unsafe_conditional_aggregate", "countIf 仅接受受限的列与常量条件。");

@@ -113,6 +113,8 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
       const turnTools = currentTurn(fixtureMessages).filter((message) => message.role === "tool");
       const call = script === "clarify-retry" && turnTools.length === 0
         ? { id: "call_reject", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: [] }) }
+        : script === "minimal-clarification" && turnTools.length === 0
+        ? { id: "call_clarify_minimal", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "needs_clarification", clarification_question: "请补充产品和日期范围。" }) }
         : (script === "clarification" && turnTools.length === 0 || script === "clarify-retry" && turnTools.length === 1)
         ? { id: "call_clarify", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "needs_clarification", draft_answer: "", resource_ids: [], clarification_question: "请说明分析范围。" }) }
         : script === "bad-args" ? badCall(body) : happyCall(fixtureMessages);
@@ -153,6 +155,8 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   const earlierUsers = messages.slice(0, messages.length - turn.length).filter((message) => message.role === "user").map(messageText);
   const hasBase = earlierUsers.some((text) => text.includes("纸灯") && text.includes("美国") && text.includes("iOS") && text.includes("雾帆") && text.includes("2026-10-06") && text.includes("2026-10-12"));
   if (latest.includes("合成空值标记投影")) return scripted(turn, nullMarkerSteps);
+  if (latest.includes("合成条件阈值")) return scripted(turn, conditionalThresholdSteps);
+  if (latest.includes("合成单资源比较")) return scripted(turn, sameResourceComparisonSteps);
   if (latest.includes("不调用记录")) return scripted(turn, noRecordSteps);
   if (latest.includes("合成收入成本比")) return scripted(turn, ratioSteps);
   if (latest.includes("合成多渠道收入成本比")) return scripted(turn, groupedRatioSteps);
@@ -189,6 +193,24 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("日本") && (hasBase || latest.includes("雾帆"))) return scripted(turn, japanSteps);
   if (latest.includes("连表")) return scripted(turn, unsafeJoinSteps);
   return scripted(turn, defaultSteps);
+}
+
+function conditionalThresholdSteps(ids: string[]) {
+  return [
+    { id: "threshold_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "threshold_query", name: "query", arguments: JSON.stringify({ sql: "SELECT countIf(new_users > 50) AS above_fifty, countIf(new_users <= 100) AS at_most_hundred, countIf(new_users != 0) AS nonzero FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'" }) },
+    { id: "threshold_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", resource_ids: ids }) },
+  ];
+}
+
+function sameResourceComparisonSteps(ids: string[]) {
+  const id = ids[0] ?? "";
+  return [
+    { id: "same_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "same_query", name: "query", arguments: JSON.stringify({ sql: "SELECT SUM(amount_usd) AS amount_sum, SUM(cost_usd) AS cost_sum, COUNT() AS row_cnt FROM fact_fox_daily_payment WHERE event_date = toDate('2026-10-08') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'" }) },
+    { id: "same_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: id, arithmetic: { op: "subtract", left: { resource_id: id, cell: "amount_sum", row: 0 }, right: { resource_id: id, cell: "cost_sum", row: 0 } } }) },
+    { id: "same_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", resource_ids: ids }) },
+  ];
 }
 
 function nullMarkerSteps(ids: string[]) {

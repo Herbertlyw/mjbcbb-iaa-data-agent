@@ -10,7 +10,8 @@ export interface VerifiedConditionalAggregate {
   table: string;
   column: string;
   output_column: string;
-  operation: "count_null" | "count_nonnull" | "count_zero";
+  operation: "count_null" | "count_nonnull" | "count_zero" | "count_compare";
+  comparison?: { operator: "=" | "!=" | "<" | "<=" | ">" | ">="; threshold: string };
   value: string;
   unit: "行";
   filters: Record<string, string>;
@@ -20,8 +21,8 @@ export interface VerifiedConditionalAggregate {
   coverage_incomplete: boolean;
 }
 
-/** Verify only direct-metric countIf NULL/non-NULL/zero predicates. SQL that
- * is safe to execute can still be wider than this trustworthy evidence subset. */
+/** Verify direct-metric countIf NULL/non-NULL/zero and safe integer threshold
+ * predicates. SQL safe to execute can still be wider than this evidence subset. */
 export function verifyConditionalAggregates(source: QueryResource, contract: DataContract): VerifiedConditionalAggregate[] | null {
   const series = contract.series;
   if (!series || series.predicted_column || series.prediction_mode !== "observed_only" || source.engine !== "clickhouse-local" || !source.session_id || !source.job_id || !source.execution_id || !Array.isArray(source.tables) || source.tables.length !== 1 || source.tables[0] !== contract.table || source.truncated || source.sql_limited || !source.complete_population || source.total_rows_exact !== true || !Array.isArray(source.rows) || !Array.isArray(source.columns) || source.rows.length !== source.returned_rows || source.rows.length !== source.total_rows || !source.rows.length || !source.time_range || source.time_range.timezone !== contract.timezone || !validCoverage(source.coverage) || source.coverage.status !== "known" || source.coverage.unknown_prediction_dates.length || !Number.isSafeInteger(source.scan_limit) || source.scan_limit! < 1 || source.scan_limit! > 2_000_000_000) return null;
@@ -47,7 +48,7 @@ export function verifyConditionalAggregates(source: QueryResource, contract: Dat
   if (groupNode && (!groups.length || groups.length > 3) || groups.some((name) => !name || name !== series.date_column && !series.dimensions.includes(name) || Object.hasOwn(scope.equalities, name)) || new Set(groups).size !== groups.length) return null;
   if (!series.dimensions.every((name) => groups.includes(name) || Object.hasOwn(scope.equalities, name)) || Object.keys(scope.inSets).some((name) => !groups.includes(name))) return null;
   const names = new Set<string>(); const groupOutputs = new Map<string, string>();
-  const metrics: Array<{ field: string; output: string; operation: VerifiedConditionalAggregate["operation"] }> = [];
+  const metrics: Array<{ field: string; output: string; operation: VerifiedConditionalAggregate["operation"]; comparison?: VerifiedConditionalAggregate["comparison"] }> = [];
   for (const item of Array.isArray(ast.columns) ? ast.columns : []) {
     const projection = object(item); const expr = object(projection?.expr);
     if (!projection || !expr) return null;
@@ -62,7 +63,7 @@ export function verifyConditionalAggregates(source: QueryResource, contract: Dat
     const args = object(expr.args); const list = args?.type === "expr_list" && Array.isArray(args.value) ? args.value : [];
     if (list.length !== 1) return null;
     const condition = object(list[0]); if (!condition) return null;
-    let field: string | null = null; let operation: VerifiedConditionalAggregate["operation"] | null = null;
+    let field: string | null = null; let operation: VerifiedConditionalAggregate["operation"] | null = null; let comparison: VerifiedConditionalAggregate["comparison"];
     const nullFn = fn(condition);
     if (nullFn === "isnull" || nullFn === "isnotnull") {
       const nullArgs = object(condition.args); const inputs = nullArgs?.type === "expr_list" && Array.isArray(nullArgs.value) ? nullArgs.value : [];
@@ -74,12 +75,16 @@ export function verifyConditionalAggregates(source: QueryResource, contract: Dat
       if (right?.type === "null" && op === "IS") operation = "count_null";
       else if (right?.type === "null" && op === "IS NOT") operation = "count_nonnull";
       else if (right?.type === "number" && right.value === 0 && op === "=") operation = "count_zero";
+      else if (right?.type === "number" && typeof right.value === "number" && Number.isSafeInteger(right.value) && ["=", "!=", "<>", "<", "<=", ">", ">="].includes(op)) {
+        operation = "count_compare";
+        comparison = { operator: (op === "<>" ? "!=" : op) as NonNullable<VerifiedConditionalAggregate["comparison"]>["operator"], threshold: String(right.value) };
+      }
     }
     const declared = contract.columns.find((c) => c.name === field);
     if (!field || !operation || !declared || !series.metrics.includes(field) || contract.sensitive_columns.includes(field) || !/^(?:nullable\()?\s*(?:u?int\d+|decimal\(\s*\d+\s*,\s*\d+\s*\))\s*\)?$/iu.test(declared.type)) return null;
     const output = projection.as;
     if (!safeAlias(output, field, contract) || names.has(output) || source.column_types?.[output]?.replace(/\s/gu, "").toLowerCase() !== "uint64") return null;
-    names.add(output); metrics.push({ field, output, operation });
+    names.add(output); metrics.push({ field, output, operation, ...(comparison ? { comparison } : {}) });
   }
   if (!metrics.length || groupOutputs.size !== groups.length || !groups.length && source.rows.length !== 1 || source.columns.length !== names.size || source.columns.some((name) => !names.has(name)) || new Set(source.columns).size !== source.columns.length) return null;
   const result: VerifiedConditionalAggregate[] = []; const seen = new Set<string>();
@@ -98,7 +103,7 @@ export function verifyConditionalAggregates(source: QueryResource, contract: Dat
       if (typeof raw !== "string" && (typeof raw !== "number" || !Number.isSafeInteger(raw))) return null;
       const text = String(raw); if (!/^\d{1,19}$/u.test(text)) return null;
       const value = BigInt(text); if (value > BigInt(source.scan_limit!)) return null;
-      result.push({ source_resource_id: source.resource_id, table: contract.table, column: metric.field, output_column: metric.output, operation: metric.operation, value: value.toString(), unit: "行", filters: scope.equalities, group, range: source.time_range, prediction: "actual_observed_only", coverage_incomplete: coverageHasGap(source.coverage) });
+      result.push({ source_resource_id: source.resource_id, table: contract.table, column: metric.field, output_column: metric.output, operation: metric.operation, ...(metric.comparison ? { comparison: metric.comparison } : {}), value: value.toString(), unit: "行", filters: scope.equalities, group, range: source.time_range, prediction: "actual_observed_only", coverage_incomplete: coverageHasGap(source.coverage) });
     }
   }
   if (!coverageHasGap(source.coverage) && Object.keys(scope.inSets).length) {

@@ -278,8 +278,14 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.ok(fake.observations.some((item) => item.userMessages.length === 3 && item.userMessages[2] === "日期改成 2026-10-06 到 2026-10-08。"));
     const decimalSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const decimalSessionId = ((await decimalSession.json()) as { session_id: string }).session_id;
-    const decimal = await postQuestion(apiPort, decimalSessionId, "合成精确金额：比较 2026-10-06 和 2026-10-08。");
+    const clarification = await postQuestion(apiPort, decimalSessionId, "只说看看收入");
+    assert.equal(clarification.status, "needs_clarification", JSON.stringify(clarification.error));
+    assert.equal(clarification.events.some((event) => event.type === "tool_started" && event.payload.tool_name === "query"), false);
+    assert.equal(clarification.analysis?.sources?.length, 0);
+    const supplement = "合成精确金额：纸灯美国 iOS 雾帆，比较 2026-10-06 和 2026-10-08。";
+    const decimal = await postQuestion(apiPort, decimalSessionId, supplement);
     assert.equal(decimal.status, "completed", JSON.stringify(decimal.error));
+    assert.ok(fake.observations.some((item) => item.userMessages.length === 2 && item.userMessages[0] === "只说看看收入" && item.userMessages[1] === supplement && item.historySummaryCount > 0));
     assert.match(decimal.analysis?.answer ?? "", /不是同一原子快照/);
     assert.match(decimal.analysis?.answer ?? "", /90071992547409\.91/);
     assert.match(decimal.analysis?.answer ?? "", /90071992547408\.91/);
@@ -732,6 +738,22 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     const markerRows = marker.analysis?.sources?.[0]?.rows as Array<Record<string, unknown>>;
     assert.deepEqual(markerRows.map((row) => row.new_users), [100, 0, 120]);
     assert.ok(markerRows.every((row) => !Object.hasOwn(row, "is_null")));
+    // Independent fixture: [100, 0, 120] has two values > 50, two <= 100,
+    // and two != 0. Equal numeric results retain three distinct predicates.
+    const threshold = await postQuestion(apiPort, await another(), "合成条件阈值：统计三天不同条件的观测日数。");
+    assert.equal(threshold.status, "completed", `${JSON.stringify(threshold.error)} ${threshold.analysis?.answer ?? ""}`);
+    const thresholdAnswer = threshold.analysis?.answer ?? "";
+    assert.match(thresholdAnswer, /> 50（NULL 不满足条件））2；单位 行/u);
+    assert.match(thresholdAnswer, /<= 100（NULL 不满足条件））2；单位 行/u);
+    assert.match(thresholdAnswer, /!= 0（NULL 不满足条件））2；单位 行/u);
+    assert.equal(threshold.analysis?.sources?.[0]?.engine, "clickhouse-local");
+    assert.ok(threshold.analysis?.sources?.[0]?.freshness_receipts?.length);
+    const sameResource = await postQuestion(apiPort, await another(), "合成单资源比较：支付流水减成本。");
+    assert.equal(sameResource.status, "completed", `${JSON.stringify(sameResource.error)} ${sameResource.analysis?.answer ?? ""} ${JSON.stringify(sameResource.events.filter((event) => event.type === "tool_finished").map((event) => ({ tool: event.payload.tool_name, code: event.payload.code })))}`);
+    assert.match(sameResource.analysis?.answer ?? "", /四则运算 subtract：-1\.00 USD/u);
+    assert.equal(sameResource.analysis?.sources?.[0]?.engine, "clickhouse-local");
+    assert.deepEqual(sameResource.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "query", "calculate_session_cells", "update_analysis"]);
+    assert.equal(sameResource.events.some((event) => event.type === "tool_finished" && event.payload.is_error === true), false);
     const japan = await postQuestion(apiPort, await another(), "纸灯在日本、iOS、雾帆，2026-10-06 到 2026-10-12 的新增用户是多少？");
     assert.match(japan.analysis?.answer ?? "", /70/);
     const joined = await postQuestion(apiPort, await another(), "把纸灯美国 iOS 的新增和变现连表后告诉我新增合计。");

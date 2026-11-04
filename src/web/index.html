@@ -521,7 +521,7 @@
       for (const model of state.models) {
         const option = document.createElement("option");
         option.value = model.id;
-        option.textContent = `${model.id}（${model.provider}，${model.verified_here ? "仅本机协议已验证" : "未做外部联调"}）`;
+        option.textContent = `${model.id}（${model.provider}，${model.verified_here ? "仅本机协议已验证" : "模型能力未认证"}）`;
         select.append(option);
       }
       select.addEventListener("change", fillReasoning);

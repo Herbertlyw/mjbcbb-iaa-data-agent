@@ -311,6 +311,23 @@ test("Pi 成功提交候选后结束工具批次，不再派发多余模型请�
   } finally { await fake.close(); }
 });
 
+test("Pi 接受只包含状态和问题的澄清参数，原话保留且不发查询", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "minimal-clarification" }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "帮我看一下收入。");
+      assert.equal(job.status, "needs_clarification", JSON.stringify(job.error));
+      assert.equal(job.analysis?.clarification_question, "请补充产品和日期范围。");
+      assert.match(job.analysis?.answer ?? "", /假设尚未核验/u);
+      assert.equal(job.analysis?.sources.length, 0);
+      assert.deepEqual(job.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["update_analysis"]);
+      assert.deepEqual(fake.observations[0]?.userMessages, ["帮我看一下收入。"]);
+      assert.equal(fake.observations.length, 1);
+    });
+  } finally { await fake.close(); }
+});
+
 test("Pi 拒绝无证据候选后允许模型修订，成功澄清后结束", async () => {
   const fake = await startFakeOpenAI(token);
   try {

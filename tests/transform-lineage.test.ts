@@ -35,8 +35,11 @@ test("完整明细与数据库分组 SUM 可按契约键对齐并递归复核", 
     const aligned = await runtime.tools.calculateSessionCells(session.session_id, { align: { op: "subtract", keys: ["country_code"], left: { resource_id: String(left.resource_id), cell: "new_users" }, right: { resource_id: String(right.resource_id), cell: "total" } } });
     assert.ok(aligned.ok, JSON.stringify(aligned)); if (!aligned.ok) return;
     assert.deepEqual((aligned.rows as Array<{ group: { country_code: string }; result: { value: string } }>).map((row) => [row.group.country_code, row.result.value]), [["JP", "0"], ["US", "25"]]);
-    const transformed = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(aligned.resource_id), steps: [{ op: "filter", column: "result_value", comparison: "gt", value: "0" }, { op: "group", by: [], aggregates: [{ op: "sum", column: "result_value", as: "sum" }] }] } });
+    const transformed = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(aligned.resource_id), transform: { resource_id: String(aligned.resource_id), steps: [{ op: "filter", column: "result_value", comparison: "gt", value: "0" }, { op: "group", by: [], aggregates: [{ op: "sum", column: "result_value", as: "sum" }] }] } });
     assert.ok(transformed.ok, JSON.stringify(transformed)); if (!transformed.ok) return;
+    const conflicting = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(left.resource_id), transform: { resource_id: String(aligned.resource_id), steps: [{ op: "group", by: [], aggregates: [{ op: "count_all", as: "n" }] }] } });
+    assert.equal(conflicting.ok, false);
+    if (!conflicting.ok) assert.equal(conflicting.code, "invalid_transform");
     const answer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(left.resource_id), String(right.resource_id), String(transformed.resource_id)] });
     assert.ok(answer.ok, JSON.stringify(answer)); if (answer.ok) { assert.equal(answer.status, "completed"); assert.match(String(answer.answer), /的合计=25（人）/); }
     runtime.sessions.setActiveJob(session.session_id, "other_job");

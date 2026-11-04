@@ -35,6 +35,13 @@ test("SUM、COUNT 和空值辅助计数同查询时可核验汇总，辅助列�
   source.rows = source.rows.map((row) => ({ ...row, observed: "1", total_rows: "1", missing: "0" }));
   const op = { op: "sum" as const, column: "total", as: "n" };
   assert.equal(verifyGroupRollup(source, contract, op, "220")?.value, "220");
+  const noArgCount = structuredClone(source);
+  noArgCount.sql = noArgCount.sql.replace("COUNT(*)", "COUNT()");
+  assert.equal(verifyGroupRollup(noArgCount, contract, op, "220")?.value, "220");
+  const inconsistentCount = structuredClone(noArgCount); inconsistentCount.rows[0]!.total_rows = "0";
+  assert.equal(verifyGroupRollup(inconsistentCount, contract, op, "220"), null);
+  const sqliteCount = structuredClone(noArgCount); sqliteCount.engine = "sqlite-local";
+  assert.equal(verifyGroupRollup(sqliteCount, contract, op, "220"), null);
   assert.equal(verifyGroupRollup(source, contract, { ...op, column: "total_rows" }, "3"), null);
   const invalid = (mutate: (item: QueryResource) => void) => { const item = structuredClone(source); mutate(item); assert.equal(verifyGroupRollup(item, contract, op, "220"), null); };
   invalid((s) => { s.rows[0]!.missing = "1"; });
