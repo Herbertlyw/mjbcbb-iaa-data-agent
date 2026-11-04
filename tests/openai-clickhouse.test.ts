@@ -68,6 +68,15 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     await clickHouseInsert(admin, "fact_fox_daily_install", data.installs);
     await clickHouseInsert(admin, "fact_fox_daily_active", data.active);
     await clickHouseInsert(admin, "fact_fox_daily_payment", data.payments);
+    // Independent synthetic goldens: 6/3=2, 10/2=5, 0/0 is unknown,
+    // 9/3=3, 4.5/3=1.5 and 12/4=3, by day and channel.
+    const dayFixture = [
+      ["2026-10-06", "mist_ads", "6.00", 3], ["2026-10-06", "pebble_net", "10.00", 2],
+      ["2026-10-07", "mist_ads", "0.00", 0], ["2026-10-07", "pebble_net", "9.00", 3],
+      ["2026-10-08", "mist_ads", "4.50", 3], ["2026-10-08", "pebble_net", "12.00", 4],
+    ] as const;
+    await clickHouseInsert(admin, "fact_fox_daily_install", dayFixture.map(([event_date, channel_id, , new_users]) => ({ event_date, channel_id, title_id: "date_demo", platform: "android", country_code: "DATEZZ", new_users, device_token: null })));
+    await clickHouseInsert(admin, "fact_fox_daily_payment", dayFixture.map(([event_date, channel_id, amount_usd]) => ({ event_date, channel_id, title_id: "date_demo", platform: "android", country_code: "DATEZZ", amount_usd, cost_usd: "1.00" })));
     const nullBase = { event_date: "2026-10-08", title_id: "null_demo", platform: "android", channel_id: "mist_ads" };
     await clickHouseInsert(admin, "fact_fox_daily_install", [
       { ...nullBase, country_code: null, new_users: 5, device_token: null },
@@ -428,6 +437,31 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       const response = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
       return ((await response.json()) as { session_id: string }).session_id;
     };
+    const dailySession = await createSyntheticSession();
+    const dailyCross = await postQuestion(apiPort, dailySession, "合成多日双渠道跨事实：按日期和渠道比较收入与新增。");
+    assert.equal(dailyCross.status, "partial", `${JSON.stringify(dailyCross.error)} tools=${dailyCross.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name).join(">")}`);
+    const dailyRows = dailyCross.analysis?.alignment_results?.[0]?.rows ?? [];
+    const expectedDaily = [
+      ["2026-10-06", "mist_ads", "2.000000000000000000", "matched"], ["2026-10-06", "pebble_net", "5.000000000000000000", "matched"],
+      ["2026-10-07", "mist_ads", null, "zero_divisor"], ["2026-10-07", "pebble_net", "3.000000000000000000", "matched"],
+    ];
+    assert.deepEqual(dailyRows.map((row) => [row.group.event_date, row.group.channel_id, row.result?.value ?? null, row.status]).sort(), expectedDaily.sort());
+    assert.equal(dailyCross.analysis?.sources?.length, 2);
+    assert.equal(dailyCross.analysis?.sources?.every((source) => source.engine === "clickhouse-local"), true);
+    for (const source of dailyCross.analysis?.sources ?? []) {
+      assert.ok(source.resource_id && source.execution_id);
+      const hash: string | undefined = dailyCross.analysis?.resource_hashes?.[source.resource_id]; assert.ok(hash);
+      const response: Response = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${dailySession}/resources/${source.resource_id}?offset=0&limit=100&resource_hash=${hash}`);
+      assert.equal(response.status, 200);
+      const page = await response.json() as { resource: { session_id: string; job_id: string; execution_id: string; rows: unknown[] } };
+      assert.equal(page.resource.session_id, dailySession); assert.equal(page.resource.job_id, dailyCross.job_id);
+      assert.equal(page.resource.execution_id, source.execution_id); assert.equal(page.resource.rows.length, 4);
+    }
+    const dailyTransform = dailyCross.analysis?.transform_results?.[0]; assert.ok(dailyTransform);
+    assert.deepEqual(dailyTransform.result.rows.map((row) => row.result_value), ["5.000000000000000000", "3.000000000000000000", "2.000000000000000000"]);
+    assert.match(dailyCross.analysis?.answer ?? "", /零分母|除数为零/);
+    assert.equal(dailyCross.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === "calculate_session_cells").length, 2);
+    assert.equal(dailyCross.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
     const rawCross = await postQuestion(apiPort, await createSyntheticSession(), "合成明细跨事实：按国家和渠道对齐收入及新增明细。");
     assert.equal(rawCross.status, "partial", `${JSON.stringify(rawCross.error)} ${rawCross.analysis?.answer ?? ""}`);
     assert.ok((rawCross.analysis?.answer ?? "").includes(crossExpected.japan_mist));
@@ -581,6 +615,21 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       assert.equal(saved.resource.execution_id, source.execution_id);
     }
     assert.equal(dateFunction.events.filter((event) => event.type === "job_finished").length, 1);
+    const inSession = await createSyntheticSession();
+    const inResult = await postQuestion(apiPort, inSession, "合成两地区 IN：查询纸灯美国和日本单日新增。");
+    assert.equal(inResult.status, "completed", `${JSON.stringify(inResult.error)} ${inResult.analysis?.answer ?? ""}`);
+    // Independent fixed fixture: US 120 and JP 10 on the selected day.
+    assert.match(inResult.analysis?.answer ?? "", /数据库求和 120；单位 人.*分组 country_code=US/u);
+    assert.match(inResult.analysis?.answer ?? "", /数据库求和 10；单位 人.*分组 country_code=JP/u);
+    const inSource = inResult.analysis?.sources?.[0]; assert.ok(inSource);
+    assert.equal(inSource.engine, "clickhouse-local"); assert.match(inSource.sql ?? "", /country_code IN \('US', 'JP'\)/u);
+    assert.equal(inSource.freshness_receipts?.length, 1);
+    assert.equal(inResult.events.filter((event) => event.type === "job_finished").length, 1);
+    const inHash: string | undefined = inResult.analysis?.resource_hashes?.[String(inSource.resource_id)]; assert.ok(inHash);
+    const inPage = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${inSession}/resources/${inSource.resource_id}?offset=0&limit=100&resource_hash=${inHash}`);
+    assert.equal(inPage.status, 200);
+    const inSaved = await inPage.json() as { resource: { session_id: string; job_id: string; execution_id: string } };
+    assert.equal(inSaved.resource.session_id, inSession); assert.equal(inSaved.resource.job_id, inResult.job_id); assert.equal(inSaved.resource.execution_id, inSource.execution_id);
     const channelCoarse = await postQuestion(apiPort, await createSyntheticSession(), "合成粗粒度渠道关联：按渠道统计美国收入和成本。");
     assert.equal(channelCoarse.status, "completed", `${JSON.stringify(channelCoarse.error)} ${channelCoarse.analysis?.answer ?? ""} events=${JSON.stringify(channelCoarse.events)}`);
     // Independent rows: mist_ads has (1.00, 2.00), pebble_net has
@@ -859,7 +908,7 @@ async function waitJob(port: number, jobId: string) {
       job_id: string;
       error?: { code?: string; message?: string };
       usage?: { input_tokens: number | null; usage_source?: string };
-      analysis?: { status?: string; answer?: string; resource_hashes?: Record<string, string>; analysis_declaration?: { provenance?: string }; alignment_results?: Array<{ resource_id?: string; rows: Array<{ group: Record<string,string|null>; status: string; result?: { value: string | null } | null }> }>; sources?: Array<{ engine?: string; resource_id?: string; execution_id?: string; sql?: string; executed_sql?: string; execution_settings?: { join_use_nulls?: boolean }; contract_revisions?: Record<string, string>; observed_at?: string; freshness_receipts?: unknown[]; total_rows?: number; rows?: unknown[]; preview_has_more?: boolean }> };
+      analysis?: { status?: string; answer?: string; resource_hashes?: Record<string, string>; analysis_declaration?: { provenance?: string }; alignment_results?: Array<{ resource_id?: string; rows: Array<{ group: Record<string,string|null>; status: string; result?: { value: string | null } | null }> }>; transform_results?: Array<{ result: { rows: Array<Record<string, unknown>> } }>; sources?: Array<{ engine?: string; resource_id?: string; execution_id?: string; sql?: string; executed_sql?: string; execution_settings?: { join_use_nulls?: boolean }; contract_revisions?: Record<string, string>; observed_at?: string; freshness_receipts?: unknown[]; total_rows?: number; rows?: unknown[]; preview_has_more?: boolean }> };
       events: Array<{ type: string; payload: Record<string, unknown> }>;
     };
     if (!["queued", "running"].includes(job.status)) return job;

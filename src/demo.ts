@@ -71,6 +71,7 @@ const HARBORLIGHT_QUESTIONS = [
   { id: "cross-resource-difference", label: "收入减成本", text: "合成跨资源收入减成本：按国家和渠道比较 2026-10-08 的收入和成本。" },
   { id: "layered-filter", label: "多层过滤关联", text: "合成多层过滤产品：统计 2026-10-06 到 2026-10-08 的收入和成本。" },
   { id: "large-channel-days", label: "十万行（大样本模式）", text: "合成十万行渠道日期：查询 2026-10-06 到 2026-10-09 四天两个渠道的新增。" },
+  { id: "two-country-in", label: "两个地区 IN", text: "合成两地区 IN：查询 2026-10-08 纸灯 iOS 雾帆在美国和日本的新增。" },
 ] as const;
 
 export function demoForScenario(harborlight: boolean, fixtureToday?: string) {

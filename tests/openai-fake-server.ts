@@ -126,6 +126,8 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成收入成本比")) return scripted(turn, ratioSteps);
   if (latest.includes("合成多渠道收入成本比")) return scripted(turn, groupedRatioSteps);
   if (latest.includes("合成分组对齐")) return scripted(turn, alignmentSteps);
+  if (latest.includes("合成两地区 IN")) return scripted(turn, inCountrySteps);
+  if (latest.includes("合成多日双渠道跨事实")) return scripted(turn, dailyCrossFactSteps);
   if (latest.includes("合成跨资源收入减成本")) return scripted(turn, crossResourceDifferenceSteps);
   if (latest.includes("合成未声明反向比率")) return scripted(turn, (ids) => coarseChannelRatioSteps(ids, true));
   if (latest.includes("合成多层过滤产品")) return scripted(turn, layeredFilterSteps);
@@ -156,6 +158,15 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("日本") && (hasBase || latest.includes("雾帆"))) return scripted(turn, japanSteps);
   if (latest.includes("连表")) return scripted(turn, unsafeJoinSteps);
   return scripted(turn, defaultSteps);
+}
+
+function inCountrySteps(ids: string[]) {
+  const sql = "SELECT country_code, SUM(new_users) AS total FROM fact_fox_daily_install WHERE event_date = '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND channel_id = 'mist_ads' AND country_code IN ('US', 'JP') GROUP BY country_code ORDER BY country_code";
+  return [
+    { id: "in_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "in_query", name: "query", arguments: JSON.stringify({ sql }) },
+    { id: "in_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
 }
 
 function crossResourceDifferenceSteps(ids: string[]) {
@@ -350,6 +361,22 @@ function crossFactRatioSteps(ids: string[]) {
     { id: "cross_fact_users", name: "query", arguments: JSON.stringify({ sql: `SELECT country_code, channel_id, SUM(new_users) AS total FROM fact_fox_daily_install WHERE ${where} GROUP BY country_code, channel_id` }) },
     { id: "cross_fact_align", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "divide", keys: ["country_code", "channel_id"], left: { resource_id: ids[0] ?? "", cell: "total" }, right: { resource_id: ids[1] ?? "", cell: "total" } } }) },
     { id: "cross_fact_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
+  ];
+}
+
+/** Scripted protocol fixture, not an autonomous model plan. */
+function dailyCrossFactSteps(ids: string[]) {
+  const where = "event_date >= '2026-10-06' AND event_date <= '2026-10-07' AND title_id = 'date_demo' AND platform = 'android' AND country_code = 'DATEZZ'";
+  return [
+    { id: "daily_cross_payment_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "daily_cross_install_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "daily_cross_amount", name: "query", arguments: JSON.stringify({ sql: `SELECT event_date, channel_id, SUM(amount_usd) AS total FROM fact_fox_daily_payment WHERE ${where} GROUP BY event_date, channel_id ORDER BY event_date, channel_id`, preview_limit: 0 }) },
+    { id: "daily_cross_users", name: "query", arguments: JSON.stringify({ sql: `SELECT event_date, channel_id, SUM(new_users) AS total FROM fact_fox_daily_install WHERE ${where} GROUP BY event_date, channel_id ORDER BY event_date, channel_id`, preview_limit: 0 }) },
+    { id: "daily_cross_align", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "divide", keys: ["event_date", "channel_id"], left: { resource_id: ids[0] ?? "", cell: "total" }, right: { resource_id: ids[1] ?? "", cell: "total" } } }) },
+    { id: "daily_cross_transform", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[2] ?? "", steps: [
+      { op: "filter", column: "result_value", comparison: "gt", value: "0" },
+      { op: "sort", keys: [{ column: "result_value", direction: "desc", nulls: "last" }] },
+    ] } }) },
   ];
 }
 

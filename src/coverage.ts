@@ -2,10 +2,19 @@ import type { CoverageGroup, CoverageReport, DataContract } from "./types.js";
 import { exactCalendarDatePredicate, parseReadonlySql } from "./sql.js";
 import { isCalendarDate } from "./config.js";
 
-/** The coverage query must describe the same population as the user's WHERE.
- * Until expression lineage is implemented, accept only one physical table and
- * conjunctive date bounds plus literal equality filters on series dimensions. */
+export interface CoverageScope { equalities: Record<string, string>; inSets: Record<string, string[]> }
+
+/** Keep legacy callers conservative: a multi-value set is never represented as
+ * a single equality or passed to old evidence/lineage code as one value. */
 export function provenCoverageFilters(sql: string, contract: DataContract, timeRange: { start: string; end: string }): Record<string, string> | null {
+  const scope = provenCoverageScope(sql, contract, timeRange);
+  return scope && !Object.keys(scope.inSets).length ? scope.equalities : null;
+}
+
+/** Describe the same input population as the guarded single-table WHERE.
+ * Only bounded literal sets can establish expected groups; NOT IN, NULL,
+ * expressions, disjunctions and ambiguous predicates cannot. */
+export function provenCoverageScope(sql: string, contract: DataContract, timeRange: { start: string; end: string }): CoverageScope | null {
   const series = contract.series;
   if (!series) return null;
   let ast: Record<string, unknown>;
@@ -19,6 +28,7 @@ export function provenCoverageFilters(sql: string, contract: DataContract, timeR
   const qualifier = typeof relation.as === "string" ? relation.as : contract.table;
   const dimensions = new Set(series.dimensions);
   const equalities: Record<string, string> = {};
+  const inSets: Record<string, string[]> = {};
   let start = "";
   let end = "";
   function visit(value: unknown): boolean {
@@ -35,12 +45,21 @@ export function provenCoverageFilters(sql: string, contract: DataContract, timeR
       if (bounds.end) end = bounds.end;
       return true;
     }
-    if (!right || right.type !== "single_quote_string" || typeof right.value !== "string") return false;
-    if (expr.operator !== "=" || !dimensions.has(left.column) || Object.hasOwn(equalities, left.column) || !/^[A-Za-z0-9_-]+$/u.test(right.value)) return false;
-    equalities[left.column] = right.value;
+    if (!right || !/^[a-z_][a-z0-9_]*$/u.test(left.column) || ["__proto__", "prototype", "constructor"].includes(left.column) || !dimensions.has(left.column) || Object.hasOwn(equalities, left.column) || Object.hasOwn(inSets, left.column)) return false;
+    if (expr.operator === "=" && right.type === "single_quote_string" && typeof right.value === "string" && /^[A-Za-z0-9_-]+$/u.test(right.value)) {
+      equalities[left.column] = right.value;
+      return true;
+    }
+    if (expr.operator !== "IN" || right.type !== "expr_list" || !Array.isArray(right.value) || right.value.length < 1 || right.value.length > 32) return false;
+    const values = right.value.map(object);
+    if (values.some((item) => item?.type !== "single_quote_string" || typeof item.value !== "string" || !/^[A-Za-z0-9_-]{1,64}$/u.test(item.value))) return false;
+    const literals = values.map((item) => item!.value as string);
+    if (new Set(literals).size !== literals.length) return false;
+    if (literals.length === 1) equalities[left.column] = literals[0]!;
+    else inSets[left.column] = literals.sort();
     return true;
   }
-  return visit(ast.where) && start === timeRange.start && end === timeRange.end && Boolean(start && end) ? equalities : null;
+  return visit(ast.where) && start === timeRange.start && end === timeRange.end && Boolean(start && end) ? { equalities, inSets } : null;
 }
 
 function object(value: unknown): Record<string, unknown> | null {
@@ -52,6 +71,7 @@ export function assessCoverage(
   equalities: Record<string, string>,
   timeRange: { start: string; end: string } | undefined,
   rows: Array<Record<string, unknown>>,
+  inSets: Record<string, string[]> = {},
 ): CoverageReport {
   const empty = (status: CoverageReport["status"], reason: string): CoverageReport => ({
     status,
@@ -69,10 +89,26 @@ export function assessCoverage(
   if (!series || !timeRange?.start || !timeRange.end) return empty("unknown", "契约没有声明可核对的日期覆盖，覆盖情况未知");
   const dates = enumerateDates(timeRange.start, timeRange.end);
   if (!dates) return empty("unknown", "日期范围无法展开，覆盖情况未知");
+  const setEntries = Object.entries(inSets).sort(([a], [b]) => a.localeCompare(b));
+  if (setEntries.some(([name, values]) => !/^[a-z_][a-z0-9_]*$/u.test(name) || ["__proto__", "prototype", "constructor"].includes(name) || !series.dimensions.includes(name) || Object.hasOwn(equalities, name) || !Array.isArray(values) || values.length < 2 || values.length > 32 || new Set(values).size !== values.length || values.some((value) => typeof value !== "string" || !/^[A-Za-z0-9_-]{1,64}$/u.test(value)))) return empty("unknown", "IN 覆盖集合不合法。");
+  if (setEntries.length && rows.some((row) => Object.entries(equalities).some(([key, value]) => row[key] !== value) || setEntries.some(([key, values]) => typeof row[key] !== "string" || !values.includes(row[key] as string)))) return empty("unknown", "覆盖观测与查询筛选不一致。");
   const pinned = series.dimensions.every((dimension) => equalities[dimension]);
   const overall = classify(rows, series.date_column, series.metrics, series.predicted_column ?? null, series.prediction_values, series.prediction_mode, dates);
   const groups: CoverageGroup[] = [];
   let groupDays = 0;
+  if (setEntries.length) {
+    let combinations: Array<Record<string, string>> = [{}];
+    for (const [name, values] of setEntries) {
+      if (combinations.length * values.length > 200 || combinations.length * values.length * dates.length > 100_000) return { ...empty("unknown", "IN 预期组合超过覆盖预算。"), ...overall };
+      combinations = combinations.flatMap((entry) => values.map((value) => ({ ...entry, [name]: value })));
+    }
+    groupDays += combinations.length * dates.length;
+    const dimension = setEntries.map(([name]) => name).join(",");
+    for (const combination of combinations) {
+      const subset = rows.filter((row) => Object.entries(combination).every(([key, value]) => row[key] === value));
+      groups.push({ dimension, value: JSON.stringify(combination), ...classify(subset, series.date_column, series.metrics, series.predicted_column ?? null, series.prediction_values, series.prediction_mode, dates) });
+    }
+  }
   if (!pinned) {
     for (const dimension of series.dimensions) {
       if (equalities[dimension]) continue;
@@ -112,7 +148,7 @@ export function assessCoverage(
     status: "known",
     reason: pinned
       ? "过滤条件钉住了契约声明的序列维度，并按自然日核对。同一天可同时包含 NULL、零和不同预测标记；实际与预测日期表示标记，不保证值非空。"
-      : "未过滤的维度只评估结果里出现的取值；没有出现的组合不算缺失。同一天的状态可以重叠，实际与预测日期表示标记，不保证值非空。",
+      : setEntries.length ? "IN 指定的维度组合按自然日逐一核对；其他未指定维度只评估已观察取值，未出现的对象不补零。" : "未过滤的维度只评估结果里出现的取值；没有出现的组合不算缺失。同一天的状态可以重叠，实际与预测日期表示标记，不保证值非空。",
     expected_days: dates.length,
     ...overall,
     groups,

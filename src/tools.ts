@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isAnalysisDeclaration, type AnalysisDeclaration } from "./analysis-declaration.js";
 import { currentCalendarDate, isCalendarDate, type AppConfig } from "./config.js";
-import { assessCoverage, combineCoverage, coverageHasGap, provenCoverageFilters, unknownCoverage } from "./coverage.js";
+import { assessCoverage, combineCoverage, coverageHasGap, provenCoverageFilters, provenCoverageScope, unknownCoverage } from "./coverage.js";
 import { plainRows } from "./database.js";
 import { verifyCell, type CellOperation, type VerifiedCell } from "./evidence.js";
 import { compareVerifiedIntegers, type VerifiedComparison } from "./evidence-comparison.js";
@@ -1220,9 +1220,9 @@ export class ToolService {
       const contract = this.ctx.knowledge.contract_by_table.get(source.tables[0]!)?.contract;
       const original = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === source.resource_id);
       const evidence = original && this.evidenceSource(session, original);
-      const filters = contract && evidence && provenCoverageFilters(evidence.sql, contract, source.time_range);
-      if (!filters) continue;
-      const key = JSON.stringify([source.tables[0], source.time_range, Object.entries(filters).sort(([a], [b]) => a.localeCompare(b))]);
+      const scope = contract && evidence && provenCoverageScope(evidence.sql, contract, source.time_range);
+      if (!scope) continue;
+      const key = JSON.stringify([source.tables[0], source.time_range, Object.entries(scope.equalities).sort(([a], [b]) => a.localeCompare(b)), Object.entries(scope.inSets).sort(([a], [b]) => a.localeCompare(b))]);
       const previous = observed.get(key);
       if (previous && previous !== source.coverage.observation_hash) {
         reasons.push("coverage_observations_conflict");
@@ -1448,7 +1448,7 @@ export class ToolService {
     return plainRows(this.ctx.db.prepare(sql).all());
   }
 
-  private async seriesRows(contract: DataContract, equalities: Record<string, string>, timeRange: { start: string; end: string }, signal?: AbortSignal) {
+  private async seriesRows(contract: DataContract, equalities: Record<string, string>, timeRange: { start: string; end: string }, signal?: AbortSignal, inSets: Record<string, string[]> = {}) {
     if (this.ctx.businessEngine === "clickhouse") {
       const series = contract.series;
       if (!series) return [];
@@ -1458,11 +1458,13 @@ export class ToolService {
         .filter(([column, value]) => /^[a-z_][a-z0-9_]*$/u.test(column) && /^[A-Za-z0-9_-]+$/u.test(value))
         .map(([column, value]) => ` AND ${column} = '${value}'`)
         .join("");
-      const sql = `SELECT ${names.join(", ")} FROM ${contract.table} WHERE ${series.date_column} >= '${timeRange.start}' AND ${series.date_column} <= '${timeRange.end}'${filters}`;
+      if (Object.entries(inSets).some(([column, values]) => !series.dimensions.includes(column) || !Array.isArray(values) || values.length < 2 || values.length > 32 || values.some((value) => !/^[A-Za-z0-9_-]{1,64}$/u.test(value)))) return null;
+      const setFilters = Object.entries(inSets).map(([column, values]) => ` AND ${column} IN (${values.map((value) => `'${value}'`).join(", ")})`).join("");
+      const sql = `SELECT ${names.join(", ")} FROM ${contract.table} WHERE ${series.date_column} >= '${timeRange.start}' AND ${series.date_column} <= '${timeRange.end}'${filters}${setFilters}`;
       const result = await clickHouseQueryBounded(this.ctx.clickhouse, sql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
       return result.truncated ? null : result.rows;
     }
-    return readSeriesRows(this.ctx.db, contract, equalities, timeRange);
+    return readSeriesRows(this.ctx.db, contract, equalities, timeRange, inSets);
   }
 
   private async coverageForTables(
@@ -1477,18 +1479,18 @@ export class ToolService {
     const parts = await Promise.all(tables.map(async (table) => {
       const contract = this.ctx.knowledge.contract_by_table.get(table)?.contract;
       if (!contract?.series) return { table, report: unknownCoverage(`${table} 没有声明日期序列，覆盖情况未知`) };
-      const applicable = provenCoverageFilters(sql, contract, timeRange);
+      const applicable = provenCoverageScope(sql, contract, timeRange);
       if (!applicable) return { table, report: unknownCoverage("覆盖统计无法证明与查询筛选完全一致。") };
       const permitted = new Set(bindings.find((binding) => binding.table === table)?.allowed_columns ?? []);
       const needed = [contract.series.date_column, ...contract.series.dimensions, ...contract.series.metrics, ...(contract.series.predicted_column ? [contract.series.predicted_column] : [])];
       if (needed.some((column) => !permitted.has(column))) return { table, report: unknownCoverage("覆盖统计需要未授权字段，未读取这些字段。") };
-      const rows = await this.seriesRows(contract, applicable, timeRange, signal);
+      const rows = await this.seriesRows(contract, applicable.equalities, timeRange, signal, applicable.inSets);
       if (!rows) return { table, report: unknownCoverage("覆盖查询超过保存预算，未把预览当作完整覆盖。") };
       // Only a comparison of observed content, not a claim of an immutable
       // ClickHouse version. Sorting makes database row order irrelevant.
       const canonical = rows.map((row) => JSON.stringify(Object.entries(row).sort(([a], [b]) => a.localeCompare(b)))).sort();
       const observation_hash = createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
-      return { table, report: { ...assessCoverage(contract, applicable, timeRange, rows), observation_hash } };
+      return { table, report: { ...assessCoverage(contract, applicable.equalities, timeRange, rows, applicable.inSets), observation_hash } };
     }));
     return combineCoverage(parts);
   }
@@ -2098,6 +2100,7 @@ function readSeriesRows(
   contract: DataContract,
   equalities: Record<string, string>,
   timeRange: { start: string; end: string },
+  inSets: Record<string, string[]> = {},
 ): Array<Record<string, unknown>> {
   const series = contract.series;
   if (!series) return [];
@@ -2109,6 +2112,11 @@ function readSeriesRows(
     if (!/^[a-z_][a-z0-9_]*$/u.test(column)) continue;
     where.push(`${column} = ?`);
     params.push(value);
+  }
+  for (const [column, values] of Object.entries(inSets)) {
+    if (!series.dimensions.includes(column) || !Array.isArray(values) || values.length < 2 || values.length > 32 || values.some((value) => !/^[A-Za-z0-9_-]{1,64}$/u.test(value))) throw new Error("coverage_scope_invalid");
+    where.push(`${column} IN (${values.map(() => "?").join(", ")})`);
+    params.push(...values);
   }
   return plainRows(db.prepare(`SELECT ${names.join(", ")} FROM ${contract.table} WHERE ${where.join(" AND ")}`).all(...params));
 }
