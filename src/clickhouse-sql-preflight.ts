@@ -130,7 +130,28 @@ export function authorizeClickHouseDirect(sql: string, rules: readonly ClickHous
   if (!rule) return { applicable: true, ok: false, code: "unknown_table" };
   const alias = typeof table.alias === "string" ? table.alias : name;
   const selections = Array.isArray(select.select) ? select.select : [];
-  const aliases = new Set(selections.map((item) => obj(item)?.alias).filter((value): value is string => typeof value === "string"));
+  const aliases = new Set<string>();
+  for (const value of selections) {
+    const item = obj(value); if (!item || typeof item.alias !== "string") continue;
+    if (aliases.has(item.alias)) return { applicable: true, ok: false, code: "duplicate_output_alias" };
+    const parts = Array.isArray(item.name_parts) ? item.name_parts : [item.name];
+    const identity = item.type === "Identifier" && parts.at(-1) === item.alias;
+    const protectedName = rule.sensitive_columns.includes(item.alias) || (rule.must_filter ?? []).includes(item.alias);
+    if (protectedName && !identity) return { applicable: true, ok: false, code: "column_alias_collision" };
+    if (!identity && rule.allowed_columns.includes(item.alias)) {
+      const unqualified = (nodeValue: unknown): boolean => {
+        if (Array.isArray(nodeValue)) return nodeValue.some(unqualified);
+        const node = obj(nodeValue); if (!node) return false;
+        if (node.type === "Identifier") {
+          const names = Array.isArray(node.name_parts) ? node.name_parts : [node.name];
+          return names.length === 1 && names[0] === item.alias;
+        }
+        return Object.entries(node).some(([key, child]) => !["alias", "location", "parent", "from", "with", "order_by"].includes(key) && unqualified(child));
+      };
+      if (unqualified({ ...select, select: selections.filter((entry) => entry !== value) })) return { applicable: true, ok: false, code: "column_alias_collision" };
+    }
+    aliases.add(item.alias);
+  }
   const columns = new Set<string>();
   let visited = 0;
   const visit = (value: unknown, allowAlias: boolean): string | null => {

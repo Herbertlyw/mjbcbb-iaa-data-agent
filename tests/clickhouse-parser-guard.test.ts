@@ -81,6 +81,10 @@ test("ClickHouse AST 独立绑定单表字段与别名，敏感列在投影、�
     legal.replace("ORDER BY total", "ORDER BY f.device_token"),
     legal.replace("sum(f.new_users)", "sum(x.new_users)"),
     legal.replace(`FROM ${fact.table}`, "FROM another_table"),
+    legal.replace("AS total", "AS event_date"),
+    legal.replace("AS total", "AS device_token"),
+    legal.replace("f.country_code, sum(f.new_users) AS total", "f.country_code AS duplicated, sum(f.new_users) AS duplicated"),
+    legal.replace("AS total", "AS country_code").replace("GROUP BY f.country_code", "GROUP BY country_code"),
   ]) {
     const result = authorizeClickHouseDirect(sql, rules);
     assert.equal(result.applicable && !result.ok, true, sql);
