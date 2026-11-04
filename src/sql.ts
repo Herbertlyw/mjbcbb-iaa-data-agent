@@ -3,7 +3,7 @@ import { isCalendarDate } from "./config.js";
 
 const require = createRequire(import.meta.url);
 const loaded = require("node-sql-parser") as {
-  Parser: new () => { astify(sql: string, opt?: { database?: string }): unknown };
+  Parser: new () => { astify(sql: string, opt?: { database?: string }): unknown; sqlify(ast: unknown, opt?: { database?: string }): string };
 };
 
 const WRITE_TYPES = new Set([
@@ -109,7 +109,11 @@ export interface RegisteredJoin {
   keys: string[];
 }
 
-export function assertJoinKeys(rawSql: string, joins: RegisteredJoin[], grains: Map<string, string[]> = new Map()): void {
+/** LEFT is opt-in only for host-verified dimension contracts. Grain alone is
+ * not enough to distinguish a dimension from another fact table. */
+export interface JoinGuardOptions { leftJoinDimensions?: ReadonlySet<string> }
+
+export function assertJoinKeys(rawSql: string, joins: RegisteredJoin[], grains: Map<string, string[]> = new Map(), options: JoinGuardOptions = {}): void {
   const parsed = parseReadonlySql(rawSql);
   // Walk every SELECT, including CTEs, derived tables, scalar subqueries and UNION arms.
   // A derived relation used as a JOIN operand remains unsupported because its
@@ -122,11 +126,11 @@ export function assertJoinKeys(rawSql: string, joins: RegisteredJoin[], grains: 
     }
   });
   walk(parsed.ast, (statement) => {
-    if (statement.type === "select") assertSelectJoinKeys(statement, joins, grains, cteNames);
+    if (statement.type === "select") assertSelectJoinKeys(statement, joins, grains, cteNames, options);
   });
 }
 
-function assertSelectJoinKeys(statement: Record<string, unknown>, joins: RegisteredJoin[], grains: Map<string, string[]>, cteNames: Set<string>): void {
+function assertSelectJoinKeys(statement: Record<string, unknown>, joins: RegisteredJoin[], grains: Map<string, string[]>, cteNames: Set<string>, options: JoinGuardOptions): void {
   const from = Array.isArray(statement.from) ? statement.from : [];
   if (from.length < 2) return;
   const relations = from.map((item, index) => relationOf(item, index));
@@ -143,7 +147,8 @@ function assertSelectJoinKeys(statement: Record<string, unknown>, joins: Registe
       seen.push(relation);
       continue;
     }
-    if (relation.join !== "INNER JOIN") throw new SqlRejected("join_structure_unsupported", `不支持 ${relation.join}。只接受登记键上的 INNER JOIN。`);
+    if (relation.join !== "INNER JOIN" && relation.join !== "LEFT JOIN") throw new SqlRejected("join_structure_unsupported", `不支持 ${relation.join}。只接受登记键上的受限 INNER 或 LEFT JOIN。`);
+    if (relation.join === "LEFT JOIN" && !options.leftJoinDimensions?.has(relation.table)) throw new SqlRejected("join_structure_unsupported", "LEFT JOIN 右侧必须是宿主确认的维表，不能仅凭粒度猜测。");
     if (seen.some((item) => item.table === relation.table)) throw new SqlRejected("self_join_unsupported", "不支持自连接。同一张表的两个别名不能用来绕过粒度。");
     const pairs = joinEqualities(relation.on);
     const otherAliases = new Set(pairs.flatMap((pair) => [pair.left.alias, pair.right.alias]).filter((alias) => alias !== relation.alias));
@@ -171,6 +176,7 @@ function assertSelectJoinKeys(statement: Record<string, unknown>, joins: Registe
     }
     const leftLeftover = leftoverGrain(grains.get(other.table) ?? [], required);
     const rightLeftover = leftoverGrain(grains.get(relation.table) ?? [], required);
+    if (relation.join === "LEFT JOIN" && (seen.length !== 1 || !leftLeftover.length || rightLeftover.length)) throw new SqlRejected("join_grain_mismatch", "LEFT JOIN 仅允许事实表关联登记键唯一的右侧维表。");
     if (leftLeftover.length && rightLeftover.length) {
       throw new SqlRejected(
         "join_grain_mismatch",
@@ -199,7 +205,124 @@ export function guardSql(rawSql: string, rules: TableRule[], dialect: "sqlite" |
       }
     }
   }
+  // For a bounded single-source wrapper, the physical date predicate lives in
+  // its inner SELECT. Never invent a range or combine conflicting scans.
+  if (!start || !end) {
+    const ranges: Array<{ start: string; end: string }> = [];
+    walk(parsed.ast, (statement) => {
+      if (statement.type !== "select" || !Array.isArray(statement.from)) return;
+      for (const item of statement.from) {
+        const relation = asRecord(item); if (typeof relation?.table !== "string") continue;
+        const table = relation.table.toLowerCase(); const rule = ruleByTable.get(table);
+        if (!rule) continue;
+        const alias = typeof relation.as === "string" && relation.as ? relation.as.toLowerCase() : table;
+        for (const field of rule.must_filter) {
+          const bounds = dateBounds(statement.where, field, alias, statement.from.length > 1);
+          if (bounds.start && bounds.end) ranges.push({ start: bounds.start, end: bounds.end });
+        }
+      }
+    });
+    if (ranges.length && ranges.every((range) => range.start === ranges[0]!.start && range.end === ranges[0]!.end)) ({ start, end } = ranges[0]!);
+    else if (ranges.length > 1) throw new SqlRejected("time_range_ambiguous", "多层查询的日期范围不一致，无法绑定单一证据范围。");
+  }
   return { sql: parsed.sql, tables: parsed.tables, columns, time_range: { start, end }, equalities: equalityFilters(parsed.ast.where) };
+}
+
+export interface SingleSourceProjectionLineage {
+  /** Original SQL is the SQL actually submitted to the driver. */
+  original_sql: string;
+  /** Proof-only canonical equivalent; never execute or present it as the executed SQL. */
+  proof_sql: string;
+  table: string;
+  output_columns: Record<string, string>;
+  time_range: { start: string; end: string };
+}
+
+/**
+ * Prove a deliberately narrow equivalence: one CTE or derived SELECT whose
+ * inner and outer projections are direct column references to one physical
+ * table. Inner filters remain unchanged, outer modifiers/filters are rejected.
+ * This never grants authorization: both original and proof SQL are guarded
+ * against the caller's current table rules before a result is returned.
+ */
+export function inspectSingleSourceProjection(rawSql: string, rules: TableRule[]): SingleSourceProjectionLineage | null {
+  try {
+    const original = guardSql(rawSql, rules);
+    if (original.tables.length !== 1 || !original.time_range.start || !original.time_range.end) return null;
+    const ast = parseReadonlySql(rawSql).ast;
+    if (ast._next || ast.distinct || ast.options || ast.where || ast.groupby || ast.having || ast.orderby || ast.limit || ast.window || ast.for_update || !Array.isArray(ast.from) || ast.from.length !== 1 || !Array.isArray(ast.columns)) return null;
+    const relation = asRecord(ast.from[0]); if (!relation || relation.join || relation.db) return null;
+    let inner: Record<string, unknown> | undefined; let virtualAlias = "";
+    if (Array.isArray(ast.with) && ast.with.length === 1 && typeof relation.table === "string" && !relation.expr) {
+      const cte = asRecord(ast.with[0]); const name = cteName(cte);
+      if (!name || relation.table.toLowerCase() !== name || cte?.columns) return null;
+      inner = nestedSelect(cte); virtualAlias = String(relation.as || relation.table).toLowerCase();
+    } else if (!ast.with && relation.expr && typeof relation.as === "string") {
+      inner = asRecord(asRecord(relation.expr)?.ast); virtualAlias = relation.as.toLowerCase();
+    } else return null;
+    if (!inner || inner.with || inner._next || inner.distinct || inner.options || inner.groupby || inner.having || inner.orderby || inner.limit || inner.window || inner.for_update || !Array.isArray(inner.from) || inner.from.length !== 1 || !Array.isArray(inner.columns) || !inner.where) return null;
+    const physical = asRecord(inner.from[0]);
+    if (!physical || physical.expr || physical.join || physical.db || typeof physical.table !== "string" || physical.table.toLowerCase() !== original.tables[0]) return null;
+    const physicalAlias = String(physical.as || physical.table).toLowerCase();
+    if (!/^[a-z_][a-z0-9_]*$/u.test(virtualAlias) || !/^[a-z_][a-z0-9_]*$/u.test(physicalAlias)) return null;
+    const inputs = new Map<string, string>();
+    for (const item of inner.columns) {
+      const projection = asRecord(item); const expr = asRecord(projection?.expr);
+      if (!expr || expr.type !== "column_ref" || typeof expr.column !== "string" || expr.column === "*" || expr.collate || (expr.table && String(expr.table).toLowerCase() !== physicalAlias)) return null;
+      const source = expr.column.toLowerCase(); const output = String(projection?.as || source).toLowerCase();
+      if (!/^[a-z_][a-z0-9_]*$/u.test(source) || !/^[a-z_][a-z0-9_]*$/u.test(output) || inputs.has(output)) return null;
+      inputs.set(output, source);
+    }
+    const outputs: Record<string, string> = Object.create(null) as Record<string, string>;
+    const projections: Record<string, unknown>[] = [];
+    for (const item of ast.columns) {
+      const projection = asRecord(item); const expr = asRecord(projection?.expr);
+      if (!projection || !expr || expr.type !== "column_ref" || typeof expr.column !== "string" || expr.collate || (expr.table && String(expr.table).toLowerCase() !== virtualAlias)) return null;
+      const virtual = expr.column.toLowerCase(); const source = inputs.get(virtual);
+      const output = String(projection.as || virtual).toLowerCase();
+      if (!source || !/^[a-z_][a-z0-9_]*$/u.test(output) || Object.hasOwn(outputs, output)) return null;
+      outputs[output] = source;
+      projections.push({ ...projection, expr: { ...expr, table: physical.as || null, column: source }, as: output === source ? null : output });
+    }
+    if (!projections.length) return null;
+    const proofAst = { ...ast, with: null, columns: projections, from: inner.from, where: inner.where };
+    // sqlify emits double-quoted identifiers that this parser reads back as
+    // double_quote_string rather than column_ref. Unquote identifiers only
+    // outside string literals; never change literal contents.
+    const proofSql = unquoteProofIdentifiers(new loaded.Parser().sqlify(proofAst, { database: "sqlite" }));
+    if (!proofSql) return null;
+    const proof = guardSql(proofSql, rules);
+    if (proof.tables.length !== 1 || proof.tables[0] !== original.tables[0] || proof.time_range.start !== original.time_range.start || proof.time_range.end !== original.time_range.end) return null;
+    return { original_sql: original.sql, proof_sql: proofSql, table: original.tables[0]!, output_columns: outputs, time_range: original.time_range };
+  } catch { return null; }
+}
+
+function unquoteProofIdentifiers(sql: string): string | null {
+  let output = "";
+  for (let i = 0; i < sql.length; i += 1) {
+    const char = sql[i]!;
+    if (char === "'") {
+      output += char; let closed = false;
+      while (++i < sql.length) {
+        const current = sql[i]!; output += current;
+        if (current === "\\" && i + 1 < sql.length) { output += sql[++i]; continue; }
+        if (current === "'") {
+          if (sql[i + 1] === "'") { output += sql[++i]; continue; }
+          closed = true; break;
+        }
+      }
+      if (!closed) return null;
+      continue;
+    }
+    if (char === '"') {
+      const end = sql.indexOf('"', i + 1); if (end < 0) return null;
+      const identifier = sql.slice(i + 1, end);
+      if (!/^[a-z_][a-z0-9_]*$/u.test(identifier)) return null;
+      output += identifier; i = end; continue;
+    }
+    output += char;
+  }
+  return output;
 }
 
 function equalityFilters(where: unknown): Record<string, string> {
@@ -263,55 +386,76 @@ function physicalTables(statement: Record<string, unknown>, cteNames: Set<string
   return tables;
 }
 
-function authorizeSelect(statement: Record<string, unknown>, cteNames: Set<string>, rules: Map<string, TableRule>): string[] {
+function authorizeSelect(statement: Record<string, unknown>, cteNames: Set<string>, rules: Map<string, TableRule>, inheritedSchemas: Map<string, Set<string>> = new Map()): string[] {
   const localCtes = new Set(cteNames);
+  const localSchemas = new Map(inheritedSchemas);
   const columns: string[] = [];
   if (Array.isArray(statement.with)) {
     for (const item of statement.with) {
       const record = asRecord(item);
       const body = nestedSelect(item);
-      if (body) columns.push(...authorizeSelect(body, localCtes, rules));
+      if (!body || record?.columns) throw new SqlRejected("cte_structure_unsupported", "无法证明 CTE 输出列。");
+      columns.push(...authorizeSelect(body, localCtes, rules, localSchemas));
       const name = cteName(record);
-      if (name) localCtes.add(name);
+      if (!name || localCtes.has(name)) throw new SqlRejected("cte_structure_unsupported", "CTE 名称缺失或重复。");
+      const schema = projectionNames(body);
+      if (!schema) throw new SqlRejected("cte_structure_unsupported", "CTE 输出列必须可唯一确定。");
+      localCtes.add(name); localSchemas.set(name, schema);
     }
   }
   const direct = directTables(statement, localCtes);
   const scopedAliases = new Map<string, string>();
+  const virtualAliases = new Map<string, Set<string>>();
   if (Array.isArray(statement.from)) {
     for (const item of statement.from) {
       const relation = asRecord(item);
+      if (relation?.expr) {
+        const body = asRecord(asRecord(relation.expr)?.ast);
+        const alias = typeof relation.as === "string" ? relation.as.toLowerCase() : "";
+        const schema = body && projectionNames(body);
+        if (!alias || !schema || virtualAliases.has(alias) || scopedAliases.has(alias)) throw new SqlRejected("derived_structure_unsupported", "派生表必须有唯一别名和可确定的输出列。");
+        virtualAliases.set(alias, schema);
+        continue;
+      }
       if (typeof relation?.table !== "string") continue;
       const table = relation.table.toLowerCase();
-      if (localCtes.has(table)) continue;
       const alias = typeof relation.as === "string" && relation.as ? relation.as.toLowerCase() : table;
-      if (scopedAliases.has(alias)) throw new SqlRejected("join_column_ambiguous", "同一查询层级不能重复使用表别名。");
+      if (scopedAliases.has(alias) || virtualAliases.has(alias)) throw new SqlRejected("join_column_ambiguous", "同一查询层级不能重复使用表别名。");
+      if (localCtes.has(table)) {
+        const schema = localSchemas.get(table);
+        if (!schema) throw new SqlRejected("cte_structure_unsupported", "不能确认 CTE 输出列。");
+        virtualAliases.set(alias, schema); continue;
+      }
       scopedAliases.set(alias, table);
     }
   }
+  if (virtualAliases.size && (virtualAliases.size !== 1 || direct.length || (Array.isArray(statement.from) && statement.from.length !== 1))) throw new SqlRejected("join_structure_unsupported", "CTE 或派生表参与 JOIN 的粒度尚未证明。");
   const localColumns = shallowColumns(statement);
   if (localColumns.some((column) => column === "*")) throw new SqlRejected("wildcard_projection", "禁止 SELECT * 或 table.*，不会按契约展开通配符");
   if (hasOperator(statement.where, "OR")) throw new SqlRejected("unsafe_predicate", "不接受可能绕过日期范围的 OR 条件");
-  for (const column of localColumns) {
-    const owners = direct.map((table) => rules.get(table)).filter((rule): rule is TableRule => rule !== undefined);
-    if (owners.some((rule) => rule.sensitive_columns.includes(column))) {
-      throw new SqlRejected("sensitive_field", `字段 ${column} 是敏感字段，不能出现在查询中`);
-    }
-    if (owners.length && !owners.some((rule) => rule.allowed_columns.includes(column))) {
-      throw new SqlRejected("column_not_in_contract", `字段 ${column} 不在当前契约允许的字段中`);
-    }
-  }
-  for (const key of ["columns", "where", "groupby", "having", "orderby"]) {
+  const owners = direct.map((table) => rules.get(table)).filter((rule): rule is TableRule => rule !== undefined);
+  const projectionAliases = new Set((Array.isArray(statement.columns) ? statement.columns : []).flatMap((entry) => {
+    const col = asRecord(entry); return typeof col?.as === "string" ? [col.as.toLowerCase()] : [];
+  }));
+  if (owners.some((rule) => rule.must_filter.some((field) => projectionAliases.has(field)))) throw new SqlRejected("date_alias_shadowing", "输出别名不能遮蔽必须过滤的日期字段。");
+  for (const key of ["columns", "where", "groupby", "having", "orderby", "from"]) {
     walkShallow(statement[key], (record) => {
-      if (record.type !== "column_ref" || typeof record.table !== "string" || typeof record.column !== "string") return;
-      const alias = record.table.toLowerCase();
-      const table = scopedAliases.get(alias);
-      // CTE and derived output lineage is handled conservatively by the JOIN guard.
-      if (!table && direct.length) throw new SqlRejected("column_scope_unsupported", "无法确认列所属表或关联子查询的作用域。");
-      if (!table) return;
-      const rule = rules.get(table);
-      const column = record.column.toLowerCase();
-      if (rule?.sensitive_columns.includes(column)) throw new SqlRejected("sensitive_field", `字段 ${column} 是敏感字段，不能出现在查询中`);
-      if (!rule?.allowed_columns.includes(column)) throw new SqlRejected("column_not_in_contract", `字段 ${column} 不属于该别名对应的契约`);
+      const column = identifierName(record); if (!column) return;
+      if (column === "*") throw new SqlRejected("wildcard_projection", "禁止 SELECT * 或 table.*");
+      if (record.type === "column_ref" && typeof record.table === "string" && record.table) {
+        const alias = record.table.toLowerCase();
+        const table = scopedAliases.get(alias); const schema = virtualAliases.get(alias);
+        if (schema) { if (!schema.has(column)) throw new SqlRejected("column_not_in_contract", `字段 ${column} 不在派生结果中`); return; }
+        if (!table) throw new SqlRejected("column_scope_unsupported", "无法确认列所属表或关联子查询的作用域。");
+        const rule = rules.get(table);
+        if (rule?.sensitive_columns.includes(column)) throw new SqlRejected("sensitive_field", `字段 ${column} 是敏感字段，不能出现在查询中`);
+        if (!rule?.allowed_columns.includes(column)) throw new SqlRejected("column_not_in_contract", `字段 ${column} 不属于该别名对应的契约`);
+        return;
+      }
+      if (owners.some((rule) => rule.sensitive_columns.includes(column))) throw new SqlRejected("sensitive_field", `字段 ${column} 是敏感字段，不能出现在查询中`);
+      if (owners.some((rule) => rule.allowed_columns.includes(column)) || [...virtualAliases.values()].some((schema) => schema.has(column))) return;
+      if (["orderby", "groupby", "having"].includes(key) && projectionAliases.has(column)) return;
+      if (owners.length || virtualAliases.size) throw new SqlRejected("column_not_in_contract", `字段 ${column} 不在当前来源允许的字段中`);
     });
   }
   columns.push(...localColumns);
@@ -329,11 +473,25 @@ function authorizeSelect(statement: Record<string, unknown>, cteNames: Set<strin
   }
   walkShallow(statement, (record) => {
     const nested = asRecord(record.ast);
-    if (nested?.type) columns.push(...authorizeSelect(nested, localCtes, rules));
+    if (nested?.type) columns.push(...authorizeSelect(nested, localCtes, rules, localSchemas));
   });
   const next = asRecord(statement._next);
-  if (next) columns.push(...authorizeSelect(next, localCtes, rules));
+  if (next) columns.push(...authorizeSelect(next, localCtes, rules, localSchemas));
   return columns;
+}
+
+/** Only explicit, unique output identifiers can become a virtual schema. */
+function projectionNames(statement: Record<string, unknown>): Set<string> | null {
+  if (statement._next || !Array.isArray(statement.columns) || !statement.columns.length) return null;
+  const result = new Set<string>();
+  for (const item of statement.columns) {
+    const projection = asRecord(item); const expr = asRecord(projection?.expr);
+    const name = typeof projection?.as === "string" && projection.as ? projection.as : expr?.type === "column_ref" && typeof expr.column === "string" ? expr.column : "";
+    const normalized = name.toLowerCase();
+    if (!/^[a-z_][a-z0-9_]*$/u.test(normalized) || result.has(normalized)) return null;
+    result.add(normalized);
+  }
+  return result;
 }
 
 function directTables(statement: Record<string, unknown>, cteNames: Set<string>): string[] {
