@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import test from "node:test";
-import { authorizeClickHouseDirect, preflightClickHouseSql } from "../src/clickhouse-sql-preflight.js";
+import { authorizeClickHouseDirect, authorizeClickHouseScoped, preflightClickHouseSql } from "../src/clickhouse-sql-preflight.js";
 import { guardSql, SqlRejected } from "../src/sql.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import { clickHouseCommand, clickHouseInsert, clickHouseQuery, clickHouseQueryBounded, createClickHouseClient } from "../src/clickhouse-client.js";
@@ -15,6 +15,34 @@ const knowledge = loadKnowledge("knowledge/harborlight");
 const fact = knowledge.contract_by_table.get("fact_fox_daily_install")!.contract!;
 const rules = [{ table: fact.table, allowed_columns: fact.columns.filter((column) => !fact.sensitive_columns.includes(column.name)).map((column) => column.name), sensitive_columns: fact.sensitive_columns, must_filter: fact.must_filter, column_types: Object.fromEntries(fact.columns.map((column) => [column.name, column.type])) }];
 const where = "event_date >= '2026-10-06' AND event_date <= '2026-10-08'";
+
+test("ClickHouse AST 逐层绑定 CTE 与派生表的输出字段及物理血缘", () => {
+  const sql = `WITH a AS (SELECT event_date AS d, country_code AS country, new_users AS n FROM ${fact.table} WHERE ${where}), b AS (SELECT d, country, n FROM a WHERE country IN ('US','JP')) SELECT country, SUM(n) AS total FROM b GROUP BY country ORDER BY total`;
+  const bound = authorizeClickHouseScoped(sql, rules);
+  assert.equal(bound.applicable, true);
+  if (!bound.applicable || !bound.ok) assert.fail(JSON.stringify(bound));
+  assert.deepEqual(bound.outputs, { country: [`${fact.table}.country_code`], total: [`${fact.table}.new_users`] });
+  assert.doesNotThrow(() => guardSql(sql, rules, "clickhouse"));
+  const derived = `SELECT q.country, q.n FROM (SELECT event_date AS d, country_code AS country, new_users AS n FROM ${fact.table} WHERE ${where}) AS q WHERE q.country = 'US'`;
+  const derivedBinding = authorizeClickHouseScoped(derived, rules);
+  assert.equal(derivedBinding.applicable && derivedBinding.ok, true, JSON.stringify(derivedBinding));
+  assert.doesNotThrow(() => guardSql(derived, rules, "clickhouse"));
+  for (const invalid of [
+    sql.replace("new_users AS n", "device_token AS n"),
+    sql.replace("SELECT d, country, n FROM a", "SELECT d, country, device_token AS n FROM a"),
+    sql.replace("SUM(n)", "SUM(new_users)"),
+    sql.replace("FROM b GROUP", "FROM unknown_table GROUP"),
+    sql.replace("SUM(n)", "SUM(other.n)"),
+  ]) {
+    const result = authorizeClickHouseScoped(invalid, rules);
+    assert.equal(result.applicable && !result.ok, true, invalid);
+    assert.throws(() => guardSql(invalid, rules, "clickhouse"), SqlRejected, invalid);
+  }
+  // JOIN remains governed by the existing registered-key policy; this binder
+  // must never claim that an unsupported multi-relation scope is authorized.
+  const join = `WITH a AS (SELECT event_date, new_users FROM ${fact.table} WHERE ${where}) SELECT a.new_users FROM a JOIN ${fact.table} AS f ON a.event_date = f.event_date`;
+  assert.deepEqual(authorizeClickHouseScoped(join, rules), { applicable: false });
+});
 
 test("ClickHouse AST 独立绑定单表字段与别名，敏感列在投影、过滤和排序均拒绝", () => {
   const legal = `SELECT f.country_code, sum(f.new_users) AS total FROM ${fact.table} AS f WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-08' AND f.country_code IN ('US','JP') GROUP BY f.country_code ORDER BY total DESC`;
@@ -119,6 +147,9 @@ test("隔离 ClickHouse：双引号是标识符，敏感字段不能冒充字符
       const allowed = `SELECT event_date, country_code, new_users FROM ${fact.table} WHERE ${where} AND country_code IN ('US','JP')`;
       assert.doesNotThrow(() => guardSql(allowed, rules, "clickhouse"));
       assert.deepEqual((await clickHouseQuery(ch, allowed)).map(({ country_code, new_users }) => ({ country_code, new_users })), [{ country_code: "JP", new_users: 13 }]);
+      const scoped = `WITH a AS (SELECT event_date AS d, country_code AS country, new_users AS n FROM ${fact.table} WHERE ${where}), b AS (SELECT d, country, n FROM a WHERE country IN ('US','JP')) SELECT country, SUM(n) AS total FROM b GROUP BY country ORDER BY total`;
+      assert.doesNotThrow(() => guardSql(scoped, rules, "clickhouse"));
+      assert.deepEqual((await clickHouseQuery(ch, scoped)).map((row) => ({ country: row.country, total: String(row.total) })), [{ country: "JP", total: "13" }]);
       await clickHouseInsert(ch, fact.table, [
         { event_date: "2026-10-06", title_id: "fixture_us", platform: "ios", country_code: "US", channel_id: "mist_ads", new_users: null, device_token: null },
         { event_date: "2026-10-07", title_id: "fixture_us", platform: "ios", country_code: "US", channel_id: "mist_ads", new_users: 0, device_token: null },

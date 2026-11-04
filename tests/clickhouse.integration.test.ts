@@ -154,6 +154,7 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
         assert.ok(calculation.ok, JSON.stringify(calculation)); if (!calculation.ok) return;
         const answer = await runtime.tools.updateAnalysis(rollSession.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(mixed.resource_id), String(calculation.resource_id)] });
         assert.ok(answer.ok, JSON.stringify(answer)); if (!answer.ok) return;
+        assert.equal(answer.status, "completed", JSON.stringify(answer.server_reasons));
         assert.match(String(answer.answer), new RegExp(`分组求和结果再求和 ${expected}；单位 人`), JSON.stringify(answer.server_reasons));
         assert.match(String(answer.answer), new RegExp(`country_code=${country}`));
         assert.ok((answer.server_reasons as string[]).includes("clickhouse_observation_nonatomic"));
@@ -164,7 +165,13 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
       // Reproduce the real model's harmless NULL-marker projection. The marker
       // itself is not a trusted label: only independently checked base columns
       // and calculations are published.
+      let previousTaskResources: string[] | undefined;
       for (const [country, expected, daily] of [["JP", 30, [10, 10, 10]], ["US", 220, [100, 0, 120]]] as const) {
+        runtime.sessions.setActiveJob(rollSession.session_id, `job_null_projection_${country}`);
+        if (previousTaskResources) {
+          const foreign = await runtime.tools.updateAnalysis(rollSession.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: previousTaskResources });
+          assert.equal(foreign.ok, false, "上一任务资源不能用于本次交付");
+        }
         const nullProjection = await runtime.tools.query(rollSession.session_id, { sql: `SELECT event_date, new_users, isNull(new_users) AS is_null FROM fact_fox_daily_install WHERE event_date >= toDate('2026-10-06') AND event_date <= toDate('2026-10-08') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = '${country}' AND channel_id = 'mist_ads' ORDER BY event_date` });
         assert.ok(nullProjection.ok, JSON.stringify(nullProjection)); if (!nullProjection.ok) return;
         assert.deepEqual((nullProjection.rows as Array<{new_users: number}>).map((row) => row.new_users), [...daily]);
@@ -176,9 +183,12 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
         assert.match(String(answer.answer), new RegExp(`合计 ${expected}；单位 人`));
         assert.doesNotMatch(String(answer.answer), /99999/);
         assert.ok((answer.server_reasons as string[]).includes("clickhouse_observation_nonatomic"));
+        assert.ok((answer.server_reasons as string[]).includes("model_draft_not_verified"));
+        if (process.env.DIAG_SYNTHETIC_REASONS === "1") console.log(JSON.stringify({ case: country, status: answer.status, server_reasons: answer.server_reasons, query_resource: nullProjection.resource_id, calculation_resource: calculation.resource_id, expected, daily }));
         const rows = (answer.sources as Array<{rows: Array<Record<string, unknown>>}>)[0]!.rows;
         assert.deepEqual(rows.map((row) => row.new_users), [...daily]);
         assert.ok(rows.every((row) => !Object.hasOwn(row, "is_null")));
+        previousTaskResources = [String(nullProjection.resource_id), String(calculation.resource_id)];
       }
       const missingMarker = await runtime.tools.query(rollSession.session_id, { sql: "SELECT event_date, new_users, isNull(new_users) AS is_null FROM fact_fox_daily_install WHERE event_date >= toDate('2026-10-06') AND event_date <= toDate('2026-10-09') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads' ORDER BY event_date" });
       assert.ok(missingMarker.ok); if (!missingMarker.ok) return;

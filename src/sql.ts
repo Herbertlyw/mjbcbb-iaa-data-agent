@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import { isCalendarDate } from "./config.js";
-import { authorizeClickHouseDirect, preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
+import { authorizeClickHouseDirect, authorizeClickHouseScoped, preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
 
 const require = createRequire(import.meta.url);
 const loaded = require("node-sql-parser") as {
@@ -223,6 +223,8 @@ function assertSelectJoinKeys(statement: Record<string, unknown>, joins: Registe
 
 export function guardSql(rawSql: string, rules: TableRule[], dialect: "sqlite" | "clickhouse" = "sqlite"): GuardedSql {
   if (dialect === "clickhouse") {
+    const scoped = authorizeClickHouseScoped(rawSql, rules);
+    if (scoped.applicable && !scoped.ok) throw new SqlRejected(scoped.code, "ClickHouse 作用域中的表或字段未获授权，或未被内层投影。");
     const direct = authorizeClickHouseDirect(rawSql, rules);
     if (direct.applicable && !direct.ok) throw new SqlRejected(direct.code, "ClickHouse 语法树中的物理来源或字段未获授权。");
   }

@@ -145,3 +145,101 @@ export function authorizeClickHouseDirect(sql: string, rules: readonly ClickHous
   }
   return { applicable: true, ok: true, table: name, columns: [...columns] };
 }
+
+export type ClickHouseScopedAuthorization =
+  | { applicable: false }
+  | { applicable: true; ok: false; code: string }
+  | { applicable: true; ok: true; outputs: Record<string, string[]> };
+
+/** Independent ClickHouse-AST field binding for bounded, single-source CTEs
+ * and derived tables. This is an additional gate: it neither authorizes SQL
+ * functions nor replaces the existing date, JOIN and resource policy. Unknown
+ * shapes fall back to those policies; they are never granted by this binder. */
+export function authorizeClickHouseScoped(sql: string, rules: readonly ClickHouseDirectRule[]): ClickHouseScopedAuthorization {
+  let statements: unknown;
+  try { statements = parse(sql, { locations: false }); } catch { return { applicable: false }; }
+  if (!Array.isArray(statements) || statements.length !== 1) return { applicable: false };
+  type Fields = Map<string, Set<string>>;
+  type Relation = { fields: Fields; qualifier: string; physical: boolean; sensitive: Set<string> };
+  class Unsupported extends Error {}
+  class Denied extends Error {}
+  let nested = false;
+  let nodes = 0;
+  const sourceRules = new Map(rules.map((rule) => [rule.table, rule]));
+  const bind = (value: unknown, inherited: ReadonlyMap<string, Fields>, depth: number): Fields => {
+    if (depth > 16) throw new Unsupported();
+    const root = obj(value);
+    if (root?.type !== "SelectWithUnionQuery" || !Array.isArray(root.selects) || root.selects.length !== 1) throw new Unsupported();
+    const select = obj(root.selects[0]);
+    if (!select || select.type !== "SelectQuery" || select.recursive_with) throw new Unsupported();
+    const scope = new Map(inherited);
+    for (const entry of Array.isArray(select.with) ? select.with : []) {
+      nested = true;
+      const item = obj(entry); const subquery = obj(item?.subquery);
+      if (item?.type !== "WithElement" || typeof item.name !== "string" || !identifier.test(item.name) || item.aliases || scope.has(item.name)) throw new Unsupported();
+      scope.set(item.name, bind(subquery?.query, scope, depth + 1));
+    }
+    const from = obj(select.from);
+    if (!Array.isArray(from?.children) || from.children.length !== 1) throw new Unsupported();
+    const element = obj(from.children[0]); const expression = obj(element?.table_expression);
+    if (!expression || element?.array_join || element?.table_join || expression.table_function) throw new Unsupported();
+    const table = obj(expression.database_and_table_name); const subquery = obj(expression.subquery);
+    let relation: Relation;
+    if (table && !table.database && typeof table.name === "string") {
+      const name = table.name;
+      const qualifier = typeof table.alias === "string" ? table.alias : name;
+      const cte = scope.get(name);
+      if (cte) relation = { fields: cte, qualifier, physical: false, sensitive: new Set() };
+      else {
+        const rule = sourceRules.get(name);
+        if (!rule) throw new Denied("unknown_table");
+        relation = { fields: new Map(rule.allowed_columns.map((field) => [field, new Set([`${name}.${field}`])])), qualifier, physical: true, sensitive: new Set(rule.sensitive_columns) };
+      }
+    } else if (subquery && typeof subquery.alias === "string") {
+      nested = true;
+      relation = { fields: bind(subquery.query, scope, depth + 1), qualifier: subquery.alias, physical: false, sensitive: new Set() };
+    } else throw new Unsupported();
+    const selections = Array.isArray(select.select) ? select.select : [];
+    if (!selections.length) throw new Unsupported();
+    const output: Fields = new Map();
+    const expr = (value: unknown, refs: Set<string>, outputAliases?: Fields): void => {
+      if (++nodes > 20_000) throw new Denied("sql_complexity_limit");
+      if (Array.isArray(value)) { value.forEach((item) => expr(item, refs, outputAliases)); return; }
+      const node = obj(value); if (!node) return;
+      if (["Subquery", "SelectQuery", "SelectWithUnionQuery", "Asterisk", "QualifiedAsterisk"].includes(String(node.type))) throw new Unsupported();
+      if (node.type === "Identifier") {
+        const parts = Array.isArray(node.name_parts) ? node.name_parts : [node.name];
+        if (parts.length < 1 || parts.length > 2 || !parts.every((part) => typeof part === "string")) throw new Unsupported();
+        const field = String(parts.at(-1));
+        if (parts.length === 2 && parts[0] !== relation.qualifier) throw new Denied("column_not_in_scope");
+        if (relation.sensitive.has(field)) throw new Denied("sensitive_field");
+        const lineage = relation.fields.get(field) ?? (parts.length === 1 ? outputAliases?.get(field) : undefined);
+        if (!lineage) throw new Denied(relation.physical ? "column_not_in_contract" : "cte_column_not_projected");
+        for (const ref of lineage) refs.add(ref);
+        return;
+      }
+      for (const [key, child] of Object.entries(node)) if (!["alias", "location", "parent"].includes(key)) expr(child, refs, outputAliases);
+    };
+    for (const value of selections) {
+      const item = obj(value); if (!item) throw new Unsupported();
+      const refs = new Set<string>(); expr(item, refs);
+      const parts = Array.isArray(item.name_parts) ? item.name_parts : [item.name];
+      const name = typeof item.alias === "string" ? item.alias : item.type === "Identifier" && typeof parts.at(-1) === "string" ? String(parts.at(-1)) : "";
+      if (!identifier.test(name) || output.has(name)) throw new Unsupported();
+      output.set(name, refs);
+    }
+    for (const [key, value] of Object.entries(select)) {
+      if (["type", "from", "with", "select", "location", "parent"].includes(key)) continue;
+      expr(value, new Set(), key === "order_by" || key === "group_by" ? output : undefined);
+    }
+    return output;
+  };
+  try {
+    const outputs = bind(statements[0], new Map(), 0);
+    if (!nested) return { applicable: false };
+    return { applicable: true, ok: true, outputs: Object.fromEntries([...outputs].map(([name, refs]) => [name, [...refs].sort()])) };
+  } catch (error) {
+    if (error instanceof Denied && nested) return { applicable: true, ok: false, code: error.message };
+    return { applicable: false };
+  }
+}
