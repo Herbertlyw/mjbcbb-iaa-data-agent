@@ -166,8 +166,8 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       REDIS_PASSWORD: statePassword,
       REDIS_QUEUE_KEY: `lumenfox:oai:${process.pid}`,
       MODEL_MODE: "pi",
-      PI_PROVIDER: "openai-compatible",
-      PI_MODEL: "local-protocol",
+      PI_PROVIDER: process.env.TEST_DEEPSEEK_DIALECT === "1" ? "deepseek" : "openai-compatible",
+      PI_MODEL: process.env.TEST_DEEPSEEK_DIALECT === "1" ? "deepseek-flash" : "local-protocol",
       PI_API_KEY: token,
       PI_BASE_URL: fake.url,
       PI_CONTEXT_WINDOW: "64000",
@@ -206,6 +206,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       assert.equal(job.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === name).length, 1, name);
     }
     assert.equal(fake.observations.some((item) => item.sawUserText && item.sawKnowledgeBody && item.authorizationMatched), true);
+    if (process.env.TEST_DEEPSEEK_DIALECT === "1") assert.ok(fake.observations.every((item) => item.thinkingType === "disabled"));
     const followup = await postQuestion(apiPort, session.session_id, "那日本呢？");
     const followupTools = followup.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name);
     assert.equal(followup.status, "completed", `followup=${followup.status} tools=${followupTools.join("> ")} answer=${followup.analysis?.answer ?? ""} error=${JSON.stringify(followup.error)} events=${JSON.stringify(followup.events.filter((e) => ["model_context", "tool_finished"].includes(e.type)))} obs=${JSON.stringify(fake.observations.slice(-4))}`);

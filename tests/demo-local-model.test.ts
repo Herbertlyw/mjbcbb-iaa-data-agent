@@ -59,3 +59,30 @@ test("显式本机服务模式接通隔离栈，假服务用量标为自报而�
     await fake.close();
   }
 });
+
+test("DeepSeek 显式隔离栈启动和健康标识不触发模型请求", { timeout: 150_000 }, async () => {
+  const child = spawn(process.execPath, ["--import", "tsx", "scripts/local-isolated-stack.ts", "--deepseek"], {
+    cwd: path.resolve("."), env: { PATH: process.env.PATH ?? "", DEEPSEEK_API_KEY: token }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+  child.stderr.on("data", (chunk: Buffer) => { output += chunk.toString(); });
+  try {
+    let port = 0; const deadline = Date.now() + 90_000;
+    while (!port && Date.now() < deadline) {
+      assert.equal(child.exitCode, null, `隔离栈启动失败：${output.replaceAll(token, "[redacted]")}`);
+      port = Number(/本机演示：http:\/\/127\.0\.0\.1:(\d+)/u.exec(output)?.[1] ?? 0);
+      if (!port) await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    assert.ok(port, "隔离栈启动超时");
+    const health = await (await fetch(`http://127.0.0.1:${port}/api/health`)).json() as { model_provider: string; model_service: string; external_model: boolean; remote_dispatch: boolean; model_catalog: { models: Array<{ id: string; verified_here: boolean }> } };
+    assert.equal(health.model_provider, "deepseek");
+    assert.equal(health.model_service, "deepseek-official-unverified");
+    assert.equal(health.external_model, true);
+    assert.equal(health.remote_dispatch, true);
+    assert.equal(health.model_catalog.models[0]?.id, "deepseek-flash");
+    assert.equal(health.model_catalog.models[0]?.verified_here, false);
+    assert.equal(output.includes(token), false);
+    // No task is submitted, so even this fictional key is never dispatched.
+  } finally { await stopProcess(child, "SIGINT"); }
+});

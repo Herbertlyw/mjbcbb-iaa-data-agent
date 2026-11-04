@@ -109,9 +109,15 @@ function spec(table: string, title: string, purpose: string, grain: string, prim
 
 function fact(table: string, title: string, purpose: string, dateColumn: string, metrics: string[], predicted: string | null, sensitive: string[], extra: ColumnSpec[], scope: string): TableSpec {
   const dims = ["title_id", "platform", "country_code", ...(table === "fact_fox_ad_receipt" || table === "fact_fox_retention_cohort" || table === "fact_fox_experiment_arm" || table === "fact_fox_experiment_metric" ? [] : ["channel_id"])];
+  const descriptions: Record<string, string> = {
+    title_id: "虚构产品标识；合成样本中纸灯为 paper_lantern，玻璃鲦为 glass_minnow，并非封闭枚举。",
+    platform: "平台标识区分大小写；合成样本使用小写 ios 和 android，并非封闭枚举。",
+    country_code: "地区标识；合成样本包括 US（美国）、JP（日本）和 DE（德国），并非封闭枚举。",
+    channel_id: "虚构渠道标识；合成样本中雾帆为 mist_ads，卵石为 pebble_net，并非封闭枚举。",
+  };
   const columns = [
     { name: dateColumn, chType: "Date", description: "业务日期，时区 America/Los_Angeles，分区按月。" },
-    ...dims.map((name) => ({ name, chType: "LowCardinality(String)", description: `${name} 维度` })),
+    ...dims.map((name) => ({ name, chType: "LowCardinality(String)", description: descriptions[name] ?? `${name} 维度` })),
     ...extra,
   ];
   return {

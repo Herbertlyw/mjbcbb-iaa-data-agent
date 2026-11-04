@@ -14,6 +14,7 @@ import { MysqlFreshnessStore } from "../src/mysql-freshness.js";
 import { syntheticDayShift } from "../src/synthetic-clock.js";
 import { largeSyntheticInstallSql } from "../src/synthetic-large.js";
 import { demoLocalModel } from "../src/demo-local-model.js";
+import { deepSeekKey } from "../src/deepseek-key.js";
 import { createTableSql, rollingWarehouse, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
 import { startFakeOpenAI } from "../tests/openai-fake-server.js";
 
@@ -24,11 +25,14 @@ const args = process.argv.slice(2);
 const rolling = args.includes("--rolling");
 const large = args.includes("--large");
 const localModel = args.includes("--local-model");
+const deepseek = args.includes("--deepseek");
 const dates = args.filter((arg) => arg.startsWith("--today="));
-if (args.some((arg) => arg !== "--rolling" && arg !== "--large" && arg !== "--local-model" && !arg.startsWith("--today=")) || dates.length > 1 || args.filter((arg) => arg === "--rolling").length > 1 || args.filter((arg) => arg === "--large").length > 1 || args.filter((arg) => arg === "--local-model").length > 1 || (dates.length && !rolling)) throw new Error("用法：npm run demo:stack -- [--large] [--local-model] [--rolling [--today=YYYY-MM-DD]]");
+if (args.some((arg) => arg !== "--rolling" && arg !== "--large" && arg !== "--local-model" && arg !== "--deepseek" && !arg.startsWith("--today=")) || dates.length > 1 || args.filter((arg) => arg === "--rolling").length > 1 || args.filter((arg) => arg === "--large").length > 1 || args.filter((arg) => arg === "--local-model").length > 1 || args.filter((arg) => arg === "--deepseek").length > 1 || (localModel && deepseek) || (dates.length && !rolling)) throw new Error("用法：npm run demo:stack -- [--large] [--local-model | --deepseek] [--rolling [--today=YYYY-MM-DD]]");
 // Explicit opt-in only. Validate before starting containers; do not probe the
 // configured service, print its token, or inherit unrelated environment.
-const configuredModel = localModel ? demoLocalModel(process.env) : null;
+const deepseekKey = deepseek ? deepSeekKey(process.env, path.join(root, ".local-runtime")) : "";
+if (deepseek && !deepseekKey) throw new Error("请先在本机环境或被忽略的本机密钥文件中设置 DeepSeek 密钥；不要把密钥发到对话中。");
+const configuredModel = deepseek ? { PI_PROVIDER: "deepseek", PI_MODEL: process.env.PI_MODEL || "deepseek-flash", PI_API_KEY: deepseekKey, PI_BASE_URL: "https://api.deepseek.com", PI_ALLOW_REMOTE_HTTPS: "true", DEEPSEEK_SYNTHETIC_ONLY: "true", PI_CONTEXT_WINDOW: "128000", PI_MAX_OUTPUT_TOKENS: "2048", PI_REASONING: "off", PI_ENABLED_REASONING: "off,low,high", PI_PROTOCOL_SCRIPT: "" } : localModel ? demoLocalModel(process.env) : null;
 const testToday = dates[0]?.slice("--today=".length);
 if (dates.length && !testToday) throw new Error("测试日期不能为空");
 const fixtureToday = rolling ? (testToday || currentCalendarDate({ simulatedToday: "" }, "America/Los_Angeles")) : "2026-10-29";
@@ -159,12 +163,12 @@ try {
     FRESHNESS_PATH: path.join(dir, "freshness.json"), DATABASE_PATH: path.join(dir, "unused.sqlite"), RESEED_DATABASE: "false", PUBLISH_FRESHNESS_ON_START: "false",
     MYSQL_HOST: "127.0.0.1", MYSQL_PORT: String(mysqlPort), MYSQL_USER: "lumenfox_it", MYSQL_PASSWORD: password, MYSQL_DATABASE: "lumenfox_it",
     REDIS_HOST: "127.0.0.1", REDIS_PORT: String(redisPort), REDIS_PASSWORD: password, REDIS_QUEUE_KEY: `dataagent:stack:${id}`,
-    MODEL_MODE: "pi", ...model, RECOVERY_MS: "600", LEASE_MS: "4000", MAX_MODEL_CALLS: "24",
+    MODEL_MODE: "pi", ...model, RECOVERY_MS: "600", LEASE_MS: "4000", MAX_MODEL_CALLS: deepseek ? "10" : "24", MAX_KNOWN_TOKENS: deepseek ? "120000" : "200000", JOB_TIMEOUT_MS: deepseek ? "120000" : "60000",
   };
   launch("src/api.ts", env); launch("src/dispatcher.ts", env); launch("src/worker.ts", env);
   await waitUntil(async () => (await fetch(`http://127.0.0.1:${apiPort}/api/health`, { signal: AbortSignal.timeout(1000) })).ok, "API");
   console.log(`\n本机演示：http://127.0.0.1:${apiPort}`);
-  console.log(`${rolling ? "滚动" : "固定日期"}合成数据；${configuredModel ? "Pi 使用用户配置的本机兼容服务，模型能力未验证。" : "Pi 连接脚本化的本机假服务，不是真实模型。"}按 Ctrl+C 停止并清理本轮资源。`);
+  console.log(`${rolling ? "滚动" : "固定日期"}合成数据；${deepseek ? "Pi 将问题、授权合成知识和查询结果发送至 DeepSeek 官方服务；模型能力尚未验证。" : configuredModel ? "Pi 使用用户配置的本机兼容服务，模型能力未验证。" : "Pi 连接脚本化的本机假服务，不是真实模型。"}按 Ctrl+C 停止并清理本轮资源。`);
   if (large) console.log("已在本轮临时数据库生成 100,000 行合成安装数据（big_demo）。");
   if (rolling && !testToday) console.log("跨业务日后旧 freshness 不能继续使用；请停止并重新启动以生成新样本和发布。 ");
   await stopped;

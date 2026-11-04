@@ -17,15 +17,17 @@ npm start
 
 浏览器打开 `http://127.0.0.1:4317`。页面可以新建会话、提问、追问，并看到运行中、完成、需要澄清、部分完成、失败、已取消和已超时。
 
-也可以运行 `npm run demo:stack` 启动隔离的分进程协议演示。它使用本机已存在的 ClickHouse、MySQL 和 Redis 镜像（不自动拉取），随机分配回环端口，在 tmpfs 中创建合成数据库和一次性凭据，然后发布 freshness 并启动 API、dispatcher 和 worker。终端打印的地址才是本次访问地址；按 Ctrl+C 停止并清理本次创建的容器和临时文件。默认固定使用 2026 年 10 月的合成数据；`npm run demo:stack -- --rolling` 按洛杉矶当前业务日整体平移合成数据并使用滚动 freshness，`--rolling --today=2027-02-15` 可注入可复现测试日期。跨业务日后须重启滚动演示以生成新样本和发布，旧 freshness 不冒充当前结果。未指定 `--local-model` 时，这两种方式使用脚本假 HTTP 模型，适合验证预置问题及协议，不代表真实模型理解或泛化；脚本里的日期平移不会改写 Pi 会话中的用户原话。不要直接双击 HTML 文件。
+也可以运行 `npm run demo:stack` 启动隔离的分进程协议演示。它使用本机已存在的 ClickHouse、MySQL 和 Redis 镜像（不自动拉取），随机分配回环端口，在 tmpfs 中创建合成数据库和一次性凭据，然后发布 freshness 并启动 API、dispatcher 和 worker。终端打印的地址才是本次访问地址；按 Ctrl+C 停止并清理本次创建的容器和临时文件。默认固定使用 2026 年 10 月的合成数据；`npm run demo:stack -- --rolling` 按洛杉矶当前业务日整体平移合成数据并使用滚动 freshness，`--rolling --today=2027-02-15` 可注入可复现测试日期。跨业务日后须重启滚动演示以生成新样本和发布，旧 freshness 不冒充当前结果。未指定 `--local-model` 或 `--deepseek` 时，这两种方式使用脚本假 HTTP 模型，适合验证预置问题及协议，不代表真实模型理解或泛化；脚本里的日期平移不会改写 Pi 会话中的用户原话。不要直接双击 HTML 文件。
 
 可加 `--large`（例如 `npm run demo:stack -- --large --rolling --today=2027-02-15`）在本轮临时 ClickHouse 内额外生成 100,000 行虚构安装数据，再点击“十万行（大样本模式）”。生成不写出数据文件，不连接已有数据库；四天、两个渠道每日日分组分别为 156250000 和 156262500，总计 1250050000。默认未启用大样本时该示例不会有这批数据。实际完成或部分完成取决于查询时能否证明所需覆盖，合成期望不是授权或 freshness 的替代。
 
-将来如需自行使用本机 OpenAI 兼容服务，可在启动进程前仅在本机设置 `PI_BASE_URL`、`PI_MODEL`、`PI_CONTEXT_WINDOW` 和 `PI_MAX_OUTPUT_TOKENS`，再运行 `npm run demo:stack -- --local-model`。如服务需要令牌，可在本机额外设置 `PI_API_KEY`；未设置时使用虚构占位令牌。地址必须是带端口的 `http://127.0.0.1`，不能携带 URL 凭据或查询参数；不使用该选项时始终启动脚本假服务。启动器不会扫描或预先探测模型服务，不会打印令牌；请勿把真实令牌发进对话或提交仓库。用户配置的服务与模型能力未验证，其返回的用量标为 `reported`（服务自报），缺失用量仍标记未知并保留预算。可用 `PI_REASONING` 和 `PI_ENABLED_REASONING` 配置支持的档位；模型是否兼容工具调用需由用户自行验证。
+将来如需自行使用本机 OpenAI 兼容服务，可在启动进程前仅在本机设置 `PI_BASE_URL`、`PI_MODEL`、`PI_CONTEXT_WINDOW` 和 `PI_MAX_OUTPUT_TOKENS`，再运行 `npm run demo:stack -- --local-model`。如服务需要令牌，可在本机额外设置 `PI_API_KEY`；未设置时使用虚构占位令牌。地址必须是带端口的 `http://127.0.0.1`，不能携带 URL 凭据或查询参数。启动器不会扫描或预先探测模型服务，不会打印令牌；请勿把真实令牌发进对话或提交仓库。用户配置的服务与模型能力未验证，其返回的用量标为 `reported`（服务自报），缺失用量仍标记未知并保留预算。可用 `PI_REASONING` 和 `PI_ENABLED_REASONING` 配置支持的档位；模型是否兼容工具调用需由用户自行验证。
 
 `npm test` 将测试文件并发限制为 2，减少本机同时启动多套数据库容器的资源压力；单个测试内部的并发、故障和恢复断言仍会执行。
 
-配置示例在 [`.env.example`](.env.example)。不要把真实密钥写入仓库。`MODEL_MODE=deterministic` 是确定性演示；`MODEL_MODE=pi` 使用 Pi AgentSession，可选择显式 `faux` 或 `openai-compatible` 本机服务。后者仅允许 `http://127.0.0.1`，本轮仅用虚构 token 和脚本假服务测试，不能代表真实模型联调。Anthropic 和远程 HTTPS 路径当前禁用，不会自动回退到 faux。
+DeepSeek 合成数据验证可在本机设置 `DEEPSEEK_API_KEY`，或使用 Git 忽略的 `.local-runtime/deepseek-api-key` 文件，然后运行 `npm run demo:stack -- --deepseek`。密钥文件必须是当前用户拥有、仅本人可读的普通文件（建议权限 `0600`），不能是符号链接；环境变量优先。不要把密钥发到对话或提交仓库。该选项使用新建的隔离服务和合成 Harborlight 知识，默认模型为 `deepseek-flash`；可通过本机 `PI_MODEL` 指定其他模型。发送的问题、选中的知识及工具结果会传给 DeepSeek，请只输入合成内容。默认关闭思考，页面可选择已启用的 `low` 或 `high`；每任务最多 10 次模型派发、120,000 已知 token 和 120 秒。用量由服务返回，失败或未返回时为未知，不自动重试。模型兼容性和自主分析能力需通过真实调用验证，本机脚本测试不能证明。地址仅允许官方 `https://api.deepseek.com`，不跟随重定向；配置检查不是对数据库内容的密码学证明，请勿向该临时栈注入真实数据。
+
+配置示例在 [`.env.example`](.env.example)。不要把真实密钥写入仓库。`MODEL_MODE=deterministic` 是确定性演示；`MODEL_MODE=pi` 使用 Pi AgentSession，可选择显式 `faux`、`openai-compatible` 本机服务或显式启用的 DeepSeek 官方服务。Anthropic 和其他远程 HTTPS 供应商当前禁用，不会自动回退到 faux。
 
 本地文件写到 `.local-runtime/`，该目录已被忽略。合成业务库存 `lumenfox.sqlite`，每次启动重建并以只读方式打开。
 

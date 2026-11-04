@@ -135,7 +135,7 @@
       "kind": "data_contract",
       "title": "每日新增",
       "summary": "按日、产品、平台、地区、渠道的新增用户。",
-      "revision": "contract.fact_fox_daily_install-r3",
+      "revision": "contract.fact_fox_daily_install-r4",
       "status": "published",
       "discoverable": true,
       "table": "fact_fox_daily_install",

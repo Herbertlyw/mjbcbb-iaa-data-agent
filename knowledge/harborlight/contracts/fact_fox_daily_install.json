@@ -1,6 +1,6 @@
 {
   "asset_id": "contract.fact_fox_daily_install",
-  "revision": "contract.fact_fox_daily_install-r3",
+  "revision": "contract.fact_fox_daily_install-r4",
   "table": "fact_fox_daily_install",
   "engine": "clickhouse-local",
   "simulated": true,
@@ -39,22 +39,22 @@
     {
       "name": "title_id",
       "type": "LowCardinality(String)",
-      "description": "title_id 维度"
+      "description": "虚构产品标识；合成样本中纸灯为 paper_lantern，玻璃鲦为 glass_minnow，并非封闭枚举。"
     },
     {
       "name": "platform",
       "type": "LowCardinality(String)",
-      "description": "platform 维度"
+      "description": "平台标识区分大小写；合成样本使用小写 ios 和 android，并非封闭枚举。"
     },
     {
       "name": "country_code",
       "type": "LowCardinality(String)",
-      "description": "country_code 维度"
+      "description": "地区标识；合成样本包括 US（美国）、JP（日本）和 DE（德国），并非封闭枚举。"
     },
     {
       "name": "channel_id",
       "type": "LowCardinality(String)",
-      "description": "channel_id 维度"
+      "description": "虚构渠道标识；合成样本中雾帆为 mist_ads，卵石为 pebble_net，并非封闭枚举。"
     },
     {
       "name": "new_users", "unit": "人",
