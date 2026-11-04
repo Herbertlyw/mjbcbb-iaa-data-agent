@@ -360,6 +360,7 @@ export interface AnalysisRecord {
     cells: Record<string, number | string>;
     verified_cells?: import("./evidence.js").VerifiedCell[];
     verified_decimal_cells?: import("./decimal-cell-evidence.js").VerifiedDecimalCell[];
+    verified_group_rollups?: import("./aggregate-rollup.js").VerifiedGroupRollup[];
     input_truncated: boolean;
     complete_population: boolean;
   }>;
@@ -369,6 +370,7 @@ export interface AnalysisRecord {
   transform_results?: Array<{ resource_id: string; source_resource_id: string; steps: import("./result-transform.js").TransformStep[]; result: import("./result-transform.js").ResultTable; total_rows?: number; preview_has_more?: boolean }>;
   alignment_results?: Array<{ resource_id: string; spec: import("./result-alignment.js").AlignmentSpec; rows: import("./result-alignment.js").AlignedRow[]; total_rows?: number; preview_has_more?: boolean; coverage_incomplete?: boolean }>;
   aggregates?: import("./aggregate-evidence.js").VerifiedAggregate[];
+  conditional_aggregates?: import("./conditional-aggregate-evidence.js").VerifiedConditionalAggregate[];
   aggregate_total?: number;
   aggregates_has_more?: boolean;
   analysis_declaration?: {

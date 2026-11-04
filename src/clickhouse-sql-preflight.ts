@@ -3,7 +3,7 @@ import { parse } from "@clickhouse/parser";
 /** A second, ClickHouse-grammar gate. It does not grant authorization: the
  * caller must still run the contract/field/partition/JOIN checks and only use
  * results whose lineage can be verified. */
-export type ClickHousePreflight = { ok: true; tables: string[]; identifiers: string[] } | { ok: false; code: string };
+export type ClickHousePreflight = { ok: true; tables: string[]; identifiers: string[]; functions: string[] } | { ok: false; code: string };
 
 const obj = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const identifier = /^[a-z_][a-z0-9_]*$/u;
@@ -15,7 +15,7 @@ export function preflightClickHouseSql(sql: string): ClickHousePreflight {
   if (!Array.isArray(statements) || statements.length !== 1) return { ok: false, code: "multiple_statements" };
   const root = obj(statements[0]);
   if (root?.type !== "SelectWithUnionQuery") return { ok: false, code: "write_statement" };
-  const pending: unknown[] = [root]; let nodes = 0; const identifiers = new Set<string>();
+  const pending: unknown[] = [root]; let nodes = 0; const identifiers = new Set<string>(); const functions = new Set<string>();
   while (pending.length) {
     const item = pending.pop();
     if (++nodes > 20_000) return { ok: false, code: "sql_complexity_limit" };
@@ -29,6 +29,12 @@ export function preflightClickHouseSql(sql: string): ClickHousePreflight {
     if (node.type === "TableExpression" && node.table_function) return { ok: false, code: "dangerous_table" };
     if (node.type === "QueryParameter") return { ok: false, code: "query_parameter_unsupported" };
     if (node.type === "Function" && (node.is_lambda_function || forbiddenFunctions.has(String(node.name ?? "").toLowerCase()))) return { ok: false, code: "dangerous_function" };
+    // The ClickHouse parser represents infix operators as Functions too;
+    // only named calls participate in the independent parser comparison.
+    if (node.type === "Function" && node.is_operator !== true) {
+      if (typeof node.name !== "string" || !identifier.test(node.name.toLowerCase())) return { ok: false, code: "clickhouse_function_unsupported" };
+      functions.add(node.name.toLowerCase());
+    }
     if ((node.type === "SelectWithUnionQuery" || node.type === "SelectIntersectExceptQuery") && (node.out_file || node.outfile_truncate || node.settings || node.format)) return { ok: false, code: "query_output_options_forbidden" };
     if (node.type === "SelectQuery" && (node.settings || node.format || node.out_file || node.recursive_with)) return { ok: false, code: "query_output_options_forbidden" };
     for (const [name, child] of Object.entries(node)) if (name !== "location" && name !== "parent") pending.push(child);
@@ -78,5 +84,5 @@ export function preflightClickHouseSql(sql: string): ClickHousePreflight {
     return true;
   };
   if (!query(root, new Set(), 0) || !physical.size) return { ok: false, code: "clickhouse_source_unsupported" };
-  return { ok: true, tables: [...physical], identifiers: [...identifiers] };
+  return { ok: true, tables: [...physical], identifiers: [...identifiers], functions: [...functions] };
 }

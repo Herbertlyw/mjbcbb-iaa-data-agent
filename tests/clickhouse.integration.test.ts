@@ -117,6 +117,52 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
       ephemeralDir: undefined,
     });
     try {
+      const rollSession = runtime.sessions.create("analyst");
+      await bindTables(runtime, rollSession.session_id, ["contract.fact_fox_daily_install"]);
+      runtime.sessions.setActiveJob(rollSession.session_id, "job_group_rollup_clickhouse");
+      const grouped = await runtime.tools.query(rollSession.session_id, {
+        sql: "SELECT event_date, SUM(new_users) AS total FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads' GROUP BY event_date ORDER BY event_date",
+      });
+      assert.ok(grouped.ok, JSON.stringify(grouped));
+      if (!grouped.ok) return;
+      assert.equal(grouped.engine, "clickhouse-local");
+      assert.deepEqual((grouped.rows as Array<Record<string, unknown>>).map((row) => String(row.total)), ["100", "0", "120"]);
+      const groupedCalculation = await runtime.tools.calculateSessionCells(rollSession.session_id, {
+        resource_id: String(grouped.resource_id),
+        operations: [{ op: "sum", column: "total", as: "sum" }, { op: "count_rows", as: "count" }, { op: "count_zero", column: "total", as: "zero" }],
+      });
+      assert.ok(groupedCalculation.ok, JSON.stringify(groupedCalculation));
+      if (!groupedCalculation.ok) return;
+      const groupedAnswer = await runtime.tools.updateAnalysis(rollSession.session_id, {
+        suggested_status: "completed", draft_answer: "", resource_ids: [String(grouped.resource_id), String(groupedCalculation.resource_id)],
+      });
+      assert.ok(groupedAnswer.ok, JSON.stringify(groupedAnswer));
+      if (!groupedAnswer.ok) return;
+      assert.equal(groupedAnswer.status, "completed");
+      assert.match(String(groupedAnswer.answer), /分组求和结果再求和 220；单位 人/);
+      assert.match(String(groupedAnswer.answer), /分组聚合输出为零的分组数 1/);
+
+      const counted = await runtime.tools.query(rollSession.session_id, {
+        sql: "SELECT countIf(isNull(new_users)) AS missing_count, countIf(isNotNull(new_users)) AS observed_count, countIf(new_users = 0) AS zero_count FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'",
+      });
+      assert.ok(counted.ok, JSON.stringify(counted));
+      if (!counted.ok) return;
+      const countAnswer = await runtime.tools.updateAnalysis(rollSession.session_id, {
+        suggested_status: "completed", draft_answer: "", resource_ids: [String(counted.resource_id)],
+      });
+      assert.ok(countAnswer.ok, JSON.stringify(countAnswer));
+      if (!countAnswer.ok) return;
+      assert.equal(countAnswer.status, "partial");
+      assert.match(String(countAnswer.answer), /条件计数（为 NULL）1；单位 行/);
+      assert.match(String(countAnswer.answer), /条件计数（非 NULL）6；单位 行/);
+      assert.match(String(countAnswer.answer), /条件计数（等于零）1；单位 行/);
+      assert.match(String(countAnswer.answer), /覆盖不完整，此计数仅描述已观测行/);
+      runtime.sessions.setActiveJob(rollSession.session_id, "other_job_clickhouse");
+      const staleCount = await runtime.tools.updateAnalysis(rollSession.session_id, {
+        suggested_status: "completed", draft_answer: "", resource_ids: [String(counted.resource_id)],
+      });
+      assert.equal(staleCount.ok, false);
+
       const session = runtime.sessions.create("analyst");
       await bindTables(runtime, session.session_id, ["contract.fact_fox_daily_install", "contract.fact_fox_ad_receipt", "contract.fact_fox_daily_spend", "contract.fact_fox_experiment_metric", "contract.dim_fox_title"]);
       const installs = await runtime.tools.query(session.session_id, {

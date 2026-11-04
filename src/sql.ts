@@ -22,7 +22,9 @@ const WRITE_TYPES = new Set([
   "revoke",
 ]);
 
-const ALLOWED_FUNCTIONS = new Set(["sum", "count", "min", "max", "avg", "lower", "upper", "exists", "todate"]);
+const CLICKHOUSE_DATE_PROJECTIONS = new Set(["toyear", "tomonth", "toyyyymm", "tostartofmonth", "tostartofday"]);
+const CLICKHOUSE_ONLY_FUNCTIONS = new Set(["todate", "countif", "isnull", "isnotnull", ...CLICKHOUSE_DATE_PROJECTIONS]);
+const ALLOWED_FUNCTIONS = new Set(["sum", "count", "min", "max", "avg", "lower", "upper", "exists", ...CLICKHOUSE_ONLY_FUNCTIONS]);
 const TABLE_FUNCTIONS = /\b(file|url|s3|s3cluster|remote|remotesecure|mysql|postgresql|mongo|mongodb|hdfs|input|cluster|clusterallreplicas|sqlite|redis|executable)\s*\(/iu;
 // Match the maximum interval that the coverage evaluator can enumerate.
 // Row/time limits in the ClickHouse driver remain independent safeguards.
@@ -52,6 +54,8 @@ export interface TableRule {
   allowed_columns: string[];
   sensitive_columns: string[];
   must_filter: string[];
+  /** Host-supplied contract types; absent types never authorize date projection. */
+  column_types?: Record<string, string>;
 }
 
 export interface ParsedSql {
@@ -106,8 +110,9 @@ export function parseReadonlySql(rawSql: string, dialect: "sqlite" | "clickhouse
     const clickhouse = preflightClickHouseSql(sql);
     if (!clickhouse.ok) throw new SqlRejected(clickhouse.code, "ClickHouse 语法或来源无法安全核验。");
     if (clickhouse.tables.length !== tables.length || clickhouse.tables.some((table) => !tables.includes(table))) throw new SqlRejected("clickhouse_source_mismatch", "两个语法树对物理来源的解析不一致。");
-    const legacyIdentifiers = new Set<string>(); let ambiguousQuotes = false;
+    const legacyIdentifiers = new Set<string>(); const legacyFunctions = new Set<string>(); let ambiguousQuotes = false;
     walk(statement, (entry) => {
+      const fn = functionName(entry); if (fn) legacyFunctions.add(fn);
       // SQLite treats double quotes as strings in contexts where ClickHouse
       // treats them as identifiers. Map only simple identifier-shaped values;
       // authorization below independently treats them as column references.
@@ -121,6 +126,7 @@ export function parseReadonlySql(rawSql: string, dialect: "sqlite" | "clickhouse
       legacyIdentifiers.add(`${qualifier}${column}`);
     });
     if (ambiguousQuotes || clickhouse.identifiers.some((name) => !legacyIdentifiers.has(name))) throw new SqlRejected("clickhouse_identifier_mismatch", "两个语法树对字段标识符的解析不一致。");
+    if (clickhouse.functions.some((name) => !legacyFunctions.has(name)) || [...legacyFunctions].some((name) => name !== "exists" && !clickhouse.functions.includes(name))) throw new SqlRejected("clickhouse_function_mismatch", "两个语法树对函数调用的解析不一致。");
   }
   return { sql, tables, ast: statement };
 }
@@ -218,7 +224,18 @@ function assertSelectJoinKeys(statement: Record<string, unknown>, joins: Registe
 export function guardSql(rawSql: string, rules: TableRule[], dialect: "sqlite" | "clickhouse" = "sqlite"): GuardedSql {
   const parsed = parseReadonlySql(rawSql, dialect);
   if (dialect !== "clickhouse") walk(parsed.ast, (node) => {
-    if (functionName(node) === "todate") throw new SqlRejected("clickhouse_function_only", "toDate 常量函数仅支持 ClickHouse，SQLite 不会模拟其语义。");
+    if (CLICKHOUSE_ONLY_FUNCTIONS.has(functionName(node) ?? "")) throw new SqlRejected("clickhouse_function_only", "该函数仅支持 ClickHouse，SQLite 不会模拟其语义。");
+  });
+  // Date projection functions are not date-bound proofs. Require a single
+  // physical table and its declared scan field; the ordinary date predicate
+  // and all field/sensitive checks still apply independently below.
+  walk(parsed.ast, (node) => {
+    if (!CLICKHOUSE_DATE_PROJECTIONS.has(functionName(node) ?? "")) return;
+    const args = callArguments(node); const col = asRecord(args?.[0]);
+    const from = Array.isArray(parsed.ast.from) ? parsed.ast.from : [];
+    const relation = asRecord(from[0]); const name = parsed.tables[0];
+    const rule = rules.find((item) => item.table === name);
+    if (parsed.ast.with || from.length !== 1 || parsed.tables.length !== 1 || relation?.table !== name || relation?.expr || !rule || !col || typeof col.column !== "string" || !rule.must_filter.includes(col.column) || rule.column_types?.[col.column]?.replace(/\s/gu, "").toLowerCase() !== "date" || col.table && col.table !== (relation.as || relation.table)) throw new SqlRejected("date_projection_scope_unsupported", "日期函数仅允许单表契约声明的 Date 类型扫描字段。");
   });
   const preaggregated = rewritePreaggregatedDimensionJoin(parsed.ast);
   if (preaggregated) {
@@ -763,7 +780,49 @@ function rejectFunctions(node: unknown): void {
     if (!name) return;
     if (!ALLOWED_FUNCTIONS.has(name)) throw new SqlRejected("dangerous_function", `函数 ${name} 不在允许列表中`);
     if (name === "todate" && !clickHouseDateConstant(record)) throw new SqlRejected("unsafe_date_function", "toDate 仅接受一个 ClickHouse Date 范围内的规范日期字符串常量。");
+    if ((name === "isnull" || name === "isnotnull") && !directNullFunction(record)) throw new SqlRejected("unsafe_null_function", "空值函数仅允许直接列引用。");
+    if (name === "countif" && !safeCountIf(record)) throw new SqlRejected("unsafe_conditional_aggregate", "countIf 仅接受受限的列与常量条件。");
+    if (CLICKHOUSE_DATE_PROJECTIONS.has(name) && !directNullFunction(record)) throw new SqlRejected("unsafe_date_function", "日期投影函数仅接受一个直接列引用。");
   });
+}
+
+function callArguments(value: Record<string, unknown>): unknown[] | null {
+  const args = asRecord(value.args);
+  return args?.type === "expr_list" && Array.isArray(args.value) && !value.over ? args.value : null;
+}
+
+function directColumn(value: unknown): boolean {
+  const col = asRecord(value);
+  return col?.type === "column_ref" && typeof col.column === "string" && /^[a-z_][a-z0-9_]*$/iu.test(col.column) && (!col.table || typeof col.table === "string" && /^[a-z_][a-z0-9_]*$/iu.test(col.table));
+}
+
+function directNullFunction(value: Record<string, unknown>): boolean {
+  const args = callArguments(value);
+  return args?.length === 1 && directColumn(args[0]);
+}
+
+/** Accept only a bounded, data-only conditional predicate. Field access is
+ * still checked separately against the exact scoped table and its contract. */
+function safeCountIf(value: Record<string, unknown>): boolean {
+  const args = callArguments(value);
+  if (!args || args.length !== 1) return false;
+  let nodes = 0;
+  const predicate = (item: unknown): boolean => {
+    if (++nodes > 32) return false;
+    const node = asRecord(item); if (!node) return false;
+    const fn = functionName(node);
+    if (fn === "isnull" || fn === "isnotnull") return directNullFunction(node);
+    if (node.type !== "binary_expr") return false;
+    const op = String(node.operator).toUpperCase();
+    if (op === "AND" || op === "OR") return predicate(node.left) && predicate(node.right);
+    if (!directColumn(node.left)) return false;
+    const right = asRecord(node.right); if (!right) return false;
+    if (op === "IS" || op === "IS NOT") return right.type === "null";
+    if (!["=", "!=", "<>", "<", "<=", ">", ">="].includes(op)) return false;
+    return right.type === "number" && typeof right.value === "number" && Number.isFinite(right.value)
+      || right.type === "single_quote_string" && typeof right.value === "string" && right.value.length <= 1024;
+  };
+  return predicate(args[0]);
 }
 
 /** Only the one-argument, literal ClickHouse Date conversion is safe to

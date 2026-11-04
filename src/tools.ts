@@ -9,6 +9,8 @@ import { compareDecimalAggregates, type AggregateComparison } from "./aggregate-
 import { arithmeticUnit, computeArithmetic, fromAggregate, isExactZero, sumDecimalStrings, type ArithmeticOp, type ArithmeticValue } from "./exact-arithmetic.js";
 import { verifyDecimalCell, type VerifiedDecimalCell } from "./decimal-cell-evidence.js";
 import { verifyDatabaseAggregates, type VerifiedAggregate } from "./aggregate-evidence.js";
+import { verifyConditionalAggregates, type VerifiedConditionalAggregate } from "./conditional-aggregate-evidence.js";
+import { verifyGroupRollup, type VerifiedGroupRollup } from "./aggregate-rollup.js";
 import { joinClosedCoverage, joinDimensionObservations, joinMissingDimensionKeys, prepareJoinAggregateEvidence, prepareJoinCoverageEvidence, prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema, type JoinEvidencePlan, type VerifiedJoinValue } from "./join-evidence.js";
 import { joinResultTable } from "./join-result-table.js";
 import { fitsResultCalculationBytes, RESULT_CALCULATION_MAX_ROWS, RESULT_CALCULATION_MAX_BYTES, transformResult, type ResultColumn, type ResultTable, type ResultValue, type TransformStep } from "./result-transform.js";
@@ -1136,6 +1138,7 @@ export class ToolService {
     const liveFreshness = deliveredFreshness.publication;
     const eligible = new Set<string>();
     const aggregates: VerifiedAggregate[] = [];
+    const conditionalAggregates: VerifiedConditionalAggregate[] = [];
     const joinLines: string[] = [];
     for (const source of sources) {
       const original = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === source.resource_id);
@@ -1146,6 +1149,7 @@ export class ToolService {
       const currentFresh = Boolean(liveFreshness && liveFreshness.valid_until >= currentCalendarDate(this.ctx.config, this.ctx.knowledge.timezone) && source.freshness_receipts.length === source.tables.length && source.tables.every((table) => source.freshness_receipts.some((receipt) => receipt.table === table)) && source.freshness_receipts.every((receipt) => receipt.publication_id === liveFreshness.publication_id && receipt.version === liveFreshness.version && liveFreshness.tables[receipt.table]?.status === "fresh"));
       const shape = evidence && contract && verifyCell(evidence, contract, { op: "count_rows", as: "internal" }, evidence.rows.length);
       const databaseAggregates = evidence && contract && verifyDatabaseAggregates(evidence, contract);
+      const conditional = evidence && contract && verifyConditionalAggregates(evidence, contract);
       const joined = original && liveFreshness ? verifyJoinResource(original as JoinQueryResource, session, this.ctx.knowledge, this.ctx.config, liveFreshness) : null;
       if (joined) {
         source.evidence_eligible = true;
@@ -1160,11 +1164,12 @@ export class ToolService {
         if (joined.values.length > 100) joinLines.push(`JOIN 验证了 ${joined.values.length} 个分组，此处展示前 100 个；其余分组保存在当前结果资源中。`);
         continue;
       }
-      source.evidence_eligible = Boolean(currentContract && currentFresh && (shape || databaseAggregates) && !source.truncated && source.complete_population);
+      source.evidence_eligible = Boolean(currentContract && currentFresh && (shape || databaseAggregates || conditional) && !source.truncated && source.complete_population);
       if (source.evidence_eligible) {
         eligible.add(source.resource_id);
         if (source.engine === "clickhouse-local") reasons.push("clickhouse_observation_nonatomic");
         if (databaseAggregates) aggregates.push(...databaseAggregates);
+        if (conditional) conditionalAggregates.push(...conditional);
         // SQL aliases are model-controlled and can look like another metric or
         // unit. The verified statements use contract names; do not present the
         // raw alias-labelled preview as verified evidence in the answer.
@@ -1179,7 +1184,7 @@ export class ToolService {
         if (!currentFresh) reasons.push("freshness_version_changed");
         if (!currentContract) reasons.push("contract_or_authorization_changed");
         if (source.truncated || !source.complete_population) reasons.push("truncated_result_is_not_population");
-        if (!shape && !databaseAggregates && currentContract) reasons.push("query_lineage_unsupported");
+        if (!shape && !databaseAggregates && !conditional && currentContract) reasons.push("query_lineage_unsupported");
         source.rows = [];
         source.coverage = unknownCoverage("该查询结果不满足当前证据条件，覆盖回执不作为事实展示。");
         if (status === "completed") status = "partial";
@@ -1232,6 +1237,7 @@ export class ToolService {
     }
     const verified: VerifiedCell[] = [];
     const verifiedDecimal: VerifiedDecimalCell[] = [];
+    const verifiedGroupRollups: VerifiedGroupRollup[] = [];
     const verifiedByCalculation = new Map<string, Map<string, VerifiedCell>>();
     for (const resource of resources) {
       if (resource.kind !== "calculation") continue;
@@ -1241,6 +1247,7 @@ export class ToolService {
       const contract = asset?.contract;
       const accepted: VerifiedCell[] = [];
       const acceptedDecimal: VerifiedDecimalCell[] = [];
+      const acceptedGrouped: VerifiedGroupRollup[] = [];
       if (original && evidence && contract && eligible.has(original.resource_id) && resource.operations) {
         for (const [name, operation] of Object.entries(resource.operations)) {
           const stored = resource.cells[name];
@@ -1251,15 +1258,17 @@ export class ToolService {
             cells.set(name, cell);
             verifiedByCalculation.set(resource.resource_id, cells);
           }
-          else if (typeof stored === "string") {
-            const decimal = verifyDecimalCell(evidence, contract, operation, stored);
+          else {
+            const decimal = typeof stored === "string" ? verifyDecimalCell(evidence, contract, operation, stored) : null;
+            const grouped = !decimal && (typeof stored === "string" || typeof stored === "number") ? verifyGroupRollup(evidence, contract, operation, stored) : null;
             if (decimal) { acceptedDecimal.push(decimal); verifiedDecimal.push(decimal); }
+            else if (grouped) { acceptedGrouped.push(grouped); verifiedGroupRollups.push(grouped); }
             else reasons.push("calculation_lineage_unsupported");
-          } else reasons.push("calculation_lineage_unsupported");
+          }
         }
       } else reasons.push("calculation_lineage_unsupported");
-      const cells = Object.fromEntries([...accepted, ...acceptedDecimal].map((cell, index) => [`cell_${index + 1}`, cell.value]));
-      calculations.push({ resource_id: resource.resource_id, source_resource_id: resource.source_resource_id, cells, verified_cells: accepted, verified_decimal_cells: acceptedDecimal, input_truncated: resource.input_truncated, complete_population: resource.complete_population });
+      const cells = Object.fromEntries([...accepted, ...acceptedDecimal, ...acceptedGrouped].map((cell, index) => [`cell_${index + 1}`, cell.value]));
+      calculations.push({ resource_id: resource.resource_id, source_resource_id: resource.source_resource_id, cells, verified_cells: accepted, verified_decimal_cells: acceptedDecimal, verified_group_rollups: acceptedGrouped, input_truncated: resource.input_truncated, complete_population: resource.complete_population });
     }
     const comparisons: VerifiedComparison[] = [];
     const aggregateComparisons: AggregateComparison[] = [];
@@ -1373,8 +1382,9 @@ export class ToolService {
     if (aggregates.some((item) => Object.keys(item.group).length)) limitations.push("分组只展示查询中出现的取值，未出现的组合没有补零。");
     if (joinLines.length) limitations.push("JOIN 分组只证明实际匹配键在本次查询捕获数据中没有放大；未出现的分组未补零，跨表不具备原子快照。");
     limitations.push("数据来自本地合成库，不是生产数据。");
-    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...verifiedDecimal.map(renderDecimalCell), ...comparisons.map(renderComparison), ...aggregates.slice(0, 100).map(renderAggregate), ...aggregateComparisons.map(renderAggregateComparison), ...arithmeticResults.map(renderArithmetic), ...transformLines];
+    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...verifiedDecimal.map(renderDecimalCell), ...verifiedGroupRollups.map(renderGroupRollup), ...comparisons.map(renderComparison), ...aggregates.slice(0, 100).map(renderAggregate), ...conditionalAggregates.slice(0, 100).map(renderConditionalAggregate), ...aggregateComparisons.map(renderAggregateComparison), ...arithmeticResults.map(renderArithmetic), ...transformLines];
     if (aggregates.length > 100) derivedLines.push(`已验证聚合共 ${aggregates.length} 个，此处展示前 100 个；其余结果保存在当前查询资源中。`);
+    if (conditionalAggregates.length > 100) derivedLines.push(`已验证条件计数共 ${conditionalAggregates.length} 个，此处展示前 100 个；其余结果保存在当前查询资源中。`);
     derivedLines.push(...alignmentLines);
     if (reasons.includes("clickhouse_observation_nonatomic")) derivedLines.push("结果基于各次 ClickHouse 观测；查询和覆盖统计不是同一原子快照，未证明共同数据版本。");
     if (reasons.includes("coverage_observations_conflict")) derivedLines.push("相同范围的覆盖观测内容发生变化，跨次计算结果不能作为一致数据集的完整结论。");
@@ -1404,6 +1414,7 @@ export class ToolService {
       transform_results: transformResults,
       alignment_results: alignmentResults,
       aggregates: aggregates.slice(0, 100),
+      conditional_aggregates: conditionalAggregates.slice(0, 100),
       aggregate_total: aggregates.length,
       aggregates_has_more: aggregates.length > 100,
       ...(analysisDeclaration ? { analysis_declaration: analysisDeclaration } : {}),
@@ -1617,6 +1628,7 @@ export class ToolService {
       allowed_columns: binding.allowed_columns,
       sensitive_columns: binding.sensitive_columns,
       must_filter: binding.must_filter,
+      column_types: Object.fromEntries(contract.columns.map((column) => [column.name, column.type])),
     };
   }
 
@@ -1763,6 +1775,13 @@ function renderAggregate(item: VerifiedAggregate): string {
   const filters = Object.entries(item.filters).map(([key, value]) => `${key}=${value}`).join("，") || "无";
   const group = Object.entries(item.group).map(([key, value]) => `${key}=${value}`).join("，");
   return `${item.table}.${item.column}（${item.description}）：数据库${item.operation === "sum" ? "求和" : "非 NULL 计数"} ${item.value}；单位 ${item.unit}；实际（契约声明仅观察值）；筛选 ${filters}${group ? `；分组 ${group}` : ""}；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${item.source_resource_id}。`;
+}
+
+function renderConditionalAggregate(item: VerifiedConditionalAggregate): string {
+  const filters = Object.entries(item.filters).map(([key, value]) => `${key}=${value}`).join("，") || "无";
+  const group = Object.entries(item.group).map(([key, value]) => `${key}=${value}`).join("，");
+  const condition = item.operation === "count_null" ? "为 NULL" : item.operation === "count_nonnull" ? "非 NULL" : "等于零";
+  return `${item.table}.${item.column}：数据库条件计数（${condition}）${item.value}；单位 行；实际（契约声明仅观察值）；筛选 ${filters}${group ? `；分组 ${group}` : ""}；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${item.source_resource_id}。${item.coverage_incomplete ? "覆盖不完整，此计数仅描述已观测行；NULL 和未出现的行没有补零。" : "此计数描述查询中已观测的行，未出现的分组没有补零。"}`;
 }
 
 function renderAggregateComparison(item: AggregateComparison): string {
@@ -1932,6 +1951,17 @@ function renderAlignment(resource: AlignmentResource, rows: AlignedRow[]): strin
 function renderDecimalCell(item: VerifiedDecimalCell): string {
   const filters = Object.entries(item.filters).map(([key, value]) => `${key}=${value}`).join("，") || "无";
   return `${item.table}.${item.column}（${item.description}）：完整资源精确十进制合计 ${item.value}；单位 ${item.unit}；实际（契约声明仅观察值）；筛选 ${filters}；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${item.source_resource_id}。`;
+}
+
+function renderGroupRollup(item: VerifiedGroupRollup): string {
+  const restrictions = [
+    ...Object.entries(item.filters).map(([key, value]) => `${key}=${value}`),
+    ...Object.entries(item.in_sets).map(([key, values]) => `${key} IN (${values.join("、")})`),
+  ].join("，") || "未限定维度";
+  const metric = `${item.table}.${item.column}（${item.description}）`;
+  const input = item.input_operation === "sum" ? "求和" : "非 NULL 计数";
+  const action = item.operation === "sum" ? `分组${input}结果再求和` : item.operation === "count_rows" ? "查询返回的结果分组数" : item.operation === "count_null" ? "分组聚合输出为 NULL 的分组数" : "分组聚合输出为零的分组数";
+  return `${metric}：${action} ${item.value}；单位 ${item.unit}；实际（契约声明仅观察值）；筛选 ${restrictions}；原查询按 ${item.grouped_by.join("、")} 分组；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${item.source_resource_id}。${item.operation === "sum" ? "仅汇总查询已返回的分组，未出现的组合没有补零。" : "这是结果分组的计数，不是底层业务明细的计数。"}`;
 }
 
 function computeCell(source: QueryResource, contract: DataContract | undefined, operation: CellOperation, notes: string[]): number | string | null {
