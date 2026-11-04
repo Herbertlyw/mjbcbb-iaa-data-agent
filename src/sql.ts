@@ -251,6 +251,75 @@ export function guardSql(rawSql: string, rules: TableRule[], dialect: "sqlite" |
  * It establishes no authority by itself: the caller must recheck every
  * physical column, contracted grain, JOIN key and actual captured tuple. */
 export function rewritePreaggregatedDimensionJoin(ast: Record<string, unknown>): { sql: string; fact: string; grain: string[] } | null {
+  const collapsed = collapsePreaggregateProjectionWrappers(ast);
+  return rewriteFlatPreaggregatedDimensionJoin(collapsed ?? ast);
+}
+
+/** Collapse only bijective direct-column wrappers; every projected value and
+ * its source survives exactly once. No predicates, ordering, aggregation,
+ * limits or extra CTEs can be erased by this proof. The resulting query still
+ * goes through the regular authorization, grain and execution checks. */
+function collapsePreaggregateProjectionWrappers(ast: Record<string, unknown>): Record<string, unknown> | null {
+  const output = structuredClone(ast);
+  if (!Array.isArray(output.from) || output.from.length !== 2) return null;
+  const relation = asRecord(output.from[0]); if (!relation) return null;
+  const ident = (value: unknown): value is string => typeof value === "string" && /^[a-z_][a-z0-9_]*$/u.test(value)
+    && !["__proto__", "prototype", "constructor"].includes(value);
+  const rename = (base: Record<string, unknown>, wrapper: Record<string, unknown>, source: string): boolean => {
+    if (wrapper.type !== "select" || wrapper.with || wrapper._next || wrapper.distinct || wrapper.options || wrapper.where || wrapper.groupby || wrapper.having || wrapper.orderby || wrapper.limit || wrapper.window || wrapper.for_update || wrapper.into || !Array.isArray(wrapper.from) || wrapper.from.length !== 1 || !Array.isArray(wrapper.columns) || !Array.isArray(base.columns)) return false;
+    const from = asRecord(wrapper.from[0]);
+    if (!from || from.db || from.join || (from.table !== source && !(source === "" && from.expr)) || (source && from.expr)) return false;
+    const alias = String(from.as || from.table || ""); if (!ident(alias)) return false;
+    const original = new Map<string, Record<string, unknown>>();
+    for (const raw of base.columns) {
+      const col = asRecord(raw); const expr = asRecord(col?.expr);
+      const name = col?.as || (expr?.type === "column_ref" ? expr.column : undefined);
+      if (!col || !ident(name) || original.has(name)) return false;
+      original.set(name, col);
+    }
+    const names = new Map<string, string>(); const used = new Set<string>();
+    for (const raw of wrapper.columns) {
+      const col = asRecord(raw); const expr = asRecord(col?.expr);
+      if (!col || expr?.type !== "column_ref" || expr.collate || !ident(expr.column) || (expr.table && expr.table !== alias)) return false;
+      const target = col.as || expr.column;
+      if (!ident(target) || !original.has(expr.column) || names.has(expr.column) || used.has(target)) return false;
+      names.set(expr.column, target); used.add(target);
+    }
+    if (!names.size || names.size !== original.size) return false;
+    for (const [old, col] of original) col.as = names.get(old)!;
+    return true;
+  };
+  if (Array.isArray(output.with) && output.with.length > 1 && output.with.length <= 8 && typeof relation.table === "string" && !relation.expr) {
+    const entries = output.with.map(asRecord);
+    if (entries.some((entry) => !entry || entry.columns)) return null;
+    const names = entries.map(cteName);
+    if (names.some((name) => !ident(name)) || new Set(names).size !== names.length || relation.table !== names.at(-1)) return null;
+    const base = nestedSelect(entries[0]); if (!base) return null;
+    for (let i = 1; i < entries.length; i += 1) {
+      const wrapper = nestedSelect(entries[i]);
+      if (!wrapper || !rename(base, wrapper, names[i - 1]!)) return null;
+    }
+    const last = entries.at(-1)!; const stmt = asRecord(last.stmt);
+    if (!stmt || !asRecord(stmt.ast)) return null;
+    stmt.ast = base; output.with = [last];
+    return output;
+  }
+  if (!output.with && relation.expr && typeof relation.as === "string") {
+    let current = asRecord(asRecord(relation.expr)?.ast); const wrappers: Record<string, unknown>[] = [];
+    while (current && Array.isArray(current.from) && current.from.length === 1 && asRecord(current.from[0])?.expr && wrappers.length < 8) {
+      wrappers.push(current);
+      current = asRecord(asRecord(asRecord(current.from[0])?.expr)?.ast);
+    }
+    if (!current || !wrappers.length) return null;
+    for (const wrapper of wrappers.reverse()) if (!rename(current, wrapper, "")) return null;
+    const expr = asRecord(relation.expr); if (!expr) return null;
+    expr.ast = current;
+    return output;
+  }
+  return null;
+}
+
+function rewriteFlatPreaggregatedDimensionJoin(ast: Record<string, unknown>): { sql: string; fact: string; grain: string[] } | null {
   try {
     if (ast._next || ast.distinct || ast.options || ast.where || ast.having || ast.limit || ast.window || ast.for_update || !Array.isArray(ast.from) || ast.from.length !== 2 || !Array.isArray(ast.columns)) return null;
     const left = asRecord(ast.from[0]); const right = asRecord(ast.from[1]);
