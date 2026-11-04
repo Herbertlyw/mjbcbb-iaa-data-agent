@@ -24,8 +24,8 @@ function page() {
     send(seq: number, type: string) { this.onmessage?.({ data: JSON.stringify({ seq, type, payload: {} }), lastEventId: String(seq) }); }
   }
   const context = vm.createContext({ document, EventSource: MockSource, setTimeout: (fn: () => void) => { timers.push(fn); } });
-  vm.runInContext(script.replace(/^\s*initialize\(\);\s*$/mu, "") + "\nglobalThis.testApi = { state, listen, renderCalculationTables, displayCell };", context);
-  const api = context.testApi as { state: { jobId: string | null; lastSeq: number }; listen: (id: string) => void; renderCalculationTables: (analysis: unknown) => string; displayCell: (value: unknown) => unknown };
+  vm.runInContext(script.replace(/^\s*initialize\(\);\s*$/mu, "") + "\nglobalThis.testApi = { state, listen, renderCalculationTables, displayCell, usageSummary };", context);
+  const api = context.testApi as { state: { jobId: string | null; lastSeq: number }; listen: (id: string) => void; renderCalculationTables: (analysis: unknown) => string; displayCell: (value: unknown) => unknown; usageSummary: (value: unknown) => string };
   return { api, timers, sources: MockSource.instances };
 }
 
@@ -40,6 +40,15 @@ test("旧任务延迟重连不能关闭新任务的事件流", () => {
   assert.equal(sources.length, 2);
   assert.equal(sources[1]!.closed, false);
   assert.match(sources[1]!.url, /\/new\/events\?after=0$/u);
+});
+
+test("预算拒绝与可能已派发次数在页面分别展示，未知用量不写成零", () => {
+  const { api } = page();
+  const html = api.usageSummary({ usage: { model_attempts: 2, model_calls: 1, provider_not_dispatched: 1, provider_completed: 1, provider_outcome_unknown: 0, input_tokens: 4308, output_tokens: 78, usage_source: "reported" } });
+  assert.match(html, /模型尝试至少 2/); assert.match(html, /可能已派发上限 1/); assert.match(html, /明确未派发 1/);
+  assert.match(html, /输入 token：4308/);
+  const unknown = api.usageSummary({ usage: { model_attempts: 1, model_calls: 0, provider_not_dispatched: 1, provider_completed: 0, provider_outcome_unknown: 0, input_tokens: null, output_tokens: null, usage_source: "not_dispatched" } });
+  assert.match(unknown, /输入 token：未知/); assert.doesNotMatch(unknown, /输入 token：0/);
 });
 
 test("页面展示经核验的变换、NULL 对齐状态及绑定哈希的续页，并转义显示值", () => {

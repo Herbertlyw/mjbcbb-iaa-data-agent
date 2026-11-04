@@ -415,6 +415,10 @@ export interface JobRecord {
   created_at: string;
   usage?: {
     model_calls: number;
+    model_attempts?: number;
+    provider_not_dispatched?: number;
+    provider_completed?: number;
+    provider_outcome_unknown?: number;
     tool_calls: number;
     input_tokens: number | null;
     output_tokens: number | null;

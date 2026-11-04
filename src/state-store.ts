@@ -16,6 +16,10 @@ export interface StoredSession {
 
 export interface JobUsage {
   model_calls: number;
+  model_attempts?: number;
+  provider_not_dispatched?: number;
+  provider_completed?: number;
+  provider_outcome_unknown?: number;
   tool_calls: number;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -132,7 +136,7 @@ export interface ProviderStepSettle {
   jobId: string;
   owner: string;
   fence: number;
-  status: "completed" | "error" | "outcome_unknown";
+  status: "completed" | "error" | "outcome_unknown" | "not_dispatched";
   inputTokens: number | null;
   outputTokens: number | null;
   usageSource: "simulated" | "reported" | "unknown";
@@ -148,7 +152,7 @@ export interface ProviderStepRecord {
   fence: number;
   provider: string;
   model: string;
-  status: "dispatched" | "completed" | "error" | "outcome_unknown";
+  status: "dispatched" | "completed" | "error" | "outcome_unknown" | "not_dispatched";
   input_tokens: number | null;
   output_tokens: number | null;
   usage_source: "simulated" | "reported" | "unknown";
@@ -729,13 +733,14 @@ export class SqliteStateStore implements StateStore {
         | undefined;
       const step = this.db.prepare("SELECT * FROM provider_steps WHERE step_id = ?").get(input.stepId) as Record<string, unknown> | undefined;
       if (!step) return { ok: false, code: "step_missing" };
+      if (String(step.job_id) !== input.jobId) return { ok: false, code: "provider_fence_rejected" };
       if (!job || job.lease_owner !== input.owner || job.status !== "running" || job.fence !== input.fence || !job.lease_until || job.lease_until <= Date.now()) {
         return { ok: false, code: "provider_fence_rejected" };
       }
       const settlement = String(step.settlement ?? "pending");
       const sameTokens = nullableNumber(step.input_tokens) === input.inputTokens && nullableNumber(step.output_tokens) === input.outputTokens;
       if (settlement === "settled") {
-        return sameTokens && String(step.status) === input.status && String(step.usage_source) === input.usageSource
+        return sameTokens && String(step.status) === input.status && String(step.usage_source) === input.usageSource && (input.status !== "not_dispatched" || (step.error_code ?? null) === input.errorCode)
           ? { ok: true, code: "idempotent" }
           : { ok: false, code: "settlement_conflict" };
       }
@@ -757,6 +762,12 @@ export class SqliteStateStore implements StateStore {
       }
       if (Number(step.fence) !== input.fence || String(step.status) !== "dispatched") {
         return { ok: false, code: "provider_fence_rejected" };
+      }
+      if (input.status === "not_dispatched") {
+        if (input.inputTokens !== null || input.outputTokens !== null || input.usageSource !== "unknown" || !input.errorCode?.startsWith("global_budget_")) return { ok: false, code: "settlement_conflict" };
+        this.db.prepare("UPDATE turn_budgets SET reserved_tokens = reserved_tokens - ?, model_calls_reserved = model_calls_reserved - 1 WHERE job_id = ?").run(Number(step.reserved_total), input.jobId);
+        this.db.prepare("UPDATE provider_steps SET status = 'not_dispatched', settlement = 'settled', input_tokens = NULL, output_tokens = NULL, usage_source = 'unknown', duration_ms = ?, error_code = ? WHERE step_id = ? AND settlement = 'pending'").run(input.durationMs, input.errorCode, input.stepId);
+        return { ok: true, code: "not_dispatched" };
       }
       const known = input.status === "completed"
         && (input.usageSource === "simulated" || input.usageSource === "reported")

@@ -869,7 +869,18 @@ function measuredUsage(
 ) {
   if (piProvider === "openai-compatible" || piProvider === "deepseek") {
     const usage = usageFromSteps(steps);
-    return { model_calls: modelCalls, tool_calls: toolCalls, cost: null, ...usage };
+    const possibleDispatches = steps.filter((step) => step.status !== "not_dispatched");
+    return {
+      model_calls: possibleDispatches.length,
+      // Recovery can start a new listener after a prior persisted attempt.
+      // Failed reservations have no row, so the combined value is a lower
+      // bound across an interrupted process rather than an invented total.
+      model_attempts: Math.max(modelCalls, steps.length),
+      provider_not_dispatched: steps.length - possibleDispatches.length,
+      provider_completed: possibleDispatches.filter((step) => step.status === "completed" && step.settlement === "settled").length,
+      provider_outcome_unknown: possibleDispatches.filter((step) => step.status === "dispatched" || step.status === "outcome_unknown" || step.settlement === "held_unknown").length,
+      tool_calls: toolCalls, cost: null, ...usage,
+    };
   }
   return {
     model_calls: modelCalls,

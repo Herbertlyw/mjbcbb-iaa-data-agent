@@ -615,13 +615,14 @@ async function settleProviderStep(input) {
     const job = jobs[0];
     const step = steps[0];
     if (!step) return { ok: false, code: "step_missing" };
+    if (step.job_id !== input.jobId) return { ok: false, code: "provider_fence_rejected" };
     if (!job || job.lease_owner !== input.owner || job.status !== "running" || Number(job.fence) !== input.fence || !(await unexpired(conn, job))) {
       return { ok: false, code: "provider_fence_rejected" };
     }
     const settlement = String(step.settlement ?? "pending");
     const sameTokens = nullable(step.input_tokens) === input.inputTokens && nullable(step.output_tokens) === input.outputTokens;
     if (settlement === "settled") {
-      return sameTokens && String(step.status) === input.status && String(step.usage_source) === input.usageSource
+      return sameTokens && String(step.status) === input.status && String(step.usage_source) === input.usageSource && (input.status !== "not_dispatched" || (step.error_code ?? null) === input.errorCode)
         ? { ok: true, code: "idempotent" }
         : { ok: false, code: "settlement_conflict" };
     }
@@ -647,6 +648,12 @@ async function settleProviderStep(input) {
     }
     const [budgets] = await conn.query("SELECT job_id FROM turn_budgets WHERE job_id = ? FOR UPDATE", [input.jobId]);
     if (!budgets[0]) return { ok: false, code: "step_missing" };
+    if (input.status === "not_dispatched") {
+      if (input.inputTokens !== null || input.outputTokens !== null || input.usageSource !== "unknown" || !input.errorCode?.startsWith("global_budget_")) return { ok: false, code: "settlement_conflict" };
+      await conn.query("UPDATE turn_budgets SET reserved_tokens = reserved_tokens - ?, model_calls_reserved = model_calls_reserved - 1 WHERE job_id = ?", [Number(step.reserved_total), input.jobId]);
+      await conn.query("UPDATE provider_steps SET status = 'not_dispatched', settlement = 'settled', input_tokens = NULL, output_tokens = NULL, usage_source = 'unknown', duration_ms = ?, error_code = ? WHERE step_id = ? AND settlement = 'pending'", [input.durationMs, input.errorCode, input.stepId]);
+      return { ok: true, code: "not_dispatched" };
+    }
     const known = input.status === "completed" && ["simulated", "reported"].includes(input.usageSource) && input.inputTokens !== null && input.outputTokens !== null && input.inputTokens + input.outputTokens > 0;
     if (known) {
       await conn.query(

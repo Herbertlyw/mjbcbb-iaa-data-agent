@@ -717,9 +717,20 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       return ((await created.json()) as { session_id: string }).session_id;
     };
     const glass = await postQuestion(apiPort, await another(), "玻璃鲦在德国 iOS、雾帆，2026-10-06 到 2026-10-12 的新增用户是多少？");
+    assert.equal(glass.status, "completed", JSON.stringify(glass.error));
     assert.equal(glass.analysis?.sources?.[0]?.engine, "clickhouse-local", `${glass.status} ${glass.analysis?.answer ?? ""}`);
     assert.match(glass.analysis?.answer ?? "", /48/);
     assert.equal((glass.analysis?.answer ?? "").includes("99999"), false);
+    assert.ok(glass.analysis?.server_reasons?.includes("model_draft_not_verified"));
+    assert.ok(glass.analysis?.server_reasons?.includes("clickhouse_observation_nonatomic"));
+    const marker = await postQuestion(apiPort, await another(), "合成空值标记投影：三天每日新增和合计。");
+    assert.equal(marker.status, "completed", JSON.stringify(marker.error));
+    assert.match(marker.analysis?.answer ?? "", /合计 220；单位 人/);
+    assert.doesNotMatch(marker.analysis?.answer ?? "", /99999/);
+    assert.ok(marker.analysis?.server_reasons?.includes("null_marker_preview_sanitized"));
+    const markerRows = marker.analysis?.sources?.[0]?.rows as Array<Record<string, unknown>>;
+    assert.deepEqual(markerRows.map((row) => row.new_users), [100, 0, 120]);
+    assert.ok(markerRows.every((row) => !Object.hasOwn(row, "is_null")));
     const japan = await postQuestion(apiPort, await another(), "纸灯在日本、iOS、雾帆，2026-10-06 到 2026-10-12 的新增用户是多少？");
     assert.match(japan.analysis?.answer ?? "", /70/);
     const joined = await postQuestion(apiPort, await another(), "把纸灯美国 iOS 的新增和变现连表后告诉我新增合计。");
@@ -783,6 +794,25 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal((updated as { affectedRows?: number }).affectedRows ?? 0, 0);
     assert.equal((steps as Array<{ status: string; input_tokens: number | null; usage_source: string }>)[0]?.status, "outcome_unknown");
     assert.equal((steps as Array<{ input_tokens: number | null }>)[0]?.input_tokens, null);
+    await stopChild(recovered);
+    const cappedOptions = { path: path.join(dir, "capped-budget.sqlite"), budgetId: "capped-integration", maxRequests: 1, maxTokens: 100000 };
+    const capped = await GlobalBudget.activate(cappedOptions);
+    try {
+      const cappedWorker = spawn(process.execPath, ["--import", "tsx", "src/worker.ts"], { cwd: root, env: { ...baseEnv, DATAAGENT_TEST_GLOBAL_BUDGET_PATH: cappedOptions.path, DEEPSEEK_BUDGET_ID: cappedOptions.budgetId, DEEPSEEK_BUDGET_MAX_REQUESTS: "1", DEEPSEEK_BUDGET_MAX_TOKENS: "100000" }, stdio: "ignore" });
+      children.push(cappedWorker);
+      const before = fake.observations.length;
+      const blocked = await postQuestion(apiPort, await another(), question);
+      assert.equal(blocked.status, "failed");
+      assert.equal(blocked.error?.code, "global_budget_exhausted");
+      assert.equal(fake.observations.length - before, 1);
+      assert.equal(blocked.usage?.model_attempts, 2);
+      assert.equal(blocked.usage?.model_calls, 1);
+      assert.equal(blocked.usage?.provider_not_dispatched, 1);
+      assert.equal(blocked.usage?.usage_source, "simulated");
+      assert.ok((blocked.usage?.input_tokens ?? 0) > 0);
+      assert.equal((await capped.stats())?.dispatched_count, 1);
+      await stopChild(cappedWorker);
+    } finally { await capped.close(); }
   } finally {
     await globalBudget.close();
     for (const child of children) if (child.exitCode === null) child.kill("SIGKILL");
@@ -923,8 +953,8 @@ async function waitJob(port: number, jobId: string) {
       status: string;
       job_id: string;
       error?: { code?: string; message?: string };
-      usage?: { input_tokens: number | null; usage_source?: string };
-      analysis?: { status?: string; answer?: string; resource_hashes?: Record<string, string>; analysis_declaration?: { provenance?: string }; alignment_results?: Array<{ resource_id?: string; rows: Array<{ group: Record<string,string|null>; status: string; result?: { value: string | null } | null }> }>; transform_results?: Array<{ result: { rows: Array<Record<string, unknown>> } }>; sources?: Array<{ engine?: string; resource_id?: string; execution_id?: string; sql?: string; executed_sql?: string; execution_settings?: { join_use_nulls?: boolean }; contract_revisions?: Record<string, string>; observed_at?: string; freshness_receipts?: unknown[]; total_rows?: number; rows?: unknown[]; preview_has_more?: boolean }> };
+      usage?: { input_tokens: number | null; usage_source?: string; model_attempts?: number; model_calls?: number; provider_not_dispatched?: number };
+      analysis?: { status?: string; answer?: string; server_reasons?: string[]; resource_hashes?: Record<string, string>; analysis_declaration?: { provenance?: string }; alignment_results?: Array<{ resource_id?: string; rows: Array<{ group: Record<string,string|null>; status: string; result?: { value: string | null } | null }> }>; transform_results?: Array<{ result: { rows: Array<Record<string, unknown>> } }>; sources?: Array<{ engine?: string; resource_id?: string; execution_id?: string; sql?: string; executed_sql?: string; execution_settings?: { join_use_nulls?: boolean }; contract_revisions?: Record<string, string>; observed_at?: string; freshness_receipts?: unknown[]; total_rows?: number; rows?: unknown[]; preview_has_more?: boolean }> };
       events: Array<{ type: string; payload: Record<string, unknown> }>;
     };
     if (!["queued", "running"].includes(job.status)) return job;

@@ -94,7 +94,14 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
       if (config.globalBudgetId) {
         globalBudget = await GlobalBudget.open({ path: config.globalBudgetPath, budgetId: config.globalBudgetId, maxRequests: config.globalBudgetMaxRequests, maxTokens: config.globalBudgetMaxTokens });
         const reservation = await globalBudget.reserve({ stepId, jobId: ledger.jobId, estimatedInput: estimate.tokens, reservedOutput: config.piMaxOutputTokens });
-        if (!reservation.ok) throw new Error(reservation.code);
+        if (!reservation.ok) {
+          // A definitive gate refusal occurs before the transport exists. Only
+          // this known refusal may release the task reservation; a timeout or
+          // lost response remains unknown and is never retried automatically.
+          const rejected = await ledger.state.settleProviderStep({ stepId, jobId: ledger.jobId, owner: ledger.owner, fence: ledger.fence, status: "not_dispatched", inputTokens: null, outputTokens: null, usageSource: "unknown", durationMs: Date.now() - started, errorCode: reservation.code });
+          if (!rejected.ok) throw new Error(rejected.code);
+          throw new Error(reservation.code);
+        }
         globalReserved = true;
         if (options?.signal?.aborted) throw new Error("provider_cancelled");
         const dispatch = await globalBudget.markDispatched(stepId);
@@ -206,15 +213,17 @@ export const fetchDeepSeekOnly: typeof fetch = async (input, init) => {
 export function usageFromSteps(steps: ProviderStepRecord[]): {
   input_tokens: number | null;
   output_tokens: number | null;
-  usage_source: "simulated" | "reported" | "unknown";
+  usage_source: "simulated" | "reported" | "unknown" | "not_dispatched";
 } {
-  const source = steps[0]?.usage_source;
-  if (source === undefined || source === "unknown" || steps.some((step) => step.usage_source !== source || step.input_tokens === null || step.output_tokens === null)) {
+  const sent = steps.filter((step) => step.status !== "not_dispatched");
+  if (!sent.length && steps.length) return { input_tokens: null, output_tokens: null, usage_source: "not_dispatched" };
+  const source = sent[0]?.usage_source;
+  if (source === undefined || source === "unknown" || sent.some((step) => step.usage_source !== source || step.input_tokens === null || step.output_tokens === null)) {
     return { input_tokens: null, output_tokens: null, usage_source: "unknown" };
   }
   return {
-    input_tokens: steps.reduce((sum, step) => sum + (step.input_tokens ?? 0), 0),
-    output_tokens: steps.reduce((sum, step) => sum + (step.output_tokens ?? 0), 0),
+    input_tokens: sent.reduce((sum, step) => sum + (step.input_tokens ?? 0), 0),
+    output_tokens: sent.reduce((sum, step) => sum + (step.output_tokens ?? 0), 0),
     usage_source: source,
   };
 }

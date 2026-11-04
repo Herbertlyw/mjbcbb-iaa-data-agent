@@ -120,6 +120,14 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
     assert.equal((await state.call("settleProviderStep", reported)).code, "idempotent");
     assert.equal((await state.call("settleProviderStep", { ...reported, usageSource: "simulated" })).code, "settlement_conflict");
     assert.equal((await state.call("listProviderSteps", job.job_id)).find((item) => item.step_id === "step_reported")?.usage_source, "reported");
+    assert.equal((await state.call("beginProviderStep", input("step_blocked"))).ok, true);
+    const notSent = { stepId: "step_blocked", jobId: job.job_id, owner: "worker-a", fence: claim.fence, status: "not_dispatched" as const, inputTokens: null, outputTokens: null, usageSource: "unknown" as const, durationMs: 5, errorCode: "global_budget_exhausted" };
+    assert.equal((await state.call("settleProviderStep", { ...notSent, fence: claim.fence - 1 })).code, "provider_fence_rejected");
+    assert.equal((await state.call("settleProviderStep", notSent)).code, "not_dispatched");
+    assert.equal((await state.call("settleProviderStep", notSent)).code, "idempotent");
+    assert.equal((await state.call("settleProviderStep", { ...notSent, errorCode: "global_budget_active_mismatch" })).code, "settlement_conflict");
+    assert.equal((await state.call("getTurnBudget", job.job_id))?.reserved_tokens, 0);
+    assert.equal((await state.call("listProviderSteps", job.job_id)).find((item) => item.step_id === "step_blocked")?.status, "not_dispatched");
     const heldBegin = (await state.call("beginProviderStep", input("step_hold")));
     assert.equal(heldBegin.ok, true, heldBegin.code);
     const missing = (await state.call("settleProviderStep", {

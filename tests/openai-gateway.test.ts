@@ -29,10 +29,43 @@ test("跨任务预算接入 Pi 派发，限流未知用量后不会跨会话超�
       assert.equal(b.status, "failed");
       assert.equal(fake.observations.length, 1);
       assert.ok([a.error?.code, b.error?.code].includes("global_budget_exhausted"));
+      const blocked = [a, b].find((job) => job.error?.code === "global_budget_exhausted")!;
+      assert.equal(blocked.usage?.model_attempts, 1);
+      assert.equal(blocked.usage?.model_calls, 0);
+      assert.equal(blocked.usage?.provider_not_dispatched, 1);
+      assert.equal(blocked.usage?.provider_outcome_unknown, 0);
+      assert.equal(blocked.usage?.usage_source, "not_dispatched");
+      assert.equal(blocked.usage?.input_tokens, null);
+      const blockedStep = runtime.state.listProviderSteps(blocked.job_id)[0];
+      assert.equal(blockedStep?.status, "not_dispatched");
+      assert.equal(blockedStep?.settlement, "settled");
       const stats = await scope.stats();
       assert.equal(stats?.requests_reserved, 1);
       assert.equal(stats?.unknown_count, 1);
       assert.equal(stats?.reported_input, null);
+    });
+  } finally { await fake.close(); await scope.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("同任务先收到用量再被跨任务预算拒绝时，不把拒绝计为派发或冲掉已报用量", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "global-gateway-known-"));
+  const options = { path: path.join(dir, "budget.sqlite"), budgetId: "known-then-blocked", maxRequests: 1, maxTokens: 100000 };
+  const scope = await GlobalBudget.activate(options);
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "happy", globalBudgetPath: options.path, globalBudgetId: options.budgetId, globalBudgetMaxRequests: 1, globalBudgetMaxTokens: options.maxTokens }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成问题");
+      assert.equal(job.status, "failed");
+      assert.equal(job.error?.code, "global_budget_exhausted");
+      assert.equal(fake.observations.length, 1);
+      assert.equal(job.usage?.model_attempts, 2);
+      assert.equal(job.usage?.model_calls, 1);
+      assert.equal(job.usage?.provider_not_dispatched, 1);
+      assert.equal(job.usage?.provider_completed, 1);
+      assert.equal(job.usage?.usage_source, "simulated");
+      assert.ok((job.usage?.input_tokens ?? 0) > 0);
+      assert.ok((job.usage?.output_tokens ?? 0) > 0);
     });
   } finally { await fake.close(); await scope.close(); rmSync(dir, { recursive: true, force: true }); }
 });
@@ -343,8 +376,11 @@ test("本机假服务请求体带有系统提示、原话、工具定义，off �
     stateDatabasePath: path.join(dir, "state.sqlite"),
     freshnessPath: path.join(dir, "freshness-current.json"),
   });
+  let offRuntime: ReturnType<typeof openRuntime> | undefined;
+  let lowRuntime: ReturnType<typeof openRuntime> | undefined;
+  let checker: ReturnType<typeof openRuntime> | undefined;
   try {
-    const offRuntime = openRuntime(dir, { ...config, databasePath: path.join(dir, "off-business.sqlite"), stateDatabasePath: path.join(dir, "off-state.sqlite"), freshnessPath: path.join(dir, "off-freshness.json") });
+    offRuntime = openRuntime(dir, { ...config, databasePath: path.join(dir, "off-business.sqlite"), stateDatabasePath: path.join(dir, "off-state.sqlite"), freshnessPath: path.join(dir, "off-freshness.json") });
     const offSession = analyst(offRuntime);
     const offJob = await ask(offRuntime, offSession.session_id, question, "off-key", { reasoning: "off" });
     assert.equal(offJob.reasoning, "off");
@@ -353,24 +389,29 @@ test("本机假服务请求体带有系统提示、原话、工具定义，off �
     assert.equal(fake.observations.at(-1)?.sawUserText, true);
     assert.equal(fake.observations.at(-1)?.sawToolDefinition, true);
     await offRuntime.close({ abandon: true });
+    offRuntime = undefined;
 
-    const lowRuntime = openRuntime(dir, config);
+    lowRuntime = openRuntime(dir, config);
     const lowSession = analyst(lowRuntime);
     const lowJob = await ask(lowRuntime, lowSession.session_id, question, "low-key", { reasoning: "low" });
     assert.equal(lowJob.reasoning, "low");
     assert.equal(fake.observations.at(-1)?.reasoningEffort, "low");
     await lowRuntime.close({ abandon: true });
+    lowRuntime = undefined;
     const child = spawnSync(process.execPath, ["--import", "tsx", "tests/read-reasoning.ts", path.join(dir, "state.sqlite"), path.join(dir, "business.sqlite"), path.join(dir, "freshness-current.json"), fake.url, lowJob.job_id], {
       cwd: path.join(import.meta.dirname, ".."),
       encoding: "utf8",
     });
     assert.equal(child.status, 0, child.stderr);
     assert.equal(child.stdout.trim(), "low");
-    const checker = openRuntime(dir, { ...config, startWorker: false });
-    assert.throws(() => checker.jobs.submit(lowSession.session_id, question, "bad-level", { reasoning: "max" }), /推理档位没有启用/);
+    checker = openRuntime(dir, { ...config, startWorker: false });
+    assert.throws(() => checker!.jobs.submit(lowSession.session_id, question, "bad-level", { reasoning: "max" }), /推理档位没有启用/);
     await checker.close();
+    checker = undefined;
   } finally {
+    await Promise.allSettled([offRuntime?.close({ abandon: true }), lowRuntime?.close({ abandon: true }), checker?.close({ abandon: true })]);
     await fake.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

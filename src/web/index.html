@@ -310,6 +310,12 @@
       return `<tr><td>${escapeHtml(group)}</td><td>${escapeHtml(value(row.left) + counts("left"))}</td><td>${escapeHtml(value(row.right) + counts("right"))}</td><td>${escapeHtml(value(row.result))}</td><td>${escapeHtml((names[row.status] || "不可验证") + (incomplete ? "（来源覆盖不完整）" : ""))}</td></tr>`;
     }
 
+    function usageSummary(job) {
+      const usage = job.usage;
+      if (!usage || !Number.isSafeInteger(usage.model_attempts)) return "";
+      return `<p class="muted">模型尝试至少 ${escapeHtml(usage.model_attempts)} · 可能已派发上限 ${escapeHtml(usage.model_calls)} · 明确未派发 ${escapeHtml(usage.provider_not_dispatched)} · 成功结算 ${escapeHtml(usage.provider_completed)} · 结果或用量未知 ${escapeHtml(usage.provider_outcome_unknown)}。输入 token：${escapeHtml(usage.input_tokens ?? "未知")}；输出 token：${escapeHtml(usage.output_tokens ?? "未知")}；来源：${escapeHtml(usage.usage_source || "未知")}。</p>`;
+    }
+
     function showJob(job) {
       state.jobId = job.job_id;
       badge(job.status);
@@ -323,7 +329,7 @@
         const note = job.status === "cancelled"
           ? "服务端终态：已取消。没有提交分析。"
           : job.error ? job.error.message : pending ? "等待服务端结论。" : `服务端终态：${labels[job.status] || job.status}。没有提交分析。`;
-        resultEl.innerHTML = `<p class="muted">${escapeHtml(job.user_text)}</p><p>${escapeHtml(note)}</p>${["failed", "cancelled", "timed_out"].includes(job.status) ? '<button id="retry" class="secondary">重新提问</button>' : ""}`;
+        resultEl.innerHTML = `<p class="muted">${escapeHtml(job.user_text)}</p><p>${escapeHtml(note)}</p>${usageSummary(job)}${["failed", "cancelled", "timed_out"].includes(job.status) ? '<button id="retry" class="secondary">重新提问</button>' : ""}`;
         document.querySelector("#retry")?.addEventListener("click", () => run(() => ask(job.user_text)));
         return;
       }
@@ -354,6 +360,7 @@
       resultEl.innerHTML = `
         <p class="muted">${escapeHtml(job.user_text)}</p>
         <p class="muted">模型 ${escapeHtml(job.model_id || "未记录")} · 档位 ${escapeHtml(job.reasoning || "未记录")}</p>
+        ${usageSummary(job)}
         <p class="muted">服务端判定：${escapeHtml(labels[analysis.status] || analysis.status)}。模型建议是 ${escapeHtml(analysis.model_suggested_status)}，不会单独生效。草稿中的数字不会自动视为已验证。</p>
         ${job.error ? `<p>${escapeHtml(job.error.message)}</p>` : ""}
         <div class="answer">${escapeHtml(analysis.answer)}</div>
