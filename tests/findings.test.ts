@@ -78,7 +78,7 @@ test("不同指标、分组和无依据草稿不会被当成已验证数字", as
     assert.doesNotMatch(String(cited.answer), /星云新增|余烬德国新增/);
     assert.match(String(cited.answer), /predicted|广告预测/);
     assert.equal(String(cited.answer).includes("99999"), false);
-    assert.match((cited.limitations as string[]).join(" "), /没有逐一验证/);
+    assert.match((cited.limitations as string[]).join(" "), /模型草稿.*未作为已验证事实/);
     assert.notEqual(cited.status, "completed");
   });
 });

@@ -152,6 +152,7 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   const latest = turn[0] ? messageText(turn[0]) : "";
   const earlierUsers = messages.slice(0, messages.length - turn.length).filter((message) => message.role === "user").map(messageText);
   const hasBase = earlierUsers.some((text) => text.includes("纸灯") && text.includes("美国") && text.includes("iOS") && text.includes("雾帆") && text.includes("2026-10-06") && text.includes("2026-10-12"));
+  if (latest.includes("合成空值标记投影")) return scripted(turn, nullMarkerSteps);
   if (latest.includes("不调用记录")) return scripted(turn, noRecordSteps);
   if (latest.includes("合成收入成本比")) return scripted(turn, ratioSteps);
   if (latest.includes("合成多渠道收入成本比")) return scripted(turn, groupedRatioSteps);
@@ -188,6 +189,15 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("日本") && (hasBase || latest.includes("雾帆"))) return scripted(turn, japanSteps);
   if (latest.includes("连表")) return scripted(turn, unsafeJoinSteps);
   return scripted(turn, defaultSteps);
+}
+
+function nullMarkerSteps(ids: string[]) {
+  return [
+    { id: "null_marker_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "null_marker_query", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, new_users, isNull(new_users) AS is_null FROM fact_fox_daily_install WHERE event_date >= toDate('2026-10-06') AND event_date <= toDate('2026-10-08') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads' ORDER BY event_date" }) },
+    { id: "null_marker_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "new_users", predicted: "actual_only", as: "total" }, { op: "count_zero", column: "new_users", as: "zero" }] }) },
+    { id: "null_marker_update", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "不可信草稿 99999", resource_ids: ids }) },
+  ];
 }
 
 function inCountrySteps(ids: string[]) {

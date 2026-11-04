@@ -142,6 +142,35 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
       assert.match(String(groupedAnswer.answer), /分组求和结果再求和 220；单位 人/);
       assert.match(String(groupedAnswer.answer), /分组聚合输出为零的分组数 1/);
 
+      // Reproduce the real model's harmless NULL-marker projection. The marker
+      // itself is not a trusted label: only independently checked base columns
+      // and calculations are published.
+      for (const [country, expected, daily] of [["JP", 30, [10, 10, 10]], ["US", 220, [100, 0, 120]]] as const) {
+        const nullProjection = await runtime.tools.query(rollSession.session_id, { sql: `SELECT event_date, new_users, isNull(new_users) AS is_null FROM fact_fox_daily_install WHERE event_date >= toDate('2026-10-06') AND event_date <= toDate('2026-10-08') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = '${country}' AND channel_id = 'mist_ads' ORDER BY event_date` });
+        assert.ok(nullProjection.ok, JSON.stringify(nullProjection)); if (!nullProjection.ok) return;
+        assert.deepEqual((nullProjection.rows as Array<{new_users: number}>).map((row) => row.new_users), [...daily]);
+        const calculation = await runtime.tools.calculateSessionCells(rollSession.session_id, { resource_id: String(nullProjection.resource_id), operations: [{ op: "sum", column: "new_users", predicted: "actual_only", as: "total" }, { op: "count_null", column: "new_users", as: "nulls" }] });
+        assert.ok(calculation.ok, JSON.stringify(calculation)); if (!calculation.ok) return;
+        const answer = await runtime.tools.updateAnalysis(rollSession.session_id, { suggested_status: "completed", draft_answer: "错误草稿 99999", resource_ids: [String(nullProjection.resource_id), String(calculation.resource_id)] });
+        assert.ok(answer.ok, JSON.stringify(answer)); if (!answer.ok) return;
+        assert.equal(answer.status, "completed", JSON.stringify(answer.server_reasons));
+        assert.match(String(answer.answer), new RegExp(`合计 ${expected}；单位 人`));
+        assert.doesNotMatch(String(answer.answer), /99999/);
+        assert.ok((answer.server_reasons as string[]).includes("clickhouse_observation_nonatomic"));
+        const rows = (answer.sources as Array<{rows: Array<Record<string, unknown>>}>)[0]!.rows;
+        assert.deepEqual(rows.map((row) => row.new_users), [...daily]);
+        assert.ok(rows.every((row) => !Object.hasOwn(row, "is_null")));
+      }
+      const missingMarker = await runtime.tools.query(rollSession.session_id, { sql: "SELECT event_date, new_users, isNull(new_users) AS is_null FROM fact_fox_daily_install WHERE event_date >= toDate('2026-10-06') AND event_date <= toDate('2026-10-09') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads' ORDER BY event_date" });
+      assert.ok(missingMarker.ok); if (!missingMarker.ok) return;
+      const missingCalc = await runtime.tools.calculateSessionCells(rollSession.session_id, { resource_id: String(missingMarker.resource_id), operations: [{ op: "sum", column: "new_users", as: "total" }, { op: "count_null", column: "new_users", as: "missing" }] });
+      assert.ok(missingCalc.ok); if (!missingCalc.ok) return;
+      const missingAnswer = await runtime.tools.updateAnalysis(rollSession.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(missingMarker.resource_id), String(missingCalc.resource_id)] });
+      assert.ok(missingAnswer.ok); if (!missingAnswer.ok) return;
+      assert.equal(missingAnswer.status, "partial");
+      assert.ok((missingAnswer.server_reasons as string[]).includes("completeness_gap"));
+      assert.ok((missingAnswer.server_reasons as string[]).includes("missing_values_disclosed"));
+
       const counted = await runtime.tools.query(rollSession.session_id, {
         sql: "SELECT countIf(isNull(new_users)) AS missing_count, countIf(isNotNull(new_users)) AS observed_count, countIf(new_users = 0) AS zero_count FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-12' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'",
       });

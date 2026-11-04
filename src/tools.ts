@@ -3,7 +3,7 @@ import { isAnalysisDeclaration, type AnalysisDeclaration } from "./analysis-decl
 import { currentCalendarDate, isCalendarDate, type AppConfig } from "./config.js";
 import { assessCoverage, combineCoverage, coverageHasGap, provenCoverageFilters, provenCoverageScope, unknownCoverage } from "./coverage.js";
 import { plainRows } from "./database.js";
-import { verifyCell, type CellOperation, type VerifiedCell } from "./evidence.js";
+import { verifiedNullMarkerPreview, verifyCell, type CellOperation, type VerifiedCell } from "./evidence.js";
 import { compareVerifiedIntegers, type VerifiedComparison } from "./evidence-comparison.js";
 import { compareDecimalAggregates, type AggregateComparison } from "./aggregate-comparison.js";
 import { arithmeticUnit, computeArithmetic, fromAggregate, isExactZero, sumDecimalStrings, type ArithmeticOp, type ArithmeticValue } from "./exact-arithmetic.js";
@@ -1175,8 +1175,9 @@ export class ToolService {
         // raw alias-labelled preview as verified evidence in the answer.
         const columns = parseReadonlySql(original!.sql).ast.columns;
         if (Array.isArray(columns) && columns.some((item) => item && typeof item === "object" && "as" in item && item.as)) {
-          source.rows = [];
-          reasons.push("alias_preview_hidden");
+          const preview = evidence && contract ? verifiedNullMarkerPreview(evidence, contract) : null;
+          source.rows = preview ?? [];
+          reasons.push(preview ? "null_marker_preview_sanitized" : "alias_preview_hidden");
         }
       }
       else {
@@ -1359,6 +1360,13 @@ export class ToolService {
     if (reasons.includes("calculation_lineage_unsupported") && status === "completed") status = "partial";
     if (input.suggested_status === "completed" && status !== "completed") reasons.push("model_completion_was_not_authoritative");
     const limitations: string[] = [];
+    // The model's prose is retained only as an explicitly unverified draft.
+    // Its numbers must neither certify a claim nor downgrade an independently
+    // verified result: matching text cannot establish metric, scope or units.
+    if (input.draft_answer.trim()) {
+      reasons.push("model_draft_not_verified");
+      limitations.push("模型草稿及其数字、标签和解释未作为已验证事实；正式结论由本次证据生成。");
+    }
     if (reasons.includes("model_declared_unresolved")) limitations.push("模型工作记录仍有待解决问题；其范围、粒度和假设均为自报，不作为已验证事实。");
     if (input.findings?.length || input.limitations?.length) limitations.push("模型提供的标签、分组、单位、状态和自由文字未作为事实采用；数值与范围由服务端元数据生成。");
     if (reasons.includes("calculation_lineage_unsupported") || reasons.includes("query_lineage_unsupported")) limitations.push("部分表达式或计算缺少可证明的血缘，没有作为已验证数值展示。");
@@ -1372,6 +1380,7 @@ export class ToolService {
     if (reasons.includes("clickhouse_observation_nonatomic")) limitations.push("ClickHouse 查询和覆盖统计是独立读取；结果代表各次观测，不宣称跨查询原子快照或共同数据版本。");
     if (reasons.includes("coverage_observations_conflict")) limitations.push("相同范围的覆盖观测内容发生变化；跨次比较可能不一致，只能部分交付。");
     if (reasons.includes("alias_preview_hidden")) limitations.push("含模型自选列别名的结果预览已隐藏；正式数值按契约字段及单位展示。");
+    if (reasons.includes("null_marker_preview_sanitized")) limitations.push("结果预览仅显示契约原字段；模型自选的空值标记和别名没有作为可信标签展示。");
     if (reasons.includes("floating_point_approximate")) limitations.push("浮点字段及其派生值仅是近似数，尚未实现可验证的精确十进制金额计算。");
     if (reasons.includes("coverage_unknown")) limitations.push("预期覆盖范围无法确定，覆盖情况未知。");
     if (reasons.includes("freshness_version_changed")) limitations.push("新鲜度发布版本已变化或失效，受影响的数值没有作为已验证事实展示。");
@@ -1389,13 +1398,7 @@ export class ToolService {
     if (reasons.includes("clickhouse_observation_nonatomic")) derivedLines.push("结果基于各次 ClickHouse 观测；查询和覆盖统计不是同一原子快照，未证明共同数据版本。");
     if (reasons.includes("coverage_observations_conflict")) derivedLines.push("相同范围的覆盖观测内容发生变化，跨次计算结果不能作为一致数据集的完整结论。");
     derivedLines.push(...joinLines);
-    let answer = renderAnswer(status, verified, sources, input.clarification_question, derivedLines);
-    const draftNumbers = input.draft_answer.match(/\d+(?:\.\d+)?/g) ?? [];
-    if (draftNumbers.some((item) => !answer.includes(item))) {
-      limitations.push("模型草稿里有正式答案没有引用到的数字，那些数字没有逐一验证。");
-      if (status === "completed") status = "partial";
-    }
-    answer = renderAnswer(status, verified, sources, input.clarification_question, derivedLines);
+    const answer = renderAnswer(status, verified, sources, input.clarification_question, derivedLines);
     const analysis: AnalysisRecord = {
       analysis_id: newId("an"),
       job_id: jobId,

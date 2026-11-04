@@ -25,8 +25,8 @@ export interface VerifiedCell {
   excludedNulls: number;
 }
 
-/** Only direct projections from one contracted table and conjunctive, literal filters
- * are currently eligible for authoritative calculation statements. This is
+/** Direct projections plus independently checked NULL markers from one contracted
+ * table and conjunctive, literal filters are eligible. This is
  * independent of SQL admission: admitted SQL can still have unknown lineage. */
 export function verifyCell(source: QueryResource, contract: DataContract, operation: CellOperation, storedValue: number): VerifiedCell | null {
   if (source.truncated || !source.complete_population || source.tables.length !== 1 || source.tables[0] !== contract.table || !contract.series) return null;
@@ -41,15 +41,45 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
   const projections = Array.isArray(ast.columns) ? ast.columns : [];
   const projectedToField = new Map<string, string>();
   const fieldToProjected = new Map<string, string>();
+  const nullMarkers: Array<{ output: string; field: string; inverted: boolean }> = [];
+  const outputNames = new Set<string>();
   const contractNames = new Set(contract.columns.map((column) => column.name));
   for (const projection of projections) {
     const item = record(projection); const expr = record(item?.expr);
-    if (!item || !expr || expr.type !== "column_ref" || typeof expr.column !== "string" || (expr.table && expr.table !== qualifier)) return null;
+    if (!item || !expr) return null;
+    if (expr.type === "function") {
+      const name = record(expr.name);
+      const pieces = Array.isArray(name?.name) ? name.name : [];
+      const functionName = pieces.length === 1 ? record(pieces[0])?.value : undefined;
+      const args = record(expr.args);
+      const arg = Array.isArray(args?.value) && args.value.length === 1 ? record(args.value[0]) : null;
+      const output = item.as;
+      const fn = typeof functionName === "string" ? functionName.toLowerCase() : "";
+      if (source.engine !== "clickhouse-local" || !["isnull", "isnotnull"].includes(fn) || expr.over || args?.type !== "expr_list" || !arg || arg.type !== "column_ref" || typeof arg.column !== "string" || (arg.table && arg.table !== qualifier) || !contractNames.has(arg.column) || contract.sensitive_columns.includes(arg.column) || typeof output !== "string" || !/^[a-z_][a-z0-9_]*$/u.test(output) || contractNames.has(output) || outputNames.has(output)) return null;
+      outputNames.add(output);
+      nullMarkers.push({ output, field: arg.column, inverted: fn === "isnotnull" });
+      continue;
+    }
+    if (expr.type !== "column_ref" || typeof expr.column !== "string" || (expr.table && expr.table !== qualifier)) return null;
     const field = expr.column;
     const output = item.as === null || item.as === undefined ? field : item.as;
-    if (typeof output !== "string" || !/^[a-z_][a-z0-9_]*$/u.test(output) || !contractNames.has(field) || projectedToField.has(output) || fieldToProjected.has(field) || (output !== field && contractNames.has(output))) return null;
+    if (typeof output !== "string" || !/^[a-z_][a-z0-9_]*$/u.test(output) || !contractNames.has(field) || contract.sensitive_columns.includes(field) || outputNames.has(output) || fieldToProjected.has(field) || (output !== field && contractNames.has(output))) return null;
+    outputNames.add(output);
     projectedToField.set(output, field);
     fieldToProjected.set(field, output);
+  }
+  // A marker is not trusted just because the SQL names it. Recompute it from
+  // the same saved row's directly projected field, with no missing/extra keys.
+  if (nullMarkers.length) {
+    if (nullMarkers.some((marker) => !fieldToProjected.has(marker.field))) return null;
+    for (const row of source.rows) {
+      if (Object.keys(row).length !== outputNames.size || [...outputNames].some((name) => !Object.hasOwn(row, name))) return null;
+      for (const marker of nullMarkers) {
+        const original = row[fieldToProjected.get(marker.field)!];
+        const expected = marker.inverted ? Number(original !== null) : Number(original === null);
+        if (row[marker.output] !== expected && row[marker.output] !== String(expected)) return null;
+      }
+    }
   }
   const dateColumn = contract.series.date_column;
   const dimensions = new Set([...contract.series.dimensions, ...(contract.grain ?? []).filter((x) => x !== dateColumn && !contract.series!.metrics.includes(x))]);
@@ -140,6 +170,25 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
     unit: op === "sum" ? (declared?.unit || "契约未声明") : "行",
     operation: op, prediction, predictionFilter: operation.predicted ?? "any", filters, range: source.time_range, sourceResourceId: source.resource_id, excludedNulls,
   };
+}
+
+/** Present only unaliased contract columns after the NULL-marker checks.
+ * Model-selected marker names and expressions never become trusted labels. */
+export function verifiedNullMarkerPreview(source: QueryResource, contract: DataContract): Array<Record<string, unknown>> | null {
+  if (!verifyCell(source, contract, { op: "count_rows", as: "preview" }, source.rows.length)) return null;
+  let columns: unknown;
+  try { columns = parseReadonlySql(source.sql).ast.columns; } catch { return null; }
+  if (!Array.isArray(columns)) return null;
+  const direct: string[] = [];
+  let markers = 0;
+  for (const item of columns) {
+    const projection = record(item); const expr = record(projection?.expr);
+    if (expr?.type === "function") { markers++; continue; }
+    if (!projection || !expr || expr.type !== "column_ref" || typeof expr.column !== "string" || projection.as && projection.as !== expr.column) return null;
+    direct.push(expr.column);
+  }
+  if (!markers || !direct.length) return null;
+  return source.rows.map((row) => Object.fromEntries(direct.map((field) => [field, row[field]])));
 }
 
 function record(value: unknown): Record<string, unknown> | null {
