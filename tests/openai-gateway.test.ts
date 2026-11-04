@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -11,8 +11,31 @@ import { fetchDeepSeekOnly, fetchLoopbackOnly } from "../src/openai-gateway.js";
 import { analyst, ask, openRuntime, waitForJob, withRuntime } from "./helpers.js";
 import { startFakeOpenAI } from "./openai-fake-server.js";
 import type { ProviderStepBegin, ProviderStepDecision, ProviderStepSettle } from "../src/state-store.js";
+import { GlobalBudget } from "../src/global-budget.js";
 
 const token = "fictional-loopback-token";
+
+test("跨任务预算接入 Pi 派发，限流未知用量后不会跨会话超发", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "global-gateway-"));
+  const options = { path: path.join(dir, "budget.sqlite"), budgetId: "test-scope", maxRequests: 1, maxTokens: 100000 };
+  const scope = await GlobalBudget.activate(options);
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "rate-limit", globalBudgetPath: options.path, globalBudgetId: options.budgetId, globalBudgetMaxRequests: 1, globalBudgetMaxTokens: options.maxTokens }), async (runtime) => {
+      const first = analyst(runtime);
+      const second = analyst(runtime);
+      const [a, b] = await Promise.all([ask(runtime, first.session_id, "合成问题甲"), ask(runtime, second.session_id, "合成问题乙")]);
+      assert.equal(a.status, "failed");
+      assert.equal(b.status, "failed");
+      assert.equal(fake.observations.length, 1);
+      assert.ok([a.error?.code, b.error?.code].includes("global_budget_exhausted"));
+      const stats = await scope.stats();
+      assert.equal(stats?.requests_reserved, 1);
+      assert.equal(stats?.unknown_count, 1);
+      assert.equal(stats?.reported_input, null);
+    });
+  } finally { await fake.close(); await scope.close(); rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("本机供应商请求禁止重定向及非回环目标", async () => {
   let redirectedRequests = 0;
@@ -114,9 +137,11 @@ test("DeepSeek 方言的流式思考与工具调用在多轮请求中完整回�
 });
 
 test("DeepSeek 远程配置必须显式启用并锁定官方地址", () => {
-  const base = gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: "https://api.deepseek.com", allowRemoteHttps: true, deepseekSyntheticOnly: true, knowledgeDir: path.join(repoRoot(), "knowledge", "harborlight"), businessEngine: "clickhouse", clickhouseUrl: "http://127.0.0.1:12345", clickhouseDatabase: "harborlight", clickhouseUser: "fox_reader", stateMode: "mysql", mysqlHost: "127.0.0.1", mysqlPort: 12346, redisHost: "127.0.0.1", redisPort: 12347 });
+  const base = gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: "https://api.deepseek.com", allowRemoteHttps: true, deepseekSyntheticOnly: true, globalBudgetId: "fixture", globalBudgetMaxRequests: 10, globalBudgetMaxTokens: 100000, knowledgeDir: path.join(repoRoot(), "knowledge", "harborlight"), businessEngine: "clickhouse", clickhouseUrl: "http://127.0.0.1:12345", clickhouseDatabase: "harborlight", clickhouseUser: "fox_reader", stateMode: "mysql", mysqlHost: "127.0.0.1", mysqlPort: 12346, redisHost: "127.0.0.1", redisPort: 12347 });
   assert.doesNotThrow(() => loadConfig(base));
   assert.throws(() => loadConfig({ ...base, allowRemoteHttps: false }), /显式启用/);
+  assert.throws(() => loadConfig({ ...base, globalBudgetId: "" }), /跨任务预算/);
+  assert.throws(() => loadConfig({ ...base, globalBudgetPath: "/tmp/different.sqlite" }), /跨任务预算/);
   assert.throws(() => loadConfig({ ...base, piBaseUrl: "https://api.deepseek.com.example.invalid" }), /官方 HTTPS/);
   assert.throws(() => loadConfig({ ...base, piBaseUrl: "https://api.deepseek.com/v1?key=fictional" }), /官方 HTTPS/);
   assert.throws(() => loadConfig({ ...base, protocolScript: "happy" }), /协议脚本/);

@@ -18,6 +18,10 @@ export interface AppConfig {
   enabledReasoning: string[];
   allowRemoteHttps: boolean;
   deepseekSyntheticOnly: boolean;
+  globalBudgetPath: string;
+  globalBudgetId: string;
+  globalBudgetMaxRequests: number;
+  globalBudgetMaxTokens: number;
   knowledgeDir: string;
   databasePath: string;
   stateDatabasePath: string;
@@ -102,6 +106,11 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     enabledReasoning: (process.env.PI_ENABLED_REASONING || "off").split(",").map((item) => item.trim()).filter(Boolean),
     allowRemoteHttps: process.env.PI_ALLOW_REMOTE_HTTPS === "true",
     deepseekSyntheticOnly: process.env.DEEPSEEK_SYNTHETIC_ONLY === "true",
+    // Only loopback protocol tests may override this; official HTTPS rejects it.
+    globalBudgetPath: process.env.DATAAGENT_TEST_GLOBAL_BUDGET_PATH || path.join(repoRoot(), ".local-runtime", "deepseek-budget.sqlite"),
+    globalBudgetId: process.env.DEEPSEEK_BUDGET_ID || "",
+    globalBudgetMaxRequests: integer("DEEPSEEK_BUDGET_MAX_REQUESTS", 0),
+    globalBudgetMaxTokens: integer("DEEPSEEK_BUDGET_MAX_TOKENS", 0),
     knowledgeDir: process.env.KNOWLEDGE_DIR || path.join(repoRoot(), "knowledge", "lumenfox"),
     databasePath: process.env.DATABASE_PATH || path.join(repoRoot(), ".local-runtime", "lumenfox.sqlite"),
     stateDatabasePath: process.env.STATE_DATABASE_PATH || path.join(repoRoot(), ".local-runtime", "state.sqlite"),
@@ -217,6 +226,7 @@ export function validateModelProvider(config: AppConfig): void {
   }
   if (config.piProvider === "deepseek" && url.origin === "https://api.deepseek.com" && (url.pathname === "/" || url.pathname === "/v1") && !url.username && !url.password && !url.search && !url.hash) {
     if (!config.allowRemoteHttps || config.protocolScript) throw new Error("DeepSeek 远程派发需要显式启用，且不能启用协议脚本。");
+    if (config.globalBudgetPath !== path.join(repoRoot(), ".local-runtime", "deepseek-budget.sqlite") || !config.globalBudgetId || config.globalBudgetMaxRequests < 1 || config.globalBudgetMaxTokens < 1) throw new Error("DeepSeek 远程派发需要先明确启用持久跨任务预算。");
     let syntheticKnowledge = false;
     let localClickHouse = false;
     try {

@@ -16,6 +16,7 @@ import { loadKnowledge } from "../src/knowledge.js";
 import { createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
 import { startFakeOpenAI } from "./openai-fake-server.js";
 import { isolatedDocker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
+import { GlobalBudget } from "../src/global-budget.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const sourceKnowledgeDir = path.join(root, "knowledge", "harborlight");
@@ -31,6 +32,8 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
   const names = [`lumenfox-oai-ch-${suffix}`, `lumenfox-oai-mysql-${suffix}`, `lumenfox-oai-redis-${suffix}`];
   const createdContainers: string[] = [];
   const dir = mkdtempSync(path.join(tmpdir(), "lumenfox-oai-"));
+  const budgetOptions = { path: path.join(dir, "budget.sqlite"), budgetId: "protocol-integration", maxRequests: 1000, maxTokens: 10000000 };
+  const globalBudget = await GlobalBudget.activate(budgetOptions);
   const knowledgeDir = path.join(dir, "knowledge");
   const children: ChildProcess[] = [];
   try {
@@ -166,6 +169,10 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       REDIS_PASSWORD: statePassword,
       REDIS_QUEUE_KEY: `lumenfox:oai:${process.pid}`,
       MODEL_MODE: "pi",
+      DATAAGENT_TEST_GLOBAL_BUDGET_PATH: budgetOptions.path,
+      DEEPSEEK_BUDGET_ID: budgetOptions.budgetId,
+      DEEPSEEK_BUDGET_MAX_REQUESTS: String(budgetOptions.maxRequests),
+      DEEPSEEK_BUDGET_MAX_TOKENS: String(budgetOptions.maxTokens),
       PI_PROVIDER: process.env.TEST_DEEPSEEK_DIALECT === "1" ? "deepseek" : "openai-compatible",
       PI_MODEL: process.env.TEST_DEEPSEEK_DIALECT === "1" ? "deepseek-flash" : "local-protocol",
       PI_API_KEY: token,
@@ -215,6 +222,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(followup.analysis?.sources?.[0]?.engine, "clickhouse-local");
     assert.deepEqual(followupTools, ["read_data_contract_view", "query", "calculate_session_cells", "update_analysis"]);
     assert.ok(fake.observations.some((item) => item.userMessages.length === 2 && item.userMessages[0] === question && item.userMessages[1] === "那日本呢？" && item.currentTurnRoles.includes("tool")));
+    assert.ok(fake.observations.some((item) => item.userMessages.length === 2 && item.historySummaryCount >= 1), "后续模型请求应携带精简的旧回合服务端结论");
     const source1 = job.analysis?.sources?.[0]?.resource_id;
     const source2 = followup.analysis?.sources?.[0]?.resource_id;
     assert.ok(source1 && source2 && source1 !== source2);
@@ -223,9 +231,15 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.deepEqual((storedMessages as Array<{ job_id: string; text: string }>).map((row) => row.text), [question, "那日本呢？"]);
     const [snapshots] = await db.query("SELECT body_json FROM agent_snapshots WHERE session_id = ? AND job_id = ? AND kind = 'settled' ORDER BY snapshot_id DESC LIMIT 1", [session.session_id, queued.job_id]);
     const firstSnapshot = JSON.parse(String((snapshots as Array<{ body_json: string }>)[0]?.body_json)) as { jsonl: string; branch_entry_ids: string[] };
-    const branch = firstSnapshot.jsonl.trim().split("\n").map((line) => JSON.parse(line) as { id?: string; type?: string; message?: { role?: string; content?: unknown } }).filter((entry) => entry.id && firstSnapshot.branch_entry_ids.includes(entry.id));
+    const branch = firstSnapshot.jsonl.trim().split("\n").map((line) => JSON.parse(line) as { id?: string; type?: string; message?: { role?: string; toolName?: string; content?: unknown } }).filter((entry) => entry.id && firstSnapshot.branch_entry_ids.includes(entry.id));
     assert.ok(branch.some((entry) => entry.message?.role === "user" && JSON.stringify(entry.message.content).includes(question)));
     assert.ok(branch.some((entry) => entry.message?.role === "toolResult"));
+    const previousReceipt = branch.find((entry) => entry.message?.role === "toolResult" && entry.message.toolName === "update_analysis");
+    const followObservation = fake.observations.find((item) => item.userMessages.length === 2 && item.historySummaryCount === 1);
+    assert.ok(previousReceipt && followObservation);
+    const fullBytes = Buffer.byteLength(JSON.stringify(previousReceipt.message?.content));
+    assert.ok(followObservation.historySummaryBytes < fullBytes, "模型请求应减小旧分析回执，原生 JSONL 保留完整内容");
+    if (process.env.DIAG_CONTEXT_SIZES === "1") console.log(`合成旧分析回执 ${fullBytes} 字节，发送摘要 ${followObservation.historySummaryBytes} 字节；追问请求体 ${followObservation.requestBytes} 字节。`);
     const [owned] = await db.query("SELECT resource_id, body_json FROM resources WHERE resource_id IN (?, ?)", [source1, source2]);
     for (const row of owned as Array<{ resource_id: string; body_json: string }>) {
       const resource = JSON.parse(String(row.body_json)) as { session_id: string; job_id: string; engine: string; freshness_receipts: unknown[] };
@@ -770,6 +784,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal((steps as Array<{ status: string; input_tokens: number | null; usage_source: string }>)[0]?.status, "outcome_unknown");
     assert.equal((steps as Array<{ input_tokens: number | null }>)[0]?.input_tokens, null);
   } finally {
+    await globalBudget.close();
     for (const child of children) if (child.exitCode === null) child.kill("SIGKILL");
     await fake.close();
     if (createdContainers.length) await isolatedDocker(["rm", "-f", ...createdContainers]).catch(() => undefined);

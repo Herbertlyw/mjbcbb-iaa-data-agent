@@ -817,6 +817,7 @@ function pauseForTest(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 function hardFailure(code: string): boolean {
+  if (code.startsWith("global_budget_")) return true;
   return [
     "budget_exhausted",
     "agent_failed",

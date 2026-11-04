@@ -14,6 +14,10 @@ export interface ProtocolObservation {
   authorizationMatched: boolean;
   userMessages: string[];
   currentTurnRoles: string[];
+  historySummaryCount: number;
+  historySummaryBytes: number;
+  requestBytes: number;
+  toolMessageBytes: number;
 }
 
 export async function startFakeOpenAI(token: string, options: { recordObservations?: boolean; syntheticDateShiftDays?: number; deepseekThinking?: boolean; cacheHitTokens?: number } = {}): Promise<{ url: string; observations: ProtocolObservation[]; close: () => Promise<void> }> {
@@ -52,6 +56,16 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
         authorizationMatched: matched,
         userMessages: messages.filter((message) => message.role === "user").map(messageText),
         currentTurnRoles: currentTurn(messages).map((message) => message.role),
+        historySummaryCount: messages.filter((message) => {
+          if (message.role !== "tool" || typeof message.content !== "string") return false;
+          try { return (JSON.parse(message.content) as { history_summary?: boolean }).history_summary === true; } catch { return false; }
+        }).length,
+        historySummaryBytes: messages.filter((message) => {
+          if (message.role !== "tool" || typeof message.content !== "string") return false;
+          try { return (JSON.parse(message.content) as { history_summary?: boolean }).history_summary === true; } catch { return false; }
+        }).reduce((sum, message) => sum + Buffer.byteLength(message.content as string), 0),
+        requestBytes: Buffer.byteLength(body),
+        toolMessageBytes: messages.filter((message) => message.role === "tool").reduce((sum, message) => sum + Buffer.byteLength(JSON.stringify(message)), 0),
       });
       if (!matched) {
         response.writeHead(401, { "content-type": "application/json" });

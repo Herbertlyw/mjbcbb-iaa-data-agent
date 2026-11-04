@@ -3,7 +3,10 @@ import { streamSimple as openAICompletions } from "@earendil-works/pi-ai/api/ope
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEvent, type Model } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AppConfig } from "./config.js";
+import { GlobalBudget } from "./global-budget.js";
 import { thinkingLevelMap } from "./model-catalog.js";
+import { compactPreviousAnalyses } from "./provider-context.js";
+import { observeProviderUsage, waitForProviderUsage, type ProviderUsageObservation, type ProviderUsageReceipt } from "./provider-usage.js";
 import type { ProviderStepRecord, StateStore } from "./state-store.js";
 
 export interface ProviderLedger {
@@ -40,10 +43,16 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
     ],
     streamSimple: (model, context, options) => {
       const outer = createAssistantMessageEventStream();
-      const estimate = estimateContextTokens(context);
+      const providerContext = compactPreviousAnalyses(context);
+      const estimate = estimateContextTokens(providerContext);
       const stepId = `step_${randomUUID()}`;
       const started = Date.now();
       void (async () => {
+      let globalBudget: GlobalBudget | undefined;
+      let globalReserved = false;
+      let globalSettled = false;
+      const usageCapture: { observation?: ProviderUsageObservation } = {};
+      try {
       assertDispatchTarget(config.piBaseUrl, deepseek && config.allowRemoteHttps);
       const began = await ledger.state.beginProviderStep({
         stepId,
@@ -82,11 +91,30 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
         if (!settled.ok) throw new Error(settled.code);
         throw new Error("provider_cancelled");
       }
+      if (config.globalBudgetId) {
+        globalBudget = await GlobalBudget.open({ path: config.globalBudgetPath, budgetId: config.globalBudgetId, maxRequests: config.globalBudgetMaxRequests, maxTokens: config.globalBudgetMaxTokens });
+        const reservation = await globalBudget.reserve({ stepId, jobId: ledger.jobId, estimatedInput: estimate.tokens, reservedOutput: config.piMaxOutputTokens });
+        if (!reservation.ok) throw new Error(reservation.code);
+        globalReserved = true;
+        if (options?.signal?.aborted) throw new Error("provider_cancelled");
+        const dispatch = await globalBudget.markDispatched(stepId);
+        if (!dispatch.ok) throw new Error(dispatch.code);
+      }
       const physical = { ...model, api: "openai-completions" as const, baseUrl: config.piBaseUrl, provider: config.piProvider };
       let stream;
       try {
         const transport = deepseek && config.allowRemoteHttps && new URL(config.piBaseUrl).origin === "https://api.deepseek.com" ? fetchDeepSeekOnly : fetchLoopbackOnly;
-        stream = openAICompletions(physical as Model<"openai-completions">, context, { ...options, fetch: transport, maxRetries: 0 });
+        let dispatched = false;
+        const observedTransport: typeof fetch = async (request, init) => {
+          // One durable reservation permits at most one transport invocation,
+          // even if a future SDK version changes its retry behavior.
+          if (dispatched) throw new Error("provider_outcome_unknown");
+          dispatched = true;
+          const response = await transport(request, init);
+          usageCapture.observation = observeProviderUsage(response);
+          return response;
+        };
+        stream = openAICompletions(physical as Model<"openai-completions">, providerContext, { ...options, fetch: observedTransport, maxRetries: 0 });
       } catch (error) {
         const settled = await ledger.state.settleProviderStep({
           stepId,
@@ -113,9 +141,25 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
       }
       if (!terminal) throw new Error("provider_outcome_unknown");
       const message = await stream.result();
-      await settleFromMessage(ledger, stepId, started, message, config.protocolScript ? "simulated" : "reported");
+      const reportedUsage = usageCapture.observation ? await waitForProviderUsage(usageCapture.observation) : null;
+      if (globalBudget) {
+        const settlement = await globalBudget.settle({ stepId, outcome: message.stopReason === "aborted" ? "cancelled" : message.stopReason === "error" ? "error" : "completed", inputTokens: reportedUsage?.inputTokens ?? null, outputTokens: reportedUsage?.outputTokens ?? null, cacheHitTokens: reportedUsage?.cacheHitTokens ?? null, cacheMissTokens: reportedUsage?.cacheMissTokens ?? null });
+        if (!settlement.ok) throw new Error(settlement.code);
+        globalSettled = true;
+      }
+      await settleFromMessage(ledger, stepId, started, message, config.protocolScript ? "simulated" : "reported", reportedUsage);
       outer.push(terminal);
       outer.end(message);
+      } finally {
+        usageCapture.observation?.cancel();
+        if (globalBudget) {
+          if (globalReserved && !globalSettled) {
+            // Never infer rollback after a timeout, including before dispatch.
+            await globalBudget.settle({ stepId, outcome: "outcome_unknown", inputTokens: null, outputTokens: null }).catch(() => undefined);
+          }
+          await globalBudget.close();
+        }
+      }
       })().catch((error: unknown) => {
         const code = error instanceof Error && /mysql_state_(?:outcome_unknown|closed|operation_failed)/u.test(error.message) ? "provider_outcome_unknown" : safeProviderError(error).code;
         const message: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "error", errorMessage: code, timestamp: started };
@@ -184,9 +228,12 @@ export function safeProviderError(error: unknown): { code: string; message: stri
   if (/\b402\b|insufficient.balance/i.test(redacted)) return { code: "provider_balance_insufficient", message: "供应商报告余额不足；未自动重试。" };
   if (/\b400\b|bad.request/i.test(redacted)) return { code: "provider_invalid_request", message: "供应商拒绝了请求格式；未记录原始请求或错误正文。" };
   if (/aborted|cancel/i.test(redacted)) return { code: "provider_cancelled", message: "供应商请求已取消。" };
-  const known = redacted.match(/provider_outcome_unknown|provider_fence_rejected|token_budget_unknown|budget_exhausted|context_window_exceeded|remote_dispatch_disabled|settlement_conflict|model_not_enabled|reasoning_not_enabled/);
+  const known = redacted.match(/global_budget_[a-z_]+|provider_outcome_unknown|provider_fence_rejected|token_budget_unknown|budget_exhausted|context_window_exceeded|remote_dispatch_disabled|settlement_conflict|model_not_enabled|reasoning_not_enabled/);
   if (known) {
     const messages: Record<string, string> = {
+      global_budget_exhausted: "跨任务供应商预算已用尽，请求没有派发。",
+      global_budget_active_mismatch: "跨任务预算未启用或配置不一致，请求没有派发。",
+      global_budget_outcome_unknown: "跨任务预算状态未知，请求不会自动重试。",
       budget_exhausted: "本回合的 token 预算或调用次数不够，请求没有派发。费用没有估算。",
       context_window_exceeded: "按完整上下文估算的输入加上授予的输出上限超过了窗口，请求没有派发。",
       token_budget_unknown: "已有一次用量不明的调用，预留仍被占用。不会把它记成 0，也不会继续派发。",
@@ -202,8 +249,8 @@ export function safeProviderError(error: unknown): { code: string; message: stri
   return { code: "provider_error", message: "供应商请求失败。日志不包含密钥、请求头或用户原文。" };
 }
 
-async function settleFromMessage(ledger: ProviderLedger, stepId: string, started: number, message: AssistantMessage, source: "simulated" | "reported"): Promise<void> {
-  const sawUsage = message.usage.input > 0 || message.usage.output > 0 || message.usage.totalTokens > 0;
+async function settleFromMessage(ledger: ProviderLedger, stepId: string, started: number, message: AssistantMessage, source: "simulated" | "reported", usage: ProviderUsageReceipt | null): Promise<void> {
+  const sawUsage = usage?.inputTokens != null && usage.outputTokens != null && usage.inputTokens + usage.outputTokens > 0;
   const failed = message.stopReason === "error" || message.stopReason === "aborted";
   const recorded = await ledger.state.saveProviderPayload({
     payloadId: `res_${stepId}`,
@@ -214,7 +261,7 @@ async function settleFromMessage(ledger: ProviderLedger, stepId: string, started
     owner: ledger.owner,
     fence: ledger.fence,
     kind: "response",
-    body: JSON.stringify({ format: "metadata-only", failed, usage_source: sawUsage ? source : "unknown" }),
+    body: JSON.stringify({ format: "metadata-only", failed, usage_source: sawUsage ? source : "unknown", input_tokens: usage?.inputTokens ?? null, output_tokens: usage?.outputTokens ?? null, cache_hit_tokens: usage?.cacheHitTokens ?? null, cache_miss_tokens: usage?.cacheMissTokens ?? null }),
   });
   if (!recorded) throw new Error("provider_fence_rejected");
   const settled = await ledger.state.settleProviderStep({
@@ -223,11 +270,10 @@ async function settleFromMessage(ledger: ProviderLedger, stepId: string, started
     owner: ledger.owner,
     fence: ledger.fence,
     status: failed ? "error" : "completed",
-    // pi-ai separates cached tokens from `input`, while DeepSeek's reported
-    // prompt_tokens includes cache hits. Budget the complete prompt, not only
-    // the cache misses, so cached prompts cannot evade the per-task limit.
-    inputTokens: sawUsage ? message.usage.input + message.usage.cacheRead + message.usage.cacheWrite : null,
-    outputTokens: sawUsage ? message.usage.output : null,
+    // Use the provider's explicit full prompt count, including cache hits.
+    // Missing usage cannot be inferred from pi-ai's zero-initialized fields.
+    inputTokens: sawUsage ? usage!.inputTokens : null,
+    outputTokens: sawUsage ? usage!.outputTokens : null,
     usageSource: sawUsage ? source : "unknown",
     durationMs: Date.now() - started,
     errorCode: failed ? safeProviderError(new Error(message.errorMessage || message.stopReason)).code : null,

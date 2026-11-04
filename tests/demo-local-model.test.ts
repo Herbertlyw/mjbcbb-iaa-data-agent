@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { GlobalBudget } from "../src/global-budget.js";
 import path from "node:path";
 import test from "node:test";
 import { demoLocalModel } from "../src/demo-local-model.js";
@@ -61,8 +64,18 @@ test("显式本机服务模式接通隔离栈，假服务用量标为自报而�
 });
 
 test("DeepSeek 显式隔离栈启动和健康标识不触发模型请求", { timeout: 150_000 }, async () => {
+  // A private copy has its own fixed official-budget path; never touch the
+  // operator's real budget ledger or secret configuration.
+  const root = mkdtempSync(path.join(tmpdir(), "deepseek-launch-"));
+  for (const item of ["src", "scripts", "knowledge", "package.json", "tsconfig.json"]) cpSync(path.resolve(item), path.join(root, item), { recursive: true });
+  mkdirSync(path.join(root, "tests"));
+  cpSync(path.resolve("tests/openai-fake-server.ts"), path.join(root, "tests/openai-fake-server.ts"));
+  symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "dir");
+  mkdirSync(path.join(root, ".local-runtime"), { mode: 0o700 });
+  const budget = await GlobalBudget.activate({ path: path.join(root, ".local-runtime", "deepseek-budget.sqlite"), budgetId: "launch-fixture", maxRequests: 1, maxTokens: 10000 });
+  await budget.close();
   const child = spawn(process.execPath, ["--import", "tsx", "scripts/local-isolated-stack.ts", "--deepseek"], {
-    cwd: path.resolve("."), env: { PATH: process.env.PATH ?? "", DEEPSEEK_API_KEY: token }, stdio: ["ignore", "pipe", "pipe"],
+    cwd: root, env: { PATH: process.env.PATH ?? "", DEEPSEEK_API_KEY: token, DEEPSEEK_BUDGET_ID: "launch-fixture", DEEPSEEK_BUDGET_MAX_REQUESTS: "1", DEEPSEEK_BUDGET_MAX_TOKENS: "10000" }, stdio: ["ignore", "pipe", "pipe"],
   });
   let output = "";
   child.stdout.on("data", (chunk: Buffer) => { output += chunk.toString(); });
@@ -84,5 +97,5 @@ test("DeepSeek 显式隔离栈启动和健康标识不触发模型请求", { tim
     assert.equal(health.model_catalog.models[0]?.verified_here, false);
     assert.equal(output.includes(token), false);
     // No task is submitted, so even this fictional key is never dispatched.
-  } finally { await stopProcess(child, "SIGINT"); }
+  } finally { await stopProcess(child, "SIGINT"); rmSync(root, { recursive: true, force: true }); }
 });
