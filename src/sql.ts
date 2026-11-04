@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import { isCalendarDate } from "./config.js";
+import { preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
 
 const require = createRequire(import.meta.url);
 const loaded = require("node-sql-parser") as {
@@ -101,6 +102,26 @@ export function parseReadonlySql(rawSql: string, dialect: "sqlite" | "clickhouse
   rejectShape(statement);
   const tables = [...physicalTables(statement, new Set())];
   if (tables.length === 0) throw new SqlRejected("missing_table", "查询没有引用表");
+  if (dialect === "clickhouse") {
+    const clickhouse = preflightClickHouseSql(sql);
+    if (!clickhouse.ok) throw new SqlRejected(clickhouse.code, "ClickHouse 语法或来源无法安全核验。");
+    if (clickhouse.tables.length !== tables.length || clickhouse.tables.some((table) => !tables.includes(table))) throw new SqlRejected("clickhouse_source_mismatch", "两个语法树对物理来源的解析不一致。");
+    const legacyIdentifiers = new Set<string>(); let ambiguousQuotes = false;
+    walk(statement, (entry) => {
+      // SQLite treats double quotes as strings in contexts where ClickHouse
+      // treats them as identifiers. Map only simple identifier-shaped values;
+      // authorization below independently treats them as column references.
+      if (entry.type === "double_quote_string") {
+        if (typeof entry.value !== "string" || !/^[a-z_][a-z0-9_]*$/iu.test(entry.value)) ambiguousQuotes = true;
+        else legacyIdentifiers.add(entry.value.toLowerCase());
+      }
+      if (entry.type !== "column_ref" || typeof entry.column !== "string" || entry.column === "*") return;
+      const column = entry.column.toLowerCase();
+      const qualifier = typeof entry.table === "string" && entry.table ? `${entry.table.toLowerCase()}.` : "";
+      legacyIdentifiers.add(`${qualifier}${column}`);
+    });
+    if (ambiguousQuotes || clickhouse.identifiers.some((name) => !legacyIdentifiers.has(name))) throw new SqlRejected("clickhouse_identifier_mismatch", "两个语法树对字段标识符的解析不一致。");
+  }
   return { sql, tables, ast: statement };
 }
 
