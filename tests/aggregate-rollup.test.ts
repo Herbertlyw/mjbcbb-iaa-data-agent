@@ -28,6 +28,25 @@ test("可信日期分组精确汇总，分组的行数与零不能冒充事实�
   assert.equal(verifyGroupRollup(base, contract, { op: "sum", column: "total", predicted: "predicted_only", as: "n" }, "220"), null);
 });
 
+test("SUM、COUNT 和空值辅助计数同查询时可核验汇总，辅助列不能冒充指标", () => {
+  const source = structuredClone(base);
+  source.sql = source.sql.replace("SUM(new_users) AS total", "SUM(new_users) AS total, COUNT(new_users) AS observed, COUNT(*) AS total_rows, countIf(new_users IS NULL) AS missing");
+  source.column_types = { observed: "UInt64", total_rows: "UInt64", missing: "UInt64" };
+  source.rows = source.rows.map((row) => ({ ...row, observed: "1", total_rows: "1", missing: "0" }));
+  const op = { op: "sum" as const, column: "total", as: "n" };
+  assert.equal(verifyGroupRollup(source, contract, op, "220")?.value, "220");
+  assert.equal(verifyGroupRollup(source, contract, { ...op, column: "total_rows" }, "3"), null);
+  const invalid = (mutate: (item: QueryResource) => void) => { const item = structuredClone(source); mutate(item); assert.equal(verifyGroupRollup(item, contract, op, "220"), null); };
+  invalid((s) => { s.rows[0]!.missing = "1"; });
+  invalid((s) => { s.rows[0]!.total_rows = "5000001"; });
+  invalid((s) => { s.column_types!.missing = "String"; });
+  invalid((s) => { s.sql = s.sql.replace("new_users IS NULL", "device_token IS NULL"); });
+  invalid((s) => { s.sql = s.sql.replace("new_users IS NULL", "new_users > 0"); });
+  invalid((s) => { s.sql = s.sql.replace("AS missing", "AS platform"); });
+  invalid((s) => { s.rows[0]!.missing = null; });
+  invalid((s) => { s.coverage.null_dates = ["2026-10-06"]; });
+});
+
 test("缺日期、NULL、未知预测、截断、别名欺骗和不完整保存均不可核验", () => {
   const operation = { op: "sum" as const, column: "total", as: "n" };
   const mutate = (f: (source: QueryResource) => void) => { const source = structuredClone(base); f(source); assert.equal(verifyGroupRollup(source, contract, operation, "220"), null); };

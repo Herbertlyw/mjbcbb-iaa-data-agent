@@ -52,6 +52,10 @@ export function verifyDatabaseAggregates(source: QueryResource, contract: DataCo
   const names = new Set<string>();
   const groupOutputs = new Map<string, string>();
   const metrics: Array<{ output: string; field: string; operation: "sum" | "count_nonnull"; scale: number }> = [];
+  // Auxiliary counts may accompany proven aggregates, but are never turned
+  // into model-labelled facts. They must have a narrow, independently known
+  // shape and are cross-checked against other counts when available.
+  const auxiliary: Array<{ output: string; field: string | null; operation: "all" | "null" | "nonnull" | "zero" }> = [];
   for (const projection of Array.isArray(ast.columns) ? ast.columns : []) {
     const item = object(projection); const expr = object(item?.expr);
     if (!item || !expr) return null;
@@ -62,6 +66,12 @@ export function verifyDatabaseAggregates(source: QueryResource, contract: DataCo
       if (typeof output !== "string" || !safeAlias(output, field, contract) || names.has(output)) return null;
       names.add(output); groupOutputs.set(field, output);
       continue;
+    }
+    const aux = auxiliaryProjection(expr, col);
+    if (aux) {
+      const output = item.as;
+      if (source.engine !== "clickhouse-local" || !Number.isSafeInteger(source.scan_limit) || source.scan_limit! < 1 || source.scan_limit! > 2_000_000_000 || typeof output !== "string" || !safeAlias(output, aux.field ?? "", contract) || names.has(output) || source.column_types?.[output]?.replace(/\s/gu, "").toLowerCase() !== "uint64" || (aux.field !== null && (!series.metrics.includes(aux.field) || contract.sensitive_columns.includes(aux.field)))) return null;
+      names.add(output); auxiliary.push({ output, ...aux }); continue;
     }
     if (expr.type !== "aggr_func" || expr.over || typeof expr.name !== "string") return null;
     const fn = expr.name.toLowerCase();
@@ -107,14 +117,54 @@ export function verifyDatabaseAggregates(source: QueryResource, contract: DataCo
     const groupKey = JSON.stringify(group);
     if (seenGroups.has(groupKey)) return null;
     seenGroups.add(groupKey);
+    const counts: Array<{ field: string | null; operation: string; value: bigint }> = [];
+    for (const item of auxiliary) {
+      const value = integerString(row[item.output]);
+      if (value === null || value.startsWith("-") || BigInt(value) > BigInt(source.scan_limit!)) return null;
+      counts.push({ field: item.field, operation: item.operation, value: BigInt(value) });
+    }
     for (const metric of metrics) {
       const value = metric.scale ? decimalString(row[metric.output], metric.scale) : integerString(row[metric.output]);
       if (value === null || (metric.operation === "count_nonnull" && value.startsWith("-"))) return null;
+      if (metric.operation === "count_nonnull") {
+        if (source.engine === "clickhouse-local" && (!Number.isSafeInteger(source.scan_limit) || BigInt(value) > BigInt(source.scan_limit!))) return null;
+        counts.push({ field: metric.field, operation: "nonnull", value: BigInt(value) });
+      }
       const declared = contract.columns.find((column) => column.name === metric.field)!;
       verified.push({ source_resource_id: source.resource_id, table: contract.table, column: metric.field, output_column: metric.output, operation: metric.operation, value, scale: metric.scale, unit: metric.operation === "sum" ? declared.unit! : "行", description: declared.description, filters, group, range: source.time_range, prediction: "actual_observed_only" });
     }
+    const all = counts.filter((item) => item.operation === "all");
+    if (all.some((item) => item.value !== all[0]!.value)) return null;
+    for (const field of new Set(counts.map((item) => item.field).filter((item): item is string => item !== null))) {
+      const forField = counts.filter((item) => item.field === field);
+      const get = (op: string) => forField.filter((item) => item.operation === op).map((item) => item.value);
+      const known = get("nonnull"), missing = get("null"), zero = get("zero");
+      if ([known, missing, zero].some((values) => values.some((value) => value !== values[0])) || all.length && forField.some((item) => item.value > all[0]!.value) || all.length && known.length && missing.length && known[0]! + missing[0]! !== all[0]!.value || known.length && zero.length && zero[0]! > known[0]!) return null;
+    }
   }
   return verified;
+}
+
+function auxiliaryProjection(expr: Record<string, unknown>, column: (value: unknown) => string | null): { field: string | null; operation: "all" | "null" | "nonnull" | "zero" } | null {
+  if (expr.over) return null;
+  const args = object(expr.args);
+  if (expr.type === "aggr_func" && typeof expr.name === "string" && expr.name.toLowerCase() === "count" && !args?.distinct && !args?.orderby && object(args?.expr)?.type === "star") return { field: null, operation: "all" };
+  const pieces = object(expr.name)?.name;
+  if (expr.type !== "function" || !Array.isArray(pieces) || pieces.length !== 1 || String(object(pieces[0])?.value).toLowerCase() !== "countif" || args?.type !== "expr_list" || !Array.isArray(args.value) || args.value.length !== 1) return null;
+  const condition = object(args.value[0]);
+  if (!condition) return null;
+  const nested = object(condition.name)?.name;
+  if (condition.type === "function" && !condition.over && Array.isArray(nested) && nested.length === 1) {
+    const name = String(object(nested[0])?.value).toLowerCase(); const callArgs = object(condition.args);
+    const field = callArgs?.type === "expr_list" && Array.isArray(callArgs.value) && callArgs.value.length === 1 ? column(callArgs.value[0]) : null;
+    if (field && (name === "isnull" || name === "isnotnull")) return { field, operation: name === "isnull" ? "null" : "nonnull" };
+  }
+  const field = column(condition.left), right = object(condition.right), op = String(condition.operator).toUpperCase();
+  if (condition.type !== "binary_expr" || !field) return null;
+  if (right?.type === "null" && op === "IS") return { field, operation: "null" };
+  if (right?.type === "null" && op === "IS NOT") return { field, operation: "nonnull" };
+  if (right?.type === "number" && right.value === 0 && op === "=") return { field, operation: "zero" };
+  return null;
 }
 
 function decimalString(value: unknown, scale: number): string | null {

@@ -142,6 +142,25 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
       assert.match(String(groupedAnswer.answer), /分组求和结果再求和 220；单位 人/);
       assert.match(String(groupedAnswer.answer), /分组聚合输出为零的分组数 1/);
 
+      // The real model emitted these mixed aggregates. Verify independent
+      // per-day values and the second-level sum against the fixture, while
+      // keeping model-chosen auxiliary aliases out of the delivered preview.
+      for (const [country, expected, daily] of [["US", "220", ["100", "0", "120"]], ["JP", "30", ["10", "10", "10"]]] as const) {
+        runtime.sessions.setActiveJob(rollSession.session_id, `job_mixed_${country}`);
+        const mixed = await runtime.tools.query(rollSession.session_id, { sql: `SELECT event_date, sum(new_users) AS new_users_sum, count(new_users) AS non_null_rows, count(*) AS rows_all, countIf(new_users IS NULL) AS null_rows FROM fact_fox_daily_install WHERE event_date BETWEEN '2026-10-06' AND '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = '${country}' AND channel_id = 'mist_ads' GROUP BY event_date ORDER BY event_date` });
+        assert.ok(mixed.ok, JSON.stringify(mixed)); if (!mixed.ok) return;
+        assert.deepEqual((mixed.rows as Array<Record<string, unknown>>).map((row) => String(row.new_users_sum)), [...daily]);
+        const calculation = await runtime.tools.calculateSessionCells(rollSession.session_id, { resource_id: String(mixed.resource_id), operations: [{ op: "sum", column: "new_users_sum", as: "combined" }] });
+        assert.ok(calculation.ok, JSON.stringify(calculation)); if (!calculation.ok) return;
+        const answer = await runtime.tools.updateAnalysis(rollSession.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(mixed.resource_id), String(calculation.resource_id)] });
+        assert.ok(answer.ok, JSON.stringify(answer)); if (!answer.ok) return;
+        assert.match(String(answer.answer), new RegExp(`分组求和结果再求和 ${expected}；单位 人`), JSON.stringify(answer.server_reasons));
+        assert.match(String(answer.answer), new RegExp(`country_code=${country}`));
+        assert.ok((answer.server_reasons as string[]).includes("clickhouse_observation_nonatomic"));
+        assert.doesNotMatch(String(answer.answer), /rows_all|non_null_rows|null_rows/);
+      }
+      runtime.sessions.setActiveJob(rollSession.session_id, "job_group_rollup_clickhouse");
+
       // Reproduce the real model's harmless NULL-marker projection. The marker
       // itself is not a trusted label: only independently checked base columns
       // and calculations are published.
