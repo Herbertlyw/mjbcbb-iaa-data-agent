@@ -5,6 +5,24 @@ import { parse } from "@clickhouse/parser";
  * results whose lineage can be verified. */
 export type ClickHousePreflight = { ok: true; tables: string[]; identifiers: string[]; functions: string[] } | { ok: false; code: string };
 
+/** Safe diagnostics contain policy guidance, never the submitted SQL. */
+export function clickHousePreflightMessage(code: string): string {
+  const messages: Record<string, string> = {
+    clickhouse_parse_failed: "ClickHouse 无法解析该语法；请使用受支持的 SELECT、常量日期与简单表达式。",
+    multiple_statements: "只允许一条只读 SELECT，不能提交多条语句。",
+    write_statement: "只允许只读 SELECT，不允许修改数据或结构。",
+    dangerous_table: "不允许表函数、外部数据源或系统表；请使用已授权的本地表。",
+    dangerous_function: "查询含未批准的函数或 lambda；请改用契约字段和受支持函数。",
+    query_parameter_unsupported: "当前查询工具不支持 SQL 参数占位符；请使用明确的合成字面量。",
+    query_output_options_forbidden: "不允许查询自行指定 SETTINGS、FORMAT 或输出文件。",
+    clickhouse_source_unsupported: "无法证明表来源或 CTE 作用域；请使用已绑定的本地表和明确的投影。",
+    clickhouse_identifier_unsupported: "字段或表限定符无法安全解析；请使用契约列名和明确表别名。",
+    clickhouse_function_unsupported: "无法安全核验函数名；请使用受支持的简单函数。",
+    sql_complexity_limit: "SQL 语法树过大；请拆分为有界查询。",
+  };
+  return messages[code] ?? "ClickHouse 语法或来源无法安全核验；请检查已绑定契约和查询形状。";
+}
+
 const obj = (value: unknown): Record<string, unknown> | undefined => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 const identifier = /^[a-z_][a-z0-9_]*$/u;
 const forbiddenFunctions = new Set(["sleep", "sleepeachrow", "url", "s3", "s3cluster", "remote", "remotesecure", "file", "mysql", "postgresql", "executable", "executablepool", "dictget", "getsetting", "currentuser"]);
@@ -27,6 +45,7 @@ export function preflightClickHouseSql(sql: string): ClickHousePreflight {
       identifiers.add(parts.map((part) => String(part).toLowerCase()).join("."));
     }
     if (node.type === "TableExpression" && node.table_function) return { ok: false, code: "dangerous_table" };
+    if (node.type === "TableIdentifier" && typeof node.database === "string" && ["system", "information_schema"].includes(node.database.toLowerCase())) return { ok: false, code: "dangerous_table" };
     if (node.type === "QueryParameter") return { ok: false, code: "query_parameter_unsupported" };
     if (node.type === "Function" && (node.is_lambda_function || forbiddenFunctions.has(String(node.name ?? "").toLowerCase()))) return { ok: false, code: "dangerous_function" };
     // The ClickHouse parser represents infix operators as Functions too;
@@ -87,7 +106,7 @@ export function preflightClickHouseSql(sql: string): ClickHousePreflight {
   return { ok: true, tables: [...physical], identifiers: [...identifiers], functions: [...functions] };
 }
 
-export interface ClickHouseDirectRule { table: string; allowed_columns: string[]; sensitive_columns: string[] }
+export interface ClickHouseDirectRule { table: string; allowed_columns: string[]; sensitive_columns: string[]; must_filter?: string[] }
 export type ClickHouseDirectAuthorization = { applicable: false } | { applicable: true; ok: true; table: string; columns: string[] } | { applicable: true; ok: false; code: string };
 
 /** Independently bind physical fields in a single-relation ClickHouse AST.
@@ -242,4 +261,96 @@ export function authorizeClickHouseScoped(sql: string, rules: readonly ClickHous
     if (error instanceof Denied && nested) return { applicable: true, ok: false, code: error.message };
     return { applicable: false };
   }
+}
+
+export type ClickHouseJoinAuthorization =
+  | { applicable: false }
+  | { applicable: true; ok: false; code: string }
+  | { applicable: true; ok: true; columns: string[] };
+
+/** Adapt the original reviewer's source/column resolution to the local
+ * unqualified table contracts. This independent ClickHouse-AST check covers
+ * direct physical JOINs; registered keys, grain, scan bounds and the legacy
+ * policy remain mandatory. Unsupported scopes never gain authorization here. */
+export function authorizeClickHouseJoin(sql: string, rules: readonly ClickHouseDirectRule[]): ClickHouseJoinAuthorization {
+  let statements: unknown;
+  try { statements = parse(sql, { locations: false }); } catch { return { applicable: false }; }
+  if (!Array.isArray(statements) || statements.length !== 1) return { applicable: false };
+  const root = obj(statements[0]);
+  if (root?.type !== "SelectWithUnionQuery" || !Array.isArray(root.selects) || root.selects.length !== 1) return { applicable: false };
+  const select = obj(root.selects[0]); const from = obj(select?.from);
+  if (!select || select.type !== "SelectQuery" || (Array.isArray(select.with) && select.with.length) || !Array.isArray(from?.children) || from.children.length < 2 || from.children.length > 8) return { applicable: false };
+  type Source = { alias: string; table: string; allowed: Set<string>; sensitive: Set<string>; required: Set<string> };
+  const sources: Source[] = [];
+  for (const [index, value] of from.children.entries()) {
+    const item = obj(value); const expression = obj(item?.table_expression); const table = obj(expression?.database_and_table_name); const join = obj(item?.table_join);
+    if (!expression || !table || typeof table.name !== "string" || table.database || expression.subquery || expression.table_function || item?.array_join || index > 0 && (!join || !join.on || join.using)) return { applicable: false };
+    const rule = rules.find((entry) => entry.table === table.name);
+    if (!rule) return { applicable: true, ok: false, code: "unknown_table" };
+    const alias = typeof table.alias === "string" ? table.alias : table.name;
+    if (sources.some((source) => source.alias === alias)) return { applicable: true, ok: false, code: "duplicate_source_alias" };
+    sources.push({ alias, table: table.name, allowed: new Set(rule.allowed_columns), sensitive: new Set(rule.sensitive_columns), required: new Set(rule.must_filter ?? []) });
+  }
+  const selections = Array.isArray(select.select) ? select.select : [];
+  if (!selections.length) return { applicable: false };
+  const aliases = new Map<string, unknown>();
+  for (const value of selections) {
+    const item = obj(value); if (!item || typeof item.alias !== "string") continue;
+    if (aliases.has(item.alias)) return { applicable: true, ok: false, code: "duplicate_output_alias" };
+    const collisions = sources.filter((source) => source.allowed.has(String(item.alias)) || source.sensitive.has(String(item.alias)));
+    const parts = Array.isArray(item.name_parts) ? item.name_parts : [item.name];
+    const identity = item.type === "Identifier" && parts.at(-1) === item.alias;
+    if (collisions.length && !identity) {
+      // As in the original review, don't let alias substitution change a
+      // partition/privacy proof or an unqualified expression's meaning.
+      const protectedName = collisions.some((source) => source.sensitive.has(String(item.alias)) || source.required.has(String(item.alias)));
+      const unqualified = (value: unknown): boolean => {
+        if (Array.isArray(value)) return value.some(unqualified);
+        const node = obj(value); if (!node) return false;
+        if (node.type === "Identifier") {
+          const names = Array.isArray(node.name_parts) ? node.name_parts : [node.name];
+          return names.length === 1 && names[0] === item.alias;
+        }
+        return Object.entries(node).some(([key, child]) => !["alias", "location", "parent", "from", "with", "order_by"].includes(key) && unqualified(child));
+      };
+      if (protectedName || unqualified({ ...select, select: selections.filter((entry) => entry !== value) })) return { applicable: true, ok: false, code: "column_alias_collision" };
+    }
+    aliases.set(item.alias, item);
+  }
+  const columns = new Set<string>(); let nodes = 0;
+  const visit = (value: unknown, allowAlias = false): string | null => {
+    if (++nodes > 20_000) return "sql_complexity_limit";
+    if (Array.isArray(value)) { for (const child of value) { const error = visit(child, allowAlias); if (error) return error; } return null; }
+    const node = obj(value); if (!node) return null;
+    if (["Subquery", "SelectQuery", "SelectWithUnionQuery"].includes(String(node.type))) return "join_scope_unsupported";
+    if (node.type === "Identifier") {
+      const parts = Array.isArray(node.name_parts) ? node.name_parts : [node.name];
+      if (parts.length < 1 || parts.length > 2 || !parts.every((part) => typeof part === "string")) return "clickhouse_identifier_unsupported";
+      const name = String(parts.at(-1));
+      const candidates = sources.filter((source) => (parts.length === 1 || source.alias === parts[0]) && (source.allowed.has(name) || source.sensitive.has(name)));
+      if (!candidates.length && parts.length === 1 && allowAlias && aliases.has(name)) return null;
+      if (!candidates.length) return "column_not_in_contract";
+      if (candidates.some((source) => source.sensitive.has(name))) return "sensitive_field";
+      if (parts.length === 1 && candidates.length > 1) return "ambiguous_column";
+      for (const source of candidates) columns.add(`${source.table}.${name}`);
+      return null;
+    }
+    for (const [key, child] of Object.entries(node)) {
+      if (["alias", "location", "parent"].includes(key)) continue;
+      const error = visit(child, allowAlias); if (error) return error;
+    }
+    return null;
+  };
+  for (const item of from.children) {
+    const error = visit(obj(item)?.table_join);
+    if (error === "join_scope_unsupported") return { applicable: false };
+    if (error) return { applicable: true, ok: false, code: error };
+  }
+  for (const [key, value] of Object.entries(select)) {
+    if (["type", "from", "with", "location", "parent"].includes(key)) continue;
+    const error = visit(value, key === "order_by" || key === "group_by");
+    if (error === "join_scope_unsupported") return { applicable: false };
+    if (error) return { applicable: true, ok: false, code: error };
+  }
+  return { applicable: true, ok: true, columns: [...columns].sort() };
 }

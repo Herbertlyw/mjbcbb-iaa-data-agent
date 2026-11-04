@@ -37,6 +37,7 @@ import type {
   TransformResource,
 } from "./types.js";
 import { clickHouseColumns, clickHouseColumnTypes, clickHouseQueryBounded } from "./clickhouse-client.js";
+import { clickHousePreflightMessage, preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
 import { assertJoinKeys, guardSql, inspectSingleSourceProjection, parseReadonlySql, SqlRejected, type TableRule } from "./sql.js";
 import type { ClickHouseClient } from "@clickhouse/client";
 import type { DatabaseSync } from "node:sqlite";
@@ -317,9 +318,18 @@ export class ToolService {
     let sqlLimited = false;
     let guarded;
     try {
+      // In ClickHouse mode, discover candidate physical sources from its own
+      // grammar before loading the session's contract-bound rules. This is
+      // discovery only: guardSql still runs both AST policies and all grants.
+      const normalized = sql.trim().replace(/;+\s*$/u, "");
+      if (!normalized) throw new SqlRejected("invalid_sql", "SQL 为空");
+      if (Buffer.byteLength(normalized, "utf8") > 64 * 1024) throw new SqlRejected("sql_size_limit", "SQL 超出安全长度上限");
+      const inspected = this.ctx.businessEngine === "clickhouse" ? preflightClickHouseSql(normalized) : undefined;
+      if (inspected && !inspected.ok) throw new SqlRejected(inspected.code, clickHousePreflightMessage(inspected.code));
       const parsed = parseReadonlySql(sql);
       sqlLimited = containsSqlLimit(parsed.ast);
-      const rules = parsed.tables.map((table) => this.ruleFor(session, table));
+      const sources = inspected?.ok ? inspected.tables : parsed.tables;
+      const rules = sources.map((table) => this.ruleFor(session, table));
       guarded = guardSql(sql, rules, this.ctx.businessEngine === "clickhouse" ? "clickhouse" : "sqlite");
     } catch (error) {
       if (error instanceof SqlRejected) return fail(error.code, error.message);

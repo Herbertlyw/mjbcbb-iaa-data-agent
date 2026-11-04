@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import { isCalendarDate } from "./config.js";
-import { authorizeClickHouseDirect, authorizeClickHouseScoped, preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
+import { authorizeClickHouseDirect, authorizeClickHouseScoped, authorizeClickHouseJoin, clickHousePreflightMessage, preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
 
 const require = createRequire(import.meta.url);
 const loaded = require("node-sql-parser") as {
@@ -108,7 +108,7 @@ export function parseReadonlySql(rawSql: string, dialect: "sqlite" | "clickhouse
   if (tables.length === 0) throw new SqlRejected("missing_table", "查询没有引用表");
   if (dialect === "clickhouse") {
     const clickhouse = preflightClickHouseSql(sql);
-    if (!clickhouse.ok) throw new SqlRejected(clickhouse.code, "ClickHouse 语法或来源无法安全核验。");
+    if (!clickhouse.ok) throw new SqlRejected(clickhouse.code, clickHousePreflightMessage(clickhouse.code));
     if (clickhouse.tables.length !== tables.length || clickhouse.tables.some((table) => !tables.includes(table))) throw new SqlRejected("clickhouse_source_mismatch", "两个语法树对物理来源的解析不一致。");
     const legacyIdentifiers = new Set<string>(); const legacyFunctions = new Set<string>(); let ambiguousQuotes = false;
     walk(statement, (entry) => {
@@ -223,6 +223,8 @@ function assertSelectJoinKeys(statement: Record<string, unknown>, joins: Registe
 
 export function guardSql(rawSql: string, rules: TableRule[], dialect: "sqlite" | "clickhouse" = "sqlite"): GuardedSql {
   if (dialect === "clickhouse") {
+    const join = authorizeClickHouseJoin(rawSql, rules);
+    if (join.applicable && !join.ok) throw new SqlRejected(join.code, "ClickHouse JOIN 字段未获授权或来源不明确。");
     const scoped = authorizeClickHouseScoped(rawSql, rules);
     if (scoped.applicable && !scoped.ok) throw new SqlRejected(scoped.code, "ClickHouse 作用域中的表或字段未获授权，或未被内层投影。");
     const direct = authorizeClickHouseDirect(rawSql, rules);

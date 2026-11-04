@@ -120,6 +120,13 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
       const rollSession = runtime.sessions.create("analyst");
       await bindTables(runtime, rollSession.session_id, ["contract.fact_fox_daily_install"]);
       runtime.sessions.setActiveJob(rollSession.session_id, "job_group_rollup_clickhouse");
+      const forbiddenOptions = await runtime.tools.query(rollSession.session_id, { sql: "SELECT new_users FROM fact_fox_daily_install WHERE event_date = '2026-10-06' SETTINGS max_threads=8" });
+      assert.equal(forbiddenOptions.ok, false);
+      if (!forbiddenOptions.ok) {
+        assert.equal(forbiddenOptions.code, "query_output_options_forbidden");
+        assert.match(forbiddenOptions.message, /SETTINGS/);
+        assert.doesNotMatch(forbiddenOptions.message, /2026-10-06/);
+      }
       const grouped = await runtime.tools.query(rollSession.session_id, {
         sql: "SELECT event_date, SUM(new_users) AS total FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads' GROUP BY event_date ORDER BY event_date",
       });

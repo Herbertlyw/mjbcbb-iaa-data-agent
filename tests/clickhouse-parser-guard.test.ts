@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import test from "node:test";
-import { authorizeClickHouseDirect, authorizeClickHouseScoped, preflightClickHouseSql } from "../src/clickhouse-sql-preflight.js";
+import { authorizeClickHouseDirect, authorizeClickHouseScoped, authorizeClickHouseJoin, preflightClickHouseSql } from "../src/clickhouse-sql-preflight.js";
 import { guardSql, SqlRejected } from "../src/sql.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import { clickHouseCommand, clickHouseInsert, clickHouseQuery, clickHouseQueryBounded, createClickHouseClient } from "../src/clickhouse-client.js";
@@ -15,6 +15,30 @@ const knowledge = loadKnowledge("knowledge/harborlight");
 const fact = knowledge.contract_by_table.get("fact_fox_daily_install")!.contract!;
 const rules = [{ table: fact.table, allowed_columns: fact.columns.filter((column) => !fact.sensitive_columns.includes(column.name)).map((column) => column.name), sensitive_columns: fact.sensitive_columns, must_filter: fact.must_filter, column_types: Object.fromEntries(fact.columns.map((column) => [column.name, column.type])) }];
 const where = "event_date >= '2026-10-06' AND event_date <= '2026-10-08'";
+
+test("ClickHouse AST 独立解析 JOIN 字段及 ON 条件，拒绝歧义、越权与别名伪装", () => {
+  const dimension = knowledge.contract_by_table.get("dim_fox_title")!.contract!;
+  const all = [...rules, { table: dimension.table, allowed_columns: dimension.columns.map((column) => column.name), sensitive_columns: dimension.sensitive_columns, must_filter: dimension.must_filter }];
+  const sql = `SELECT d.title_name AS label, SUM(f.new_users) AS total FROM ${fact.table} f JOIN ${dimension.table} d ON f.title_id = d.title_id WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-08' GROUP BY d.title_name ORDER BY label`;
+  const result = authorizeClickHouseJoin(sql, all);
+  assert.equal(result.applicable && result.ok, true, JSON.stringify(result));
+  if (result.applicable && result.ok) assert.deepEqual(result.columns, ["dim_fox_title.title_id", "dim_fox_title.title_name", "fact_fox_daily_install.event_date", "fact_fox_daily_install.new_users", "fact_fox_daily_install.title_id"]);
+  assert.doesNotThrow(() => guardSql(sql, all, "clickhouse"));
+  for (const invalid of [
+    sql.replace("SUM(f.new_users)", "SUM(f.device_token)"),
+    sql.replace("f.title_id = d.title_id", "f.device_token = d.title_id"),
+    sql.replace("d.title_name AS label", "title_id AS label"),
+    sql.replace("SUM(f.new_users)", "SUM(other.new_users)"),
+    sql.replace("dim_fox_title d", "unknown_dimension d"),
+    sql.replace("AS total", "AS label"),
+    sql.replace("AS total", "AS event_date"),
+    sql.replace("AS total", "AS title_id").replace("GROUP BY d.title_name", "GROUP BY d.title_name, title_id"),
+  ]) {
+    const rejected = authorizeClickHouseJoin(invalid, all);
+    assert.equal(rejected.applicable && !rejected.ok, true, invalid);
+    assert.throws(() => guardSql(invalid, all, "clickhouse"), SqlRejected, invalid);
+  }
+});
 
 test("ClickHouse AST 逐层绑定 CTE 与派生表的输出字段及物理血缘", () => {
   const sql = `WITH a AS (SELECT event_date AS d, country_code AS country, new_users AS n FROM ${fact.table} WHERE ${where}), b AS (SELECT d, country, n FROM a WHERE country IN ('US','JP')) SELECT country, SUM(n) AS total FROM b GROUP BY country ORDER BY total`;
