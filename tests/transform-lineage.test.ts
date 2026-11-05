@@ -37,6 +37,19 @@ test("完整明细与数据库分组 SUM 可按契约键对齐并递归复核", 
     assert.deepEqual((aligned.rows as Array<{ group: { country_code: string }; result: { value: string } }>).map((row) => [row.group.country_code, row.result.value]), [["JP", "0"], ["US", "25"]]);
     const transformed = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(aligned.resource_id), transform: { resource_id: String(aligned.resource_id), steps: [{ op: "filter", column: "result_value", comparison: "gt", value: "0" }, { op: "group", by: [], aggregates: [{ op: "sum", column: "result_value", as: "sum" }] }] } });
     assert.ok(transformed.ok, JSON.stringify(transformed)); if (!transformed.ok) return;
+    const ref = { resource_id: String(transformed.resource_id), execution_id: String(transformed.execution_id), cell: "sum", row: 0 };
+    const doubled = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: ref, right: ref } });
+    assert.ok(doubled.ok, JSON.stringify(doubled)); if (!doubled.ok) return;
+    assert.equal((doubled.result as { value: string }).value, "50");
+    assert.equal((doubled.result as { interpretation: string }).interpretation, "mathematical_only");
+    const chainedRef = { resource_id: String(doubled.resource_id), cell: "result" };
+    const chained = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: chainedRef, right: chainedRef } });
+    assert.ok(chained.ok, JSON.stringify(chained)); if (!chained.ok) return;
+    assert.equal((chained.result as { value: string }).value, "100");
+    const final = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(chained.resource_id)] });
+    assert.ok(final.ok, JSON.stringify(final)); if (final.ok) { assert.equal(final.status, "completed"); assert.match(String(final.answer), /数学运算 add：100 人/); assert.match(String(final.answer), /不认证业务指标名称/); }
+    const wrongId = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: { ...ref, execution_id: "wrong" }, right: ref } });
+    assert.equal(wrongId.ok, false);
     const conflicting = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(left.resource_id), transform: { resource_id: String(aligned.resource_id), steps: [{ op: "group", by: [], aggregates: [{ op: "count_all", as: "n" }] }] } });
     assert.equal(conflicting.ok, false);
     if (!conflicting.ok) assert.equal(conflicting.code, "invalid_transform");
@@ -66,6 +79,10 @@ test("已出现分组全部匹配也不能抹去输入缺日期，递归变换�
     assert.equal(alignedAnswer.ok, true); if (alignedAnswer.ok) { assert.equal(alignedAnswer.status, "partial"); assert.match(String(alignedAnswer.answer), /仅为已观察记录的计算/); }
     const transformed = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(result.resource_id), steps: [{ op: "group", by: [], aggregates: [{ op: "sum", column: "result_value", as: "total" }] }] } });
     assert.equal(transformed.ok, true, JSON.stringify(transformed)); if (!transformed.ok) return;
+    const ref = { resource_id: String(transformed.resource_id), execution_id: String(transformed.execution_id), cell: "total", row: 0 };
+    const calculated = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: ref, right: ref } });
+    assert.equal(calculated.ok, true, JSON.stringify(calculated));
+    if (calculated.ok) { const result = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(calculated.resource_id)] }); assert.equal(result.ok, true); if (result.ok) assert.equal(result.status, "partial"); }
     const answer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [left, right, String(transformed.resource_id)] });
     assert.equal(answer.ok, true); if (answer.ok) { assert.equal(answer.status, "partial"); assert.ok((answer.server_reasons as string[]).includes("alignment_incomplete")); }
   });
@@ -193,6 +210,10 @@ test("同任务完整聚合可链式变换并在交付前重新验证全部来�
     assert.equal(second.ok, true, JSON.stringify(second));
     if (!second.ok) return;
     assert.deepEqual((second.result as { rows: object[] }).rows.map((row) => ({ ...row })), [{ result: "120", n: "1" }]);
+    const ref = { resource_id: String(second.resource_id), execution_id: String(second.execution_id), cell: "result", aggregate: "sum" as const };
+    const twice = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: ref, right: ref } });
+    assert.ok(twice.ok, JSON.stringify(twice)); if (!twice.ok) return;
+    assert.equal((twice.result as { value: string }).value, "240");
     const ids = [String(query.resource_id), String(first.resource_id), String(second.resource_id)];
     const answer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: ids });
     assert.equal(answer.ok, true, JSON.stringify(answer));
@@ -207,12 +228,38 @@ test("同任务完整聚合可链式变换并在交付前重新验证全部来�
     const altered = structuredClone(stored.resource) as TransformResource;
     altered.result.rows[0]!.total = "999";
     runtime.state.saveResource(altered);
+    const rejectedMath = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: ref, right: ref } });
+    assert.equal(rejectedMath.ok, false);
     const tampered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: ids });
     assert.equal(tampered.ok, true);
     if (tampered.ok) { assert.equal(tampered.status, "partial"); assert.doesNotMatch(String(tampered.answer), /=999/); assert.ok((tampered.server_reasons as string[]).includes("transform_lineage_unsupported")); }
     runtime.sessions.setActiveJob(session.session_id, "job_other");
     const foreign = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(query.resource_id), steps: [{ op: "sort", keys: [{ column: "total", direction: "desc", nulls: "last" }] }] } });
     assert.equal(foreign.ok, false);
+  });
+});
+
+test("变换结果的全 NULL 与零分母向后续算术传播为未知，不自动补零", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]); runtime.sessions.setActiveJob(session.session_id, "job_derived_null");
+    const query = await runtime.tools.query(session.session_id, { sql: "SELECT event_date, new_users FROM daily_installs WHERE event_date = '2026-10-09' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'" });
+    assert.ok(query.ok, JSON.stringify(query)); if (!query.ok) return;
+    const transformed = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(query.resource_id), steps: [{ op: "group", by: [], aggregates: [{ op: "sum", column: "new_users", as: "total" }] }] } });
+    assert.ok(transformed.ok, JSON.stringify(transformed)); if (!transformed.ok) return;
+    const ref = { resource_id: String(transformed.resource_id), execution_id: String(transformed.execution_id), cell: "total", row: 0 };
+    const calculated = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: ref, right: ref } });
+    assert.ok(calculated.ok, JSON.stringify(calculated)); if (!calculated.ok) return;
+    assert.equal((calculated.result as { value: unknown }).value, null);
+    assert.equal((calculated.result as { undefined_reason: string }).undefined_reason, "null_input");
+    const delivered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(calculated.resource_id)] });
+    assert.ok(delivered.ok, JSON.stringify(delivered)); if (delivered.ok) { assert.equal(delivered.status, "partial"); assert.match(String(delivered.answer), /输入为空或 NULL，结果未知/); }
+    const zeroQuery = await runtime.tools.query(session.session_id, { sql: "SELECT event_date, new_users FROM daily_installs WHERE event_date = '2026-10-07' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'" });
+    assert.ok(zeroQuery.ok, JSON.stringify(zeroQuery)); if (!zeroQuery.ok) return;
+    const zero = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(zeroQuery.resource_id), steps: [{ op: "group", by: [], aggregates: [{ op: "sum", column: "new_users", as: "total" }] }] } });
+    assert.ok(zero.ok, JSON.stringify(zero)); if (!zero.ok) return;
+    const zeroRef = { resource_id: String(zero.resource_id), execution_id: String(zero.execution_id), cell: "total", row: 0 };
+    const division = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "divide", left: zeroRef, right: zeroRef } });
+    assert.ok(division.ok, JSON.stringify(division)); if (division.ok) { assert.equal((division.result as { value: unknown }).value, null); assert.equal((division.result as { undefined_reason: string }).undefined_reason, "zero_divisor"); }
   });
 });
 

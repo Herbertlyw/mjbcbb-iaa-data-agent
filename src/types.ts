@@ -254,6 +254,7 @@ export interface QueryResource {
 
 export interface CalculationResource {
   resource_id: string;
+  execution_id?: string;
   session_id: string;
   kind: "calculation";
   created_at: string;
@@ -274,6 +275,7 @@ export interface CalculationResource {
 export interface ArithmeticRef { resource_id: string; cell: string; group?: Record<string, string>; execution_id?: string; row?: number; aggregate?: "sum" }
 export interface ArithmeticResource {
   resource_id: string;
+  execution_id?: string;
   session_id: string;
   job_id: string;
   kind: "arithmetic";
@@ -289,6 +291,8 @@ export interface ArithmeticResource {
 
 export interface TransformResource {
   resource_id: string;
+  /** Identity of this saved computation, distinct from any database query. */
+  execution_id?: string;
   session_id: string;
   job_id: string;
   kind: "transform";
@@ -303,6 +307,7 @@ export interface TransformResource {
 
 export interface AlignmentResource {
   resource_id: string;
+  execution_id?: string;
   session_id: string;
   job_id: string;
   kind: "alignment";

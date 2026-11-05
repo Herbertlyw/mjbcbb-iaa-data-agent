@@ -38,6 +38,8 @@ import type {
 } from "./types.js";
 import { clickHouseColumns, clickHouseColumnTypes, clickHouseQueryBounded, clickHousePreflightedQuery, ClickHousePlanError } from "./clickhouse-client.js";
 import { clickHousePreflightMessage, preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
+import { ResourceGraph } from "./resource-graph.js";
+import { savedResultView } from "./result-view.js";
 import { assertJoinKeys, guardSql, inspectSingleSourceProjection, parseReadonlySql, SqlRejected, type TableRule } from "./sql.js";
 import type { ClickHouseClient } from "@clickhouse/client";
 import type { DatabaseSync } from "node:sqlite";
@@ -466,8 +468,12 @@ export class ToolService {
         published_at: published.published_at,
       });
     }
-    const latency = await waitForQuery(this.ctx.config.queryLatencyMs, this.ctx.config.queryTimeoutMs, signal);
-    if (latency === "cancelled") return fail("query_cancelled", "查询已取消");
+    // One deadline covers preflight, the actual read, any proof fallback and
+    // coverage reads; EXPLAIN must not create a fresh full timeout budget.
+    const deadline = AbortSignal.timeout(this.ctx.config.queryTimeoutMs);
+    const querySignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    const latency = await waitForQuery(this.ctx.config.queryLatencyMs, this.ctx.config.queryTimeoutMs, querySignal);
+    if (latency === "cancelled") return deadline.aborted && !signal?.aborted ? fail("query_timeout", "查询超时，没有留下结果") : fail("query_cancelled", "查询已取消");
     if (latency === "timeout") return fail("query_timeout", "查询超时，没有留下结果");
     let rows: Array<Record<string, unknown>>;
     let bounded: Awaited<ReturnType<typeof clickHouseQueryBounded>> | null = null;
@@ -477,7 +483,7 @@ export class ToolService {
     try {
       if (this.ctx.businessEngine === "clickhouse") {
         if (!this.ctx.clickhouse) throw new Error("clickhouse_unavailable");
-        bounded = await clickHousePreflightedQuery(this.ctx.clickhouse, executedSql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
+        bounded = await clickHousePreflightedQuery(this.ctx.clickhouse, executedSql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, querySignal);
         // Retry only a successfully returned, read-only observation whose
         // detailed proof did not fit or could not verify. This is a new
         // observation, never a continuation or a claim of a shared snapshot.
@@ -486,7 +492,7 @@ export class ToolService {
           if (aggregatePlan) {
             joinPlan = aggregatePlan;
             executedSql = aggregatePlan.executionSql;
-            bounded = await clickHousePreflightedQuery(this.ctx.clickhouse, executedSql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
+            bounded = await clickHousePreflightedQuery(this.ctx.clickhouse, executedSql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, querySignal);
           }
         }
         if (joinPlan && joinFact && joinDimension) {
@@ -503,9 +509,10 @@ export class ToolService {
           bounded.column_types = cleanTypes;
         }
         rows = bounded.rows;
-      } else rows = await this.executeGuarded(guarded.sql, signal);
+      } else rows = await this.executeGuarded(guarded.sql, querySignal);
     } catch (error) {
       if (signal?.aborted) return fail("query_cancelled", "查询已取消");
+      if (deadline.aborted) return fail("query_timeout", "查询超时，没有留下结果");
       if (error instanceof ClickHousePlanError) return fail(error.code, "ClickHouse 执行计划预检失败或结果不完整，正式查询没有继续执行。");
       const message = error instanceof Error ? error.message : "查询执行失败";
       if (/max_rows_to_read|Limit for rows/iu.test(message)) return fail("scan_limit", "查询超过扫描行数限制");
@@ -522,11 +529,14 @@ export class ToolService {
     let coverage;
     try {
       const projection = inspectSingleSourceProjection(guarded.sql, guarded.tables.map((table) => this.ruleFor(session, table)));
-      coverage = joinPlan && joinProof ? joinCoverage(joinPlan, joinProof.rows, joinFact) : await this.coverageForTables(projection?.proof_sql ?? guarded.sql, guarded.tables, guarded.time_range, bindings, signal);
+      coverage = joinPlan && joinProof ? joinCoverage(joinPlan, joinProof.rows, joinFact) : await this.coverageForTables(projection?.proof_sql ?? guarded.sql, guarded.tables, guarded.time_range, bindings, querySignal);
     } catch {
       if (signal?.aborted) return fail("query_cancelled", "查询已取消");
+      if (deadline.aborted) return fail("query_timeout", "查询超时，没有留下结果");
       return fail("coverage_query_failed", "覆盖统计无法完成，查询结果没有保存。");
     }
+    if (signal?.aborted) return fail("query_cancelled", "查询已取消");
+    if (deadline.aborted) return fail("query_timeout", "查询超时，没有留下结果");
     if (Buffer.byteLength(JSON.stringify(coverage)) > 500_000) coverage = unknownCoverage("覆盖回执超过保存预算，未证明完整覆盖。");
     // Coverage can itself be a separate database query. It must be included in
     // the freshness interval, rather than checking only the first SELECT.
@@ -635,7 +645,7 @@ export class ToolService {
       if (typeof id !== "string") continue;
       const resource = await this.ctx.sessions.lookupResourceAsync(sessionId, id);
       if (!resource.ok) return fail(resource.code, resource.message);
-      if (!await this.resourceReadable(sessionId, resource.resource, new Set())) return fail("resource_authorization_changed", "资源引用的授权、契约或来源发生变化，不能继续读取或计算。");
+      if (!await this.resourceReadable(sessionId, resource.resource)) return fail("resource_authorization_changed", "资源引用的授权、契约或来源发生变化，不能继续读取或计算。");
     }
     if (input.align) {
       if (input.transform || input.arithmetic || input.resource_id || input.operations) return fail("invalid_alignment", "分组对齐须单独提交。");
@@ -669,6 +679,7 @@ export class ToolService {
     }
     const resource: CalculationResource = {
       resource_id: newId("res"),
+      execution_id: newId("calc"),
       session_id: sessionId,
       kind: "calculation",
       created_at: new Date().toISOString(),
@@ -688,6 +699,7 @@ export class ToolService {
     return {
       ok: true,
       resource_id: resource.resource_id,
+      execution_id: resource.execution_id,
       source_resource_id: source.resource_id,
       cells,
       input_truncated: resource.input_truncated,
@@ -713,12 +725,13 @@ export class ToolService {
     if (!left || !right) return fail("arithmetic_lineage_unsupported", "输入不属于当前任务、已变化或不能证明完整血缘。引用多行结果中的明细行时请提供查询结果中的 execution_id、row 和列名；单行资源可使用其保存的执行 ID。不要使用历史任务资源。");
     const result = this.computeProvenArithmetic(expression.op, left.value, right.value);
     if (!result) return fail("arithmetic_scope_incompatible", "指标关系须由契约声明，且单位、粒度、实际/预测状态及范围须兼容。");
-    const resource: ArithmeticResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "arithmetic", created_at: new Date().toISOString(), operation: expression.op, left: expression.left, right: expression.right, input_hashes: { ...left.hashes, ...right.hashes }, result, input_truncated: false, complete_population: true };
+    const resource: ArithmeticResource = { resource_id: newId("res"), execution_id: newId("calc"), session_id: sessionId, job_id: jobId, kind: "arithmetic", created_at: new Date().toISOString(), operation: expression.op, left: expression.left, right: expression.right, input_hashes: { ...left.hashes, ...right.hashes }, result, input_truncated: false, complete_population: true };
     await this.ctx.sessions.saveResourceAsync(resource);
-    return { ok: true, resource_id: resource.resource_id, result: resource.result, dependencies: Object.keys(resource.input_hashes), notice: `${result.value === null ? "除数为零，结果不可计算；没有补成零。" : "定点计算；除法保留 18 位小数、半数远离零。正式结论须引用所有来源并经服务端复核。"} resource_id=${resource.resource_id}` };
+    return { ok: true, resource_id: resource.resource_id, execution_id: resource.execution_id, result: resource.result, dependencies: Object.keys(resource.input_hashes), notice: `${result.value === null ? result.undefined_reason === "null_input" ? "输入为空或 NULL，结果未知；没有补成零。" : "除数为零，结果不可计算；没有补成零。" : "定点计算；除法保留 18 位小数、半数远离零。正式结论须经服务端复核。"}${result.interpretation === "mathematical_only" ? " 这是基于已验证结果单元的数学运算，不认证业务指标名称或范围。" : ""} resource_id=${resource.resource_id}` };
   }
 
   private computeProvenArithmetic(op: ArithmeticOp, left: ArithmeticValue, right: ArithmeticValue): ArithmeticValue | null {
+    if (left.interpretation === "mathematical_only" || right.interpretation === "mathematical_only") return computeArithmetic(op, left, right, false, true);
     const a = left.basis; const b = right.basis;
     const aBases = left.bases ?? [a]; const bBases = right.bases ?? [b];
     let declared = false;
@@ -755,10 +768,10 @@ export class ToolService {
     const transformed = this.applyProvenTransform(inputTable.table, input.steps);
     if (!transformed) return fail("invalid_transform", "变换参数、类型、契约指标关系或资源边界不受支持。");
     const result = transformed.table;
-    const resource: TransformResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "transform", created_at: new Date().toISOString(), source_resource_id: input.resource_id, steps: input.steps, input_hashes: inputTable.hashes, result, input_truncated: false, complete_population: true };
+    const resource: TransformResource = { resource_id: newId("res"), execution_id: newId("calc"), session_id: sessionId, job_id: jobId, kind: "transform", created_at: new Date().toISOString(), source_resource_id: input.resource_id, steps: input.steps, input_hashes: inputTable.hashes, result, input_truncated: false, complete_population: true };
     await this.ctx.sessions.saveResourceAsync(resource);
     const preview = previewRows(result.rows, 100);
-    return { ok: true, resource_id: resource.resource_id, result: { ...result, rows: preview }, result_total_rows: result.rows.length, result_has_more: result.rows.length > preview.length, dependencies: Object.keys(resource.input_hashes), notice: `变换应用于完整已保存结果；预览限 100 行及 32 KB，可使用 read_session_resource 续读。${transformed.undefinedArithmetic ? "存在 NULL 输入或零分母，部分运算结果未知。" : ""}正式交付时递归复核来源。resource_id=${resource.resource_id}` };
+    return { ok: true, resource_id: resource.resource_id, execution_id: resource.execution_id, result: { ...result, rows: preview }, result_total_rows: result.rows.length, result_has_more: result.rows.length > preview.length, dependencies: Object.keys(resource.input_hashes), notice: `变换应用于完整已保存结果；预览限 100 行及 32 KB，可使用 read_session_resource 续读。${transformed.undefinedArithmetic ? "存在 NULL 输入或零分母，部分运算结果未知。" : ""}正式交付时递归复核来源。resource_id=${resource.resource_id}` };
   }
 
   /** Only host-reconstructed JOIN SUM provenance can establish a declared
@@ -794,10 +807,10 @@ export class ToolService {
     if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
     const checked = await this.resolveAlignment(session, jobId, spec, fresh.publication);
     if (!checked) return fail("alignment_lineage_unsupported", "分组、指标口径、范围或完整来源无法证明。");
-    const resource: AlignmentResource = { resource_id: newId("res"), session_id: sessionId, job_id: jobId, kind: "alignment", created_at: new Date().toISOString(), spec, input_hashes: checked.hashes, rows: checked.rows, coverage_incomplete: checked.partial, input_truncated: false, complete_population: true };
+    const resource: AlignmentResource = { resource_id: newId("res"), execution_id: newId("calc"), session_id: sessionId, job_id: jobId, kind: "alignment", created_at: new Date().toISOString(), spec, input_hashes: checked.hashes, rows: checked.rows, coverage_incomplete: checked.partial, input_truncated: false, complete_population: true };
     await this.ctx.sessions.saveResourceAsync(resource);
     const preview = previewRows(checked.rows, 100);
-    return { ok: true, resource_id: resource.resource_id, rows: preview, result_total_rows: checked.rows.length, result_has_more: checked.rows.length > preview.length, coverage_incomplete: checked.partial, dependencies: Object.keys(checked.hashes), notice: `按完整结果的分组键全集对齐；预览限 100 行及 32 KB，某侧未出现的组不补零。${checked.partial ? "来源覆盖不完整或未知，结果只能部分交付。" : ""}resource_id=${resource.resource_id}` };
+    return { ok: true, resource_id: resource.resource_id, execution_id: resource.execution_id, rows: preview, result_total_rows: checked.rows.length, result_has_more: checked.rows.length > preview.length, coverage_incomplete: checked.partial, dependencies: Object.keys(checked.hashes), notice: `按完整结果的分组键全集对齐；预览限 100 行及 32 KB，某侧未出现的组不补零。${checked.partial ? "来源覆盖不完整或未知，结果只能部分交付。" : ""}resource_id=${resource.resource_id}` };
   }
 
   private async resolveAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
@@ -1011,7 +1024,42 @@ export class ToolService {
       if (matching.length !== 1) return null;
       return { value: fromAggregate(matching[0]!), hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id] };
     }
-    if (ref.execution_id !== undefined || ref.row !== undefined || ref.aggregate !== undefined) return null;
+    if (resource.kind === "transform" || resource.kind === "alignment") {
+      // Derived executions have their own identity; never interpret row zero
+      // from different resources as a matched business row.
+      if (ref.group || !resource.execution_id || ref.execution_id !== resource.execution_id || (ref.row === undefined) === (ref.aggregate === undefined) || (ref.row !== undefined && (!Number.isSafeInteger(ref.row) || ref.row < 0)) || (ref.aggregate !== undefined && ref.aggregate !== "sum")) return null;
+      const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, new Set());
+      const column = checked?.table.columns.find((item) => item.name === ref.cell);
+      if (!checked || !column || column.type !== "decimal" || !Number.isInteger(column.scale) || column.scale! < 0 || column.scale! > 38) return null;
+      let values: Array<string | null>;
+      if (ref.row !== undefined) {
+        const row = checked.table.rows[ref.row];
+        if (!row || !Object.hasOwn(row, ref.cell)) return null;
+        const value = row[ref.cell];
+        if (value !== null && typeof value !== "string") return null;
+        values = [value as string | null];
+      } else {
+        values = [];
+        for (const row of checked.table.rows) {
+          const value = row[ref.cell];
+          if (value !== null && typeof value !== "string") return null;
+          values.push(value as string | null);
+        }
+      }
+      const nonNull = values.filter((value): value is string => value !== null);
+      const value = nonNull.length ? sumDecimalStrings(nonNull, column.scale!) : null;
+      if (nonNull.length && value === null) return null;
+      const partial = checked.partial || !values.length || nonNull.length !== values.length;
+      const selection = ref.row !== undefined ? `第 ${ref.row} 行` : "整列非 NULL 合计";
+      const result: ArithmeticValue = {
+        value, scale: column.scale!, unit: column.unit || "未认证",
+        basis: { table: "结果资源", column: ref.cell, operation: "result_cell", unit: column.unit || "未认证", prediction: "未认证", timezone: "未认证" },
+        interpretation: "mathematical_only", ...(partial ? { partial: true } : {}),
+        formula: `${resource.resource_id} 的列 ${ref.cell}（${selection}）`, scopes: [],
+      };
+      return { value: result, hashes: checked.hashes, leaves: checked.leaves };
+    }
+    if ((ref.execution_id !== undefined && ref.execution_id !== resource.execution_id) || ref.row !== undefined || ref.aggregate !== undefined) return null;
     if (resource.kind === "calculation") {
       if (ref.group || !resource.operations || !Object.hasOwn(resource.operations, ref.cell)) return null;
       const foundSource = await this.ctx.sessions.lookupResourceAsync(session.session_id, resource.source_resource_id);
@@ -1054,17 +1102,28 @@ export class ToolService {
     return contract;
   }
 
-  async readSessionResource(sessionId: string, input: { resource_id?: string; row_offset?: number; row_limit?: number; columns?: string[]; expected_resource_hash?: string }, signal?: AbortSignal): Promise<ToolResult> {
+  async readSessionResource(sessionId: string, input: { resource_id?: string; row_offset?: number; row_limit?: number; columns?: string[]; expected_resource_hash?: string; format?: "result_view" }, signal?: AbortSignal): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
     const found = await this.ctx.sessions.lookupResourceAsync(sessionId, input.resource_id ?? "");
     if (!found.ok) return fail(found.code, found.message);
-    if (!await this.resourceReadable(sessionId, found.resource, new Set())) return fail("resource_authorization_changed", "资源引用的授权、契约或来源发生变化，不能继续读取。");
+    if (!await this.resourceReadable(sessionId, found.resource)) return fail("resource_authorization_changed", "资源引用的授权、契约或来源发生变化，不能继续读取。");
     const hash = createHash("sha256").update(JSON.stringify(found.resource)).digest("hex");
     const offset = input.row_offset ?? 0;
     const limit = input.row_limit ?? 50;
     if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) return fail("invalid_resource_page", "行偏移须为非负整数，每页限 1 到 100 行。");
     if ((offset > 0 && !input.expected_resource_hash) || (input.expected_resource_hash && input.expected_resource_hash !== hash)) return fail("resource_version_changed", "续读须携带首页的资源哈希，资源变化后请从头读取。");
+    if (input.format !== undefined && input.format !== "result_view") return fail("invalid_resource_page", "不支持的结果格式。");
+    if (input.format === "result_view") {
+      const view = savedResultView(found.resource);
+      if (!view) return fail("resource_execution_identity_missing", "旧资源缺少可验证的执行身份，请重新查询或计算。");
+      const available = view.columns.map((column) => column.name); const selected = input.columns ?? available;
+      if (offset > view.saved_rows || !Array.isArray(selected) || new Set(selected).size !== selected.length || selected.some((name) => typeof name !== "string" || !available.includes(name))) return fail("invalid_resource_page", "行偏移或列选择不合法。");
+      const rows = previewRows(view.rows.slice(offset, offset + limit).map((row) => Object.fromEntries(selected.map((name) => [name, row[name]]))), limit);
+      if (!rows.length && offset < view.saved_rows) return fail("resource_page_byte_limit", "单行超过页面字节上限，请选择较少字段。");
+      const next = offset + rows.length;
+      return { ok: true, result_view: { ...view, columns: view.columns.filter((column) => selected.includes(column.name)), rows }, resource_hash: hash, row_offset: offset, has_more: next < view.saved_rows, next_row_offset: next < view.saved_rows ? next : null, resource_truncated: view.source_truncated, notice: "已保存的结果视图；本次读取检查权限，正式交付仍须递归重算并复核新鲜度。" };
+    }
     if (found.resource.kind === "transform") {
       const resource = found.resource; const available = resource.result.columns.map((column) => column.name);
       const selected = input.columns ?? available;
@@ -1121,54 +1180,16 @@ export class ToolService {
     const reasons: string[] = [];
     const resources: SessionResource[] = [];
     let invalidSelectedResource = false;
-    // Traverse the actual persisted dependency graph, not a model-supplied
-    // list of ancestors. Every node is scoped again to this session and job.
-    // A cycle or missing parent makes the entire candidate unprovable.
-    const visited = new Set<string>();
-    const visiting = new Set<string>();
-    const ordered: SessionResource[] = [];
-    const loaded = new Map<string, SessionResource>();
-    const visit = async (resourceId: string): Promise<string | null> => {
-      if (visited.has(resourceId)) return null;
-      if (visiting.has(resourceId)) return "resource_dependency_cycle";
-      if (visited.size + visiting.size >= 128 || visiting.size >= 16) return "resource_dependency_limit";
-      let resource = loaded.get(resourceId);
-      if (!resource) {
-        const found = await this.ctx.sessions.lookupResourceAsync(sessionId, resourceId);
-        if (!found.ok) return found.code;
-        resource = found.resource; loaded.set(resourceId, resource);
-      }
-      if (jobId && resource.job_id !== jobId) return "resource_from_other_execution";
-      visiting.add(resourceId);
-      const parents = resource.kind === "query_result" ? [] : resource.kind === "calculation" || resource.kind === "transform"
-        ? [resource.source_resource_id] : resource.kind === "arithmetic"
-          ? [resource.left.resource_id, resource.right.resource_id] : [resource.spec.left.resource_id, resource.spec.right.resource_id];
-      for (const parent of parents) {
-        if (typeof parent !== "string" || !parent) return "resource_dependency_invalid";
-        const error = await visit(parent);
-        if (error) return error;
-      }
-      visiting.delete(resourceId); visited.add(resourceId); ordered.push(resource);
-      return null;
-    };
+    const graph = new ResourceGraph((id) => this.ctx.sessions.lookupResourceAsync(sessionId, id), sessionId, jobId || undefined);
     for (const id of input.resource_ids ?? []) {
-      const selected = await this.ctx.sessions.lookupResourceAsync(sessionId, id);
-      if (!selected.ok) { invalidSelectedResource = true; reasons.push(selected.code); continue; }
-      if (jobId && selected.resource.job_id !== jobId) { invalidSelectedResource = true; reasons.push("resource_from_other_execution"); continue; }
-      loaded.set(id, selected.resource);
-      const checkpoint = ordered.length;
-      const error = await visit(id);
+      const error = await graph.add(id);
       if (error) {
         if (error === "resource_dependency_cycle" || error === "resource_dependency_limit") return fail(error, "证据依赖存在循环或超过限制；请重新计算。");
-        // Do not retain ancestors visited solely for a rejected root. Other
-        // independently selected, valid results may still be delivered partial.
-        ordered.splice(checkpoint); visiting.clear(); visited.clear();
-        for (const retained of ordered) visited.add(retained.resource_id);
         invalidSelectedResource = true;
         reasons.push(error);
       }
     }
-    for (const resource of ordered) {
+    for (const resource of graph.nodes()) {
       resources.push(resource);
       citations.push({ resource_id: resource.resource_id, note: resource.kind });
       if (resource.kind === "query_result") {
@@ -1439,6 +1460,7 @@ export class ToolService {
       }
       arithmeticResults.push({ resource_id: resource.resource_id, operation: resource.operation, left: resource.left, right: resource.right, result: checked.value });
       noteUnprovenSnapshot(checked.leaves);
+      if (checked.value.partial) { reasons.push("arithmetic_input_incomplete"); if (status === "completed") status = "partial"; }
       if (checked.value.value === null && status === "completed") status = "partial";
     }
     const transformResults: NonNullable<AnalysisRecord["transform_results"]> = [];
@@ -1497,6 +1519,7 @@ export class ToolService {
     if (reasons.includes("calculation_lineage_unsupported") || reasons.includes("query_lineage_unsupported")) limitations.push("部分表达式或计算缺少可证明的血缘，没有作为已验证数值展示。");
     if (reasons.includes("comparison_unverifiable")) limitations.push("部分比较的范围、覆盖、单位、预测状态或整数精度无法证明，没有展示比较结果。");
     if (reasons.includes("arithmetic_lineage_unsupported")) limitations.push("部分四则运算的递归来源、资源哈希、授权或新鲜度无法证明，没有展示结果。");
+    if (reasons.includes("arithmetic_input_incomplete")) limitations.push("部分数学输入包含缺失或覆盖不完整；非 NULL 合计不代表完整总体。");
     if (reasons.includes("transform_lineage_unsupported")) limitations.push("部分结果变换的递归来源、资源哈希、授权或新鲜度无法证明，没有展示结果。");
     if (reasons.includes("alignment_lineage_unsupported")) limitations.push("部分分组对齐的完整来源、范围或口径无法证明，没有展示结果。");
     if (reasons.includes("alignment_incomplete")) limitations.push("对齐来源存在未出现的分组或零分母；变换未把未知结果当作零。");
@@ -1654,7 +1677,7 @@ export class ToolService {
     const session = await this.ctx.sessions.requireAsync(sessionId);
     for (const citation of analysis.citations) {
       const found = await this.ctx.sessions.lookupResourceAsync(sessionId, citation.resource_id);
-      if (!found.ok || found.resource.job_id !== jobId || analysis.resource_hashes[citation.resource_id] !== createHash("sha256").update(JSON.stringify(found.resource)).digest("hex") || !await this.resourceReadable(sessionId, found.resource, new Set())) return false;
+      if (!found.ok || found.resource.job_id !== jobId || analysis.resource_hashes[citation.resource_id] !== createHash("sha256").update(JSON.stringify(found.resource)).digest("hex") || !await this.resourceReadable(sessionId, found.resource)) return false;
     }
     const excerpts = analysis.analysis_declaration?.declaration.source_excerpts ?? [];
     for (const excerpt of excerpts) {
@@ -1696,25 +1719,21 @@ export class ToolService {
 
   /** Recheck each leaf after restart; historical resources remain readable only
    * while the current principal still has the contract and table permissions. */
-  private async resourceReadable(sessionId: string, resource: SessionResource, path: Set<string>): Promise<boolean> {
-    if (path.has(resource.resource_id) || path.size >= 32) return false;
-    const next = new Set(path); next.add(resource.resource_id);
-    if (resource.kind === "query_result") {
-      const session = await this.ctx.sessions.requireAsync(sessionId);
-      if (resource.registry_revision !== this.ctx.knowledge.registry_revision) return false;
+  private async resourceReadable(sessionId: string, resource: SessionResource): Promise<boolean> {
+    const graph = new ResourceGraph((id) => id === resource.resource_id
+      ? Promise.resolve({ ok: true as const, resource }) : this.ctx.sessions.lookupResourceAsync(sessionId, id), sessionId, resource.job_id);
+    if (await graph.add(resource.resource_id)) return false;
+    const session = await this.ctx.sessions.requireAsync(sessionId);
+    for (const node of graph.nodes()) {
+      if (node.kind !== "query_result") continue;
+      if (node.registry_revision !== this.ctx.knowledge.registry_revision) return false;
       const ids: string[] = [];
-      for (const table of resource.tables) {
+      for (const table of node.tables) {
         const asset = this.ctx.knowledge.contract_by_table.get(table); const contract = asset?.contract;
-        if (!asset || !contract || !canRead(this.ctx.knowledge, session.role, asset.asset_id) || !canQueryTable(this.ctx.knowledge, session.role, table) || contractValidity(contract, currentCalendarDate(this.ctx.config, contract.timezone)) || resource.contract_revisions[table] !== contract.revision || resource.asset_hashes[asset.asset_id] !== asset.content_hash) return false;
+        if (!asset || !contract || !canRead(this.ctx.knowledge, session.role, asset.asset_id) || !canQueryTable(this.ctx.knowledge, session.role, table) || contractValidity(contract, currentCalendarDate(this.ctx.config, contract.timezone)) || node.contract_revisions[table] !== contract.revision || node.asset_hashes[asset.asset_id] !== asset.content_hash) return false;
         ids.push(asset.asset_id);
       }
-      return validateKnowledgeSources(this.ctx.knowledge, ids);
-    }
-    const ids = resource.kind === "calculation" ? [resource.source_resource_id] : resource.kind === "arithmetic" ? [resource.left.resource_id, resource.right.resource_id] : resource.kind === "transform" ? [resource.source_resource_id] : [resource.spec.left.resource_id, resource.spec.right.resource_id];
-    for (const id of new Set(ids)) {
-      const parent = await this.ctx.sessions.lookupResourceAsync(sessionId, id);
-      if (resource.kind === "calculation" && (!parent.ok || !resource.source_resource_hash || resource.source_resource_hash !== createHash("sha256").update(JSON.stringify(parent.resource)).digest("hex"))) return false;
-      if (!parent.ok || (resource.job_id && parent.resource.job_id !== resource.job_id) || !await this.resourceReadable(sessionId, parent.resource, next)) return false;
+      if (!await validateKnowledgeSources(this.ctx.knowledge, ids)) return false;
     }
     return true;
   }
@@ -1919,7 +1938,8 @@ function renderAggregateComparison(item: AggregateComparison): string {
 }
 
 function renderArithmetic(item: NonNullable<AnalysisRecord["arithmetic_results"]>[number]): string {
-  const value = item.result.value === null ? "除数为零，结果不可计算" : `${item.result.value} ${item.result.unit}`;
+  const value = item.result.value === null ? item.result.undefined_reason === "null_input" ? "输入为空或 NULL，结果未知" : "除数为零，结果不可计算" : `${item.result.value} ${item.result.unit}`;
+  if (item.result.interpretation === "mathematical_only") return `${item.result.formula ?? "所选结果单元"} 可复核数学运算 ${item.operation}：${value}；输入 ${item.left.resource_id}、${item.right.resource_id}；计算资源 ${item.resource_id}。仅认证计算与来源，不认证业务指标名称、用户意图或完整范围。${item.result.partial ? "输入有缺失或覆盖不完整。" : ""}`;
   const scope = item.result.scopes.map((entry) => `${Object.entries(entry.filters).map(([key, part]) => `${key}=${part}`).join("，")}；${entry.start} 到 ${entry.end}`).join(" / ");
   return `${item.result.formula ?? `${item.result.basis.table}.${item.result.basis.column}`} 可复核四则运算 ${item.operation}：${value}；范围 ${scope}（${item.result.basis.timezone}）；输入 ${item.left.resource_id}、${item.right.resource_id}；计算资源 ${item.resource_id}。除法保留 18 位，半数远离零。`;
 }

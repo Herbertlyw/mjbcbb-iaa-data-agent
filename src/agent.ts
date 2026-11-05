@@ -194,7 +194,7 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "calculate_session_cells",
       label: "计算会话单元格",
-      description: "对当前任务查询资源计算 sum、count_null、count_zero 或 count_rows；对于完整、可证明来源的分组 SUM 或 COUNT 结果，可用 sum 对输出列再次汇总，count_rows 和 count_zero 数的是结果分组而非原始事实行。也可对可证明的结果进行定点四则、按键对齐和表格变换：一次只选 operations、arithmetic、align、transform 中一种；四则和变换通常省略顶层 resource_id，引用写在对应输入里。单行资源可用 row=0，执行 ID 来自保存的查询记录；多行明细引用须显式提供执行 ID。正式交付可只引用最终计算资源，服务端会追溯并复核其依赖；缺组、NULL、预测或截断不可自行补零。",
+      description: "对当前任务结果做单资源计算、定点四则、按键对齐或表格变换，一次只选 operations、arithmetic、align、transform 一种。变换或对齐输出可作为四则输入，提供 resource_id、返回的 execution_id、cell 及 row，或 aggregate=sum；这类结果只证明数学运算与来源，不自动认证业务名称。单行查询可用 row=0，多行明细须提供执行 ID。正式交付可只引用最终结果；服务端追溯依赖。缺组、NULL、预测或截断不可补零。",
       parameters: Type.Object({
         resource_id: Type.Optional(Type.String({ description: "当前会话的查询资源 ID" })),
         operations: Type.Optional(Type.Array(
@@ -233,15 +233,16 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "read_session_resource",
       label: "读取会话资源",
-      description: "按行分页读取当前会话资源；续页使用 resource_hash。has_more 是保存结果的续页，resource_truncated 是查询被截断。不能跨会话读取。",
+      description: "按行分页读取当前会话资源；format=result_view 将查询、计算、变换和对齐适配成同一结果视图，含执行 ID、列类型、来源及完整行数。续页使用 resource_hash。读取检查权限，正式交付仍须重算和复核新鲜度。",
       parameters: Type.Object({
         resource_id: Type.String({ description: "资源 ID" }),
         row_offset: Type.Optional(Type.Integer({ minimum: 0 })),
         row_limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
         columns: Type.Optional(Type.Array(Type.String())),
         expected_resource_hash: Type.Optional(Type.String({ description: "续页时须填写首页 resource_hash" })),
+        format: Type.Optional(Type.Literal("result_view", { description: "统一的查询和计算结果视图，旧资源缺少执行身份时需要重新执行" })),
       }),
-      execute: async (_toolCallId, params, signal) => pack(await tools.readSessionResource(sessionId, params as { resource_id?: string; row_offset?: number; row_limit?: number; columns?: string[]; expected_resource_hash?: string }, signal)),
+      execute: async (_toolCallId, params, signal) => pack(await tools.readSessionResource(sessionId, params as { resource_id?: string; row_offset?: number; row_limit?: number; columns?: string[]; expected_resource_hash?: string; format?: "result_view" }, signal)),
     },
     {
       name: "update_analysis",

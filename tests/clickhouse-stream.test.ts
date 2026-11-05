@@ -58,3 +58,20 @@ test("宿主执行计划预检失败或无效时不执行正式查询；成功�
   const denied = { query: async () => { throw Object.assign(new Error("untrusted server detail"), { code: "497" }); } } as unknown as ClickHouseClient;
   await assert.rejects(clickHousePreflightedQuery(denied, sql, 10, 1000), (error: Error) => error.message === "clickhouse_access_denied" && !error.message.includes("untrusted"));
 });
+
+test("计划和正式读取共享同一个取消信号与时限", async () => {
+  const calls: string[] = [];
+  const client = { query: async ({ query, abort_signal }: { query: string; abort_signal: AbortSignal }) => {
+    calls.push(query);
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, calls.length === 1 ? 20 : 1000);
+      abort_signal.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); }, { once: true });
+      if (abort_signal.aborted) { clearTimeout(timer); reject(new Error("aborted")); }
+    });
+    return { query_id: "plan", stream: async function* () { yield [["explain"], ["String"], ["Expression"]].map((line) => ({ json: () => line })); }, close: () => {} };
+  } } as unknown as ClickHouseClient;
+  const started = Date.now();
+  await assert.rejects(clickHousePreflightedQuery(client, "SELECT 1", 10, 1000, AbortSignal.timeout(150)));
+  assert.equal(calls.length, 2);
+  assert.ok(Date.now() - started < 700, "计划等待不能为实际查询重新开始完整时限");
+});

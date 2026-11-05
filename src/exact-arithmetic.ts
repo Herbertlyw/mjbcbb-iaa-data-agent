@@ -24,6 +24,10 @@ export interface ArithmeticValue {
   /** Ordered, server-generated source identities, not model labels. */
   bases?: Array<ArithmeticValue["basis"]>;
   formula?: string;
+  /** Result of arithmetic on verified cells, without certifying a business metric. */
+  interpretation?: "mathematical_only";
+  partial?: boolean;
+  undefined_reason?: "null_input" | "zero_divisor";
   /** Bound only for a directly verified row, never supplied by the model. */
   row_identity?: { resource_id: string; execution_id: string; row: number };
   scopes: Array<{ filters: Record<string, string | null>; start: string; end: string }>;
@@ -49,21 +53,27 @@ export function fromAggregate(item: VerifiedAggregate): ArithmeticValue {
 
 /** Arithmetic is deliberately limited to one contracted metric and compatible
  * scopes. No missing group or NULL is silently converted into zero. */
-export function computeArithmetic(op: ArithmeticOp, left: ArithmeticValue, right: ArithmeticValue, declaredCrossMetric = false): ArithmeticValue | null {
+export function computeArithmetic(op: ArithmeticOp, left: ArithmeticValue, right: ArithmeticValue, declaredCrossMetric = false, mathematicalOnly = false): ArithmeticValue | null {
   const leftBases = left.bases ?? [left.basis]; const rightBases = right.bases ?? [right.basis];
   const identity = (bases: ArithmeticValue["basis"][]) => JSON.stringify([...new Set(bases.map((base) => JSON.stringify(base)))].sort());
   const sameBasis = identity(leftBases) === identity(rightBases);
-  if (!sameBasis && (!declaredCrossMetric || leftBases.length !== 1 || rightBases.length !== 1)) return null;
-  if (sameBasis ? !left.scopes.every((a) => right.scopes.every((b) => compatible(a, b))) : !left.scopes.every((a) => right.scopes.every((b) => identicalScope(a, b)))) return null;
-  if ((op === "add" || op === "subtract") && left.unit !== right.unit) return null;
-  if (left.value === null || right.value === null) return null;
+  if (!mathematicalOnly && !sameBasis && (!declaredCrossMetric || leftBases.length !== 1 || rightBases.length !== 1)) return null;
+  if (!mathematicalOnly && (sameBasis ? !left.scopes.every((a) => right.scopes.every((b) => compatible(a, b))) : !left.scopes.every((a) => right.scopes.every((b) => identicalScope(a, b))))) return null;
+  if (!mathematicalOnly && (op === "add" || op === "subtract") && left.unit !== right.unit) return null;
+  if (left.value === null || right.value === null) {
+    if (!mathematicalOnly) return null;
+    const nullScale = op === "divide" ? 18 : op === "multiply" ? left.scale + right.scale : Math.max(left.scale, right.scale);
+    if (nullScale > 38 || left.scopes.length + right.scopes.length > 32) return null;
+    const unit = left.unit === right.unit && (op === "add" || op === "subtract") ? left.unit : "未认证";
+    return { value: null, scale: nullScale, unit, basis: left.basis, scopes: [...left.scopes, ...right.scopes], interpretation: "mathematical_only", partial: true, undefined_reason: "null_input", formula: `(${left.formula ?? `${left.basis.table}.${left.basis.column}`} ${op} ${right.formula ?? `${right.basis.table}.${right.basis.column}`})` };
+  }
   const a = parse(left.value, left.scale); const b = parse(right.value, right.scale);
   if (a === null || b === null) return null;
   let result: bigint | null; let scale: number; let unit: string;
   if (op === "add" || op === "subtract") {
     scale = Math.max(left.scale, right.scale);
     const x = a * 10n ** BigInt(scale - left.scale); const y = b * 10n ** BigInt(scale - right.scale);
-    result = op === "add" ? x + y : x - y; unit = left.unit;
+    result = op === "add" ? x + y : x - y; unit = left.unit === right.unit ? left.unit : "未认证";
   } else if (op === "multiply") {
     scale = left.scale + right.scale;
     if (scale > 38) return null;
@@ -78,7 +88,7 @@ export function computeArithmetic(op: ArithmeticOp, left: ArithmeticValue, right
   if (scopes.length > 32) return null;
   const bases = [...new Map([...leftBases, ...rightBases].map((base) => [JSON.stringify(base), base])).values()];
   const label = (value: ArithmeticValue) => value.formula ?? `${value.basis.table}.${value.basis.column}`;
-  return { value: result === null ? null : fixed(result, scale), scale, unit, basis: left.basis, ...(bases.length > 1 ? { bases, formula: `(${label(left)} ${op} ${label(right)})` } : left.formula || right.formula ? { formula: `(${label(left)} ${op} ${label(right)})` } : {}), scopes };
+  return { value: result === null ? null : fixed(result, scale), scale, unit, basis: left.basis, ...(bases.length > 1 ? { bases, formula: `(${label(left)} ${op} ${label(right)})` } : left.formula || right.formula ? { formula: `(${label(left)} ${op} ${label(right)})` } : {}), scopes, ...(mathematicalOnly ? { interpretation: "mathematical_only" as const } : {}), ...(left.partial || right.partial ? { partial: true } : {}), ...(mathematicalOnly && result === null ? { undefined_reason: "zero_divisor" as const } : {}) };
 }
 
 function identicalScope(a: ArithmeticValue["scopes"][number], b: ArithmeticValue["scopes"][number]): boolean {
