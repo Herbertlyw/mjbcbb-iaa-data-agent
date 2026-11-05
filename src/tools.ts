@@ -895,6 +895,7 @@ export class ToolService {
       const source = found.resource; const contract = this.arithmeticContract(session, source, publication);
       const evidence = contract && this.evidenceSource(session, source);
       if (!contract || !evidence) return null;
+      if (!await this.evaluateVerifiedResult(session, jobId, source.resource_id, publication, path, evaluation)) return null;
       const aggregates = verifyDatabaseAggregates(evidence, contract)?.filter((item) => item.output_column === ref.cell) ?? null;
       inputs.push({ source, contract, aggregates });
     }
@@ -1168,6 +1169,7 @@ export class ToolService {
       const contract = this.arithmeticContract(session, resource, publication);
       const evidence = this.evidenceSource(session, resource);
       if (!contract || !evidence) return null;
+      if (!await this.evaluateVerifiedResult(session, jobId, resource.resource_id, publication, path, evaluation)) return null;
       // An ungrouped, independently verified aggregate has exactly one row.
       // Its stored resource already binds the execution and content hash, so
       // row 0 can be resolved without trusting a model-supplied execution ID.
