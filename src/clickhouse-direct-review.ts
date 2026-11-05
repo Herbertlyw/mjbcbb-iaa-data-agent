@@ -5,18 +5,20 @@ import { preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
 import { clickHouseReviewPolicy, safeNativeConditionalAggregates, safeNativeDateFunctions } from "./clickhouse-review-policy.js";
 import { reviewSql } from "./clickhouse-review.js";
 import { clickHouseScopedProjection } from "./clickhouse-scoped-projection.js";
+import { clickHouseScanRange } from "./clickhouse-scan-range.js";
 
-/** A deliberately narrow native path: one physical fact table and an exact
- * coverage scope. Complex queries remain on the prior guarded path. */
+/** A native path for one physical fact table with a proven scan range. Exact
+ * business coverage is a separate proof and may remain unknown. */
 export function reviewDirectClickHouse(sql: string, contract: DataContract, rule: TableRule, database: string, maxRows: number): GuardedSql | null {
   const preflight = preflightClickHouseSql(sql);
   if (!preflight.ok || preflight.tables.length !== 1 || preflight.tables[0] !== rule.table || contract.table !== rule.table) return null;
   const scope = clickHouseCoverageAnalysis(sql, contract);
-  if (!scope || !safeNativeConditionalAggregates(sql) || !safeNativeDateFunctions(sql, rule)) return null;
+  const range = scope?.time_range ?? clickHouseScanRange(sql, contract);
+  if (!range || !safeNativeConditionalAggregates(sql) || !safeNativeDateFunctions(sql, rule)) return null;
   try {
     const review = reviewSql(sql, clickHouseReviewPolicy(database, [rule], maxRows));
     if (!review.ok || review.tables.length !== 1 || review.tables[0] !== `${database}.${rule.table}`) return null;
-    return { sql, tables: [rule.table], columns: [], time_range: scope.time_range, equalities: scope.scope.equalities };
+    return { sql, tables: [rule.table], columns: [], time_range: range, equalities: scope?.scope.equalities ?? {} };
   } catch { return null; }
 }
 

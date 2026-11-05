@@ -256,6 +256,7 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成条件求和表达式")) return scripted(turn, (ids) => expressionSteps(ids, "sumif"));
   if (latest.includes("合成安全除法表达式")) return scripted(turn, (ids) => expressionSteps(ids, "nullif"));
   if (latest.includes("合成显式空值替换")) return scripted(turn, (ids) => expressionSteps(ids, "ifnull"));
+  if (latest.includes("合成未知覆盖筛选")) return scripted(turn, (ids) => expressionSteps(ids, "filtered"));
   if (latest.includes("合成左关联产品")) return scripted(turn, leftTitleSteps);
   if (latest.includes("合成跨事实比率")) return scripted(turn, crossFactRatioSteps);
   if (latest.includes("合成三千六百行")) return scripted(turn, largerTransformSteps);
@@ -468,14 +469,14 @@ function outerFilterSteps(ids: string[]) {
   return steps;
 }
 
-function expressionSteps(ids: string[], kind: "sumif" | "nullif" | "ifnull") {
+function expressionSteps(ids: string[], kind: "sumif" | "nullif" | "ifnull" | "filtered") {
   const end = kind === "ifnull" ? "2026-10-12" : "2026-10-08";
   const where = `event_date >= '2026-10-06' AND event_date <= '${end}' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'`;
-  const select = kind === "sumif" ? "sumIf(new_users, new_users > 0) AS observed" : kind === "nullif" ? "SUM(new_users) / nullIf(COUNT(), 0) AS observed" : "event_date, ifNull(new_users, 0) AS observed";
+  const select = kind === "sumif" ? "sumIf(new_users, new_users > 0) AS observed" : kind === "nullif" ? "SUM(new_users) / nullIf(COUNT(), 0) AS observed" : kind === "filtered" ? "SUM(new_users) AS observed" : "event_date, ifNull(new_users, 0) AS observed";
   const compute = kind === "ifnull" ? { resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "observed", as: "result" }] } : { arithmetic: { op: "add", left: { resource_id: ids[0] ?? "", cell: "observed", row: 0 }, right: { resource_id: ids[0] ?? "", cell: "observed", row: 0 } } };
   return [
     { id: "expr_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
-    { id: "expr_query", name: "query", arguments: JSON.stringify({ sql: `SELECT ${select} FROM fact_fox_daily_install WHERE ${where}` }) },
+    { id: "expr_query", name: "query", arguments: JSON.stringify({ sql: `SELECT ${select} FROM fact_fox_daily_install WHERE ${where}${kind === "filtered" ? " AND new_users > 0" : ""}` }) },
     { id: "expr_calculate", name: "calculate_session_cells", arguments: JSON.stringify(compute) },
   ];
 }

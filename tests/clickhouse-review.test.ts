@@ -40,6 +40,10 @@ test("原生直接授权只接受契约、封闭日期和受限覆盖筛选的�
   assert.deepEqual(review(query)?.time_range, { start: "2026-10-06", end: "2026-10-08" });
   const constantDates = query.replace("'2026-10-06'", "toDate('2026-10-06')").replace("'2026-10-08'", "toDate('2026-10-08')");
   assert.deepEqual(review(constantDates)?.time_range, { start: "2026-10-06", end: "2026-10-08" });
+  const extraPredicate = query + " AND new_users > 0";
+  assert.deepEqual(review(extraPredicate)?.time_range, { start: "2026-10-06", end: "2026-10-08" }, "扫描授权不应依赖业务覆盖证明");
+  const strictDates = query.replace("event_date >= '2026-10-06'", "event_date > '2026-10-05'").replace("event_date <= '2026-10-08'", "event_date < '2026-10-09'");
+  assert.deepEqual(review(strictDates)?.time_range, { start: "2026-10-06", end: "2026-10-08" });
   assert.equal(review(constantDates.replace("toDate('2026-10-06')", "toDate('2026-02-30')")), null);
   assert.equal(review(constantDates.replace("toDate('2026-10-06')", "toDate(event_date)")), null);
   assert.equal(review(constantDates.replace("toDate('2026-10-06')", "toDate('1969-12-31')")), null);

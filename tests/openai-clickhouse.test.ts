@@ -625,6 +625,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       { question: "合成条件求和表达式", expected: /440/, status: "completed" },
       { question: "合成安全除法表达式", expected: /146\.66666666666666/, status: "partial" },
       { question: "合成显式空值替换", expected: /670/, status: "partial" },
+      { question: "合成未知覆盖筛选", expected: /440/, status: "partial" },
     ]) {
       const sessionId = await createSyntheticSession();
       const answer = await postQuestion(apiPort, sessionId, sample.question);
@@ -634,6 +635,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       assert.match((answer.analysis?.limitations ?? []).join(" "), /业务含义未认证/);
       if (sample.question.includes("空值")) assert.match((answer.analysis?.limitations ?? []).join(" "), /替换/);
       if (sample.question.includes("除法")) assert.ok(answer.analysis?.server_reasons?.includes("floating_point_approximate"));
+      if (sample.question.includes("未知覆盖")) assert.ok(answer.analysis?.server_reasons?.includes("coverage_unknown"));
       const response = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${sessionId}/resources/${answer.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
       assert.equal(((await response.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, "clickhouse_ast_direct");
     }
