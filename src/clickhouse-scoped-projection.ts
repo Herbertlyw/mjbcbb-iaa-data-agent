@@ -2,10 +2,10 @@ import { format, parse } from "@clickhouse/parser";
 
 const obj = (value: unknown): Record<string, unknown> | null => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 
-/** Prove equivalence for a chain of identity projections over one physical
+/** Prove equivalence for a chain of direct projections over one physical
  * table. The generated SQL is used solely to analyze evidence; the original
  * statement is still the one sent to ClickHouse. Any filter, LIMIT, alias
- * rewrite, join or expression inside a wrapper fails closed. */
+ * collision, join or expression inside a wrapper fails closed. */
 export function clickHouseScopedProjection(sql: string, tableName: string): string | null {
   let statements: unknown[]; try { statements = parse(sql, { locations: false }); } catch { return null; }
   const root = obj(statements[0]); const branches = root?.selects;
@@ -21,10 +21,9 @@ export function clickHouseScopedProjection(sql: string, tableName: string): stri
     }
     return names;
   };
-  type Source = { base: Record<string, unknown>; available: Set<string>; depth: number };
+  type Source = { base: Record<string, unknown>; available: Map<string, string>; physical: Set<string>; depth: number };
   const resolve = (query: Record<string, unknown>, depth: number): Source | null => {
     if (depth > 12 || query.type !== "SelectQuery" || query.distinct || query.having || query.limit || query.limit_by || query.qualify || query.group_by || query.order_by || !Array.isArray(query.select)) return null;
-    const fields = identity(query.select); if (!fields) return null;
     const from = obj(query.from); const elements = from?.children;
     if (!Array.isArray(elements) || elements.length !== 1) return null;
     const element = obj(elements[0]); const expression = obj(element?.table_expression); const table = obj(expression?.database_and_table_name); const subquery = obj(expression?.subquery);
@@ -35,7 +34,18 @@ export function clickHouseScopedProjection(sql: string, tableName: string): stri
       if (node?.type !== "SelectWithUnionQuery" || !Array.isArray(list) || list.length !== 1 || query.with) return null;
       nested = obj(list[0]);
     } else if (table && !table.database && table.name === tableName && !query.with) {
-      return { base: query, available: fields, depth };
+      // Keep the physical layer unchanged: aliases visible in its WHERE can
+      // have ClickHouse-specific substitution semantics.
+      const fields = identity(query.select); if (!fields) return null;
+      const physical = new Set(fields);
+      const collect = (value: unknown): void => {
+        if (Array.isArray(value)) { value.forEach(collect); return; }
+        const node = obj(value); if (!node) return;
+        if (node.type === "Identifier" && typeof node.name === "string") physical.add(node.name);
+        Object.values(node).forEach(collect);
+      };
+      collect(query.where); collect(query.prewhere);
+      return { base: query, available: new Map([...fields].map((field) => [field, field])), physical, depth };
     } else if (table && !table.database && Array.isArray(query.with) && query.with.length === 1) {
       const entry = obj(query.with[0]); const source = obj(entry?.subquery); const node = obj(source?.query); const list = node?.selects;
       if (entry?.type !== "WithElement" || entry.name !== table.name || entry.aliases || node?.type !== "SelectWithUnionQuery" || !Array.isArray(list) || list.length !== 1) return null;
@@ -43,7 +53,16 @@ export function clickHouseScopedProjection(sql: string, tableName: string): stri
     } else return null;
     if (query.where || query.prewhere || !nested) return null;
     const source = resolve(nested, depth + 1);
-    if (!source || [...fields].some((field) => !source.available.has(field))) return null;
+    if (!source) return null;
+    const fields = new Map<string, string>();
+    for (const raw of query.select) {
+      const node = obj(raw); const parts = node && typeof node.name === "string" ? (Array.isArray(node.name_parts) ? node.name_parts : node.name.split(".")) : [];
+      if (node?.type !== "Identifier" || parts.length !== 1 || typeof parts[0] !== "string") return null;
+      const name = parts[0]; const output = node.alias === undefined ? name : node.alias;
+      const physical = source.available.get(name);
+      if (typeof output !== "string" || !output || !physical || fields.has(output) || output !== name && (source.available.has(output) || source.physical.has(output))) return null;
+      fields.set(output, physical);
+    }
     return { ...source, available: fields };
   };
   const from = obj(final.from); const elements = from?.children;
@@ -62,19 +81,28 @@ export function clickHouseScopedProjection(sql: string, tableName: string): stri
   }
   if (!nested) return null;
   const source = resolve(nested, 1); if (!source) return null;
-  const check = (value: unknown): boolean => {
-    if (Array.isArray(value)) return value.every(check);
+  const rewrite = (value: unknown, topLevel = false): boolean => {
+    if (Array.isArray(value)) return value.every((child) => rewrite(child, topLevel));
     const node = obj(value); if (!node) return true;
     if (node.type === "Subquery" || node.is_window_function || node.window_definition || node.parameters) return false;
     if (node.type === "Identifier") {
       const parts = typeof node.name === "string" ? (Array.isArray(node.name_parts) ? node.name_parts : node.name.split(".")) : [];
-      return parts.length === 1 && typeof parts[0] === "string" && source.available.has(parts[0]);
+      if (parts.length !== 1 || typeof parts[0] !== "string") return false;
+      const original = parts[0]; const physical = source.available.get(original);
+      if (!physical) return false;
+      if (node.alias !== undefined && (typeof node.alias !== "string" || node.alias !== original && node.alias !== physical && (source.available.has(node.alias) || source.physical.has(node.alias)))) return false;
+      node.name = physical;
+      if (Array.isArray(node.name_parts)) node.name_parts = [physical];
+      if (topLevel && physical !== original && node.alias === undefined) node.alias = original;
+      return true;
     }
-    return Object.entries(node).every(([key, child]) => key === "alias" || key === "location" || key === "parent" || check(child));
+    if (typeof node.alias === "string" && (source.available.has(node.alias) || source.physical.has(node.alias))) return false;
+    return Object.entries(node).every(([key, child]) => key === "alias" || key === "location" || key === "parent" || rewrite(child));
   };
-  if (!check(final.select) || final.group_by && !check(final.group_by)) return null;
-  const base = structuredClone(source.base); base.select = structuredClone(final.select);
-  if (final.group_by) base.group_by = structuredClone(final.group_by);
+  const selection = structuredClone(final.select); const grouping = structuredClone(final.group_by);
+  if (!rewrite(selection, true) || grouping && !rewrite(grouping)) return null;
+  const base = structuredClone(source.base); base.select = selection;
+  if (grouping) base.group_by = grouping;
   else delete base.group_by;
   try { return format([{ type: "SelectWithUnionQuery", selects: [base] }] as Parameters<typeof format>[0]); } catch { return null; }
 }

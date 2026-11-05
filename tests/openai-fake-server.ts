@@ -248,6 +248,7 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成 CTE 预聚合关联")) return scripted(turn, (ids) => preaggregatedTitleSteps(ids, false));
   if (latest.includes("合成 CTE 查询")) return scripted(turn, cteSteps);
   if (latest.includes("合成多层恒等投影")) return scripted(turn, nestedCteSteps);
+  if (latest.includes("合成多层重命名投影")) return scripted(turn, renamedCteSteps);
   if (latest.includes("合成左关联产品")) return scripted(turn, leftTitleSteps);
   if (latest.includes("合成跨事实比率")) return scripted(turn, crossFactRatioSteps);
   if (latest.includes("合成三千六百行")) return scripted(turn, largerTransformSteps);
@@ -451,6 +452,16 @@ function nestedCteSteps(ids: string[]) {
   if (!original.sql.startsWith(prefix) || !original.sql.endsWith(suffix)) throw new Error("invalid_cte_fixture");
   const inner = original.sql.slice(prefix.length, -suffix.length);
   steps[1] = { ...steps[1]!, arguments: JSON.stringify({ sql: `WITH scoped AS (SELECT event_date, new_users FROM (${inner})) SELECT event_date, new_users FROM scoped` }) };
+  return steps;
+}
+
+function renamedCteSteps(ids: string[]) {
+  const steps = cteSteps(ids);
+  const original = JSON.parse(steps[1]!.arguments) as { sql: string };
+  const prefix = "WITH scoped AS ("; const suffix = ") SELECT event_date, new_users FROM scoped";
+  if (!original.sql.startsWith(prefix) || !original.sql.endsWith(suffix)) throw new Error("invalid_cte_fixture");
+  const inner = original.sql.slice(prefix.length, -suffix.length);
+  steps[1] = { ...steps[1]!, arguments: JSON.stringify({ sql: `WITH scoped AS (SELECT event_date, new_users AS measure FROM (${inner})) SELECT event_date, measure AS new_users FROM scoped` }) };
   return steps;
 }
 

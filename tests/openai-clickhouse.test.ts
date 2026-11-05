@@ -626,6 +626,20 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       const proofRows = await clickHouseQuery(proofReader, proofSql);
       assert.deepEqual(originalRows.map((row) => JSON.stringify(row)).sort(), proofRows.map((row) => JSON.stringify(row)).sort(), "固定合成数据上原查询与内部证明应返回相同可见行；两次读取没有共同原子快照");
     } finally { await proofReader.close(); }
+    const renamedSession = await createSyntheticSession();
+    const renamed = await postQuestion(apiPort, renamedSession, "合成多层重命名投影：纸灯日本七日新增。");
+    assert.equal(renamed.status, "completed", JSON.stringify({ error: renamed.error, answer: renamed.analysis?.answer, reasons: renamed.analysis?.server_reasons }));
+    assert.match(renamed.analysis?.answer ?? "", /70/);
+    const renamedResource = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${renamedSession}/resources/${renamed.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
+    const renamedSource = ((await renamedResource.json()) as { resource: { sql_review_engine?: string; sql: string } }).resource;
+    assert.equal(renamedSource.sql_review_engine, "clickhouse_ast_scoped");
+    const renamedProof = clickHouseScopedProjection(renamedSource.sql, "fact_fox_daily_install"); assert.ok(renamedProof);
+    const renamedReader = createClickHouseClient({ url: clickhouseUrl, username: "fox_reader", password: readerPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 10 }, true);
+    try {
+      const originalRows = await clickHouseQuery(renamedReader, renamedSource.sql);
+      const proofRows = await clickHouseQuery(renamedReader, renamedProof);
+      assert.deepEqual(originalRows.map((row) => JSON.stringify(row)).sort(), proofRows.map((row) => JSON.stringify(row)).sort());
+    } finally { await renamedReader.close(); }
     const left = await postQuestion(apiPort, await createSyntheticSession(), "合成左关联产品：保留未匹配产品。");
     assert.equal(left.status, "completed", `${JSON.stringify(left.error)} ${left.analysis?.answer ?? ""}`);
     assert.match(left.analysis?.answer ?? "", /JOIN 求和 70/);

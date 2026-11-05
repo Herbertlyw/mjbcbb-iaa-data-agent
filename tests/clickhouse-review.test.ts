@@ -93,7 +93,7 @@ test("CTE 来源只暴露已授权投影，每个物理表独立证明日期", (
   // verify a registered relationship, grain and duplicate-key evidence.
 });
 
-test("多层恒等投影生成的内部证明保持物理筛选，改名或内层截断拒绝", () => {
+test("多层直接投影生成的内部证明保持物理筛选，错误作用域或截断拒绝", () => {
   const base = "SELECT day, country, amount FROM daily_sales WHERE day >= '2026-10-01' AND day <= '2026-10-03' AND country = 'US'";
   const query = `WITH c AS (SELECT day, country, amount FROM (${base})) SELECT country, SUM(amount) AS total FROM c GROUP BY country`;
   const proof = clickHouseScopedProjection(query, "daily_sales");
@@ -103,4 +103,17 @@ test("多层恒等投影生成的内部证明保持物理筛选，改名或内�
   assert.equal(clickHouseScopedProjection(query.replace("day, country, amount FROM (", "day, country AS market, amount FROM ("), "daily_sales"), null);
   assert.equal(clickHouseScopedProjection(query.replace("country = 'US'", "country = 'US' LIMIT 1"), "daily_sales"), null);
   assert.equal(clickHouseScopedProjection(query.replace("SELECT country, SUM(amount)", "SELECT secret, SUM(amount)"), "daily_sales"), null);
+  const renamed = `WITH c AS (SELECT day, country AS market, amount AS measure FROM (${base})) SELECT market, SUM(measure) AS total FROM c GROUP BY market`;
+  const renamedProof = clickHouseScopedProjection(renamed, "daily_sales");
+  assert.ok(renamedProof);
+  assert.equal(reviewSql(renamed, policy).ok, true, JSON.stringify(reviewSql(renamed, policy)));
+  assert.equal(reviewSql(renamedProof, policy).ok, true, JSON.stringify(reviewSql(renamedProof, policy)));
+  assert.match(renamedProof, /country AS market/i);
+  assert.match(renamedProof, /sum\(amount\)/i);
+  assert.equal(clickHouseScopedProjection(renamed.replace("country AS market", "country AS amount"), "daily_sales"), null);
+  assert.equal(clickHouseScopedProjection(renamed.replace("AS total", "AS day"), "daily_sales"), null);
+  assert.equal(clickHouseScopedProjection(renamed.replace("GROUP BY market", "GROUP BY country"), "daily_sales"), null);
+  assert.equal(clickHouseScopedProjection(renamed.replace("amount AS measure", "amount AS market"), "daily_sales"), null);
+  const hiddenWhere = renamed.replace("country = 'US'", "country = 'US' AND secret = 'x'").replace("AS total", "AS secret");
+  assert.equal(clickHouseScopedProjection(hiddenWhere, "daily_sales"), null, "不能将外层别名提升为底层过滤字段的别名");
 });
