@@ -37,7 +37,15 @@ export function clickHouseScanRange(sql: string, contract: DataContract): { star
     const left = record(node.arguments[0]); if (left?.type !== "Identifier" || typeof left.name !== "string") continue;
     const parts = Array.isArray(left.name_parts) ? left.name_parts : left.name.split(".");
     if (parts.at(-1) !== contract.series.date_column || parts.length > 2 || parts.length === 2 && parts[0] !== qualifier) continue;
-    const op = String(node.name).toLowerCase(); const day = date(node.arguments[1]);
+    const op = String(node.name).toLowerCase(); const tuple = record(node.arguments[1]);
+    if (op === "in" && tuple?.type === "Literal" && tuple.value_type === "Tuple" && Array.isArray(tuple.value)) {
+      if (!tuple.value.length || tuple.value.length > 32) return null;
+      const days = tuple.value.map((item) => { const literal = record(item); return literal ? date({ ...literal, type: "Literal" }) : null; });
+      if (days.some((item) => item === null)) return null;
+      low = Math.max(low ?? -Infinity, Math.min(...days as number[])); high = Math.min(high ?? Infinity, Math.max(...days as number[]));
+      continue;
+    }
+    const day = date(node.arguments[1]);
     if (day === null || !["equals", "greaterorequals", "greater", "lessorequals", "less"].includes(op)) return null;
     if (op === "equals" || op === "greaterorequals" || op === "greater") low = Math.max(low ?? -Infinity, day + (op === "greater" ? 1 : 0));
     if (op === "equals" || op === "lessorequals" || op === "less") high = Math.min(high ?? Infinity, day - (op === "less" ? 1 : 0));

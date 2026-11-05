@@ -354,6 +354,9 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.match(groupedRatio.analysis?.answer ?? "", /channel_id=mist_ads，country_code=US.*结果 0\.500000000000000000 比值/);
     assert.match(groupedRatio.analysis?.answer ?? "", /channel_id=pebble_net，country_code=US.*结果 2\.000000000000000000 比值/);
     assert.equal(groupedRatio.analysis?.sources?.length, 2);
+    await stopChild(happyWorker);
+    happyWorker = spawn(process.execPath, ["--import", "tsx", "--import", "./tests/forbid-sqlite-parser.mjs", "src/worker.ts"], { cwd: root, env: baseEnv, stdio: "ignore" });
+    children.push(happyWorker);
     const joinSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const joinSessionId = ((await joinSession.json()) as { session_id: string }).session_id;
     const join = await postQuestion(apiPort, joinSessionId, "合成产品维表关联：统计纸灯日本 iOS 雾帆 2026-10-06 到 2026-10-12 新增。");
@@ -364,6 +367,23 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(join.analysis?.sources?.[0]?.freshness_receipts?.length, 2);
     assert.deepEqual(join.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "read_data_contract_view", "query"]);
     assert.ok(join.events.some((event) => event.type === "tool_finished" && event.payload.tool_name === "query" && event.payload.is_error === false));
+    const noLegacyLeftSession = ((await (await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json()) as { session_id: string }).session_id;
+    const noLegacyLeft = await postQuestion(apiPort, noLegacyLeftSession, "合成左关联产品：保留未匹配产品。");
+    assert.equal(noLegacyLeft.status, "completed", JSON.stringify({ error: noLegacyLeft.error, answer: noLegacyLeft.analysis?.answer, reasons: noLegacyLeft.analysis?.server_reasons }));
+    assert.match(noLegacyLeft.analysis?.answer ?? "", /JOIN 求和 70/);
+    assert.match(noLegacyLeft.analysis?.answer ?? "", /JOIN 求和 21/);
+    const noLegacyLeftResponse = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${noLegacyLeftSession}/resources/${noLegacyLeft.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
+    assert.equal(((await noLegacyLeftResponse.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, "clickhouse_ast_join");
+    const joinedSource = join.analysis?.sources?.[0]; assert.ok(joinedSource?.sql && joinedSource.executed_sql);
+    const joinReader = createClickHouseClient({ url: clickhouseUrl, username: "fox_reader", password: readerPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 10 }, true);
+    try {
+      const visible = await clickHouseQuery(joinReader, joinedSource.sql);
+      const captured = await clickHouseQuery(joinReader, joinedSource.executed_sql);
+      assert.deepEqual(captured.map(({ __da_join_proof: _proof, ...row }) => JSON.stringify(row)).sort(), visible.map((row) => JSON.stringify(row)).sort(), "原始查询与证明查询在固定合成数据上的可见结果一致；两次读取不是共同快照");
+    } finally { await joinReader.close(); }
+    await stopChild(happyWorker);
+    happyWorker = spawn(process.execPath, ["--import", "tsx", "src/worker.ts"], { cwd: root, env: baseEnv, stdio: "ignore" });
+    children.push(happyWorker);
     const joinTransformSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const joinTransformSessionId = ((await joinTransformSession.json()) as { session_id: string }).session_id;
     const joinTransform = await postQuestion(apiPort, joinTransformSessionId, "合成维表关联后再汇总：纸灯日本 iOS 雾帆 2026-10-06 到 2026-10-12 新增，合计后再加自身。");
@@ -408,11 +428,12 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
         const source = result.analysis?.sources?.[0];
         assert.ok(source?.resource_id && source.execution_id && source.observed_at);
         const [rows] = await joinDb.query("SELECT body_json FROM resources WHERE resource_id = ?", [source.resource_id]);
-        const resource = JSON.parse(String((rows as Array<{ body_json: string }>)[0]?.body_json)) as { session_id: string; job_id: string; execution_id: string; created_at: string; freshness_receipts: Array<{ table: string; status: string; version: number; publication_id: string }> };
+        const resource = JSON.parse(String((rows as Array<{ body_json: string }>)[0]?.body_json)) as { session_id: string; job_id: string; execution_id: string; created_at: string; sql_review_engine?: string; freshness_receipts: Array<{ table: string; status: string; version: number; publication_id: string }> };
         assert.equal(resource.session_id, sessionId);
         assert.equal(resource.job_id, result.job_id);
         assert.equal(resource.execution_id, source.execution_id);
         assert.equal(resource.created_at, source.observed_at);
+        assert.equal(resource.sql_review_engine, "clickhouse_ast_join");
         assert.deepEqual(resource.freshness_receipts.map((receipt) => receipt.table).sort(), [dimension, "fact_fox_daily_install"].sort());
         assert.ok(resource.freshness_receipts.every((receipt) => receipt.status === "fresh" && receipt.version === resource.freshness_receipts[0]?.version && receipt.publication_id === resource.freshness_receipts[0]?.publication_id));
         const [sessions] = await joinDb.query("SELECT actor_id FROM sessions WHERE session_id = ?", [sessionId]);

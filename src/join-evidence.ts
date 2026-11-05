@@ -2,6 +2,7 @@ import { isCalendarDate } from "./config.js";
 import { assertJoinKeys, parseReadonlySql, rewritePreaggregatedDimensionJoin } from "./sql.js";
 import { sumDecimalStrings } from "./exact-arithmetic.js";
 import type { CoverageReport, DataContract, JoinConstraint } from "./types.js";
+import { clickHouseJoinShape } from "./clickhouse-join-shape.js";
 
 /** Narrow one-fact/one-dimension JOIN whose aggregate can be recomputed from
  * the rows captured by the *same* ClickHouse SELECT. This is not an immutable
@@ -61,22 +62,22 @@ const quote = (value: string) => `'${value}'`;
 /** Returns null when any SQL feature, contract or relationship is outside
  * this proof's strictly enumerated subset. Call the normal authorization and
  * freshness checks as well; this function does not grant access. */
-export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[]): JoinEvidencePlan | null {
-  return buildJoinEvidence(sql, fact, dimension, joins, false, false, false);
+export function prepareJoinEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[], native = false): JoinEvidencePlan | null {
+  return buildJoinEvidence(sql, fact, dimension, joins, false, false, false, native);
 }
 
 /** Alternative proof for coarse CTEs with large fact populations. The database
  * checks complete-group cardinality and emits bounded dimension observations;
  * the application does not fetch or recompute every contributing fact row. */
-export function prepareJoinAggregateEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[]): JoinEvidencePlan | null {
-  const plan = buildJoinEvidence(sql, fact, dimension, joins, false, true, false);
+export function prepareJoinAggregateEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[], native = false): JoinEvidencePlan | null {
+  const plan = buildJoinEvidence(sql, fact, dimension, joins, false, true, false, native);
   return plan?.coarse ? plan : null;
 }
 
 /** Coverage is admitted only for a finite contract-declared Cartesian scope.
  * Its proof is a new SQL shape, so historical aggregate receipts stay readable. */
-export function prepareJoinCoverageEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[]): JoinEvidencePlan | null {
-  const plan = buildJoinEvidence(sql, fact, dimension, joins, false, true, true);
+export function prepareJoinCoverageEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[], native = false): JoinEvidencePlan | null {
+  const plan = buildJoinEvidence(sql, fact, dimension, joins, false, true, true, native);
   return plan?.coarse && plan.coverageExpectedRows !== undefined ? plan : null;
 }
 
@@ -125,11 +126,13 @@ function closedCoverageScope(series: NonNullable<DataContract["series"]>, filter
   return { expected, predicate: predicates.length ? predicates.join(" AND ") : "1" };
 }
 
-function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[], coarse: boolean, aggregateProof: boolean, coverageProof: boolean): JoinEvidencePlan | null {
+function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContract, joins: JoinConstraint[], coarse: boolean, aggregateProof: boolean, coverageProof: boolean, native = false): JoinEvidencePlan | null {
   try {
     const series = fact.series;
     if (!series || series.prediction_mode !== "observed_only" || series.predicted_column || dimension.series || fact.timezone !== dimension.timezone || !fact.grain || [...fact.grain].sort().join("|") !== [series.date_column, ...series.dimensions].sort().join("|")) return null;
-    const parsed = parseReadonlySql(sql);
+    const nativeAst = native ? clickHouseJoinShape(sql, fact, dimension, joins) : null;
+    if (native && !nativeAst) return null;
+    const parsed = native ? { sql, ast: nativeAst! } : parseReadonlySql(sql);
     const ast = parsed.ast;
     const preaggregated = rewritePreaggregatedDimensionJoin(ast);
     if (preaggregated) {
@@ -151,7 +154,7 @@ function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContr
     if (!IDENT.test(fa) || !IDENT.test(da) || fa === da || !IDENT.test(fact.table) || !IDENT.test(dimension.table)) return null;
     const relation = joins.find((item) => item.tables.length === 2 && item.tables.includes(fact.table) && item.tables.includes(dimension.table));
     if (!relation || !relation.keys.length || !dimension.grain || [...relation.keys].sort().join("|") !== [...dimension.grain].sort().join("|") || relation.keys.some((key) => !series.dimensions.includes(key))) return null;
-    assertJoinKeys(sql, joins, new Map([[fact.table, [series.date_column, ...series.dimensions]], [dimension.table, dimension.grain]]), { leftJoinDimensions: new Set([dimension.table]) });
+    if (!native) assertJoinKeys(sql, joins, new Map([[fact.table, [series.date_column, ...series.dimensions]], [dimension.table, dimension.grain]]), { leftJoinDimensions: new Set([dimension.table]) });
     const factColumns = new Set(fact.columns.map((col) => col.name)); const dimColumns = new Set(dimension.columns.map((col) => col.name));
     // Proof tuples introduce reads beyond SELECT projections. They must be
     // independently authorized even if outer SQL checks already inspected

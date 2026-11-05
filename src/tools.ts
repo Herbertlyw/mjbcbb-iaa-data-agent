@@ -39,6 +39,8 @@ import type {
 import { clickHouseColumns, clickHouseColumnTypes, clickHouseQueryBounded, clickHousePreflightedQuery, ClickHousePlanError } from "./clickhouse-client.js";
 import { clickHousePreflightMessage, preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
 import { reviewDirectClickHouse, reviewScopedClickHouse } from "./clickhouse-direct-review.js";
+import { clickHouseReviewPolicy } from "./clickhouse-review-policy.js";
+import { reviewSql } from "./clickhouse-review.js";
 import { queryEvidenceShape } from "./evidence-shape.js";
 import { ResourceGraph } from "./resource-graph.js";
 import { savedResultView } from "./result-view.js";
@@ -399,6 +401,7 @@ export class ToolService {
     let sqlLimited = false;
     let nativeDirect = false;
     let nativeProofSql: string | undefined;
+    let nativeJoinPlan: JoinEvidencePlan | null = null;
     let guarded;
     try {
       // In ClickHouse mode, discover candidate physical sources from its own
@@ -415,8 +418,17 @@ export class ToolService {
       const contract = sources.length === 1 ? this.ctx.knowledge.contract_by_table.get(sources[0]!)?.contract : undefined;
       const direct = inspected?.ok && contract && rules.length === 1 ? reviewDirectClickHouse(normalized, contract, rules[0]!, this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows) : null;
       const scoped = !direct && inspected?.ok && contract && rules.length === 1 ? reviewScopedClickHouse(normalized, contract, rules[0]!, this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows) : null;
-      if (direct || scoped) {
-        guarded = direct ?? scoped!.guarded;
+      if (inspected?.ok && rules.length === 2) {
+        const contracts = sources.map((table) => this.ctx.knowledge.contract_by_table.get(table)?.contract);
+        const fact = contracts.find((item) => item?.series); const dimension = contracts.find((item) => item && !item.series);
+        try {
+          if (fact && dimension && reviewSql(normalized, clickHouseReviewPolicy(this.ctx.config.clickhouseDatabase, rules, this.ctx.config.maxResultRows)).ok) {
+            nativeJoinPlan = (fact.series?.coverage_domains !== undefined ? prepareJoinCoverageEvidence(normalized, fact, dimension, this.ctx.knowledge.joins, true) : null) ?? prepareJoinEvidence(normalized, fact, dimension, this.ctx.knowledge.joins, true);
+          }
+        } catch { nativeJoinPlan = null; }
+      }
+      if (direct || scoped || nativeJoinPlan) {
+        guarded = direct ?? scoped?.guarded ?? { sql: normalized, tables: sources, columns: [], time_range: { start: nativeJoinPlan!.range.start, end: nativeJoinPlan!.range.end }, equalities: nativeJoinPlan!.factFilters };
         nativeDirect = true;
         nativeProofSql = scoped?.proofSql;
       } else {
@@ -472,8 +484,8 @@ export class ToolService {
     const joinContracts = guarded.tables.map((table) => this.ctx.knowledge.contract_by_table.get(table)?.contract);
     const joinFact = joinContracts.find((contract) => contract?.series);
     const joinDimension = joinContracts.find((contract) => contract && !contract.series);
-    let joinPlan = this.ctx.businessEngine === "clickhouse" && guarded.tables.length === 2 && joinFact && joinDimension
-      ? (joinFact.series?.coverage_domains !== undefined ? prepareJoinCoverageEvidence(guarded.sql, joinFact, joinDimension, this.ctx.knowledge.joins) : null) ?? prepareJoinEvidence(guarded.sql, joinFact, joinDimension, this.ctx.knowledge.joins) : null;
+    let joinPlan = nativeJoinPlan ?? (this.ctx.businessEngine === "clickhouse" && guarded.tables.length === 2 && joinFact && joinDimension
+      ? (joinFact.series?.coverage_domains !== undefined ? prepareJoinCoverageEvidence(guarded.sql, joinFact, joinDimension, this.ctx.knowledge.joins) : null) ?? prepareJoinEvidence(guarded.sql, joinFact, joinDimension, this.ctx.knowledge.joins) : null);
     const initialFreshness = await this.currentFreshness();
     if (!initialFreshness.ok) return initialFreshness;
     const published = initialFreshness.publication;
@@ -521,7 +533,7 @@ export class ToolService {
         // detailed proof did not fit or could not verify. This is a new
         // observation, never a continuation or a claim of a shared snapshot.
         if (joinPlan?.coarse && !joinPlan.aggregateProof && joinFact && joinDimension && (bounded.truncated || !verifyJoinExecutionSchema(joinPlan, joinFact, joinDimension, bounded.column_types) || !verifyJoinEvidence(joinPlan, bounded.rows) || Buffer.byteLength(JSON.stringify({ captured: bounded.rows, cleanRows: bounded.rows.map(({ __da_join_proof: _proof, ...row }) => row), types: bounded.column_types })) > this.ctx.config.maxResultBytes)) {
-          const aggregatePlan = prepareJoinAggregateEvidence(guarded.sql, joinFact, joinDimension, this.ctx.knowledge.joins);
+          const aggregatePlan = prepareJoinAggregateEvidence(guarded.sql, joinFact, joinDimension, this.ctx.knowledge.joins, Boolean(nativeJoinPlan));
           if (aggregatePlan) {
             joinPlan = aggregatePlan;
             executedSql = aggregatePlan.executionSql;
@@ -599,7 +611,7 @@ export class ToolService {
       created_at: new Date().toISOString(),
       ...(session.active_job_id ? { job_id: session.active_job_id } : {}),
       engine: this.ctx.businessEngine === "clickhouse" ? "clickhouse-local" : "sqlite-local",
-      sql_review_engine: nativeProofSql ? "clickhouse_ast_scoped" : nativeDirect ? "clickhouse_ast_direct" : "legacy_guard",
+      sql_review_engine: nativeJoinPlan ? "clickhouse_ast_join" : nativeProofSql ? "clickhouse_ast_scoped" : nativeDirect ? "clickhouse_ast_direct" : "legacy_guard",
       elapsed_ms: elapsedMs,
       execution_id: bounded?.query_id ?? newId("exec"),
       ...(bounded ? { column_types: bounded.column_types, execution_settings: { join_use_nulls: true as const } } : {}),
@@ -2008,6 +2020,9 @@ export class ToolService {
   /** Reconstruct an equivalent proof projection, never the SQL sent to ClickHouse. */
   private evidenceSource(session: SessionRecord, source: QueryResource): QueryResource | null {
     try {
+      // JOIN evidence has its own native tuple planner and must not be sent
+      // through the legacy single-source SQL parser.
+      if (source.engine === "clickhouse-local" && source.sql_review_engine === "clickhouse_ast_join") return null;
       if (source.engine === "clickhouse-local" && source.sql_review_engine === "clickhouse_ast_scoped" && source.tables.length === 1 && source.executed_sql === source.sql) {
         const contract = this.ctx.knowledge.contract_by_table.get(source.tables[0]!)?.contract;
         const checked = contract && reviewScopedClickHouse(source.sql, contract, this.ruleFor(session, source.tables[0]!), this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows);
@@ -2147,7 +2162,17 @@ function verifyJoinResource(resource: JoinQueryResource, session: SessionRecord,
   if (!fact || !dimension) return null;
   const receipts = resource.freshness_receipts;
   if (receipts.length !== 2 || resource.tables.some((table) => !receipts.some((receipt) => receipt.table === table && receipt.status === "fresh" && receipt.publication_id === publication.publication_id && receipt.version === publication.version && publication.tables[table]?.status === "fresh"))) return null;
-  const plan = [prepareJoinEvidence(resource.sql, fact, dimension, knowledge.joins), prepareJoinCoverageEvidence(resource.sql, fact, dimension, knowledge.joins), prepareJoinAggregateEvidence(resource.sql, fact, dimension, knowledge.joins)].find((candidate) => candidate?.executionSql === resource.executed_sql);
+  const native = resource.sql_review_engine === "clickhouse_ast_join";
+  if (native) {
+    const rules: TableRule[] = [];
+    for (const asset of assets) {
+      const contract = asset?.contract; const binding = session.bindings.find((item) => item.table === contract?.table && item.queryable);
+      if (!contract || !binding || binding.registry_revision !== knowledge.registry_revision || binding.content_hash !== asset?.content_hash) return null;
+      rules.push({ table: contract.table, allowed_columns: binding.allowed_columns, sensitive_columns: binding.sensitive_columns, must_filter: binding.must_filter, column_types: Object.fromEntries(contract.columns.map((column) => [column.name, column.type])) });
+    }
+    try { if (!reviewSql(resource.sql, clickHouseReviewPolicy(config.clickhouseDatabase, rules, config.maxResultRows)).ok) return null; } catch { return null; }
+  }
+  const plan = [prepareJoinEvidence(resource.sql, fact, dimension, knowledge.joins, native), prepareJoinCoverageEvidence(resource.sql, fact, dimension, knowledge.joins, native), prepareJoinAggregateEvidence(resource.sql, fact, dimension, knowledge.joins, native)].find((candidate) => candidate?.executionSql === resource.executed_sql);
   if (!plan || plan.range.start !== resource.time_range.start || plan.range.end !== resource.time_range.end || plan.range.timezone !== resource.time_range.timezone || !verifyJoinExecutionSchema(plan, fact, dimension, resource.join_proof.column_types)) return null;
   if (plan.joinType === "left" && resource.execution_settings?.join_use_nulls !== true) return null;
   if (resource.executed_sql !== plan.executionSql || resource.join_proof.capture_hash !== joinCaptureHash(resource.sql, resource.executed_sql, resource.execution_id, resource.join_proof.rows, resource.join_proof.column_types)) return null;
