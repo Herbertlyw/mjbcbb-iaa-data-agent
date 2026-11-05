@@ -72,6 +72,7 @@ export interface AppConfig {
   modelHoldMs: number;
   toolResultHoldMs: number;
   toolResultHoldNames: string[];
+  candidateHoldMs: number;
 }
 
 export function repoRoot(): string {
@@ -143,6 +144,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     modelHoldMs: integer("PI_HOLD_BEFORE_MODEL_RESPONSE_MS", 0),
     toolResultHoldMs: integer("PI_HOLD_AFTER_TOOL_RESULT_MS", 0),
     toolResultHoldNames: (process.env.PI_HOLD_AFTER_TOOL_NAMES ?? "").split(",").map((item) => item.trim()).filter(Boolean),
+    candidateHoldMs: integer("PI_HOLD_AFTER_CANDIDATE_MS", 0),
     maxModelCalls: integer("MAX_MODEL_CALLS", 16),
     maxToolCalls: integer("MAX_TOOL_CALLS", 40),
     maxContextChars: integer("MAX_CONTEXT_CHARS", 500_000),

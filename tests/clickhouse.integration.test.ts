@@ -847,17 +847,18 @@ async function runSplitProcess(clickhouseUrl: string, freshnessPath: string, dir
 
     killWorkers();
     await new Promise((resolve) => setTimeout(resolve, 300));
-    spawnWorker({ PI_HOLD_AFTER_TOOL_RESULT_MS: "8000", PI_HOLD_AFTER_TOOL_NAMES: "update_analysis" });
+    spawnWorker({ PI_HOLD_AFTER_CANDIDATE_MS: "8000" });
     const candidate = await askNew(question);
-    const candidateReceipt = await waitForPayload(apiPort, candidate.job_id, "transcript_saved", (payload) => payload.tool_name === "update_analysis");
+    const candidateReceipt = await waitForPayload(apiPort, candidate.job_id, "snapshot_saved", (payload) => payload.role === "assistant" && payload.stop_reason === "stop");
     killWorkers();
     await new Promise((resolve) => setTimeout(resolve, 2500));
     spawnWorker({});
     const submitted = await waitHttpJob(apiPort, candidate.job_id);
     const candidateEvents = submitted.events ?? [];
-    assert.equal(candidateEvents.filter((event) => event.type === "tool_started" && event.payload.tool_name === "update_analysis").length, 1);
-    assert.equal(candidateEvents.filter((event) => event.type === "tool_started" && event.payload.tool_call_id === candidateReceipt.tool_call_id).length, 1);
+    assert.equal(candidateEvents.filter((event) => event.type === "tool_started" && event.payload.tool_name === "query").length, 1);
     assert.equal(candidateEvents.filter((event) => event.type === "model_context" && event.payload.decision === "reread_candidate").length, 1);
+    assert.equal(candidateEvents.filter((event) => event.type === "model_context" && event.payload.decision === "reread_candidate").at(-1)?.payload.leaf_id, candidateReceipt.leaf_id);
+    assert.equal(candidateEvents.filter((event) => event.type === "candidate_reviewed").length, 1);
     assert.match(submitted.analysis?.answer ?? "", /670/);
     assert.equal(candidateEvents.filter((event) => event.type === "job_finished").length, 1);
 

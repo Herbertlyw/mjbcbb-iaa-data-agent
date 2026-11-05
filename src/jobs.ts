@@ -662,6 +662,7 @@ export class JobService {
             if (!saved) { markLost(); return; }
             const snapshotEvent = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "snapshot_saved", {
               role: message.role,
+              stop_reason: message.role === "assistant" ? message.stopReason : null,
               tool_name: "toolName" in message ? message.toolName : null,
               tool_call_id: messageCallId(message),
               leaf_id: snapshot.leaf_id,
@@ -669,6 +670,7 @@ export class JobService {
             });
             if (!snapshotEvent) { markLost(); return; }
             this.publishEvent(input.jobId, snapshotEvent);
+            if (message.role === "assistant" && message.stopReason === "stop") await pauseForTest(this.host.config.candidateHoldMs, signal);
             if (message.role === "toolResult") {
               const transcriptEvent = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "transcript_saved", {
                 tool_name: message.toolName, tool_call_id: message.toolCallId,
