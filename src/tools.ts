@@ -37,7 +37,7 @@ import type {
   TransformResource,
 } from "./types.js";
 import { clickHouseColumns, clickHouseColumnTypes, clickHouseQueryBounded, clickHousePreflightedQuery, ClickHousePlanError } from "./clickhouse-client.js";
-import { clickHousePreflightMessage, preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
+import { authorizeClickHouseDirect, authorizeClickHouseJoin, authorizeClickHouseScoped, clickHousePreflightMessage, preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
 import { reviewDirectClickHouse, reviewScopedClickHouse } from "./clickhouse-direct-review.js";
 import { clickHouseReviewPolicy } from "./clickhouse-review-policy.js";
 import { reviewSql } from "./clickhouse-review.js";
@@ -416,6 +416,11 @@ export class ToolService {
       const parsed = inspected?.ok ? undefined : parseReadonlySql(sql);
       const sources = inspected?.ok ? inspected.tables : parsed!.tables;
       const rules = sources.map((table) => this.ruleFor(session, table));
+      if (inspected?.ok) {
+        for (const decision of [authorizeClickHouseJoin(normalized, rules), authorizeClickHouseScoped(normalized, rules), authorizeClickHouseDirect(normalized, rules)]) {
+          if (decision.applicable && !decision.ok) throw new SqlRejected(decision.code, "ClickHouse 语法树中的物理来源或字段未获授权。");
+        }
+      }
       const contract = sources.length === 1 ? this.ctx.knowledge.contract_by_table.get(sources[0]!)?.contract : undefined;
       const direct = inspected?.ok && contract && rules.length === 1 ? reviewDirectClickHouse(normalized, contract, rules[0]!, this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows) : null;
       const scoped = !direct && inspected?.ok && contract && rules.length === 1 ? reviewScopedClickHouse(normalized, contract, rules[0]!, this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows) : null;
@@ -1115,7 +1120,17 @@ export class ToolService {
         table = rawResultTable({ ...evidence, rows }, contract);
       }
       let expressionOnly = false;
-      if (!table && contract && evidence) { table = typedObservation(resource); expressionOnly = Boolean(table); }
+      if (!table && contract && evidence) {
+        // A failed business proof for an aggregate over a known incomplete
+        // population must not be bypassed by relabelling its result as an
+        // anonymous mathematical observation. Unknown coverage is separately
+        // disclosed as partial; explicit NULL, missing and predicted dates
+        // are stronger evidence that the requested population is incomplete.
+        const inspected = preflightClickHouseSql(resource.sql);
+        const aggregateWithKnownGap = resource.coverage.status === "known" && coverageHasGap(resource.coverage) && inspected.ok && inspected.functions.some((name) => ["sum", "sumif", "count", "countif", "avg", "min", "max"].includes(name));
+        if (!aggregateWithKnownGap) table = typedObservation(resource);
+        expressionOnly = Boolean(table);
+      }
       const partial = coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length > 0 || resource.coverage.status !== "known" || !resource.rows.length;
       return table ? { table, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial, ...(expressionOnly ? { expression_only: true } : {}), ...(partial ? { partial_reason: "transform_coverage_incomplete" as const } : {}) } : null;
     }
@@ -1663,7 +1678,10 @@ export class ToolService {
       if (resource.kind !== "calculation") continue;
       const parentResource = resources.find((item) => item.resource_id === resource.source_resource_id);
       const parentEvaluation = resource.evaluated_table_v1 && parentResource?.kind === "query_result" && liveFreshness && jobId ? await this.evaluateVerifiedResult(session, jobId, parentResource.resource_id, liveFreshness, new Set(), evaluation) : null;
-      if (resource.evaluated_table_v1 && (parentResource?.kind !== "query_result" || parentEvaluation?.expression_only)) {
+      const parentContract = parentResource?.kind === "query_result" && parentResource.tables.length === 1 ? this.ctx.knowledge.contract_by_table.get(parentResource.tables[0]!)?.contract : undefined;
+      const parentEvidence = parentResource?.kind === "query_result" && parentContract ? this.evidenceSource(session, parentResource) : null;
+      const hasBusinessShape = parentResource?.kind === "query_result" && parentContract && parentEvidence && Boolean(verifyCell(parentEvidence, parentContract, { op: "count_rows", as: "shape" }, parentEvidence.rows.length) || verifyDatabaseAggregates(parentEvidence, parentContract) || verifyConditionalAggregates(parentEvidence, parentContract));
+      if (resource.evaluated_table_v1 && (parentResource?.kind !== "query_result" || parentEvaluation?.expression_only && !hasBusinessShape)) {
         const checked = liveFreshness && jobId ? await this.evaluateVerifiedResult(session, jobId, resource.resource_id, liveFreshness, new Set(), evaluation) : null;
         if (!checked || checked.leaves.some((id) => !eligible.has(id))) {
           reasons.push("calculation_lineage_unsupported");

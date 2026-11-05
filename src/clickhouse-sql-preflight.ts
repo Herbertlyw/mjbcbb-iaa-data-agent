@@ -130,6 +130,7 @@ export function authorizeClickHouseDirect(sql: string, rules: readonly ClickHous
   if (!rule) return { applicable: true, ok: false, code: "unknown_table" };
   const alias = typeof table.alias === "string" ? table.alias : name;
   const selections = Array.isArray(select.select) ? select.select : [];
+  if (selections.some((value) => obj(value)?.type === "Asterisk")) return { applicable: true, ok: false, code: "wildcard_projection" };
   const aliases = new Set<string>();
   for (const value of selections) {
     const item = obj(value); if (!item || typeof item.alias !== "string") continue;
