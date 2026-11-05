@@ -1,4 +1,6 @@
-import { exactCalendarDatePredicate, parseReadonlySql } from "./sql.js";
+import { exactCalendarDatePredicate } from "./sql.js";
+import { queryEvidenceShape } from "./evidence-shape.js";
+import { clickHouseCoverageScope } from "./clickhouse-coverage-scope.js";
 import type { DataContract, QueryResource } from "./types.js";
 
 export interface CellOperation {
@@ -30,8 +32,12 @@ export interface VerifiedCell {
  * independent of SQL admission: admitted SQL can still have unknown lineage. */
 export function verifyCell(source: QueryResource, contract: DataContract, operation: CellOperation, storedValue: number): VerifiedCell | null {
   if (source.truncated || !source.complete_population || source.tables.length !== 1 || source.tables[0] !== contract.table || !contract.series) return null;
-  let ast: Record<string, unknown>;
-  try { ast = parseReadonlySql(source.sql).ast; } catch { return null; }
+  const ast = queryEvidenceShape(source, contract); if (!ast) return null;
+  const native = source.engine === "clickhouse-local" && source.sql_review_engine === "clickhouse_ast_direct";
+  const nativeScope = native ? clickHouseCoverageScope(source.sql, contract, source.time_range) : null;
+  if (native) {
+    if (!nativeScope || Object.keys(nativeScope.inSets).length) return null;
+  }
   if (ast.with || ast.distinct || ast.groupby || ast.having || ast.limit || ast._next || ast.options) return null;
   const from = Array.isArray(ast.from) ? ast.from : [];
   if (from.length !== 1) return null;
@@ -83,8 +89,8 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
   }
   const dateColumn = contract.series.date_column;
   const dimensions = new Set([...contract.series.dimensions, ...(contract.grain ?? []).filter((x) => x !== dateColumn && !contract.series!.metrics.includes(x))]);
-  const filters: Record<string, string> = {};
-  let start = ""; let end = "";
+  const filters: Record<string, string> = nativeScope ? { ...nativeScope.equalities } : {};
+  let start = nativeScope ? source.time_range.start : ""; let end = nativeScope ? source.time_range.end : "";
   function visit(value: unknown): boolean {
     const expression = record(value);
     if (!expression || expression.type !== "binary_expr") return false;
@@ -104,7 +110,7 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
     filters[left.column] = valueString;
     return true;
   }
-  if (!visit(ast.where) || !start || !end || start !== source.time_range.start || end !== source.time_range.end) return null;
+  if ((!nativeScope && !visit(ast.where)) || !start || !end || start !== source.time_range.start || end !== source.time_range.end) return null;
   for (const [key, value] of Object.entries(filters)) {
     const output = fieldToProjected.get(key);
     if (output && source.rows.some((row) => String(row[output]) !== value)) return null;
@@ -177,7 +183,7 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
 export function verifiedNullMarkerPreview(source: QueryResource, contract: DataContract): Array<Record<string, unknown>> | null {
   if (!verifyCell(source, contract, { op: "count_rows", as: "preview" }, source.rows.length)) return null;
   let columns: unknown;
-  try { columns = parseReadonlySql(source.sql).ast.columns; } catch { return null; }
+  columns = queryEvidenceShape(source, contract)?.columns;
   if (!Array.isArray(columns)) return null;
   const direct: string[] = [];
   let markers = 0;

@@ -219,6 +219,8 @@ export interface QueryResource {
   created_at: string;
   job_id?: string;
   engine: "sqlite-local" | "clickhouse-local";
+  /** Audit metadata only; current authorization is rechecked on use. */
+  sql_review_engine?: "clickhouse_ast_direct" | "clickhouse_ast_scoped" | "legacy_guard";
   simulated: true;
   elapsed_ms?: number;
   execution_id?: string;

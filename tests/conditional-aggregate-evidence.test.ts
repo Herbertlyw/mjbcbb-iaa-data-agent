@@ -38,6 +38,15 @@ test("整数阈值条件计数保留原字段、操作符、分组和范围", ()
   ]);
 });
 
+test("CK 原生审查的条件计数重核 NULL、零与整数阈值", () => {
+  const source = sample(); source.sql_review_engine = "clickhouse_ast_direct";
+  assert.deepEqual(verifyConditionalAggregates(source, contract)?.slice(0, 3).map((item) => [item.operation, item.value]), [["count_null", "0"], ["count_zero", "0"], ["count_nonnull", "3"]]);
+  source.sql = source.sql.replace("isNull(new_users)", "new_users > 10");
+  assert.deepEqual(verifyConditionalAggregates(source, contract)?.[0]?.comparison, { operator: ">", threshold: "10" });
+  source.sql = source.sql.replace("new_users > 10", "new_users > device_token");
+  assert.equal(verifyConditionalAggregates(source, contract), null);
+});
+
 test("条件计数拒绝未知覆盖、SQL 越权、复杂谓词、伪造分组及不完整结果", () => {
   for (const mutate of [
     (s: QueryResource) => { s.truncated = true; },

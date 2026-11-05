@@ -3,10 +3,27 @@ import test from "node:test";
 import { assessCoverage, coverageHasGap, provenCoverageFilters, provenCoverageScope } from "../src/coverage.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import { analyst, bindTables, withRuntime } from "./helpers.js";
+import { clickHouseCoverageScope } from "../src/clickhouse-coverage-scope.js";
 
 const contract = loadKnowledge("knowledge/lumenfox").contract_by_table.get("daily_installs")!.contract!;
 const range = { start: "2026-10-06", end: "2026-10-07" };
 const base = "SELECT country_code, channel, SUM(new_users) AS total FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-07' AND product_id = 'starlane_drift' AND platform = 'ios'";
+
+test("ClickHouse AST 从原生谓词证明覆盖筛选，不将不支持的条件视为完整", () => {
+  const ck = { ...contract, engine: "clickhouse-local" as const };
+  const sql = `${base} AND country_code IN ('US', 'JP') AND channel = 'nebula_ads' GROUP BY country_code, channel`;
+  assert.deepEqual(clickHouseCoverageScope(sql, ck, range), { equalities: { product_id: "starlane_drift", platform: "ios", channel: "nebula_ads" }, inSets: { country_code: ["JP", "US"] } });
+  assert.deepEqual(provenCoverageScope(sql, ck, range), clickHouseCoverageScope(sql, ck, range));
+  const day = { start: "2026-10-06", end: "2026-10-06" };
+  assert.ok(clickHouseCoverageScope("SELECT new_users FROM daily_installs WHERE event_date = toDate('2026-10-06') AND country_code = 'US'", ck, day));
+  for (const query of [
+    sql.replace("country_code IN ('US', 'JP')", "country_code IN ('US', NULL)"),
+    sql.replace("country_code IN ('US', 'JP')", "country_code IN ('US', 'US')"),
+    sql.replace("country_code IN ('US', 'JP')", "(country_code = 'US' OR country_code = 'JP')"),
+    `${sql} LIMIT 1`,
+    sql.replace("daily_installs WHERE", "daily_installs AS x WHERE").replace("country_code IN", "other.country_code IN"),
+  ]) assert.equal(clickHouseCoverageScope(query, ck, range), null, query);
+});
 
 test("IN 集合覆盖核对各值和笛卡尔组合，不把 NULL、缺组或零混同", () => {
   const sql = `${base} AND country_code IN ('US', 'JP') AND channel IN ('nebula_ads', 'comet_network') GROUP BY country_code, channel`;

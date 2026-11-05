@@ -1,6 +1,7 @@
 import type { CoverageGroup, CoverageReport, DataContract } from "./types.js";
 import { exactCalendarDatePredicate, parseReadonlySql } from "./sql.js";
 import { isCalendarDate } from "./config.js";
+import { clickHouseCoverageScope } from "./clickhouse-coverage-scope.js";
 
 export interface CoverageScope { equalities: Record<string, string>; inSets: Record<string, string[]> }
 
@@ -17,6 +18,10 @@ export function provenCoverageFilters(sql: string, contract: DataContract, timeR
 export function provenCoverageScope(sql: string, contract: DataContract, timeRange: { start: string; end: string }): CoverageScope | null {
   const series = contract.series;
   if (!series) return null;
+  if (contract.engine === "clickhouse-local") {
+    const native = clickHouseCoverageScope(sql, contract, timeRange);
+    if (native !== undefined) return native;
+  }
   let ast: Record<string, unknown>;
   try { ast = parseReadonlySql(sql).ast; } catch { return null; }
   // Coverage describes the input population before grouping; HAVING, LIMIT,

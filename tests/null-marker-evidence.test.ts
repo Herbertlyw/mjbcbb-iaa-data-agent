@@ -29,6 +29,19 @@ test("空值辅助投影逐行重算，仅按契约原字段交付", () => {
   assert.equal(verifyCell(nullable, contract, { op: "count_zero", column: "new_users", as: "n" }, 1)?.value, 1);
 });
 
+test("CK 原生审查的明细及空值标记由 CK 投影与覆盖范围重核", () => {
+  const native = structuredClone(source);
+  native.sql_review_engine = "clickhouse_ast_direct";
+  native.sql = native.sql.replaceAll("toDate('2026-10-06')", "'2026-10-06'").replaceAll("toDate('2026-10-08')", "'2026-10-08'");
+  assert.equal(verifyCell(native, contract, sum, 220)?.value, 220);
+  assert.equal(verifiedNullMarkerPreview(native, contract)?.length, 3);
+  const forged = structuredClone(native); forged.rows[0]!.is_null = 1;
+  assert.equal(verifyCell(forged, contract, sum, 220), null);
+  const changedScope = structuredClone(native); changedScope.sql = changedScope.sql.replace("country_code = 'US'", "country_code = 'JP'");
+  changedScope.rows = changedScope.rows.map((row) => ({ ...row, country_code: "US" }));
+  assert.equal(verifyCell(changedScope, contract, sum, 220), null);
+});
+
 test("伪造标记、缺直接字段、敏感字段及任意表达式不能用于证据", () => {
   const forged = structuredClone(source); forged.rows[0]!.is_null = 1;
   const missing = structuredClone(source); delete missing.rows[0]!.new_users;

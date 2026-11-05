@@ -38,6 +38,8 @@ import type {
 } from "./types.js";
 import { clickHouseColumns, clickHouseColumnTypes, clickHouseQueryBounded, clickHousePreflightedQuery, ClickHousePlanError } from "./clickhouse-client.js";
 import { clickHousePreflightMessage, preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
+import { reviewDirectClickHouse, reviewScopedClickHouse } from "./clickhouse-direct-review.js";
+import { queryEvidenceShape } from "./evidence-shape.js";
 import { ResourceGraph } from "./resource-graph.js";
 import { savedResultView } from "./result-view.js";
 import { normalizeCalculation } from "./calculation-protocol.js";
@@ -390,6 +392,8 @@ export class ToolService {
     const previewLimit = input.preview_limit ?? 20;
     if (!Number.isInteger(previewLimit) || previewLimit < 0 || previewLimit > 100) return fail("invalid_resource_page", "预览行数须在 0 到 100 之间。");
     let sqlLimited = false;
+    let nativeDirect = false;
+    let nativeProofSql: string | undefined;
     let guarded;
     try {
       // In ClickHouse mode, discover candidate physical sources from its own
@@ -400,11 +404,21 @@ export class ToolService {
       if (Buffer.byteLength(normalized, "utf8") > 64 * 1024) throw new SqlRejected("sql_size_limit", "SQL 超出安全长度上限");
       const inspected = this.ctx.businessEngine === "clickhouse" ? preflightClickHouseSql(normalized) : undefined;
       if (inspected && !inspected.ok) throw new SqlRejected(inspected.code, clickHousePreflightMessage(inspected.code));
-      const parsed = parseReadonlySql(sql);
-      sqlLimited = containsSqlLimit(parsed.ast);
-      const sources = inspected?.ok ? inspected.tables : parsed.tables;
+      const parsed = inspected?.ok ? undefined : parseReadonlySql(sql);
+      const sources = inspected?.ok ? inspected.tables : parsed!.tables;
       const rules = sources.map((table) => this.ruleFor(session, table));
-      guarded = guardSql(sql, rules, this.ctx.businessEngine === "clickhouse" ? "clickhouse" : "sqlite");
+      const contract = sources.length === 1 ? this.ctx.knowledge.contract_by_table.get(sources[0]!)?.contract : undefined;
+      const direct = inspected?.ok && contract && rules.length === 1 ? reviewDirectClickHouse(normalized, contract, rules[0]!, this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows) : null;
+      const scoped = !direct && inspected?.ok && contract && rules.length === 1 ? reviewScopedClickHouse(normalized, contract, rules[0]!, this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows) : null;
+      if (direct || scoped) {
+        guarded = direct ?? scoped!.guarded;
+        nativeDirect = true;
+        nativeProofSql = scoped?.proofSql;
+      } else {
+        const fallbackParsed = parsed ?? parseReadonlySql(sql);
+        sqlLimited = containsSqlLimit(fallbackParsed.ast);
+        guarded = guardSql(sql, rules, this.ctx.businessEngine === "clickhouse" ? "clickhouse" : "sqlite");
+      }
     } catch (error) {
       if (error instanceof SqlRejected) return fail(error.code, error.message);
       throw error;
@@ -445,7 +459,7 @@ export class ToolService {
         const contract = this.ctx.knowledge.contract_by_table.get(table)?.contract;
         return Boolean(contract && !contract.series && contract.must_filter.length === 0 && contract.grain?.length && canQueryTable(this.ctx.knowledge, session.role, table));
       }));
-      assertJoinKeys(sql, this.ctx.knowledge.joins, grains, { leftJoinDimensions });
+      if (!nativeDirect) assertJoinKeys(sql, this.ctx.knowledge.joins, grains, { leftJoinDimensions });
     } catch (error) {
       if (error instanceof SqlRejected) return fail(error.code, error.message);
       throw error;
@@ -542,8 +556,8 @@ export class ToolService {
     }
     let coverage;
     try {
-      const projection = inspectSingleSourceProjection(guarded.sql, guarded.tables.map((table) => this.ruleFor(session, table)));
-      coverage = joinPlan && joinProof ? joinCoverage(joinPlan, joinProof.rows, joinFact) : await this.coverageForTables(projection?.proof_sql ?? guarded.sql, guarded.tables, guarded.time_range, bindings, querySignal);
+      const projection = nativeDirect ? null : inspectSingleSourceProjection(guarded.sql, guarded.tables.map((table) => this.ruleFor(session, table)));
+      coverage = joinPlan && joinProof ? joinCoverage(joinPlan, joinProof.rows, joinFact) : await this.coverageForTables(nativeProofSql ?? projection?.proof_sql ?? guarded.sql, guarded.tables, guarded.time_range, bindings, querySignal);
     } catch {
       if (signal?.aborted) return fail("query_cancelled", "查询已取消");
       if (deadline.aborted) return fail("query_timeout", "查询超时，没有留下结果");
@@ -579,6 +593,7 @@ export class ToolService {
       created_at: new Date().toISOString(),
       ...(session.active_job_id ? { job_id: session.active_job_id } : {}),
       engine: this.ctx.businessEngine === "clickhouse" ? "clickhouse-local" : "sqlite-local",
+      sql_review_engine: nativeProofSql ? "clickhouse_ast_scoped" : nativeDirect ? "clickhouse_ast_direct" : "legacy_guard",
       elapsed_ms: elapsedMs,
       execution_id: bounded?.query_id ?? newId("exec"),
       ...(bounded ? { column_types: bounded.column_types, execution_settings: { join_use_nulls: true as const } } : {}),
@@ -614,6 +629,7 @@ export class ToolService {
       ok: true,
       resource_id: resource.resource_id,
       sql: resource.sql,
+      sql_review_engine: resource.sql_review_engine,
       executed_sql: resource.executed_sql,
       tables: resource.tables,
       contract_revisions: resource.contract_revisions,
@@ -833,15 +849,17 @@ export class ToolService {
     return { ok: true, resource_id: resource.resource_id, execution_id: resource.execution_id, rows: preview, result_total_rows: checked.rows.length, result_has_more: checked.rows.length > preview.length, coverage_incomplete: checked.partial, dependencies: Object.keys(checked.hashes), notice: `按完整结果的分组键全集对齐；预览限 100 行及 32 KB，某侧未出现的组不补零。${checked.partial ? "来源覆盖不完整或未知，结果只能部分交付。" : ""}resource_id=${resource.resource_id}` };
   }
 
-  private async resolveAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
+  private async resolveAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication, path: Set<string> = new Set()): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
     if (!spec || !spec.left || !spec.right || typeof spec.left.resource_id !== "string" || typeof spec.right.resource_id !== "string" || typeof spec.left.cell !== "string" || typeof spec.right.cell !== "string") return null;
     const inputs: Array<{ source: QueryResource; contract: DataContract; aggregates: VerifiedAggregate[] | null }> = [];
     for (const ref of [spec.left, spec.right]) {
       const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, ref.resource_id);
-      if (!found.ok || found.resource.kind !== "query_result" || found.resource.job_id !== jobId) return null;
+      if (!found.ok || found.resource.job_id !== jobId) return null;
+      if (found.resource.kind !== "query_result") return this.resolveDerivedAlignment(session, jobId, spec, publication, path);
       const source = found.resource; const contract = this.arithmeticContract(session, source, publication);
-      if (!contract) return null;
-      const aggregates = verifyDatabaseAggregates(source, contract)?.filter((item) => item.output_column === ref.cell) ?? null;
+      const evidence = contract && this.evidenceSource(session, source);
+      if (!contract || !evidence) return null;
+      const aggregates = verifyDatabaseAggregates(evidence, contract)?.filter((item) => item.output_column === ref.cell) ?? null;
       inputs.push({ source, contract, aggregates });
     }
     if (!inputs[0]!.aggregates?.length || !inputs[1]!.aggregates?.length) return this.resolveCompleteRawAlignment(session, jobId, spec, publication, inputs);
@@ -854,6 +872,45 @@ export class ToolService {
     if (!rows) return null;
     const hashes = Object.fromEntries(inputs.map(({ source }) => [source.resource_id, createHash("sha256").update(JSON.stringify(source)).digest("hex")]));
     return { rows, hashes, leaves: [...new Set(inputs.map(({ source }) => source.resource_id))], partial: false };
+  }
+
+  /** Keyed mathematical alignment of verified derived results. Restrict both
+   * inputs to the same physical contract, compatible range and pinned filters;
+   * derived labels do not establish a new business metric. */
+  private async resolveDerivedAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication, path: Set<string>): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
+    if (!Array.isArray(spec.keys) || !spec.keys.length || spec.keys.length > 3 || new Set(spec.keys).size !== spec.keys.length) return null;
+    const checked = await Promise.all([spec.left, spec.right].map((ref) => this.resolveTransform(session, jobId, ref.resource_id, publication, new Set(path))));
+    if (!checked[0] || !checked[1] || checked.some((item) => !item || item.leaves.length !== 1)) return null;
+    const leafResults = await Promise.all(checked.map((item) => this.ctx.sessions.lookupResourceAsync(session.session_id, item!.leaves[0]!)));
+    if (leafResults.some((item) => !item.ok || item.resource.kind !== "query_result" || item.resource.job_id !== jobId)) return null;
+    const leftSource = (leafResults[0] as { ok: true; resource: QueryResource }).resource;
+    const rightSource = (leafResults[1] as { ok: true; resource: QueryResource }).resource;
+    if (leftSource.tables.length !== 1 || rightSource.tables.length !== 1 || leftSource.tables[0] !== rightSource.tables[0] || leftSource.time_range.start !== rightSource.time_range.start || leftSource.time_range.end !== rightSource.time_range.end || leftSource.time_range.timezone !== rightSource.time_range.timezone) return null;
+    const contract = this.arithmeticContract(session, leftSource, publication);
+    if (!contract?.series || !this.arithmeticContract(session, rightSource, publication) || contract.series.predicted_column || contract.series.prediction_mode !== "observed_only") return null;
+    const leftEvidence = this.evidenceSource(session, leftSource); const rightEvidence = this.evidenceSource(session, rightSource);
+    const leftFilters = leftEvidence && provenCoverageFilters(leftEvidence.sql, contract, leftSource.time_range);
+    const rightFilters = rightEvidence && provenCoverageFilters(rightEvidence.sql, contract, rightSource.time_range);
+    if (!leftFilters || !rightFilters || stableHashes(leftFilters) !== stableHashes(rightFilters) || spec.keys.some((key) => key !== contract.series!.date_column && !contract.series!.dimensions.includes(key) || Object.hasOwn(leftFilters, key)) || !contract.series.dimensions.every((key) => spec.keys.includes(key) || Object.hasOwn(leftFilters, key))) return null;
+    for (const item of checked) for (const key of spec.keys) {
+      const column = item!.table.columns.find((candidate) => candidate.name === key);
+      if (!column || column.type !== "text" || column.label !== `${contract.table}.${key}` || column.unit !== `维度 ${contract.table}.${key}`) return null;
+    }
+    const inputs: CompleteKeyedInput[] = []; const makers: Array<(value: string | null) => ArithmeticValue> = [];
+    for (let index = 0; index < 2; index++) {
+      const ref = index ? spec.right : spec.left; const table = checked[index]!.table;
+      const metric = table.columns.find((column) => column.name === ref.cell);
+      if (!metric || metric.type !== "decimal" || !Number.isInteger(metric.scale)) return null;
+      const make = (value: string | null): ArithmeticValue => ({ value, scale: metric.scale!, unit: metric.unit || "未认证", basis: { table: "结果资源", column: `${ref.resource_id}.${ref.cell}`, operation: "result_cell", unit: metric.unit || "未认证", prediction: "未认证", timezone: "未认证" }, scopes: [], interpretation: "mathematical_only", formula: `${ref.resource_id}.${ref.cell}` });
+      makers.push(make);
+      inputs.push({ table, valueColumn: ref.cell, keyColumns: spec.keys, valueForGroup: make });
+    }
+    const aligned = alignCompleteTables(inputs[0]!, inputs[1]!, spec.op, (op, left, right) => this.computeProvenArithmetic(op, left, right));
+    if (!aligned) return null;
+    const rows: AlignedRow[] = aligned.map((row) => ({ group: row.group as Record<string, string | null>, status: row.status, left: row.left ? makers[0]!(row.left.value) : null, right: row.right ? makers[1]!(row.right.value) : null, result: row.result, ...(row.left ? { left_count: row.left.count, left_null_count: row.left.null_count } : {}), ...(row.right ? { right_count: row.right.count, right_null_count: row.right.null_count } : {}) }));
+    const hashes: Record<string, string> = {};
+    for (const item of checked) for (const [id, digest] of Object.entries(item!.hashes)) { if (hashes[id] && hashes[id] !== digest) return null; hashes[id] = digest; }
+    return { rows, hashes, leaves: [...new Set(checked.flatMap((item) => item!.leaves))], partial: checked.some((item) => item!.partial) };
   }
 
   /** Each side is a complete direct projection or a verified database SUM;
@@ -883,7 +940,7 @@ export class ToolService {
         continue;
       }
       const shape = verifyCell(evidence, contract, { op: "count_rows", as: "shape" }, source.rows.length);
-      const projections = parseReadonlySql(evidence.sql).ast.columns;
+      const projections = queryEvidenceShape(evidence, contract)?.columns;
       if (!shape || !Array.isArray(projections)) return null;
       const fields = new Map<string, string>();
       for (const entry of projections as Array<{ as?: string | null; expr?: { type?: string; column?: string } }>) if (entry.expr?.type === "column_ref" && entry.expr.column) fields.set(entry.as ?? entry.expr.column, entry.expr.column);
@@ -966,11 +1023,29 @@ export class ToolService {
       return table ? { table, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial, ...(partial ? { partial_reason: "transform_coverage_incomplete" as const } : {}) } : null;
     }
     if (resource.kind === "alignment") {
-      const checked = await this.resolveAlignment(session, jobId, resource.spec, publication);
+      const next = new Set(path); next.add(resourceId);
+      const checked = await this.resolveAlignment(session, jobId, resource.spec, publication, next);
       if (!checked || Boolean(resource.coverage_incomplete) !== checked.partial || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) return null;
       const table = alignmentTable(resource.spec, checked.rows);
       const partial = checked.partial || checked.rows.some((row) => row.status !== "matched" || Object.values(row.group).some((value) => value === null));
       return table ? { table, hashes: { ...checked.hashes, [resource.resource_id]: ownHash }, leaves: checked.leaves, partial, ...(partial ? { partial_reason: "alignment_incomplete" as const } : {}) } : null;
+    }
+    if (resource.kind === "calculation" || resource.kind === "arithmetic") {
+      if (!resource.execution_id) return null;
+      const names = resource.kind === "calculation" ? Object.keys(resource.cells) : ["result"];
+      if (!names.length || names.length > 40) return null;
+      const columns: ResultColumn[] = []; const row: Record<string, string | null> = {};
+      const hashes: Record<string, string> = {}; const leaves = new Set<string>(); let partial = false;
+      for (const name of names) {
+        const checked = await this.resolveArithmetic(session, jobId, { resource_id: resourceId, execution_id: resource.execution_id, cell: name }, publication, path);
+        if (!checked || !Number.isInteger(checked.value.scale) || checked.value.scale < 0 || checked.value.scale > 38) return null;
+        columns.push({ name, type: "decimal", scale: checked.value.scale, unit: checked.value.unit || "未认证", label: `已复核计算单元 ${name}` });
+        row[name] = checked.value.value;
+        for (const [id, digest] of Object.entries(checked.hashes)) { if (hashes[id] && hashes[id] !== digest) return null; hashes[id] = digest; }
+        checked.leaves.forEach((id) => leaves.add(id));
+        partial ||= checked.value.partial === true || checked.value.value === null;
+      }
+      return { table: { columns, rows: [row] }, hashes, leaves: [...leaves], partial, ...(partial ? { partial_reason: "transform_undefined_division" as const } : {}) };
     }
     if (resource.kind !== "transform") return null;
     const next = new Set(path); next.add(resourceId);
@@ -1007,10 +1082,10 @@ export class ToolService {
         // explicit mismatches and all multi-row references still fail closed.
         const executionId = ref.execution_id ?? (ref.row === 0 && resource.rows.length === 1 ? resource.execution_id : undefined);
         if (ref.group || !executionId || executionId !== resource.execution_id || (ref.row === undefined) === (ref.aggregate === undefined) || (ref.row !== undefined && (!Number.isSafeInteger(ref.row) || ref.row < 0)) || (ref.aggregate !== undefined && ref.aggregate !== "sum") || coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length) return null;
-        const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, new Set());
+        const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, path);
         const table = checked?.table; const column = table?.columns.find((candidate) => candidate.name === ref.cell);
         const shape = verifyCell(evidence, contract, { op: "count_rows", as: "shape" }, resource.rows.length);
-        const projections = parseReadonlySql(evidence.sql).ast.columns;
+        const projections = queryEvidenceShape(evidence, contract)?.columns;
         const projection = Array.isArray(projections) ? projections.find((item) => item && typeof item === "object" && ((item as { as?: string | null; expr?: { column?: string } }).as ?? (item as { expr?: { column?: string } }).expr?.column) === ref.cell) as { expr?: { type?: string; column?: string } } | undefined : undefined;
         const field = projection?.expr?.type === "column_ref" ? projection.expr.column : undefined;
         if (!checked || !table || !column || column.type !== "decimal" || !shape || !field || !contract.series?.metrics.includes(field) || !contract.columns.find((candidate) => candidate.name === field)?.unit || !rawResultTable(evidence, contract)) return null;
@@ -1048,7 +1123,7 @@ export class ToolService {
       // Derived executions have their own identity; never interpret row zero
       // from different resources as a matched business row.
       if (ref.group || !resource.execution_id || ref.execution_id !== resource.execution_id || (ref.row === undefined) === (ref.aggregate === undefined) || (ref.row !== undefined && (!Number.isSafeInteger(ref.row) || ref.row < 0)) || (ref.aggregate !== undefined && ref.aggregate !== "sum")) return null;
-      const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, new Set());
+      const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, path);
       const column = checked?.table.columns.find((item) => item.name === ref.cell);
       if (!checked || !column || column.type !== "decimal" || !Number.isInteger(column.scale) || column.scale! < 0 || column.scale! > 38) return null;
       let values: Array<string | null>;
@@ -1088,7 +1163,16 @@ export class ToolService {
       if (!resource.source_resource_hash || resource.source_resource_hash !== createHash("sha256").update(JSON.stringify(source)).digest("hex")) return null;
       const evidence = this.evidenceSource(session, source);
       const operation = resource.operations[ref.cell]; const stored = resource.cells[ref.cell];
-      if (!contract || !evidence || !operation || operation.op !== "sum" || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length) return null;
+      if (!contract || !evidence || !operation || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length) return null;
+      if (operation.op !== "sum") {
+        if (typeof stored !== "number" || !Number.isSafeInteger(stored) || stored < 0) return null;
+        const verified = verifyCell(evidence, contract, operation, stored);
+        const grouped = !verified ? verifyGroupRollup(evidence, contract, operation, stored) : null;
+        if (verified && (verified.precision !== "exact_integer" || !verified.prediction.startsWith("实际（")) || grouped && Object.keys(grouped.in_sets).length || !verified && !grouped) return null;
+        const value = verified ?? grouped!;
+        const result: ArithmeticValue = { value: String(stored), scale: 0, unit: value.unit, basis: { table: value.table, column: value.column ?? "结果行", operation: operation.op, unit: value.unit, prediction: "actual_observed_only", timezone: value.range.timezone }, scopes: [{ filters: value.filters, start: value.range.start, end: value.range.end }] };
+        return { value: result, hashes: { [source.resource_id]: createHash("sha256").update(JSON.stringify(source)).digest("hex"), [resource.resource_id]: ownHash }, leaves: [source.resource_id] };
+      }
       const decimal = typeof stored === "string" ? verifyDecimalCell(evidence, contract, operation, stored) : null;
       const integer = typeof stored === "number" ? verifyCell(evidence, contract, operation, stored) : null;
       const grouped = !decimal && !integer && (typeof stored === "string" || typeof stored === "number") ? verifyGroupRollup(evidence, contract, operation, stored) : null;
@@ -1339,8 +1423,8 @@ export class ToolService {
         // SQL aliases are model-controlled and can look like another metric or
         // unit. The verified statements use contract names; do not present the
         // raw alias-labelled preview as verified evidence in the answer.
-        const columns = parseReadonlySql(original!.sql).ast.columns;
-        if (Array.isArray(columns) && columns.some((item) => item && typeof item === "object" && "as" in item && item.as)) {
+        const columns = evidence && contract ? queryEvidenceShape(evidence, contract)?.columns : null;
+        if (!Array.isArray(columns) || columns.some((item) => item && typeof item === "object" && "as" in item && item.as)) {
           const preview = evidence && contract ? verifiedNullMarkerPreview(evidence, contract) : null;
           source.rows = preview ?? [];
           reasons.push(preview ? "null_marker_preview_sanitized" : "alias_preview_hidden");
@@ -1761,6 +1845,16 @@ export class ToolService {
   /** Reconstruct an equivalent proof projection, never the SQL sent to ClickHouse. */
   private evidenceSource(session: SessionRecord, source: QueryResource): QueryResource | null {
     try {
+      if (source.engine === "clickhouse-local" && source.sql_review_engine === "clickhouse_ast_scoped" && source.tables.length === 1 && source.executed_sql === source.sql) {
+        const contract = this.ctx.knowledge.contract_by_table.get(source.tables[0]!)?.contract;
+        const checked = contract && reviewScopedClickHouse(source.sql, contract, this.ruleFor(session, source.tables[0]!), this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows);
+        return checked && checked.guarded.time_range.start === source.time_range.start && checked.guarded.time_range.end === source.time_range.end ? { ...source, sql: checked.proofSql, sql_review_engine: "clickhouse_ast_direct" } : null;
+      }
+      if (source.engine === "clickhouse-local" && source.sql_review_engine === "clickhouse_ast_direct" && source.tables.length === 1 && source.executed_sql === source.sql) {
+        const contract = this.ctx.knowledge.contract_by_table.get(source.tables[0]!)?.contract;
+        const checked = contract && reviewDirectClickHouse(source.sql, contract, this.ruleFor(session, source.tables[0]!), this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows);
+        return checked && checked.time_range.start === source.time_range.start && checked.time_range.end === source.time_range.end ? source : null;
+      }
       const ast = parseReadonlySql(source.sql).ast;
       const from = Array.isArray(ast.from) ? ast.from : [];
       const nested = Boolean(ast.with || from.some((item) => item && typeof item === "object" && "expr" in item && item.expr));
@@ -1975,7 +2069,7 @@ function stableHashes(value: Record<string, string>): string {
 function rawResultTable(source: QueryResource, contract: DataContract): ResultTable | null {
   if (!contract.series || contract.series.prediction_mode !== "observed_only" || contract.series.predicted_column || source.truncated || source.sql_limited || !source.complete_population || source.total_rows_exact !== true || source.rows.length > RESULT_CALCULATION_MAX_ROWS || source.rows.length !== source.returned_rows || source.rows.length !== source.total_rows || (source.engine === "clickhouse-local" && !source.execution_id)) return null;
   if (!verifyCell(source, contract, { op: "count_rows", as: "shape" }, source.rows.length)) return null;
-  const projections = parseReadonlySql(source.sql).ast.columns;
+  const projections = queryEvidenceShape(source, contract)?.columns;
   if (!Array.isArray(projections) || projections.length !== source.columns.length || projections.length > 40) return null;
   const fields: Array<{ column: ResultColumn; field: string; declared: DataContract["columns"][number]; kind: "integer" | "decimal" | "text" }> = [];
   for (const projection of projections) {
@@ -2105,6 +2199,7 @@ function renderTransform(resource: TransformResource, input: ResultTable, result
 
 function renderAlignment(resource: AlignmentResource, rows: AlignedRow[]): string[] {
   const lines = [`按分组键全集对齐并执行 ${resource.spec.op}；输入 ${resource.spec.left.resource_id}、${resource.spec.right.resource_id}；计算资源 ${resource.resource_id}。未出现的组不补零。`];
+  if (rows.some((row) => row.result?.interpretation === "mathematical_only")) lines.push("这是按已核验结果键值进行的数学对齐；不认证模型自选的业务名称或自然语言意图。");
   if (resource.coverage_incomplete) lines.push("来源覆盖不完整或未知；以下各组计算仅基于已观察记录，不能代表完整周期。");
   if (rows.some((row) => Object.values(row.group).some((value) => value === null))) lines.push("NULL 键作为独立分组保留；当前覆盖回执不证明 NULL 键的周期完整性，因此只能部分交付。");
   for (const row of rows.slice(0, 100)) {

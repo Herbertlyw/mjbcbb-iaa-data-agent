@@ -29,7 +29,7 @@ export function savedResultView(resource: SessionResource): SavedResultView | nu
     columns: resource.columns.map((name) => ({ name, type: resource.column_types?.[name] ?? "Unknown", unit: null })),
     rows: resource.rows, saved_rows: resource.rows.length, source_truncated: resource.truncated,
     sql_limited: resource.sql_limited === true, complete_population: resource.complete_population,
-    source: { engine: resource.engine, sql: resource.sql, executed_sql: resource.executed_sql ?? resource.sql, execution_settings: resource.execution_settings ?? null, tables: resource.tables, contract_revisions: resource.contract_revisions, asset_hashes: resource.asset_hashes, freshness_receipts: resource.freshness_receipts },
+    source: { engine: resource.engine, sql_review_engine: resource.sql_review_engine ?? "legacy_unknown", sql: resource.sql, executed_sql: resource.executed_sql ?? resource.sql, execution_settings: resource.execution_settings ?? null, tables: resource.tables, contract_revisions: resource.contract_revisions, asset_hashes: resource.asset_hashes, freshness_receipts: resource.freshness_receipts },
   };
   if (resource.kind === "transform") return {
     ...common, columns: resource.result.columns.map((column) => ({ name: column.name, type: column.type === "decimal" ? `Decimal(scale=${column.scale})` : column.type, unit: column.unit || null })),

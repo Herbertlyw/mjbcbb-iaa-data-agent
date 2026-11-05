@@ -28,6 +28,18 @@ test("可信日期分组精确汇总，分组的行数与零不能冒充事实�
   assert.equal(verifyGroupRollup(base, contract, { op: "sum", column: "total", predicted: "predicted_only", as: "n" }, "220"), null);
 });
 
+test("CK 原生审查的分组结果以 CK 投影形状复核后继续求和", () => {
+  const native = { ...structuredClone(base), sql_review_engine: "clickhouse_ast_direct" as const };
+  const op = { op: "sum" as const, column: "total", as: "result" };
+  assert.equal(verifyGroupRollup(native, contract, op, "220")?.value, "220");
+  const incorrect = structuredClone(native); incorrect.rows[2]!.total = "121";
+  assert.equal(verifyGroupRollup(incorrect, contract, op, "220"), null);
+  const forged = structuredClone(native); forged.sql = forged.sql.replace("SUM(new_users) AS total", "SUM(new_users) OVER () AS total");
+  assert.equal(verifyGroupRollup(forged, contract, op, "220"), null);
+  const hidden = structuredClone(native); hidden.sql = hidden.sql.replace("SUM(new_users)", "SUM(device_token)");
+  assert.equal(verifyGroupRollup(hidden, contract, op, "220"), null);
+});
+
 test("SUM、COUNT 和空值辅助计数同查询时可核验汇总，辅助列不能冒充指标", () => {
   const source = structuredClone(base);
   source.sql = source.sql.replace("SUM(new_users) AS total", "SUM(new_users) AS total, COUNT(new_users) AS observed, COUNT(*) AS total_rows, countIf(new_users IS NULL) AS missing");

@@ -1,6 +1,6 @@
 import { coverageHasGap, provenCoverageScope } from "./coverage.js";
 import { isCalendarDate } from "./config.js";
-import { parseReadonlySql } from "./sql.js";
+import { queryEvidenceShape } from "./evidence-shape.js";
 import type { DataContract, QueryResource } from "./types.js";
 
 export interface VerifiedAggregate {
@@ -28,8 +28,7 @@ export function verifyDatabaseAggregates(source: QueryResource, contract: DataCo
   const scope = provenCoverageScope(source.sql, contract, source.time_range);
   if (!scope) return null;
   const filters = scope.equalities;
-  let ast: Record<string, unknown>;
-  try { ast = parseReadonlySql(source.sql).ast; } catch { return null; }
+  const ast = queryEvidenceShape(source, contract); if (!ast) return null;
   if (ast.with || ast._next || ast.having || ast.limit || ast.distinct || ast.options) return null;
   const from = Array.isArray(ast.from) ? ast.from : [];
   const relation = object(from[0]);

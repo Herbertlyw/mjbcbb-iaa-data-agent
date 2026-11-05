@@ -1,7 +1,7 @@
 import { coverageHasGap } from "./coverage.js";
 import { verifyCell, type CellOperation } from "./evidence.js";
 import { sumDecimalStrings } from "./exact-arithmetic.js";
-import { parseReadonlySql } from "./sql.js";
+import { queryEvidenceShape } from "./evidence-shape.js";
 import type { DataContract, QueryResource } from "./types.js";
 
 export interface VerifiedDecimalCell {
@@ -21,7 +21,7 @@ export function verifyDecimalCell(source: QueryResource, contract: DataContract,
   if (source.engine !== "clickhouse-local" || operation.op !== "sum" || !operation.column || operation.predicted === "predicted_only" || contract.series?.prediction_mode !== "observed_only" || contract.series.predicted_column || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length) return null;
   const shape = verifyCell(source, contract, { op: "count_rows", as: "shape" }, source.rows.length);
   if (!shape) return null;
-  const columns = parseReadonlySql(source.sql).ast.columns;
+  const columns = queryEvidenceShape(source, contract)?.columns;
   if (!Array.isArray(columns)) return null;
   const projection = columns.find((item) => item && typeof item === "object" && ((item as { as?: string; expr?: { column?: string } }).as ?? (item as { expr?: { column?: string } }).expr?.column) === operation.column) as { expr?: { type?: string; column?: string } } | undefined;
   const field = projection?.expr?.type === "column_ref" ? projection.expr.column : undefined;

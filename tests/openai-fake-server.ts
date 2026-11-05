@@ -221,6 +221,8 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成空值标记投影")) return scripted(turn, nullMarkerSteps);
   if (latest.includes("合成条件阈值")) return scripted(turn, conditionalThresholdSteps);
   if (latest.includes("合成单资源比较")) return scripted(turn, sameResourceComparisonSteps);
+  if (latest.includes("合成维表关联后再汇总")) return scripted(turn, joinTransformSteps);
+  if (latest.includes("合成变换结果对齐")) return scripted(turn, derivedAlignmentSteps);
   if (latest.includes("合成单明细比较")) return scripted(turn, rawSingleComparisonSteps);
   if (latest.includes("合成不同明细来源")) return scripted(turn, rawDifferentResourceSteps);
   if (latest.includes("不调用记录")) return scripted(turn, noRecordSteps);
@@ -245,6 +247,7 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成 CTE 左关联未匹配")) return scripted(turn, (ids) => preaggregatedTitleSteps(ids, true));
   if (latest.includes("合成 CTE 预聚合关联")) return scripted(turn, (ids) => preaggregatedTitleSteps(ids, false));
   if (latest.includes("合成 CTE 查询")) return scripted(turn, cteSteps);
+  if (latest.includes("合成多层恒等投影")) return scripted(turn, nestedCteSteps);
   if (latest.includes("合成左关联产品")) return scripted(turn, leftTitleSteps);
   if (latest.includes("合成跨事实比率")) return scripted(turn, crossFactRatioSteps);
   if (latest.includes("合成三千六百行")) return scripted(turn, largerTransformSteps);
@@ -441,6 +444,16 @@ function cteSteps(ids: string[]) {
   ];
 }
 
+function nestedCteSteps(ids: string[]) {
+  const steps = cteSteps(ids);
+  const original = JSON.parse(steps[1]!.arguments) as { sql: string };
+  const prefix = "WITH scoped AS ("; const suffix = ") SELECT event_date, new_users FROM scoped";
+  if (!original.sql.startsWith(prefix) || !original.sql.endsWith(suffix)) throw new Error("invalid_cte_fixture");
+  const inner = original.sql.slice(prefix.length, -suffix.length);
+  steps[1] = { ...steps[1]!, arguments: JSON.stringify({ sql: `WITH scoped AS (SELECT event_date, new_users FROM (${inner})) SELECT event_date, new_users FROM scoped` }) };
+  return steps;
+}
+
 function leftTitleSteps(ids: string[]) {
   const sql = "SELECT f.title_id, d.title_name AS label, SUM(f.new_users) AS total FROM fact_fox_daily_install f LEFT JOIN dim_fox_title d ON f.title_id = d.title_id WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-12' AND f.platform = 'android' AND f.country_code = 'ZZ' AND f.channel_id = 'mist_ads' GROUP BY f.title_id, d.title_name ORDER BY f.title_id";
   return [
@@ -593,6 +606,24 @@ function validJoinSteps(ids: string[]) {
     { id: "join_query", name: "query", arguments: JSON.stringify({ sql: "SELECT d.title_name AS label, SUM(f.new_users) AS total FROM fact_fox_daily_install f JOIN dim_fox_title d ON f.title_id = d.title_id WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-12' AND f.title_id = 'paper_lantern' AND f.platform = 'ios' AND f.country_code = 'JP' AND f.channel_id = 'mist_ads' AND d.title_name = '纸灯' GROUP BY d.title_name ORDER BY d.title_name" }) },
     { id: "join_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
   ];
+}
+
+function joinTransformSteps(ids: string[]) {
+  return [
+    ...validJoinSteps(ids).slice(0, 3),
+    { id: "join_transform", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: [{ op: "group", by: [], aggregates: [{ op: "sum", column: "total", as: "joined_total" }] }] } }) },
+    { id: "join_twice", name: "calculate_session_cells", arguments: JSON.stringify({ arithmetic: { op: "add", left: { resource_id: ids[1] ?? "", cell: "joined_total", row: 0 }, right: { resource_id: ids[1] ?? "", cell: "joined_total", row: 0 } } }) },
+    { id: "join_final", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", resource_ids: [ids[2] ?? ""] }) },
+  ];
+}
+
+function derivedAlignmentSteps(ids: string[]) {
+  const steps = [{ id: "derived_align_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "derived_align_query", name: "query", arguments: JSON.stringify({ sql: "SELECT country_code, SUM(new_users) AS total FROM fact_fox_daily_install WHERE event_date = '2026-10-06' AND title_id = 'paper_lantern' AND platform = 'ios' AND channel_id = 'mist_ads' GROUP BY country_code" }) }];
+  for (const direction of ["asc", "desc"]) steps.push({ id: `derived_sort_${direction}`, name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: [{ op: "sort", keys: [{ column: "country_code", direction, nulls: "last" }] }] } }) });
+  steps.push({ id: "derived_align", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "divide", keys: ["country_code"], left: { resource_id: ids[1] ?? "", cell: "total" }, right: { resource_id: ids[2] ?? "", cell: "total" } } }) });
+  steps.push({ id: "derived_align_final", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", resource_ids: [ids[3] ?? ""] }) });
+  return steps;
 }
 
 function validChannelJoinSteps(ids: string[]) {

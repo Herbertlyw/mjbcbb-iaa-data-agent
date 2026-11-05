@@ -17,6 +17,7 @@ import { createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehou
 import { startFakeOpenAI } from "./openai-fake-server.js";
 import { isolatedDocker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
 import { GlobalBudget } from "../src/global-budget.js";
+import { clickHouseScopedProjection } from "../src/clickhouse-scoped-projection.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const sourceKnowledgeDir = path.join(root, "knowledge", "harborlight");
@@ -259,10 +260,11 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     if (process.env.DIAG_CONTEXT_SIZES === "1") console.log(`合成旧分析回执 ${fullBytes} 字节，发送摘要 ${followObservation.historySummaryBytes} 字节；追问请求体 ${followObservation.requestBytes} 字节。`);
     const [owned] = await db.query("SELECT resource_id, body_json FROM resources WHERE resource_id IN (?, ?)", [source1, source2]);
     for (const row of owned as Array<{ resource_id: string; body_json: string }>) {
-      const resource = JSON.parse(String(row.body_json)) as { session_id: string; job_id: string; engine: string; freshness_receipts: unknown[] };
+      const resource = JSON.parse(String(row.body_json)) as { session_id: string; job_id: string; engine: string; sql_review_engine?: string; freshness_receipts: unknown[] };
       assert.equal(resource.session_id, session.session_id);
       assert.equal(resource.job_id, row.resource_id === source1 ? queued.job_id : followup.job_id);
       assert.equal(resource.engine, "clickhouse-local");
+      assert.equal(resource.sql_review_engine, "clickhouse_ast_direct");
       assert.ok(resource.freshness_receipts.length > 0);
     }
     assert.equal((owned as unknown[]).length, 2);
@@ -316,9 +318,10 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     try {
       for (const id of decimalIds) {
         const [rows] = await decimalDb.query("SELECT body_json FROM resources WHERE resource_id = ?", [id]);
-        const resource = JSON.parse(String((rows as Array<{ body_json: string }>)[0]?.body_json)) as { session_id: string; job_id: string; rows: Array<{ total: unknown }>; freshness_receipts: unknown[] };
+        const resource = JSON.parse(String((rows as Array<{ body_json: string }>)[0]?.body_json)) as { session_id: string; job_id: string; sql_review_engine?: string; rows: Array<{ total: unknown }>; freshness_receipts: unknown[] };
         assert.equal(resource.session_id, decimalSessionId);
         assert.equal(resource.job_id, decimal.job_id);
+        assert.equal(resource.sql_review_engine, "clickhouse_ast_direct");
         assert.equal(typeof resource.rows[0]?.total, "string");
         assert.ok(resource.freshness_receipts.length > 0);
       }
@@ -361,6 +364,35 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(join.analysis?.sources?.[0]?.freshness_receipts?.length, 2);
     assert.deepEqual(join.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "read_data_contract_view", "query"]);
     assert.ok(join.events.some((event) => event.type === "tool_finished" && event.payload.tool_name === "query" && event.payload.is_error === false));
+    const joinTransformSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const joinTransformSessionId = ((await joinTransformSession.json()) as { session_id: string }).session_id;
+    const joinTransform = await postQuestion(apiPort, joinTransformSessionId, "合成维表关联后再汇总：纸灯日本 iOS 雾帆 2026-10-06 到 2026-10-12 新增，合计后再加自身。");
+    assert.equal(joinTransform.status, "completed", JSON.stringify({ error: joinTransform.error, answer: joinTransform.analysis?.answer, reasons: joinTransform.analysis?.server_reasons, tools: joinTransform.events.filter((event) => event.type === "tool_finished") }));
+    assert.match(joinTransform.analysis?.answer ?? "", /140/);
+    assert.equal(joinTransform.events.find((event) => event.type === "candidate_reviewed")?.payload.selected_count, 1);
+    assert.equal(joinTransform.events.filter((event) => event.type === "tool_finished" && event.payload.tool_name === "calculate_session_cells" && event.payload.is_error === false).length, 2);
+    assert.equal(joinTransform.analysis?.sources?.[0]?.engine, "clickhouse-local");
+    await stopChild(happyWorker);
+    const candidateWorker = spawn(process.execPath, ["--import", "tsx", "src/worker.ts"], { cwd: root, env: { ...baseEnv, PI_HOLD_AFTER_CANDIDATE_MS: "8000" }, stdio: "ignore" });
+    children.push(candidateWorker);
+    const recoverySessionResponse = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const recoverySession = ((await recoverySessionResponse.json()) as { session_id: string }).session_id;
+    const recoveryPost = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${recoverySession}/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "合成维表关联后再汇总：纸灯日本 iOS 雾帆 2026-10-06 到 2026-10-12 新增，合计后再加自身。", idempotency_key: randomUUID() }) });
+    assert.equal(recoveryPost.status, 202);
+    const recoveryId = ((await recoveryPost.json()) as { job_id: string }).job_id;
+    const savedCandidate = await waitCandidateSnapshot(apiPort, recoveryId);
+    await stopChild(candidateWorker);
+    await new Promise((resolve) => setTimeout(resolve, 4500));
+    happyWorker = spawn(process.execPath, ["--import", "tsx", "src/worker.ts"], { cwd: root, env: baseEnv, stdio: "ignore" });
+    children.push(happyWorker);
+    const resumedJoin = await waitJob(apiPort, recoveryId);
+    assert.equal(resumedJoin.status, "completed", JSON.stringify({ error: resumedJoin.error, reasons: resumedJoin.analysis?.server_reasons }));
+    assert.match(resumedJoin.analysis?.answer ?? "", /140/);
+    assert.equal(resumedJoin.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === "query").length, 1);
+    assert.equal(resumedJoin.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === "calculate_session_cells").length, 2);
+    assert.equal(resumedJoin.events.find((event) => event.type === "model_context" && event.payload.decision === "reread_candidate")?.payload.leaf_id, savedCandidate);
+    assert.equal(resumedJoin.events.filter((event) => event.type === "candidate_reviewed").length, 1);
+    assert.equal(resumedJoin.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
     const channelJoinSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const channelJoinSessionId = ((await channelJoinSession.json()) as { session_id: string }).session_id;
     const channelJoin = await postQuestion(apiPort, channelJoinSessionId, "合成渠道维表关联：统计纸灯日本 iOS 雾帆 2026-10-06 到 2026-10-12 新增。");
@@ -476,6 +508,12 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       return ((await response.json()) as { session_id: string }).session_id;
     };
     const dailySession = await createSyntheticSession();
+    const derivedAligned = await postQuestion(apiPort, await createSyntheticSession(), "合成变换结果对齐：比较纸灯 iOS 雾帆 2026-10-06 各国家新增分组的两个排序结果。");
+    assert.equal(derivedAligned.status, "completed", JSON.stringify({ error: derivedAligned.error, answer: derivedAligned.analysis?.answer, reasons: derivedAligned.analysis?.server_reasons, tools: derivedAligned.events.filter((event) => event.type === "tool_finished") }));
+    const derivedRows = derivedAligned.analysis?.alignment_results?.[0]?.rows ?? [];
+    assert.ok(derivedRows.length >= 2); assert.ok(derivedRows.every((row) => row.status === "matched" && row.result?.value === "1.000000000000000000"));
+    assert.match(derivedAligned.analysis?.answer ?? "", /数学对齐/);
+    assert.equal(derivedAligned.events.find((event) => event.type === "candidate_reviewed")?.payload.selected_count, 1);
     const dailyCross = await postQuestion(apiPort, dailySession, "合成多日双渠道跨事实：按日期和渠道比较收入与新增。");
     assert.equal(dailyCross.status, "partial", `${JSON.stringify(dailyCross.error)} tools=${dailyCross.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name).join(">")}`);
     assert.equal(dailyCross.events.find((event) => event.type === "candidate_reviewed")?.payload.selected_count, 1, "只选择最终变换，依赖由宿主展开");
@@ -564,10 +602,30 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(mixedRows.find((row) => row.group.country_code === "US" && row.group.channel_id === "mist_ads")?.result?.value, "0.008333333333333333");
     assert.equal(mixedRows.find((row) => row.group.country_code === "US" && row.group.channel_id === "pebble_net")?.status, "missing_right");
     assert.equal(mixed.analysis?.sources?.length, 2);
-    const cte = await postQuestion(apiPort, await createSyntheticSession(), "合成 CTE 查询：纸灯日本七日新增。");
+    const cteSessionId = await createSyntheticSession();
+    const cte = await postQuestion(apiPort, cteSessionId, "合成 CTE 查询：纸灯日本七日新增。");
     assert.equal(cte.status, "completed", `${JSON.stringify(cte.error)} ${cte.analysis?.answer ?? ""}`);
     assert.match(cte.analysis?.answer ?? "", /70/);
     assert.equal(cte.analysis?.sources?.[0]?.engine, "clickhouse-local");
+    const cteResource = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${cteSessionId}/resources/${cte.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
+    assert.equal(cteResource.status, 200);
+    assert.equal(((await cteResource.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, "clickhouse_ast_scoped");
+    const nestedCteSessionId = await createSyntheticSession();
+    const nestedCte = await postQuestion(apiPort, nestedCteSessionId, "合成多层恒等投影：纸灯日本七日新增。");
+    assert.equal(nestedCte.status, "completed", JSON.stringify({ error: nestedCte.error, answer: nestedCte.analysis?.answer, reasons: nestedCte.analysis?.server_reasons }));
+    assert.match(nestedCte.analysis?.answer ?? "", /70/);
+    const nestedCteResource = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${nestedCteSessionId}/resources/${nestedCte.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
+    assert.equal(nestedCteResource.status, 200);
+    const nativeScoped = ((await nestedCteResource.json()) as { resource: { sql_review_engine?: string; sql?: string; executed_sql?: string } }).resource;
+    assert.equal(nativeScoped.sql_review_engine, "clickhouse_ast_scoped");
+    assert.equal(nativeScoped.sql, nativeScoped.executed_sql, "实际执行用户原 SQL，内部证明不替代查询");
+    const proofSql = clickHouseScopedProjection(nativeScoped.sql!, "fact_fox_daily_install"); assert.ok(proofSql);
+    const proofReader = createClickHouseClient({ url: clickhouseUrl, username: "fox_reader", password: readerPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 10 }, true);
+    try {
+      const originalRows = await clickHouseQuery(proofReader, nativeScoped.sql!);
+      const proofRows = await clickHouseQuery(proofReader, proofSql);
+      assert.deepEqual(originalRows.map((row) => JSON.stringify(row)).sort(), proofRows.map((row) => JSON.stringify(row)).sort(), "固定合成数据上原查询与内部证明应返回相同可见行；两次读取没有共同原子快照");
+    } finally { await proofReader.close(); }
     const left = await postQuestion(apiPort, await createSyntheticSession(), "合成左关联产品：保留未匹配产品。");
     assert.equal(left.status, "completed", `${JSON.stringify(left.error)} ${left.analysis?.answer ?? ""}`);
     assert.match(left.analysis?.answer ?? "", /JOIN 求和 70/);
@@ -1022,6 +1080,19 @@ async function waitJob(port: number, jobId: string) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error("任务没有结束");
+}
+
+async function waitCandidateSnapshot(port: number, jobId: string): Promise<unknown> {
+  const started = Date.now();
+  while (Date.now() - started < 60_000) {
+    const response = await fetch(`http://127.0.0.1:${port}/api/jobs/${jobId}`);
+    const job = await response.json() as { status: string; events: Array<{ type: string; payload: Record<string, unknown> }> };
+    const event = job.events.find((item) => item.type === "snapshot_saved" && item.payload.role === "assistant" && item.payload.stop_reason === "stop");
+    if (event) return event.payload.leaf_id;
+    if (!["queued", "running"].includes(job.status)) throw new Error("候选快照出现前任务已终止");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("候选快照等待超时");
 }
 
 async function waitDispatched(port: number, password: string, jobId: string) {
