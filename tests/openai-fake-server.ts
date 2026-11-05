@@ -256,6 +256,7 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成多层预聚合")) return scripted(turn, layeredPreaggregateSteps);
   if (latest.includes("合成聚合 CTE 观察")) return scripted(turn, scopedAggregateObservationSteps);
   if (latest.includes("合成聚合 CTE 证明")) return scripted(turn, scopedAggregateProofSteps);
+  if (latest.includes("合成实际范围变换")) return scripted(turn, observedOnlyTransformSteps);
   if (latest.includes("合成常量日期查询")) return scripted(turn, constantDateSteps);
   if (latest.includes("合成外层维度筛选")) return scripted(turn, outerFilterSteps);
   if (latest.includes("合成条件求和表达式")) return scripted(turn, (ids) => expressionSteps(ids, "sumif"));
@@ -506,6 +507,15 @@ function scopedAggregateProofSteps(ids: string[]) {
     { id: "scoped_proof_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
     { id: "scoped_proof_query", name: "query", arguments: JSON.stringify({ sql: "WITH a AS (SELECT country_code, SUM(new_users) AS total FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND channel_id = 'mist_ads' AND country_code IN ('US', 'JP') GROUP BY country_code), b AS (SELECT country_code, total FROM a) SELECT country_code, total FROM b" }) },
     { id: "scoped_proof_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "total", as: "result" }] }) },
+  ];
+}
+
+function observedOnlyTransformSteps(ids: string[]) {
+  return [
+    { id: "observed_scope_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "observed_scope_query", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'" }) },
+    { id: "observed_scope_sort", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: [{ op: "sort", keys: [{ column: "event_date", direction: "desc", nulls: "last" }] }] } }) },
+    { id: "observed_scope_total", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[1] ?? "", operations: [{ op: "sum", column: "new_users", predicted: "actual_only", as: "observed_total" }] }) },
   ];
 }
 

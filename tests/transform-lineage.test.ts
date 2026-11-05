@@ -6,6 +6,44 @@ import path from "node:path";
 import { analyst, bindTables, withRuntime } from "./helpers.js";
 import type { TransformResource } from "../src/types.js";
 
+test("仅观察值契约在直接计算和排序后均保留 actual_only 语义，旧资源不被改写", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]); runtime.sessions.setActiveJob(session.session_id, "job_observed_scope");
+    const sql = "SELECT event_date, country_code, new_users FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'";
+    const query = await runtime.tools.query(session.session_id, { sql }); assert.ok(query.ok, JSON.stringify(query)); if (!query.ok) return;
+    const operations = [{ op: "sum" as const, column: "new_users", predicted: "actual_only" as const, as: "total" }];
+    const direct = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(query.resource_id), operations });
+    assert.ok(direct.ok, JSON.stringify(direct)); if (!direct.ok) return;
+    const directResource = runtime.sessions.lookupResource(session.session_id, String(direct.resource_id));
+    assert.ok(directResource.ok && directResource.resource.kind === "calculation" && directResource.resource.evaluated_table_v1?.table.prediction_scope === "observed_only");
+    const sorted = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(query.resource_id), steps: [{ op: "sort", keys: [{ column: "event_date", direction: "desc", nulls: "last" }] }] } });
+    assert.ok(sorted.ok, JSON.stringify(sorted)); if (!sorted.ok) return;
+    const derived = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(sorted.resource_id), operations });
+    assert.ok(derived.ok, JSON.stringify(derived)); if (!derived.ok) return;
+    assert.equal(String((direct.cells as Record<string, unknown>).total), "215");
+    assert.equal(String((derived.cells as Record<string, unknown>).total), "215");
+    const result = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(derived.resource_id)] });
+    assert.ok(result.ok, JSON.stringify(result)); if (result.ok) assert.equal(result.status, "completed", JSON.stringify(result));
+    const arithmetic = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: { resource_id: String(direct.resource_id), cell: "total" }, right: { resource_id: String(direct.resource_id), cell: "total" } } });
+    assert.ok(arithmetic.ok, JSON.stringify(arithmetic)); if (!arithmetic.ok) return;
+    const arithmeticCells = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(arithmetic.resource_id), operations: [{ op: "sum", column: "result", predicted: "actual_only", as: "total" }] });
+    assert.ok(arithmeticCells.ok, JSON.stringify(arithmeticCells)); if (!arithmeticCells.ok) return;
+    assert.equal(String((arithmeticCells.cells as Record<string, unknown>).total), "430");
+    const aligned = await runtime.tools.calculateSessionCells(session.session_id, { align: { op: "add", keys: ["event_date"], left: { resource_id: String(query.resource_id), cell: "new_users" }, right: { resource_id: String(query.resource_id), cell: "new_users" } } });
+    assert.ok(aligned.ok, JSON.stringify(aligned)); if (!aligned.ok) return;
+    const alignedCells = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(aligned.resource_id), operations: [{ op: "sum", column: "result_value", predicted: "actual_only", as: "total" }] });
+    assert.ok(alignedCells.ok, JSON.stringify(alignedCells)); if (!alignedCells.ok) return;
+    assert.equal(String((alignedCells.cells as Record<string, unknown>).total), "430");
+    const oldQuery = await runtime.tools.query(session.session_id, { sql }); assert.ok(oldQuery.ok); if (!oldQuery.ok) return;
+    const old = runtime.sessions.lookupResource(session.session_id, String(oldQuery.resource_id)); assert.ok(old.ok && old.resource.kind === "query_result"); if (!old.ok || old.resource.kind !== "query_result") return;
+    const saved = structuredClone(old.resource); delete saved.result_semantics_version; runtime.state.saveResource(saved);
+    const oldSorted = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(oldQuery.resource_id), steps: [{ op: "sort", keys: [{ column: "event_date", direction: "asc", nulls: "last" }] }] } });
+    assert.ok(oldSorted.ok, JSON.stringify(oldSorted)); if (!oldSorted.ok) return;
+    const cannotInfer = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(oldSorted.resource_id), operations });
+    assert.equal(cannotInfer.ok, false, "旧资源不能凭展示标签补造预测语义");
+  });
+});
+
 test("完整明细按业务日期和国家全键对齐并递归交付", async () => {
   await withRuntime({}, async (runtime) => {
     const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]);

@@ -623,6 +623,7 @@ export class ToolService {
       session_id: session.session_id,
       kind: "query_result",
       key_lineage_version: 1,
+      result_semantics_version: 2,
       created_at: new Date().toISOString(),
       ...(session.active_job_id ? { job_id: session.active_job_id } : {}),
       engine: this.ctx.businessEngine === "clickhouse" ? "clickhouse-local" : "sqlite-local",
@@ -774,7 +775,7 @@ export class ToolService {
     // New exact, observed-only query results use the same typed evaluation as
     // derived tables. Keep legacy business proofs and serialized cells for
     // existing consumers; unsupported historical shapes retain their adapter.
-    if (activeJob && operations && Object.values(operations).every((operation) => operation.predicted === undefined || operation.predicted === "any")) {
+    if (activeJob && operations && Object.values(operations).every((operation) => operation.predicted === undefined || operation.predicted === "any" || operation.predicted === "actual_only")) {
       const session = await this.ctx.sessions.requireAsync(sessionId);
       const input = activePublication ? await this.evaluateVerifiedResult(session, activeJob, source.resource_id, activePublication, new Set()) : null;
       const typed = input && calculateResultCells(input.table, Object.values(operations));
@@ -1115,7 +1116,8 @@ export class ToolService {
         const fact = joined && this.ctx.knowledge.contract_by_table.get(joined.plan.fact)?.contract;
         const dimension = joined && this.ctx.knowledge.contract_by_table.get(joined.plan.dimension)?.contract;
         const table = joined && fact && dimension && joinResultTable(joined.plan, joined.values, fact, dimension);
-        return table ? { table, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial: false } : null;
+        const classified = table && resource.result_semantics_version === 2 && fact?.series?.prediction_mode === "observed_only" && !fact.series.predicted_column ? { ...table, prediction_scope: "observed_only" as const } : table;
+        return classified ? { table: classified, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial: false } : null;
       }
       const contract = this.arithmeticContract(session, resource, publication);
       const evidence = this.evidenceSource(session, resource);
@@ -1143,6 +1145,7 @@ export class ToolService {
       }
       let expressionOnly = false;
       if (!table && contract && evidence) { table = typedObservation(resource); expressionOnly = Boolean(table); }
+      if (table && resource.result_semantics_version === 2 && contract?.series?.prediction_mode === "observed_only" && !contract.series.predicted_column) table = { ...table, prediction_scope: "observed_only" };
       const partial = coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length > 0 || resource.coverage.status !== "known" || !resource.rows.length || Boolean(aggregates?.some((item) => item.coverage_incomplete));
       return table ? { table, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial, ...(expressionOnly ? { expression_only: true } : {}), ...(partial ? { partial_reason: "transform_coverage_incomplete" as const } : {}) } : null;
     }
@@ -1151,9 +1154,11 @@ export class ToolService {
       const checked = await this.resolveAlignment(session, jobId, resource.spec, publication, next, evaluation);
       if (!checked || Boolean(resource.coverage_incomplete) !== checked.partial || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) return null;
       const keySources: Record<string, NonNullable<ResultColumn["key_lineages"]>> = {};
+      let observedOnly = false;
       if (resource.key_lineage_version === 1) {
         const a = await this.evaluateVerifiedResult(session, jobId, resource.spec.left.resource_id, publication, next, evaluation);
         const b = await this.evaluateVerifiedResult(session, jobId, resource.spec.right.resource_id, publication, next, evaluation);
+        observedOnly = a?.table.prediction_scope === "observed_only" && b?.table.prediction_scope === "observed_only";
         if (a && b) for (const key of resource.spec.keys) {
           const columns = [a, b].map((item) => item.table.columns.find((column) => column.name === key));
           const lineages = columns.flatMap((column) => column?.key_lineages ?? (column?.key_lineage ? [column.key_lineage] : []));
@@ -1162,7 +1167,7 @@ export class ToolService {
       }
       const table = alignmentTable(resource.spec, checked.rows, keySources);
       const partial = checked.partial || checked.rows.some((row) => row.status !== "matched" || Object.values(row.group).some((value) => value === null));
-      return table ? { table, hashes: { ...checked.hashes, [resource.resource_id]: ownHash }, leaves: checked.leaves, partial, ...(partial ? { partial_reason: "alignment_incomplete" as const } : {}) } : null;
+      return table ? { table: observedOnly ? { ...table, prediction_scope: "observed_only" } : table, hashes: { ...checked.hashes, [resource.resource_id]: ownHash }, leaves: checked.leaves, partial, ...(partial ? { partial_reason: "alignment_incomplete" as const } : {}) } : null;
     }
     if (resource.kind === "calculation" && resource.evaluated_table_v1) {
       if (!resource.execution_id || !resource.operations || !resource.source_resource_hash) return null;
@@ -1189,7 +1194,21 @@ export class ToolService {
         checked.leaves.forEach((id) => leaves.add(id));
         partial ||= checked.value.partial === true || checked.value.value === null;
       }
-      return { table: { columns, rows: [row] }, hashes, leaves: [...leaves], partial, ...(partial ? { partial_reason: "transform_undefined_division" as const } : {}) };
+      let observedOnly = leaves.size > 0;
+      // Check every intermediate recipe, not only the outer resource. An
+      // arithmetic wrapper must never turn a forecast-only calculation into
+      // an observation merely because its physical leaf is observed-only.
+      for (const id of Object.keys(hashes)) {
+        const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, id);
+        if (!found.ok || found.resource.kind === "calculation" && Object.values(found.resource.operations ?? {}).some((operation) => operation.predicted === "predicted_only")) observedOnly = false;
+      }
+      for (const id of leaves) {
+        const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, id);
+        const query = found.ok && found.resource.kind === "query_result" ? found.resource : null;
+        const facts = query?.tables.map((table) => this.ctx.knowledge.contract_by_table.get(table)?.contract).filter((contract) => contract?.series) ?? [];
+        if (!query || query.result_semantics_version !== 2 || facts.length !== 1 || facts[0]?.series?.prediction_mode !== "observed_only" || facts[0].series.predicted_column) observedOnly = false;
+      }
+      return { table: { columns, rows: [row], ...(observedOnly ? { prediction_scope: "observed_only" as const } : {}) }, hashes, leaves: [...leaves], partial, ...(partial ? { partial_reason: "transform_undefined_division" as const } : {}) };
     }
     if (resource.kind !== "transform") return null;
     const next = new Set(path); next.add(resourceId);

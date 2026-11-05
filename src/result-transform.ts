@@ -17,7 +17,8 @@ export interface ResultColumn {
   key_lineages?: Array<{ table: string; column: string; physical_type: string }>;
   value_lineage?: { table: string; column: string };
 }
-export interface ResultTable { columns: ResultColumn[]; rows: Array<Record<string, ResultValue>> }
+/** Host-derived classification of contributing rows; it is not a model label. */
+export interface ResultTable { columns: ResultColumn[]; rows: Array<Record<string, ResultValue>>; prediction_scope?: "observed_only" }
 export type ComparisonOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 /** Limits apply to the complete input AND every intermediate result. They are
  * independent of preview-page size and of the query driver's storage cap. */
@@ -44,7 +45,7 @@ const comparisons = new Set<ComparisonOp>(["eq", "ne", "lt", "le", "gt", "ge"]);
 /** Returns null for malformed instructions, incompatible units or overflow. */
 export function transformResult(input: ResultTable, steps: TransformStep[], authorizeArithmetic?: (left: ResultColumn, right: ResultColumn, op: ArithmeticOp) => boolean): ResultTable | null {
   if (!Array.isArray(steps) || steps.length < 1 || steps.length > RESULT_TRANSFORM_MAX_STEPS || !validTable(input)) return null;
-  let table: ResultTable = { columns: input.columns.map((c) => ({ ...c })), rows: input.rows.map((r) => ({ ...r })) };
+  let table: ResultTable = { columns: input.columns.map((c) => ({ ...c })), rows: input.rows.map((r) => ({ ...r })), ...(input.prediction_scope ? { prediction_scope: input.prediction_scope } : {}) };
   for (const step of steps) {
     if (!step || typeof step !== "object") return null;
     const column = (name: string) => table.columns.find((c) => c.name === name);
@@ -143,7 +144,7 @@ export function transformResult(input: ResultTable, steps: TransformStep[], auth
         }
         rows.push(output);
       }
-      table = { columns: outputs, rows };
+      table = { columns: outputs, rows, ...(table.prediction_scope ? { prediction_scope: table.prediction_scope } : {}) };
     } else return null;
     if (!validTable(table)) return null;
   }
@@ -170,7 +171,7 @@ function arithmetic(op: "add" | "subtract" | "multiply", left: string, right: st
 
 function validName(name: unknown, columns: ResultColumn[]): name is string { return typeof name === "string" && namePattern.test(name) && !["__proto__", "constructor", "prototype"].includes(name) && !columns.some((c) => c.name === name); }
 function validTable(table: ResultTable): boolean {
-  if (!table || !Array.isArray(table.columns) || !table.columns.length || table.columns.length > 40 || !Array.isArray(table.rows) || table.rows.length > RESULT_CALCULATION_MAX_ROWS || !fitsResultCalculationBytes(table)) return false;
+  if (!table || table.prediction_scope !== undefined && table.prediction_scope !== "observed_only" || !Array.isArray(table.columns) || !table.columns.length || table.columns.length > 40 || !Array.isArray(table.rows) || table.rows.length > RESULT_CALCULATION_MAX_ROWS || !fitsResultCalculationBytes(table)) return false;
   const names: ResultColumn[] = [];
   for (const field of table.columns) {
     if (!field || !validName(field.name, names) || !["text", "decimal", "boolean"].includes(field.type) || typeof field.label !== "string" || typeof field.unit !== "string" || (field.type === "decimal" && (!Number.isInteger(field.scale) || field.scale! < 0 || field.scale! > 76))) return false;

@@ -11,8 +11,9 @@ export function calculateResultCells(input: ResultTable, operations: CellOperati
   let incomplete = false;
   for (const operation of operations) {
     if (!operation || !["sum", "count_null", "count_zero", "count_rows"].includes(operation.op) || !/^[a-z_][a-z0-9_]{0,63}$/u.test(operation.as) || ["__proto__", "constructor", "prototype"].includes(operation.as) || Object.hasOwn(row, operation.as)) return null;
-    // A table value does not itself establish a prediction classification.
-    if (operation.predicted !== undefined && operation.predicted !== "any") return null;
+    // Only host-derived source semantics can establish that every input row
+    // is an actual observation. Unknown and forecast filtering fail closed.
+    if (operation.predicted !== undefined && operation.predicted !== "any" && !(operation.predicted === "actual_only" && input.prediction_scope === "observed_only")) return null;
     const field = operation.column ? input.columns.find((column) => column.name === operation.column) : undefined;
     if (operation.op === "count_rows" ? operation.column !== undefined : !field) return null;
     if ((operation.op === "sum" || operation.op === "count_zero") && field?.type !== "decimal") return null;
@@ -31,7 +32,7 @@ export function calculateResultCells(input: ResultTable, operations: CellOperati
       ? { name: operation.as, type: "decimal", unit: field!.unit, label: `${field!.label} 的非 NULL 合计`, scale: field!.scale, ...(field!.approximate ? { approximate: true } : {}) }
       : { name: operation.as, type: "decimal", unit: "结果行", label: operation.op === "count_rows" ? "输入结果行数" : `${field!.label} 的${operation.op === "count_null" ? "NULL" : "零"}结果行数`, scale: 0 });
   }
-  const table = { columns, rows: [row] };
+  const table: ResultTable = { columns, rows: [row], ...(input.prediction_scope ? { prediction_scope: input.prediction_scope } : {}) };
   // Reuse the same bounds and value validation as transform operations.
   return transformResult(table, [{ op: "sort", keys: [{ column: columns[0]!.name, direction: "asc", nulls: "last" }] }]) ? { table, incomplete } : null;
 }
