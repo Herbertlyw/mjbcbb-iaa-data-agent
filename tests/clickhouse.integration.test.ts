@@ -21,6 +21,7 @@ import { bulkInstalls, chunks, createTableSql, smallWarehouse, WAREHOUSE_TABLES 
 import { bindTables } from "./helpers.js";
 import { verifyDatabaseAggregates } from "../src/aggregate-evidence.js";
 import { isolatedDocker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
+import { clickHouseAggregateProjection } from "../src/clickhouse-aggregate-projection.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const { Parser } = createRequire(import.meta.url)("node-sql-parser") as { Parser: { prototype: { astify: (...args: unknown[]) => unknown } } };
@@ -246,6 +247,33 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
       let forbiddenCalls = 0;
       try {
         Parser.prototype.astify = () => { forbiddenCalls++; throw new Error("test_sqlite_parser_forbidden"); };
+        const groupedSql = `WITH a AS (
+          SELECT country_code, SUM(new_users) AS total FROM fact_fox_daily_install
+          WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08'
+            AND title_id = 'paper_lantern' AND platform = 'ios' AND channel_id = 'mist_ads' AND country_code IN ('US', 'JP')
+          GROUP BY country_code
+        ), b AS (SELECT country_code, total FROM a)
+        SELECT country_code, total FROM b`;
+        const groupedCte = await runtime.tools.query(observedSession.session_id, { sql: groupedSql });
+        assert.ok(groupedCte.ok, JSON.stringify(groupedCte)); if (!groupedCte.ok) return;
+        assert.equal(groupedCte.sql_review_engine, "clickhouse_ast_scoped");
+        const contract = runtime.knowledge.contract_by_table.get("fact_fox_daily_install")!.contract!;
+        const proofSql = clickHouseAggregateProjection(groupedSql, contract); assert.ok(proofSql);
+        const sortedRows = (rows: Array<Record<string, unknown>>) => rows.map((row) => ({ country_code: String(row.country_code), total: String(row.total) })).sort((a, b) => a.country_code.localeCompare(b.country_code));
+        assert.deepEqual(sortedRows(groupedCte.rows as Array<Record<string, unknown>>), sortedRows(await clickHouseQuery(reader, proofSql)));
+        assert.deepEqual(sortedRows(groupedCte.rows as Array<Record<string, unknown>>), [{ country_code: "JP", total: "30" }, { country_code: "US", total: "220" }]);
+        const groupedDelivery = await runtime.tools.updateAnalysis(observedSession.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(groupedCte.resource_id)] });
+        assert.ok(groupedDelivery.ok, JSON.stringify(groupedDelivery)); if (!groupedDelivery.ok) return;
+        assert.equal(groupedDelivery.status, "completed", JSON.stringify(groupedDelivery));
+        assert.match(String(groupedDelivery.answer), /数据库求和 220；单位 人/u);
+        assert.match(String(groupedDelivery.answer), /数据库求和 30；单位 人/u);
+        const incompleteCte = await runtime.tools.query(observedSession.session_id, { sql: groupedSql.replace("2026-10-08", "2026-10-12") });
+        assert.ok(incompleteCte.ok, JSON.stringify(incompleteCte)); if (!incompleteCte.ok) return;
+        const incompleteDelivery = await runtime.tools.updateAnalysis(observedSession.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(incompleteCte.resource_id)] });
+        assert.ok(incompleteDelivery.ok, JSON.stringify(incompleteDelivery)); if (!incompleteDelivery.ok) return;
+        assert.equal(incompleteDelivery.status, "partial");
+        assert.ok((incompleteDelivery.server_reasons as string[]).includes("query_lineage_unsupported"));
+        assert.doesNotMatch(String(incompleteDelivery.answer), /数据库求和 670/u);
         const observation = await runtime.tools.query(observedSession.session_id, { sql: `WITH a AS (
           SELECT country_code, SUM(new_users) AS total FROM fact_fox_daily_install
           WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08'
