@@ -259,6 +259,8 @@ export interface CalculationResource {
   created_at: string;
   job_id?: string;
   source_resource_id: string;
+  /** Digest of the full persisted input, binding the operation to its scope. */
+  source_resource_hash?: string;
   cells: Record<string, number | string | null>;
   operations?: Record<string, import("./evidence.js").CellOperation>;
   input_truncated: boolean;

@@ -79,6 +79,30 @@ export async function clickHouseQueryBounded(client: ClickHouseClient, sql: stri
   } finally { result.close(); }
 }
 
+/** Host-owned preflight. The application must have authorized SQL before this
+ * is called; EXPLAIN is never exposed as an agent tool. A failed or incomplete
+ * plan must not fall through to the business query. */
+export class ClickHousePlanError extends Error {
+  constructor(readonly code: "clickhouse_plan_invalid" | "clickhouse_plan_unavailable" | "clickhouse_timeout" | "clickhouse_access_denied" | "clickhouse_schema_mismatch" | "clickhouse_sql_invalid" | "clickhouse_result_limit_exceeded") { super(code); }
+}
+
+export async function clickHousePreflightedQuery(client: ClickHouseClient, sql: string, maxRows: number, maxBytes: number, signal?: AbortSignal): Promise<Awaited<ReturnType<typeof clickHouseQueryBounded>>> {
+  let plan: Awaited<ReturnType<typeof clickHouseQueryBounded>>;
+  try { plan = await clickHouseQueryBounded(client, `EXPLAIN PLAN\n${sql}`, 10_000, 262_144, signal); }
+  catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? Number(error.code) : NaN;
+    if (code === 159 || code === 209) throw new ClickHousePlanError("clickhouse_timeout");
+    if (code === 497 || code === 516) throw new ClickHousePlanError("clickhouse_access_denied");
+    if (code === 47 || code === 60) throw new ClickHousePlanError("clickhouse_schema_mismatch");
+    if ([62, 43, 44, 46, 48, 184, 215].includes(code)) throw new ClickHousePlanError("clickhouse_sql_invalid");
+    if (code === 396) throw new ClickHousePlanError("clickhouse_result_limit_exceeded");
+    throw new ClickHousePlanError("clickhouse_plan_unavailable");
+  }
+  const columns = Object.keys(plan.column_types);
+  if (plan.truncated || !plan.rows.length || columns.length !== 1 || columns[0] !== "explain" || plan.column_types.explain !== "String" || plan.rows.some((row) => typeof row.explain !== "string" || !row.explain)) throw new ClickHousePlanError("clickhouse_plan_invalid");
+  return clickHouseQueryBounded(client, sql, maxRows, maxBytes, signal);
+}
+
 export async function clickHouseCommand(client: ClickHouseClient, sql: string): Promise<void> {
   await client.command({ query: sql });
 }

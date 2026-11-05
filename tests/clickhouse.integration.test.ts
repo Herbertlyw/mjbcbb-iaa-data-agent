@@ -166,6 +166,15 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
         assert.match(String(answer.answer), new RegExp(`country_code=${country}`));
         assert.ok((answer.server_reasons as string[]).includes("clickhouse_observation_nonatomic"));
         assert.doesNotMatch(String(answer.answer), /rows_all|non_null_rows|null_rows/);
+        const ref = { resource_id: String(calculation.resource_id), cell: "combined" };
+        const twice = await runtime.tools.calculateSessionCells(rollSession.session_id, { arithmetic: { op: "add", left: ref, right: ref } });
+        assert.ok(twice.ok, JSON.stringify(twice)); if (!twice.ok) return;
+        const independentDouble = country === "US" ? "440" : "60";
+        assert.equal((twice.result as { value: string }).value, independentDouble);
+        const derived = await runtime.tools.updateAnalysis(rollSession.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(twice.resource_id)] });
+        assert.ok(derived.ok, JSON.stringify(derived)); if (!derived.ok) return;
+        assert.equal(derived.status, "completed", JSON.stringify(derived.server_reasons));
+        assert.match(String(derived.answer), new RegExp(`四则运算 add：${independentDouble} 人`));
       }
       runtime.sessions.setActiveJob(rollSession.session_id, "job_group_rollup_clickhouse");
 

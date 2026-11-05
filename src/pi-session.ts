@@ -33,7 +33,7 @@ export const DATA_ANALYSIS_SYSTEM_PROMPT = `你是本地只读数据分析代理
 需要事实时先搜索已发布资产；搜索结果已经足以定位资产时，直接读取所需表卡，不要对同一目标反复搜索。正文一次读不完就分页阅读，并在查询前读取对应数据契约。
 只有权限、封闭时间范围、粒度和已登记的连接键都成立时，才执行只读查询。不要使用编码、文件或 shell 工具。
 把四件事分开：值为 NULL 的缺失、根本没有行的日期、观测到的真实零、以及预测值。预测不计入实际，缺失和缺行不要补成零。
-通过会话资源回读和计算形成可溯源结论，并写明限制与覆盖。每个正式数字都要引用本次任务的查询或计算结果；对明细做合计、计数等计算时先使用 calculate_session_cells，将查询和计算资源一起提交。分组查询若需要对结果列再次汇总，也可在 calculate_session_cells 中引用该查询资源及其输出列；只有范围、覆盖和血缘完整时才能交付，不能假设缺失分组为零。
+通过会话资源回读和计算形成可溯源结论，并写明限制与覆盖。每个正式数字都要引用本次任务的查询或计算结果；对明细做合计、计数等计算时先使用 calculate_session_cells，提交最终结果资源，服务端会自行追溯其来源。分组查询若需要对结果列再次汇总，也可在 calculate_session_cells 中引用该查询资源及其输出列；只有范围、覆盖和血缘完整时才能交付，不能假设缺失分组为零。
 工作记录和摘录是可选的，不能确认引用的字段、执行号或原文时不要填写。草稿简洁即可，服务端会生成经核验的数字和标签。
 证据不足、契约失效、新鲜度不是已发布的新鲜状态、结果被截断或连接不成立时，明确说明不能得出结论。
 完成状态只是建议。服务端会核对主体、会话、任务、契约哈希、新鲜度回执、截断和覆盖。模型草稿里的数字不会自动变成已验证事实。`;
@@ -73,6 +73,10 @@ export interface PiSessionSnapshotBody {
   leaf_id: string | null;
   branch_entry_ids: string[];
   user_message_sha256: string;
+  /** The user entry for this turn, on the captured active branch. */
+  user_message_entry_id?: string;
+  /** Job that captured the current turn; older snapshots did not persist it. */
+  job_id?: string;
   jsonl: string;
 }
 
@@ -133,7 +137,7 @@ export function decideResume(input: {
     return { action: "continue", decision: "compaction_checkpoint_continued", query_may_rerun: false };
   }
   const userTexts = input.contextMessages.filter((message) => message.role === "user").map(messageText);
-  if (!userTexts.includes(input.jobUserText)) {
+  if (userTexts.at(-1) !== input.jobUserText) {
     return { action: "reject", decision: "reject", code: "session_message_mismatch", message: "进度快照的活动分支没有当前用户原话。", query_may_rerun: false };
   }
   if (!last) return { action: "reject", decision: "reject", code: "session_not_continuable", message: "活动分支没有可继续的消息。", query_may_rerun: false };
@@ -173,7 +177,7 @@ export function decideResume(input: {
   };
 }
 
-export function captureSessionSnapshot(session: AgentSession, userText: string): PiSessionSnapshotBody {
+export function captureSessionSnapshot(session: AgentSession, userText: string, jobId?: string): PiSessionSnapshotBody {
   const file = session.sessionManager.getSessionFile();
   if (!file) throw new SessionSnapshotError("session_snapshot_missing", "SessionManager 还没有会话文件，不能保存空快照。");
   let jsonl: string;
@@ -186,6 +190,8 @@ export function captureSessionSnapshot(session: AgentSession, userText: string):
   }
   parseSessionEntries(jsonl);
   const branch = session.sessionManager.getBranch();
+  const lastUser = branch.findLast((entry) => entry.type === "message" && entry.message.role === "user");
+  if (!lastUser || lastUser.type !== "message" || lastUser.message.role !== "user" || messageText(lastUser.message) !== userText) throw new SessionSnapshotError("session_message_mismatch", "活动分支的当前用户消息与任务不一致。");
   return {
     format: SESSION_SNAPSHOT_FORMAT,
     sdk: SDK_NAME,
@@ -193,6 +199,8 @@ export function captureSessionSnapshot(session: AgentSession, userText: string):
     leaf_id: session.sessionManager.getLeafId(),
     branch_entry_ids: branch.map((entry) => entry.id),
     user_message_sha256: createHash("sha256").update(userText).digest("hex"),
+    user_message_entry_id: lastUser.id,
+    ...(jobId ? { job_id: jobId } : {}),
     jsonl,
   };
 }
@@ -206,6 +214,7 @@ export interface GovernedSession {
 export async function openGovernedSession(input: {
   config: AppConfig;
   appSessionId: string;
+  jobId?: string;
   tools: ToolService;
   userText: string;
   snapshot?: PiSessionSnapshotBody;
@@ -286,7 +295,26 @@ export async function openGovernedSession(input: {
     const leafId = sessionManager.getLeafId();
     const branchIds = sessionManager.getBranch().map((entry) => entry.id);
     if (leafId !== input.snapshot.leaf_id || !sameIds(branchIds, input.snapshot.branch_entry_ids)) {
+      rmSync(root, { recursive: true, force: true });
       throw new SessionSnapshotError("session_branch_mismatch", "打开后的活动分支或 leaf 与已保存快照不一致。");
+    }
+    if (input.requireUserText === true) {
+      if (input.jobId && input.snapshot.job_id !== undefined && input.snapshot.job_id !== input.jobId) {
+        rmSync(root, { recursive: true, force: true });
+        throw new SessionSnapshotError("session_message_mismatch", "进度快照不属于当前任务。");
+      }
+      const users = sessionManager.getBranch().filter((entry) => entry.type === "message" && entry.message.role === "user");
+      const current = users.at(-1);
+      if (!current || current.type !== "message" || current.message.role !== "user" || messageText(current.message) !== input.userText || (input.snapshot.user_message_entry_id !== undefined && input.snapshot.user_message_entry_id !== current.id)) {
+        rmSync(root, { recursive: true, force: true });
+        throw new SessionSnapshotError("session_message_mismatch", "活动分支的当前用户消息或条目身份与任务不一致。");
+      }
+      // Old snapshots lack a turn ID. Repeated identical user text cannot be
+      // assigned to a particular historical job without a trusted boundary.
+      if (input.snapshot.user_message_entry_id === undefined && users.filter((entry) => entry.type === "message" && entry.message.role === "user" && messageText(entry.message) === input.userText).length > 1) {
+        rmSync(root, { recursive: true, force: true });
+        throw new SessionSnapshotError("session_turn_boundary_unknown", "旧快照中重复原话缺少本轮条目身份，不能安全恢复。");
+      }
     }
   }
   const settings = SettingsManager.create(cwd, agentDir);
@@ -370,7 +398,7 @@ function assertSnapshot(snapshot: PiSessionSnapshotBody, userText: string, requi
     throw new SessionSnapshotError("session_snapshot_corrupt", "快照缺少活动分支 entry id 或 JSONL。");
   }
   const digest = createHash("sha256").update(userText).digest("hex");
-  if (requireUserText && (snapshot.user_message_sha256 !== digest || !snapshot.jsonl.includes(userText))) {
+  if (requireUserText && snapshot.user_message_sha256 !== digest) {
     throw new SessionSnapshotError("session_message_mismatch", "进度快照的用户消息哈希或原文与当前任务不一致。");
   }
 }
@@ -468,8 +496,10 @@ export function inspectCompaction(
   userText: string,
 ): { hidesToolResults: boolean; userTextPersisted: boolean } {
   const visible = new Set(contextMessages.filter((message) => message.role === "toolResult" && message.toolCallId).map((message) => message.toolCallId));
-  const hidesToolResults = entries.some((entry) => entry.type === "message" && entry.message?.role === "toolResult" && !visible.has(entry.message.toolCallId));
-  const userTextPersisted = entries.some((entry) => entry.type === "message" && entry.message?.role === "user" && messageText(entry.message).includes(userText));
+  const lastUser = entries.findLastIndex((entry) => entry.type === "message" && entry.message?.role === "user");
+  const currentTurn = lastUser < 0 ? [] : entries.slice(lastUser);
+  const hidesToolResults = currentTurn.some((entry) => entry.type === "message" && entry.message?.role === "toolResult" && !visible.has(entry.message.toolCallId));
+  const userTextPersisted = lastUser >= 0 && messageText(entries[lastUser]!.message ?? {}) === userText;
   return { hidesToolResults, userTextPersisted };
 }
 

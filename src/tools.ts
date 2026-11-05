@@ -36,7 +36,7 @@ import type {
   ToolFailure,
   TransformResource,
 } from "./types.js";
-import { clickHouseColumns, clickHouseColumnTypes, clickHouseQueryBounded } from "./clickhouse-client.js";
+import { clickHouseColumns, clickHouseColumnTypes, clickHouseQueryBounded, clickHousePreflightedQuery, ClickHousePlanError } from "./clickhouse-client.js";
 import { clickHousePreflightMessage, preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
 import { assertJoinKeys, guardSql, inspectSingleSourceProjection, parseReadonlySql, SqlRejected, type TableRule } from "./sql.js";
 import type { ClickHouseClient } from "@clickhouse/client";
@@ -477,7 +477,7 @@ export class ToolService {
     try {
       if (this.ctx.businessEngine === "clickhouse") {
         if (!this.ctx.clickhouse) throw new Error("clickhouse_unavailable");
-        bounded = await clickHouseQueryBounded(this.ctx.clickhouse, executedSql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
+        bounded = await clickHousePreflightedQuery(this.ctx.clickhouse, executedSql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
         // Retry only a successfully returned, read-only observation whose
         // detailed proof did not fit or could not verify. This is a new
         // observation, never a continuation or a claim of a shared snapshot.
@@ -486,7 +486,7 @@ export class ToolService {
           if (aggregatePlan) {
             joinPlan = aggregatePlan;
             executedSql = aggregatePlan.executionSql;
-            bounded = await clickHouseQueryBounded(this.ctx.clickhouse, executedSql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
+            bounded = await clickHousePreflightedQuery(this.ctx.clickhouse, executedSql, this.ctx.config.maxResultRows, this.ctx.config.maxResultBytes, signal);
           }
         }
         if (joinPlan && joinFact && joinDimension) {
@@ -506,6 +506,7 @@ export class ToolService {
       } else rows = await this.executeGuarded(guarded.sql, signal);
     } catch (error) {
       if (signal?.aborted) return fail("query_cancelled", "查询已取消");
+      if (error instanceof ClickHousePlanError) return fail(error.code, "ClickHouse 执行计划预检失败或结果不完整，正式查询没有继续执行。");
       const message = error instanceof Error ? error.message : "查询执行失败";
       if (/max_rows_to_read|Limit for rows/iu.test(message)) return fail("scan_limit", "查询超过扫描行数限制");
       if (/Timeout|max_execution_time/iu.test(message)) return fail("query_timeout", "查询超时，没有留下结果");
@@ -673,6 +674,7 @@ export class ToolService {
       created_at: new Date().toISOString(),
       ...(activeJob ? { job_id: activeJob } : {}),
       source_resource_id: source.resource_id,
+      source_resource_hash: createHash("sha256").update(JSON.stringify(source)).digest("hex"),
       cells,
       operations,
       input_truncated: source.truncated || source.sql_limited === true,
@@ -1015,15 +1017,20 @@ export class ToolService {
       const foundSource = await this.ctx.sessions.lookupResourceAsync(session.session_id, resource.source_resource_id);
       if (!foundSource.ok || foundSource.resource.kind !== "query_result" || foundSource.resource.job_id !== jobId) return null;
       const source = foundSource.resource; const contract = this.arithmeticContract(session, source, publication);
+      if (!resource.source_resource_hash || resource.source_resource_hash !== createHash("sha256").update(JSON.stringify(source)).digest("hex")) return null;
       const evidence = this.evidenceSource(session, source);
       const operation = resource.operations[ref.cell]; const stored = resource.cells[ref.cell];
       if (!contract || !evidence || !operation || operation.op !== "sum" || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length) return null;
       const decimal = typeof stored === "string" ? verifyDecimalCell(evidence, contract, operation, stored) : null;
       const integer = typeof stored === "number" ? verifyCell(evidence, contract, operation, stored) : null;
-      if (!decimal && (!integer || integer.precision !== "exact_integer" || !integer.column || integer.unit === "契约未声明" || !integer.prediction.startsWith("实际（") || integer.excludedNulls)) return null;
-      const base = decimal ?? integer!;
+      const grouped = !decimal && !integer && (typeof stored === "string" || typeof stored === "number") ? verifyGroupRollup(evidence, contract, operation, stored) : null;
+      // ArithmeticValue currently represents equality filters, not IN sets.
+      // Do not silently drop an IN restriction when converting a rollup.
+      if (grouped && (grouped.input_operation !== "sum" || Object.keys(grouped.in_sets).length)) return null;
+      if (!decimal && !grouped && (!integer || integer.precision !== "exact_integer" || !integer.column || integer.unit === "契约未声明" || !integer.prediction.startsWith("实际（") || integer.excludedNulls)) return null;
+      const base = decimal ?? grouped ?? integer!;
       const column = base.column!; const value = String(base.value);
-      const scale = decimal ? (value.split(".")[1]?.length ?? 0) : 0;
+      const scale = decimal || grouped ? (value.split(".")[1]?.length ?? 0) : 0;
       const aggregate: VerifiedAggregate = { source_resource_id: source.resource_id, table: base.table, column, output_column: operation.column ?? "", operation: "sum", value, scale, unit: base.unit, description: base.description, filters: base.filters, group: {}, range: base.range, prediction: "actual_observed_only" };
       return { value: fromAggregate(aggregate), hashes: { [source.resource_id]: createHash("sha256").update(JSON.stringify(source)).digest("hex"), [resource.resource_id]: ownHash }, leaves: [source.resource_id] };
     }
@@ -1113,49 +1120,81 @@ export class ToolService {
     const calculations: AnalysisRecord["calculations"] = [];
     const reasons: string[] = [];
     const resources: SessionResource[] = [];
-    for (const resourceId of input.resource_ids ?? []) {
-      const found = await this.ctx.sessions.lookupResourceAsync(sessionId, resourceId);
-      if (!found.ok) {
-        reasons.push(found.code);
-        continue;
+    let invalidSelectedResource = false;
+    // Traverse the actual persisted dependency graph, not a model-supplied
+    // list of ancestors. Every node is scoped again to this session and job.
+    // A cycle or missing parent makes the entire candidate unprovable.
+    const visited = new Set<string>();
+    const visiting = new Set<string>();
+    const ordered: SessionResource[] = [];
+    const loaded = new Map<string, SessionResource>();
+    const visit = async (resourceId: string): Promise<string | null> => {
+      if (visited.has(resourceId)) return null;
+      if (visiting.has(resourceId)) return "resource_dependency_cycle";
+      if (visited.size + visiting.size >= 128 || visiting.size >= 16) return "resource_dependency_limit";
+      let resource = loaded.get(resourceId);
+      if (!resource) {
+        const found = await this.ctx.sessions.lookupResourceAsync(sessionId, resourceId);
+        if (!found.ok) return found.code;
+        resource = found.resource; loaded.set(resourceId, resource);
       }
-      if (jobId && found.resource.job_id !== jobId) {
-        reasons.push("resource_from_other_execution");
-        continue;
+      if (jobId && resource.job_id !== jobId) return "resource_from_other_execution";
+      visiting.add(resourceId);
+      const parents = resource.kind === "query_result" ? [] : resource.kind === "calculation" || resource.kind === "transform"
+        ? [resource.source_resource_id] : resource.kind === "arithmetic"
+          ? [resource.left.resource_id, resource.right.resource_id] : [resource.spec.left.resource_id, resource.spec.right.resource_id];
+      for (const parent of parents) {
+        if (typeof parent !== "string" || !parent) return "resource_dependency_invalid";
+        const error = await visit(parent);
+        if (error) return error;
       }
-      if (found.resource.kind === "calculation" && jobId) {
-        const source = await this.ctx.sessions.lookupResourceAsync(sessionId, found.resource.source_resource_id);
-        if (!source.ok || source.resource.kind !== "query_result" || source.resource.job_id !== jobId || !(input.resource_ids ?? []).includes(source.resource.resource_id)) {
-          reasons.push("resource_from_other_execution");
-          continue;
-        }
+      visiting.delete(resourceId); visited.add(resourceId); ordered.push(resource);
+      return null;
+    };
+    for (const id of input.resource_ids ?? []) {
+      const selected = await this.ctx.sessions.lookupResourceAsync(sessionId, id);
+      if (!selected.ok) { invalidSelectedResource = true; reasons.push(selected.code); continue; }
+      if (jobId && selected.resource.job_id !== jobId) { invalidSelectedResource = true; reasons.push("resource_from_other_execution"); continue; }
+      loaded.set(id, selected.resource);
+      const checkpoint = ordered.length;
+      const error = await visit(id);
+      if (error) {
+        if (error === "resource_dependency_cycle" || error === "resource_dependency_limit") return fail(error, "证据依赖存在循环或超过限制；请重新计算。");
+        // Do not retain ancestors visited solely for a rejected root. Other
+        // independently selected, valid results may still be delivered partial.
+        ordered.splice(checkpoint); visiting.clear(); visited.clear();
+        for (const retained of ordered) visited.add(retained.resource_id);
+        invalidSelectedResource = true;
+        reasons.push(error);
       }
-      resources.push(found.resource);
-      citations.push({ resource_id: resourceId, note: found.resource.kind });
-      if (found.resource.kind === "query_result") {
+    }
+    for (const resource of ordered) {
+      resources.push(resource);
+      citations.push({ resource_id: resource.resource_id, note: resource.kind });
+      if (resource.kind === "query_result") {
         sources.push({
-          resource_id: found.resource.resource_id,
-          sql: found.resource.sql,
-          executed_sql: found.resource.executed_sql,
-          tables: found.resource.tables,
-          contract_revisions: found.resource.contract_revisions,
-          asset_hashes: found.resource.asset_hashes,
-          time_range: found.resource.time_range,
-          freshness: found.resource.freshness,
-          truncated: found.resource.truncated,
-          total_rows: found.resource.total_rows,
-          total_rows_exact: found.resource.total_rows_exact,
-          returned_rows: found.resource.returned_rows,
-          complete_population: found.resource.complete_population,
+          resource_id: resource.resource_id,
+          sql: resource.sql,
+          executed_sql: resource.executed_sql,
+          tables: resource.tables,
+          contract_revisions: resource.contract_revisions,
+          asset_hashes: resource.asset_hashes,
+          time_range: resource.time_range,
+          freshness: resource.freshness,
+          truncated: resource.truncated,
+          total_rows: resource.total_rows,
+          total_rows_exact: resource.total_rows_exact,
+          returned_rows: resource.returned_rows,
+          complete_population: resource.complete_population,
           simulated: true,
-          engine: found.resource.engine,
-          ...(found.resource.execution_id ? { execution_id: found.resource.execution_id } : {}),
-          ...(found.resource.execution_settings ? { execution_settings: found.resource.execution_settings } : {}),
-          observed_at: found.resource.created_at,
-          ...((found.resource as JoinQueryResource).join_proof ? { data_capture_hash: (found.resource as JoinQueryResource).join_proof!.capture_hash } : {}),
-          rows: found.resource.rows,
-          coverage: found.resource.coverage ?? unknownCoverage("资源没有覆盖回执，覆盖情况未知。"),
-          freshness_receipts: found.resource.freshness_receipts ?? [],
+          engine: resource.engine,
+          ...(resource.execution_id ? { execution_id: resource.execution_id } : {}),
+          ...(resource.execution_settings ? { execution_settings: resource.execution_settings } : {}),
+          observed_at: resource.created_at,
+          ...((resource as JoinQueryResource).join_proof ? { data_capture_hash: (resource as JoinQueryResource).join_proof!.capture_hash } : {}),
+          rows: resource.rows,
+          coverage: resource.coverage ?? unknownCoverage("资源没有覆盖回执，覆盖情况未知。"),
+          freshness_receipts: resource.freshness_receipts ?? [],
         });
       }
     }
@@ -1199,6 +1238,7 @@ export class ToolService {
       return { ok: true, ...exhausted, notice: "修订次数用完后，只交付有证据的部分。" };
     }
     let status: AnalysisStatus = input.suggested_status;
+    if (invalidSelectedResource && status === "completed") status = "partial";
     if (input.clarification_question) {
       status = "needs_clarification";
       reasons.push("clarification_requested");
@@ -1334,7 +1374,7 @@ export class ToolService {
       const accepted: VerifiedCell[] = [];
       const acceptedDecimal: VerifiedDecimalCell[] = [];
       const acceptedGrouped: VerifiedGroupRollup[] = [];
-      if (original && evidence && contract && eligible.has(original.resource_id) && resource.operations) {
+      if (original && evidence && contract && eligible.has(original.resource_id) && resource.operations && resource.source_resource_hash === createHash("sha256").update(JSON.stringify(original)).digest("hex")) {
         for (const [name, operation] of Object.entries(resource.operations)) {
           const stored = resource.cells[name];
           const cell = typeof stored === "number" ? verifyCell(evidence, contract, operation, stored) : null;
@@ -1673,6 +1713,7 @@ export class ToolService {
     const ids = resource.kind === "calculation" ? [resource.source_resource_id] : resource.kind === "arithmetic" ? [resource.left.resource_id, resource.right.resource_id] : resource.kind === "transform" ? [resource.source_resource_id] : [resource.spec.left.resource_id, resource.spec.right.resource_id];
     for (const id of new Set(ids)) {
       const parent = await this.ctx.sessions.lookupResourceAsync(sessionId, id);
+      if (resource.kind === "calculation" && (!parent.ok || !resource.source_resource_hash || resource.source_resource_hash !== createHash("sha256").update(JSON.stringify(parent.resource)).digest("hex"))) return false;
       if (!parent.ok || (resource.job_id && parent.resource.job_id !== resource.job_id) || !await this.resourceReadable(sessionId, parent.resource, next)) return false;
     }
     return true;

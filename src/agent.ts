@@ -194,7 +194,7 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "calculate_session_cells",
       label: "计算会话单元格",
-      description: "对当前任务查询资源计算 sum、count_null、count_zero 或 count_rows；对于完整、可证明来源的分组 SUM 或 COUNT 结果，可用 sum 对输出列再次汇总，count_rows 和 count_zero 数的是结果分组而非原始事实行。也可对可证明的结果进行定点四则、按键对齐和表格变换：一次只选 operations、arithmetic、align、transform 中一种；四则和变换通常省略顶层 resource_id，引用写在对应输入里。单行资源可用 row=0，执行 ID 来自保存的查询记录；多行明细引用须显式提供执行 ID。计算返回的资源 ID 与输入查询资源 ID 都需在正式交付时引用；缺组、NULL、预测或截断不可自行补零。",
+      description: "对当前任务查询资源计算 sum、count_null、count_zero 或 count_rows；对于完整、可证明来源的分组 SUM 或 COUNT 结果，可用 sum 对输出列再次汇总，count_rows 和 count_zero 数的是结果分组而非原始事实行。也可对可证明的结果进行定点四则、按键对齐和表格变换：一次只选 operations、arithmetic、align、transform 中一种；四则和变换通常省略顶层 resource_id，引用写在对应输入里。单行资源可用 row=0，执行 ID 来自保存的查询记录；多行明细引用须显式提供执行 ID。正式交付可只引用最终计算资源，服务端会追溯并复核其依赖；缺组、NULL、预测或截断不可自行补零。",
       parameters: Type.Object({
         resource_id: Type.Optional(Type.String({ description: "当前会话的查询资源 ID" })),
         operations: Type.Optional(Type.Array(
@@ -246,7 +246,7 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "update_analysis",
       label: "更新分析",
-      description: "提交分析建议，服务端根据本次任务证据决定终态并生成可信数字，草稿里的数字不会自动交付。明细合计须先用计算工具，并将查询及计算资源 ID 都列入 resource_ids。需要澄清时填写 needs_clarification 和具体的 clarification_question；没有查询证据时可省略 resource_ids 和 draft_answer。declaration、findings、comparisons 均可省略；不确定引用或摘录时不要填写。",
+      description: "提交分析建议，服务端根据本次任务证据决定终态并生成可信数字，草稿里的数字不会自动交付。明细合计须先用计算工具，resource_ids 可只列最终结果；服务端自行复核其来源。需要澄清时填写 needs_clarification 和具体的 clarification_question；没有查询证据时可省略 resource_ids 和 draft_answer。declaration、findings、comparisons 均可省略；不确定引用或摘录时不要填写。",
       parameters: Type.Object({
         suggested_status: Type.Union([
           Type.Literal("completed"),

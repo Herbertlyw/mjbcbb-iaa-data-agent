@@ -556,6 +556,7 @@ export class JobService {
       governed = await openGovernedSession({
         config: this.host.config,
         appSessionId: input.sessionId,
+        jobId: input.jobId,
         tools: this.host.tools,
         userText: input.userText,
         modelId: selection.modelId,
@@ -637,9 +638,9 @@ export class JobService {
             const message = event.message;
             // Pi keeps setup-only entries in memory until a user/assistant
             // message exists; there is no JSONL file to snapshot yet.
-            if (message.role === "system" && !session.sessionManager.getEntries().some((entry) => entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant"))) return;
+            if (message.role === "system") return;
             // Capture before the first await so later branches cannot replace it.
-            const snapshot = captureSessionSnapshot(session, input.userText);
+            const snapshot = captureSessionSnapshot(session, input.userText, input.jobId);
             const saved = await this.stateCall("saveAgentSnapshot", {
               sessionId: input.sessionId, jobId: input.jobId, owner: this.owner,
               fence: input.fence, kind: "progress", body: snapshot as unknown as Record<string, unknown>,
@@ -696,7 +697,7 @@ export class JobService {
     if (candidate) input.rememberCandidate(candidate);
     const leaf = session.sessionManager.getLeafEntry();
     const leafMessage = leaf?.type === "message" ? leaf.message : undefined;
-    const entries = session.sessionManager.getEntries();
+    const entries = session.sessionManager.getBranch();
     const inspection = inspectCompaction(entries, context.messages, input.userText);
     const decision = decideResume({
       contextMessages: context.messages,
@@ -756,7 +757,7 @@ export class JobService {
           owner: this.owner,
           fence: input.fence,
           kind: "settled",
-          body: captureSessionSnapshot(session, input.userText) as unknown as Record<string, unknown>,
+          body: captureSessionSnapshot(session, input.userText, input.jobId) as unknown as Record<string, unknown>,
         });
         if (!saved) markLost();
       }

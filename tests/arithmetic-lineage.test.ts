@@ -127,6 +127,9 @@ test("同任务聚合的四则运算可递归复核，零分母、篡改和跨�
       assert.match(String(answer.answer), /1\.791666666666666667/);
       assert.equal((answer.arithmetic_results as unknown[]).length, 2);
     }
+    const implicitAncestors = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [chain.ref.resource_id] });
+    assert.ok(implicitAncestors.ok, JSON.stringify(implicitAncestors));
+    if (implicitAncestors.ok) { assert.equal(implicitAncestors.status, "completed"); assert.match(String(implicitAncestors.answer), /1\.791666666666666667/); }
     const noZero = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [b.resource_id, zero.resource_id, invalid.ref.resource_id] });
     assert.equal(noZero.ok, true);
     if (noZero.ok) { assert.equal(noZero.status, "partial"); assert.match(String(noZero.answer), /除数为零，结果不可计算/); }
@@ -137,10 +140,13 @@ test("同任务聚合的四则运算可递归复核，零分母、篡改和跨�
     const tampered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: ids });
     assert.equal(tampered.ok, true);
     if (tampered.ok) { assert.notEqual(tampered.status, "completed"); assert.doesNotMatch(String(tampered.answer), /999999/); assert.ok((tampered.server_reasons as string[]).includes("arithmetic_lineage_unsupported")); }
+    const tamperedAncestor = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [chain.ref.resource_id] });
+    assert.ok(tamperedAncestor.ok);
+    if (tamperedAncestor.ok) { assert.notEqual(tamperedAncestor.status, "completed"); assert.doesNotMatch(String(tamperedAncestor.answer), /999999/); }
     runtime.state.saveResource({ ...stored.resource, left: { resource_id: stored.resource.resource_id, cell: "result" } } as ArithmeticResource);
     const cycle = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: ids });
-    assert.equal(cycle.ok, true);
-    if (cycle.ok) assert.ok((cycle.server_reasons as string[]).includes("arithmetic_lineage_unsupported"));
+    assert.equal(cycle.ok, false);
+    if (!cycle.ok) assert.equal(cycle.code, "resource_dependency_cycle");
     runtime.sessions.setActiveJob(session.session_id, "job_other");
     const foreign = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: a, right: b } });
     assert.equal(foreign.ok, false);

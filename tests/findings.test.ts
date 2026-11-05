@@ -103,6 +103,7 @@ test("当前任务不能用旧任务查询重新计算并冒充本轮证据", as
     const forged = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(current.resource_id), "res_forged_calculation"] });
     assert.equal(forged.ok, true);
     if (forged.ok) {
+      assert.notEqual(forged.status, "completed");
       assert.equal(String(forged.answer).includes("123456"), false);
       assert.ok((forged.server_reasons as string[]).includes("resource_from_other_execution"));
     }

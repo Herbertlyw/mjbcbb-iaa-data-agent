@@ -131,8 +131,29 @@ test("完整数据库分组在当前任务交付精确合计并核对来源；�
     assert.equal(result.status, "completed"); assert.match(String(result.answer), /分组求和结果再求和 215；单位 人/);
     assert.match(String(result.answer), /结果分组数 3/); assert.match(String(result.answer), /分组聚合输出为零的分组数 1/);
     assert.doesNotMatch(String(result.answer), /model_label/); assert.match(String(result.answer), /不是底层业务明细的计数/);
+    const ref = { resource_id: String(calc.resource_id), cell: "model_label" };
+    const twice = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: ref, right: ref } });
+    assert.ok(twice.ok, JSON.stringify(twice)); if (!twice.ok) return;
+    assert.equal((twice.result as { value: string }).value, "430");
+    // Only the terminal resource is named; the server resolves and checks the
+    // calculation and query ancestors itself.
+    const derived = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(twice.resource_id)] });
+    assert.ok(derived.ok, JSON.stringify(derived)); if (!derived.ok) return;
+    assert.equal(derived.status, "completed"); assert.match(String(derived.answer), /430/);
+    const original = runtime.sessions.lookupResource(session.session_id, String(query.resource_id));
+    assert.ok(original.ok && original.resource.kind === "query_result"); if (!original.ok || original.resource.kind !== "query_result") return;
+    // A changed range with identical numeric rows cannot silently give an old
+    // calculation a new business meaning.
+    runtime.state.saveResource({ ...original.resource, time_range: { ...original.resource.time_range, start: "2026-10-05" } });
+    const altered = await runtime.tools.calculateSessionCells(session.session_id, { arithmetic: { op: "add", left: ref, right: ref } });
+    assert.equal(altered.ok, false);
+    const alteredDelivery = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(twice.resource_id)] });
+    if (alteredDelivery.ok) { assert.notEqual(alteredDelivery.status, "completed"); assert.doesNotMatch(String(alteredDelivery.answer), /430/); }
+    runtime.state.saveResource(original.resource);
     runtime.sessions.setActiveJob(session.session_id, "other_job");
+    const crossedDerived = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(twice.resource_id)] });
+    assert.equal(crossedDerived.ok, false);
     const crossed = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(query.resource_id), String(calc.resource_id)] });
-    assert.equal(crossed.ok, false);
+    if (crossed.ok) { assert.notEqual(crossed.status, "completed"); assert.doesNotMatch(String(crossed.answer), /215|430/); }
   });
 });
