@@ -20,8 +20,8 @@ export function clickHouseReviewPolicy(database: string, rules: readonly TableRu
     if (partitionColumn && rule.column_types?.[partitionColumn]?.replace(/\s/gu, "").toLowerCase() !== "date") throw new Error("clickhouse_review_partition_unsupported");
     return { fqn: `${database}.${rule.table}`, columns: [...fields].map((name) => ({ name, privacy: sensitive.has(name) ? "forbidden" as const : "ordinary" as const })), maxScanDays: 400, ...(partitionColumn ? { partitionColumn, scanKind: "day" as const } : { scanKind: "unpartitioned" as const }) };
   });
-  const aggregates = ["sum", "count", "min", "max", "avg", "countIf"];
-  return { defaultDatabase: database, allowDetail: true, tables, maxRows, maxSqlBytes: 64 * 1024, aggregateFunctions: aggregates, allowedFunctions: [...aggregates, "toDate", "toYear", "toMonth", "toYYYYMM", "toStartOfMonth", "toStartOfDay", "isNull", "isNotNull", "lower", "upper"] };
+  const aggregates = ["sum", "count", "min", "max", "avg", "countIf", "sumIf"];
+  return { defaultDatabase: database, allowDetail: true, tables, maxRows, maxSqlBytes: 64 * 1024, aggregateFunctions: aggregates, allowedFunctions: [...aggregates, "toDate", "toYear", "toMonth", "toYYYYMM", "toStartOfMonth", "toStartOfDay", "isNull", "isNotNull", "ifNull", "nullIf", "lower", "upper"] };
 }
 
 /** Keep the prior explicitly bounded countIf grammar while migrating the
@@ -47,8 +47,9 @@ export function safeNativeConditionalAggregates(sql: string): boolean {
     if (++nodes > 20_000) return false;
     const value = pending.pop(); if (Array.isArray(value)) { pending.push(...value); continue; }
     const node = object(value); if (!node) continue;
-    if (node.type === "Function" && String(node.name).toLowerCase() === "countif") {
-      if (!Array.isArray(node.arguments) || node.arguments.length !== 1 || !predicate(node.arguments[0])) return false;
+    if (node.type === "Function" && ["countif", "sumif"].includes(String(node.name).toLowerCase())) {
+      const name = String(node.name).toLowerCase();
+      if (!Array.isArray(node.arguments) || (name === "countif" ? node.arguments.length !== 1 || !predicate(node.arguments[0]) : node.arguments.length !== 2 || !column(node.arguments[0]) || !predicate(node.arguments[1]))) return false;
     }
     for (const [key, child] of Object.entries(node)) if (key !== "location" && key !== "parent") pending.push(child);
   }
@@ -81,6 +82,14 @@ export function safeNativeDateFunctions(sql: string, rule: TableRule): boolean {
       if (name === "isnull" || name === "isnotnull") {
         const col = Array.isArray(args) && args.length === 1 && args[0] && typeof args[0] === "object" ? args[0] as Record<string, unknown> : null;
         if (col?.type !== "Identifier" || typeof col.name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/u.test(col.name)) return false;
+      }
+      if (name === "ifnull" || name === "nullif") {
+        if (!Array.isArray(args) || args.length !== 2) return false;
+        const first = args[0] && typeof args[0] === "object" ? args[0] as Record<string, unknown> : null;
+        const second = args[1] && typeof args[1] === "object" ? args[1] as Record<string, unknown> : null;
+        const direct = first?.type === "Identifier" && typeof first.name === "string" && /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/u.test(first.name);
+        const count = first?.type === "Function" && String(first.name).toLowerCase() === "count" && Array.isArray(first.arguments) && (first.arguments.length === 0 || first.arguments.length === 1 && (first.arguments[0] as Record<string, unknown>)?.type === "Asterisk");
+        if (!(direct || name === "nullif" && count) || second?.type !== "Literal" || !["String", "UInt64", "Int64", "Float64"].includes(String(second.value_type))) return false;
       }
     }
     for (const [key, child] of Object.entries(node)) if (key !== "location" && key !== "parent") pending.push(child);

@@ -621,6 +621,22 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.match(constantDate.analysis?.answer ?? "", /70/);
     const constantDateResource = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${constantDateSession}/resources/${constantDate.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
     assert.equal(((await constantDateResource.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, "clickhouse_ast_scoped");
+    for (const sample of [
+      { question: "合成条件求和表达式", expected: /440/, status: "completed" },
+      { question: "合成安全除法表达式", expected: /146\.66666666666666/, status: "partial" },
+      { question: "合成显式空值替换", expected: /670/, status: "partial" },
+    ]) {
+      const sessionId = await createSyntheticSession();
+      const answer = await postQuestion(apiPort, sessionId, sample.question);
+      assert.equal(answer.status, sample.status, JSON.stringify({ error: answer.error, answer: answer.analysis?.answer, reasons: answer.analysis?.server_reasons, tools: answer.events.filter((event) => event.type === "tool_finished") }));
+      assert.match(answer.analysis?.answer ?? "", sample.expected);
+      assert.ok(answer.analysis?.server_reasons?.includes("query_expression_semantics_unverified"));
+      assert.match((answer.analysis?.limitations ?? []).join(" "), /业务含义未认证/);
+      if (sample.question.includes("空值")) assert.match((answer.analysis?.limitations ?? []).join(" "), /替换/);
+      if (sample.question.includes("除法")) assert.ok(answer.analysis?.server_reasons?.includes("floating_point_approximate"));
+      const response = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${sessionId}/resources/${answer.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
+      assert.equal(((await response.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, "clickhouse_ast_direct");
+    }
     const outerFilterSession = await createSyntheticSession();
     const outerFilter = await postQuestion(apiPort, outerFilterSession, "合成外层维度筛选：纸灯日本七日新增。");
     assert.equal(outerFilter.status, "completed", JSON.stringify({ error: outerFilter.error, answer: outerFilter.analysis?.answer, reasons: outerFilter.analysis?.server_reasons }));
@@ -1126,7 +1142,7 @@ async function waitJob(port: number, jobId: string) {
       job_id: string;
       error?: { code?: string; message?: string };
       usage?: { input_tokens: number | null; usage_source?: string; model_attempts?: number; model_calls?: number; provider_not_dispatched?: number };
-      analysis?: { status?: string; answer?: string; server_reasons?: string[]; resource_hashes?: Record<string, string>; analysis_declaration?: { provenance?: string }; alignment_results?: Array<{ resource_id?: string; rows: Array<{ group: Record<string,string|null>; status: string; result?: { value: string | null } | null }> }>; transform_results?: Array<{ result: { rows: Array<Record<string, unknown>> } }>; sources?: Array<{ engine?: string; resource_id?: string; execution_id?: string; sql?: string; executed_sql?: string; execution_settings?: { join_use_nulls?: boolean }; contract_revisions?: Record<string, string>; observed_at?: string; freshness_receipts?: unknown[]; total_rows?: number; rows?: unknown[]; preview_has_more?: boolean }> };
+      analysis?: { status?: string; answer?: string; limitations?: string[]; server_reasons?: string[]; resource_hashes?: Record<string, string>; analysis_declaration?: { provenance?: string }; alignment_results?: Array<{ resource_id?: string; rows: Array<{ group: Record<string,string|null>; status: string; result?: { value: string | null } | null }> }>; transform_results?: Array<{ result: { rows: Array<Record<string, unknown>> } }>; sources?: Array<{ engine?: string; resource_id?: string; execution_id?: string; sql?: string; executed_sql?: string; execution_settings?: { join_use_nulls?: boolean }; contract_revisions?: Record<string, string>; observed_at?: string; freshness_receipts?: unknown[]; total_rows?: number; rows?: unknown[]; preview_has_more?: boolean }> };
       events: Array<{ type: string; payload: Record<string, unknown> }>;
     };
     if (!["queued", "running"].includes(job.status)) return job;

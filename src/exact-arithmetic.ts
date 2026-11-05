@@ -26,6 +26,7 @@ export interface ArithmeticValue {
   formula?: string;
   /** Result of arithmetic on verified cells, without certifying a business metric. */
   interpretation?: "mathematical_only";
+  approximate?: boolean;
   partial?: boolean;
   undefined_reason?: "null_input" | "zero_divisor";
   /** Bound only for a directly verified row, never supplied by the model. */
@@ -65,7 +66,7 @@ export function computeArithmetic(op: ArithmeticOp, left: ArithmeticValue, right
     const nullScale = op === "divide" ? 18 : op === "multiply" ? left.scale + right.scale : Math.max(left.scale, right.scale);
     if (nullScale > 38 || left.scopes.length + right.scopes.length > 32) return null;
     const unit = left.unit === right.unit && (op === "add" || op === "subtract") ? left.unit : "未认证";
-    return { value: null, scale: nullScale, unit, basis: left.basis, scopes: [...left.scopes, ...right.scopes], interpretation: "mathematical_only", partial: true, undefined_reason: "null_input", formula: `(${left.formula ?? `${left.basis.table}.${left.basis.column}`} ${op} ${right.formula ?? `${right.basis.table}.${right.basis.column}`})` };
+    return { value: null, scale: nullScale, unit, basis: left.basis, scopes: [...left.scopes, ...right.scopes], interpretation: "mathematical_only", partial: true, undefined_reason: "null_input", ...(left.approximate || right.approximate ? { approximate: true } : {}), formula: `(${left.formula ?? `${left.basis.table}.${left.basis.column}`} ${op} ${right.formula ?? `${right.basis.table}.${right.basis.column}`})` };
   }
   const a = parse(left.value, left.scale); const b = parse(right.value, right.scale);
   if (a === null || b === null) return null;
@@ -88,7 +89,7 @@ export function computeArithmetic(op: ArithmeticOp, left: ArithmeticValue, right
   if (scopes.length > 32) return null;
   const bases = [...new Map([...leftBases, ...rightBases].map((base) => [JSON.stringify(base), base])).values()];
   const label = (value: ArithmeticValue) => value.formula ?? `${value.basis.table}.${value.basis.column}`;
-  return { value: result === null ? null : fixed(result, scale), scale, unit, basis: left.basis, ...(bases.length > 1 ? { bases, formula: `(${label(left)} ${op} ${label(right)})` } : left.formula || right.formula ? { formula: `(${label(left)} ${op} ${label(right)})` } : {}), scopes, ...(mathematicalOnly ? { interpretation: "mathematical_only" as const } : {}), ...(left.partial || right.partial ? { partial: true } : {}), ...(mathematicalOnly && result === null ? { undefined_reason: "zero_divisor" as const } : {}) };
+  return { value: result === null ? null : fixed(result, scale), scale, unit, basis: left.basis, ...(bases.length > 1 ? { bases, formula: `(${label(left)} ${op} ${label(right)})` } : left.formula || right.formula ? { formula: `(${label(left)} ${op} ${label(right)})` } : {}), scopes, ...(mathematicalOnly ? { interpretation: "mathematical_only" as const } : {}), ...(left.approximate || right.approximate ? { approximate: true } : {}), ...(left.partial || right.partial ? { partial: true } : {}), ...(mathematicalOnly && result === null ? { undefined_reason: "zero_divisor" as const } : {}) };
 }
 
 function identicalScope(a: ArithmeticValue["scopes"][number], b: ArithmeticValue["scopes"][number]): boolean {

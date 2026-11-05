@@ -59,7 +59,7 @@ test("原生直接授权只接受契约、封闭日期和受限覆盖筛选的�
     query.replace("SUM(new_users)", "SUM(new_users) + sleep(1)"),
     query.replace("SUM(new_users)", "countIf(new_users > device_token)"),
     query.replace("SUM(new_users)", "toYear(country_code)"),
-    query.replace("SUM(new_users)", "sumIf(new_users, country_code = 'US')"),
+    query.replace("SUM(new_users)", "sumIf(device_token, country_code = 'US')"),
     query.replace("fact_fox_daily_install WHERE", "fact_fox_daily_install SAMPLE 0.1 WHERE"),
     query.replace("fact_fox_daily_install WHERE", "fact_fox_daily_install FINAL WHERE"),
     query.replace("country_code = 'US'", "(country_code = 'US' OR device_token = 'x')"),
@@ -81,7 +81,8 @@ test("宿主规则转换保留敏感列、分区与默认数据库，模糊配�
   assert.equal(safeNativeConditionalAggregates("SELECT countIf(amount > 0) FROM daily_sales WHERE day = '2026-10-01'"), true);
   assert.equal(safeNativeConditionalAggregates("SELECT countIf(amount IS NULL) FROM daily_sales WHERE day = '2026-10-01'"), true);
   assert.equal(safeNativeConditionalAggregates("SELECT countIf(amount > country) FROM daily_sales WHERE day = '2026-10-01'"), false);
-  assert.equal(reviewSql("SELECT sumIf(amount, country = 'US') FROM daily_sales WHERE day = '2026-10-01'", derived).ok, false);
+  assert.equal(reviewSql("SELECT sumIf(amount, country = 'US') FROM daily_sales WHERE day = '2026-10-01'", derived).ok, true);
+  assert.equal(safeNativeConditionalAggregates("SELECT sumIf(secret, amount > secret) FROM daily_sales WHERE day = '2026-10-01'"), false);
   assert.equal(safeNativeDateFunctions("SELECT toYear(day) FROM daily_sales WHERE day = '2026-10-01'", rule), true);
   assert.equal(safeNativeDateFunctions("SELECT toYear(country) FROM daily_sales WHERE day = '2026-10-01'", rule), false);
   assert.equal(safeNativeDateFunctions("SELECT toDate(country) FROM daily_sales WHERE day = '2026-10-01'", rule), false);

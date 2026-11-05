@@ -43,6 +43,7 @@ import { queryEvidenceShape } from "./evidence-shape.js";
 import { ResourceGraph } from "./resource-graph.js";
 import { savedResultView } from "./result-view.js";
 import { calculateResultCells } from "./result-cells.js";
+import { typedObservation } from "./typed-observation.js";
 import { normalizeCalculation } from "./calculation-protocol.js";
 import { assertJoinKeys, guardSql, inspectSingleSourceProjection, parseReadonlySql, SqlRejected, type TableRule } from "./sql.js";
 import type { ClickHouseClient } from "@clickhouse/client";
@@ -61,7 +62,7 @@ export interface ToolContext {
 type ToolResult = ToolFailure | { ok: true; [key: string]: unknown };
 type PrivateJoinProof = { rows: Array<Record<string, unknown>>; column_types: Record<string, string>; capture_hash: string };
 type JoinQueryResource = QueryResource & { join_proof?: PrivateJoinProof };
-type EvaluatedResult = { table: ResultTable; hashes: Record<string, string>; leaves: string[]; partial: boolean; partial_reason?: "alignment_incomplete" | "transform_coverage_incomplete" | "transform_undefined_division" };
+type EvaluatedResult = { table: ResultTable; hashes: Record<string, string>; leaves: string[]; partial: boolean; expression_only?: boolean; partial_reason?: "alignment_incomplete" | "transform_coverage_incomplete" | "transform_undefined_division" };
 type EvaluationContext = { completed: Map<string, EvaluatedResult>; seen: Set<string>; rows: number; bytes: number };
 const evaluationContext = (): EvaluationContext => ({ completed: new Map(), seen: new Set(), rows: 0, bytes: 0 });
 
@@ -966,7 +967,7 @@ export class ToolService {
       const ref = index ? spec.right : spec.left; const table = checked[index]!.table;
       const metric = table.columns.find((column) => column.name === ref.cell);
       if (!metric || metric.type !== "decimal" || !Number.isInteger(metric.scale)) return null;
-      const make = (value: string | null): ArithmeticValue => ({ value, scale: metric.scale!, unit: metric.unit || "未认证", basis: { table: "结果资源", column: `${ref.resource_id}.${ref.cell}`, operation: "result_cell", unit: metric.unit || "未认证", prediction: "未认证", timezone: "未认证" }, scopes: [], interpretation: "mathematical_only", formula: `${ref.resource_id}.${ref.cell}` });
+      const make = (value: string | null): ArithmeticValue => ({ value, scale: metric.scale!, unit: metric.unit || "未认证", basis: { table: "结果资源", column: `${ref.resource_id}.${ref.cell}`, operation: "result_cell", unit: metric.unit || "未认证", prediction: "未认证", timezone: "未认证" }, scopes: [], interpretation: "mathematical_only", ...(metric.approximate ? { approximate: true } : {}), formula: `${ref.resource_id}.${ref.cell}` });
       makers.push(make);
       const normalized = { ...table, columns: table.columns.map((column) => spec.keys.includes(column.name) ? { ...column, unit: `维度 ${column.name}` } : column) };
       inputs.push({ table: normalized, valueColumn: ref.cell, keyColumns: spec.keys, valueForGroup: make });
@@ -1099,8 +1100,10 @@ export class ToolService {
         if (rows.length !== resource.returned_rows || rows.length !== resource.total_rows || resource.total_rows_exact !== true) return null;
         table = rawResultTable({ ...evidence, rows }, contract);
       }
-      const partial = coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length > 0;
-      return table ? { table, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial, ...(partial ? { partial_reason: "transform_coverage_incomplete" as const } : {}) } : null;
+      let expressionOnly = false;
+      if (!table && contract && evidence) { table = typedObservation(resource); expressionOnly = Boolean(table); }
+      const partial = coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length > 0 || resource.coverage.status !== "known" || !resource.rows.length;
+      return table ? { table, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial, ...(expressionOnly ? { expression_only: true } : {}), ...(partial ? { partial_reason: "transform_coverage_incomplete" as const } : {}) } : null;
     }
     if (resource.kind === "alignment") {
       const next = new Set(path); next.add(resourceId);
@@ -1139,7 +1142,7 @@ export class ToolService {
       for (const name of names) {
         const checked = await this.resolveArithmetic(session, jobId, { resource_id: resourceId, execution_id: resource.execution_id, cell: name }, publication, path, evaluation);
         if (!checked || !Number.isInteger(checked.value.scale) || checked.value.scale < 0 || checked.value.scale > 38) return null;
-        columns.push({ name, type: "decimal", scale: checked.value.scale, unit: checked.value.unit || "未认证", label: `已复核计算单元 ${name}` });
+        columns.push({ name, type: "decimal", scale: checked.value.scale, unit: checked.value.unit || "未认证", label: `已复核计算单元 ${name}`, ...(checked.value.approximate ? { approximate: true } : {}) });
         row[name] = checked.value.value;
         for (const [id, digest] of Object.entries(checked.hashes)) { if (hashes[id] && hashes[id] !== digest) return null; hashes[id] = digest; }
         checked.leaves.forEach((id) => leaves.add(id));
@@ -1169,7 +1172,12 @@ export class ToolService {
       const contract = this.arithmeticContract(session, resource, publication);
       const evidence = this.evidenceSource(session, resource);
       if (!contract || !evidence) return null;
-      if (!await this.evaluateVerifiedResult(session, jobId, resource.resource_id, publication, path, evaluation)) return null;
+      const evaluated = await this.evaluateVerifiedResult(session, jobId, resource.resource_id, publication, path, evaluation);
+      if (!evaluated) return null;
+      if (evaluated.expression_only) {
+        if (ref.group || !resource.execution_id || ref.execution_id !== resource.execution_id || (ref.row === undefined) === (ref.aggregate === undefined) || ref.row !== undefined && (!Number.isSafeInteger(ref.row) || ref.row < 0) || ref.aggregate !== undefined && ref.aggregate !== "sum") return null;
+        return this.selectTableArithmetic(evaluated, ref);
+      }
       // An ungrouped, independently verified aggregate has exactly one row.
       // Its stored resource already binds the execution and content hash, so
       // row 0 can be resolved without trusting a model-supplied execution ID.
@@ -1237,11 +1245,12 @@ export class ToolService {
     if (resource.kind === "calculation") {
       const directParent = await this.ctx.sessions.lookupResourceAsync(session.session_id, resource.source_resource_id);
       if (!directParent.ok) return null;
-      if (resource.evaluated_table_v1 && directParent.resource.kind !== "query_result") {
+      const parentEvaluation = resource.evaluated_table_v1 && directParent.resource.kind === "query_result" ? await this.evaluateVerifiedResult(session, jobId, directParent.resource.resource_id, publication, new Set([...path, resource.resource_id]), evaluation) : null;
+      if (resource.evaluated_table_v1 && (directParent.resource.kind !== "query_result" || parentEvaluation?.expression_only)) {
         const checked = await this.evaluateVerifiedResult(session, jobId, resource.resource_id, publication, path, evaluation);
         const column = checked?.table.columns.find((item) => item.name === ref.cell); const value = checked?.table.rows[0]?.[ref.cell];
         if (!checked || !column || column.type !== "decimal" || !Number.isInteger(column.scale) || value !== null && typeof value !== "string") return null;
-        return { value: { value: value as string | null, scale: column.scale!, unit: column.unit || "未认证", basis: { table: "结果资源", column: ref.cell, operation: "result_cell", unit: column.unit || "未认证", prediction: "未认证", timezone: "未认证" }, interpretation: "mathematical_only", ...(checked.partial || value === null ? { partial: true } : {}), formula: `${resource.resource_id} 的列 ${ref.cell}`, scopes: [] }, hashes: checked.hashes, leaves: checked.leaves };
+        return { value: { value: value as string | null, scale: column.scale!, unit: column.unit || "未认证", basis: { table: "结果资源", column: ref.cell, operation: "result_cell", unit: column.unit || "未认证", prediction: "未认证", timezone: "未认证" }, interpretation: "mathematical_only", ...(column.approximate ? { approximate: true } : {}), ...(checked.partial || value === null ? { partial: true } : {}), formula: `${resource.resource_id} 的列 ${ref.cell}`, scopes: [] }, hashes: checked.hashes, leaves: checked.leaves };
       }
       if (resource.evaluated_table_v1 && !await this.evaluateVerifiedResult(session, jobId, resource.resource_id, publication, path, evaluation)) return null;
       if (ref.group || !resource.operations || !Object.hasOwn(resource.operations, ref.cell)) return null;
@@ -1312,7 +1321,7 @@ export class ToolService {
       const result: ArithmeticValue = {
         value, scale: column.scale!, unit: column.unit || "未认证",
         basis: { table: "结果资源", column: ref.cell, operation: "result_cell", unit: column.unit || "未认证", prediction: "未认证", timezone: "未认证" },
-        interpretation: "mathematical_only", ...(partial ? { partial: true } : {}),
+        interpretation: "mathematical_only", ...(column.approximate ? { approximate: true } : {}), ...(partial ? { partial: true } : {}),
         formula: `${ref.resource_id} 的列 ${ref.cell}（${selection}）`, scopes: [],
       };
       return { value: result, hashes: checked.hashes, leaves: checked.leaves };
@@ -1511,6 +1520,7 @@ export class ToolService {
     const aggregates: VerifiedAggregate[] = [];
     const conditionalAggregates: VerifiedConditionalAggregate[] = [];
     const joinLines: string[] = [];
+    const expressionLines: string[] = [];
     for (const source of sources) {
       const original = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === source.resource_id);
       const evidence = original && this.evidenceSource(session, original);
@@ -1521,6 +1531,7 @@ export class ToolService {
       const shape = evidence && contract && verifyCell(evidence, contract, { op: "count_rows", as: "internal" }, evidence.rows.length);
       const databaseAggregates = evidence && contract && verifyDatabaseAggregates(evidence, contract);
       const conditional = evidence && contract && verifyConditionalAggregates(evidence, contract);
+      const observation = !shape && !databaseAggregates && !conditional && original && liveFreshness && jobId ? await this.evaluateVerifiedResult(session, jobId, original.resource_id, liveFreshness, new Set(), evaluation) : null;
       const joined = original && liveFreshness ? verifyJoinResource(original as JoinQueryResource, session, this.ctx.knowledge, this.ctx.config, liveFreshness) : null;
       if (joined) {
         source.evidence_eligible = true;
@@ -1535,9 +1546,16 @@ export class ToolService {
         if (joined.values.length > 100) joinLines.push(`JOIN 验证了 ${joined.values.length} 个分组，此处展示前 100 个；其余分组保存在当前结果资源中。`);
         continue;
       }
-      source.evidence_eligible = Boolean(currentContract && currentFresh && (shape || databaseAggregates || conditional) && !source.truncated && source.complete_population);
+      source.evidence_eligible = Boolean(currentContract && currentFresh && (shape || databaseAggregates || conditional || observation?.expression_only) && !source.truncated && source.complete_population);
       if (source.evidence_eligible) {
         eligible.add(source.resource_id);
+        if (observation?.expression_only) {
+          reasons.push("query_expression_semantics_unverified");
+          if (observation.table.columns.some((column) => column.approximate)) { reasons.push("floating_point_approximate"); if (status === "completed") status = "partial"; }
+          if (observation.partial && status === "completed") status = "partial";
+          if (!observation.table.rows.length) expressionLines.push(`查询资源 ${source.resource_id} 没有结果行；空结果不等于零。`);
+          for (const row of previewRows(observation.table.rows, 100)) expressionLines.push(`查询资源 ${source.resource_id} 的表达式结果：${observation.table.columns.map((column) => `${column.label}=${row[column.name] === null ? "NULL（未知）" : column.type === "text" ? JSON.stringify(row[column.name]) : String(row[column.name])}（单位未认证）`).join("；")}。`);
+        }
         if (source.engine === "clickhouse-local") reasons.push("clickhouse_observation_nonatomic");
         if (databaseAggregates) aggregates.push(...databaseAggregates);
         if (conditional) conditionalAggregates.push(...conditional);
@@ -1615,7 +1633,8 @@ export class ToolService {
     for (const resource of resources) {
       if (resource.kind !== "calculation") continue;
       const parentResource = resources.find((item) => item.resource_id === resource.source_resource_id);
-      if (resource.evaluated_table_v1 && parentResource?.kind !== "query_result") {
+      const parentEvaluation = resource.evaluated_table_v1 && parentResource?.kind === "query_result" && liveFreshness && jobId ? await this.evaluateVerifiedResult(session, jobId, parentResource.resource_id, liveFreshness, new Set(), evaluation) : null;
+      if (resource.evaluated_table_v1 && (parentResource?.kind !== "query_result" || parentEvaluation?.expression_only)) {
         const checked = liveFreshness && jobId ? await this.evaluateVerifiedResult(session, jobId, resource.resource_id, liveFreshness, new Set(), evaluation) : null;
         if (!checked || checked.leaves.some((id) => !eligible.has(id))) {
           reasons.push("calculation_lineage_unsupported");
@@ -1704,6 +1723,7 @@ export class ToolService {
         continue;
       }
       arithmeticResults.push({ resource_id: resource.resource_id, operation: resource.operation, left: resource.left, right: resource.right, result: checked.value });
+      if (checked.value.approximate) { reasons.push("floating_point_approximate"); if (status === "completed") status = "partial"; }
       noteUnprovenSnapshot(checked.leaves);
       if (checked.value.partial) { reasons.push("arithmetic_input_incomplete"); if (status === "completed") status = "partial"; }
       if (checked.value.value === null && status === "completed") status = "partial";
@@ -1720,6 +1740,7 @@ export class ToolService {
         continue;
       }
       if (checked.partial) { reasons.push(checked.partial_reason ?? "transform_coverage_incomplete"); if (status === "completed") status = "partial"; }
+      if (checked.table.columns.some((column) => column.approximate)) { reasons.push("floating_point_approximate"); if (status === "completed") status = "partial"; }
       noteUnprovenSnapshot(checked.leaves);
       const preview = previewRows(checked.table.rows, 100);
       transformResults.push({ resource_id: resource.resource_id, source_resource_id: resource.source_resource_id, steps: resource.steps, result: { ...checked.table, rows: preview }, total_rows: checked.table.rows.length, preview_has_more: checked.table.rows.length > preview.length });
@@ -1773,6 +1794,7 @@ export class ToolService {
     if (reasons.includes("clickhouse_observation_nonatomic")) limitations.push("ClickHouse 查询和覆盖统计是独立读取；结果代表各次观测，不宣称跨查询原子快照或共同数据版本。");
     if (reasons.includes("coverage_observations_conflict")) limitations.push("相同范围的覆盖观测内容发生变化；跨次比较可能不一致，只能部分交付。");
     if (reasons.includes("alias_preview_hidden")) limitations.push("含模型自选列别名的结果预览已隐藏；正式数值按契约字段及单位展示。");
+    if (reasons.includes("query_expression_semantics_unverified")) limitations.push("SQL 表达式的返回值可追溯到本次查询，但指标名称、单位和业务含义未认证。SQL 中显式空值替换如有发生，不代表观测到零。");
     if (reasons.includes("null_marker_preview_sanitized")) limitations.push("结果预览仅显示契约原字段；模型自选的空值标记和别名没有作为可信标签展示。");
     if (reasons.includes("floating_point_approximate")) limitations.push("浮点字段及其派生值仅是近似数，尚未实现可验证的精确十进制金额计算。");
     if (reasons.includes("coverage_unknown")) limitations.push("预期覆盖范围无法确定，覆盖情况未知。");
@@ -1784,7 +1806,7 @@ export class ToolService {
     if (aggregates.some((item) => Object.keys(item.group).length)) limitations.push("分组只展示查询中出现的取值，未出现的组合没有补零。");
     if (joinLines.length) limitations.push("JOIN 分组只证明实际匹配键在本次查询捕获数据中没有放大；未出现的分组未补零，跨表不具备原子快照。");
     limitations.push("数据来自本地合成库，不是生产数据。");
-    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...verifiedDecimal.map(renderDecimalCell), ...verifiedGroupRollups.map(renderGroupRollup), ...tableCellLines, ...comparisons.map(renderComparison), ...aggregates.slice(0, 100).map(renderAggregate), ...conditionalAggregates.slice(0, 100).map(renderConditionalAggregate), ...aggregateComparisons.map(renderAggregateComparison), ...arithmeticResults.map(renderArithmetic), ...transformLines];
+    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...verifiedDecimal.map(renderDecimalCell), ...verifiedGroupRollups.map(renderGroupRollup), ...tableCellLines, ...expressionLines, ...comparisons.map(renderComparison), ...aggregates.slice(0, 100).map(renderAggregate), ...conditionalAggregates.slice(0, 100).map(renderConditionalAggregate), ...aggregateComparisons.map(renderAggregateComparison), ...arithmeticResults.map(renderArithmetic), ...transformLines];
     if (aggregates.length > 100) derivedLines.push(`已验证聚合共 ${aggregates.length} 个，此处展示前 100 个；其余结果保存在当前查询资源中。`);
     if (conditionalAggregates.length > 100) derivedLines.push(`已验证条件计数共 ${conditionalAggregates.length} 个，此处展示前 100 个；其余结果保存在当前查询资源中。`);
     derivedLines.push(...alignmentLines);
@@ -2194,7 +2216,7 @@ function renderAggregateComparison(item: AggregateComparison): string {
 
 function renderArithmetic(item: NonNullable<AnalysisRecord["arithmetic_results"]>[number]): string {
   const value = item.result.value === null ? item.result.undefined_reason === "null_input" ? "输入为空或 NULL，结果未知" : "除数为零，结果不可计算" : `${item.result.value} ${item.result.unit}`;
-  if (item.result.interpretation === "mathematical_only") return `${item.result.formula ?? "所选结果单元"} 可复核数学运算 ${item.operation}：${value}；输入 ${item.left.resource_id}、${item.right.resource_id}；计算资源 ${item.resource_id}。仅认证计算与来源，不认证业务指标名称、用户意图或完整范围。${item.result.partial ? "输入有缺失或覆盖不完整。" : ""}`;
+  if (item.result.interpretation === "mathematical_only") return `${item.result.formula ?? "所选结果单元"} 可复核数学运算 ${item.operation}：${value}；输入 ${item.left.resource_id}、${item.right.resource_id}；计算资源 ${item.resource_id}。仅认证计算与来源，不认证业务指标名称、用户意图或完整范围。${item.result.approximate ? "输入含浮点观测，结果为近似值。" : ""}${item.result.partial ? "输入有缺失或覆盖不完整。" : ""}`;
   const scope = item.result.scopes.map((entry) => `${Object.entries(entry.filters).map(([key, part]) => `${key}=${part}`).join("，")}；${entry.start} 到 ${entry.end}`).join(" / ");
   return `${item.result.formula ?? `${item.result.basis.table}.${item.result.basis.column}`} 可复核四则运算 ${item.operation}：${value}；范围 ${scope}（${item.result.basis.timezone}）；输入 ${item.left.resource_id}、${item.right.resource_id}；计算资源 ${item.resource_id}。除法保留 18 位，半数远离零。`;
 }
@@ -2297,9 +2319,9 @@ function alignmentTable(spec: AlignmentSpec, rows: AlignedRow[], keySources: Rec
   const leftLabel = `${left.basis.table}.${left.basis.column}`; const rightLabel = `${right.basis.table}.${right.basis.column}`;
   const columns: ResultColumn[] = [
     ...[...spec.keys].sort().map((name) => ({ name, type: "text" as const, unit: `维度 ${name}`, label: name, ...(keySources[name]?.length ? { key_lineages: keySources[name] } : {}) })),
-    { name: "left_value", type: "decimal", unit: left.unit, label: `左侧 ${leftLabel}`, scale: left.scale },
-    { name: "right_value", type: "decimal", unit: right.unit, label: `右侧 ${rightLabel}`, scale: right.scale },
-    { name: "result_value", type: "decimal", unit: output.unit, label: `${leftLabel} ${spec.op} ${rightLabel}`, scale: output.scale },
+    { name: "left_value", type: "decimal", unit: left.unit, label: `左侧 ${leftLabel}`, scale: left.scale, ...(left.approximate ? { approximate: true } : {}) },
+    { name: "right_value", type: "decimal", unit: right.unit, label: `右侧 ${rightLabel}`, scale: right.scale, ...(right.approximate ? { approximate: true } : {}) },
+    { name: "result_value", type: "decimal", unit: output.unit, label: `${leftLabel} ${spec.op} ${rightLabel}`, scale: output.scale, ...(output.approximate ? { approximate: true } : {}) },
     { name: "alignment_status", type: "text", unit: "状态", label: "对齐状态" },
   ];
   for (const row of rows) {

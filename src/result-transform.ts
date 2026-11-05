@@ -8,6 +8,8 @@ export interface ResultColumn {
   unit: string;
   label: string;
   scale?: number;
+  /** Values are decimal renderings of a database Float observation, not exact monetary data. */
+  approximate?: boolean;
   /** Host-generated lineage for a verified, observed JOIN SUM; aliases do not grant it. */
   metric?: { table: string; column: string; operation: "sum" };
   /** Host-generated physical key identity; model labels are not authority. */
@@ -76,7 +78,7 @@ export function transformResult(input: ResultTable, steps: TransformStep[], auth
       const scale = step.op === "divide" ? 18 : step.op === "multiply" ? left.scale! + right.scale! : Math.max(left.scale!, right.scale!);
       if (!unit || scale > 38) return null;
       const symbol = { add: "+", subtract: "−", multiply: "×", divide: "/" }[step.op];
-      const output: ResultColumn = { name: step.as, type: "decimal", scale, unit, label: `（${left.label} ${symbol} ${right.label}）` };
+      const output: ResultColumn = { name: step.as, type: "decimal", scale, unit, label: `（${left.label} ${symbol} ${right.label}）`, ...(left.approximate || right.approximate ? { approximate: true } : {}) };
       const rows: Array<Record<string, ResultValue>> = [];
       for (const row of table.rows) {
         const x = row[left.name]; const y = row[right.name];

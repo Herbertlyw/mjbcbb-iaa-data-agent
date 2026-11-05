@@ -28,7 +28,7 @@ export function calculateResultCells(input: ResultTable, operations: CellOperati
     else value = String(input.rows.filter((item) => isExactZero(item[field!.name])).length);
     row[operation.as] = value;
     columns.push(operation.op === "sum"
-      ? { name: operation.as, type: "decimal", unit: field!.unit, label: `${field!.label} 的非 NULL 合计`, scale: field!.scale }
+      ? { name: operation.as, type: "decimal", unit: field!.unit, label: `${field!.label} 的非 NULL 合计`, scale: field!.scale, ...(field!.approximate ? { approximate: true } : {}) }
       : { name: operation.as, type: "decimal", unit: "结果行", label: operation.op === "count_rows" ? "输入结果行数" : `${field!.label} 的${operation.op === "count_null" ? "NULL" : "零"}结果行数`, scale: 0 });
   }
   const table = { columns, rows: [row] };
