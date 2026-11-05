@@ -166,6 +166,10 @@ test("MySQL 事务里并发预留、重复结算、冲突、缺用量和旧围�
     const blocked = (await state.call("beginProviderStep", input("step_after_hold")));
     assert.equal(blocked.ok, false);
     assert.equal(blocked.code, "token_budget_unknown");
+    const rejectedAttempt = (await state.call("listProviderSteps", job.job_id)).find((item) => item.step_id === "step_after_hold");
+    assert.equal(rejectedAttempt?.status, "not_dispatched");
+    assert.equal(rejectedAttempt?.error_code, "token_budget_unknown");
+    assert.equal(rejectedAttempt?.reserved_total, 0);
     assert.equal((await state.call("getTurnBudget", job.job_id))?.reserved_tokens, 200);
     const oldFence = (await state.call("settleProviderStep", {
       stepId: "step_hold",

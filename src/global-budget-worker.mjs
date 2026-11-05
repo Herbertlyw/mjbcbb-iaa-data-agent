@@ -22,7 +22,7 @@ try {
     if (!raced.isFile() || raced.isSymbolicLink() || (raced.mode & 0o077) !== 0 || typeof process.getuid === "function" && raced.uid !== process.getuid()) throw new Error("global_budget_path_unsafe");
   }
 }
-const db = new DatabaseSync(workerData.path);
+const db = new DatabaseSync(workerData.path, { readOnly: workerData.mode === "inspect" });
 db.exec("PRAGMA busy_timeout = 3000; PRAGMA foreign_keys = ON;");
 // WAL recovery can transiently return SQLITE_BUSY_RECOVERY before SQLite's
 // normal busy handler applies. Only retry these read-only startup probes.
@@ -67,6 +67,7 @@ else {
 // Upgrade previously created ledgers without dropping scope history.
 const columns = new Set(db.prepare("PRAGMA table_info(global_provider_steps)").all().map((row) => row.name));
 if (["cache_hit_tokens", "cache_miss_tokens"].some((name) => !columns.has(name))) {
+  if (workerData.mode === "inspect") throw new Error("global_budget_schema_upgrade_required");
   db.exec("BEGIN IMMEDIATE");
   try {
     const lockedColumns = new Set(db.prepare("PRAGMA table_info(global_provider_steps)").all().map((row) => row.name));
@@ -188,6 +189,12 @@ function acknowledgeInterrupted(input) {
   });
 }
 function run(op, input) {
+  if (workerData.mode === "inspect" && !["verifyInspection", "stats", "pendingSteps", "step"].includes(op)) throw new Error("global_budget_read_only");
+  if (op === "verifyInspection") {
+    checkConfig(input);
+    return same(db.prepare("SELECT * FROM budget_scopes WHERE budget_id = ?").get(input.budgetId), input)
+      ? { ok: true, code: "inspectable" } : { ok: false, code: "global_budget_scope_mismatch" };
+  }
   if (op === "activate") return activate(input);
   if (op === "verify") return verify(input);
   if (op === "reserve") return reserve(input);

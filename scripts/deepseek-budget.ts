@@ -12,7 +12,7 @@ if (!budgetId || !["activate", "status", "close", "acknowledge"].includes(comman
 const dir = path.join(repoRoot(), ".local-runtime");
 if (command === "activate") await mkdir(dir, { recursive: true, mode: 0o700 });
 const options = { path: path.join(dir, "deepseek-budget.sqlite"), budgetId, maxRequests, maxTokens };
-const budget = command === "activate" ? await GlobalBudget.activate(options) : await GlobalBudget.open(options);
+const budget = command === "activate" ? await GlobalBudget.activate(options) : command === "status" ? await GlobalBudget.inspect(options) : await GlobalBudget.open(options);
 try {
   if (command === "close") {
     const result = await budget.closeScope(argument === "acknowledge-unknown");

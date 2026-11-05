@@ -47,7 +47,7 @@ export class GlobalBudget {
   private readonly timeoutMs: number;
   private readonly scope: Pick<GlobalBudgetOptions, "budgetId" | "maxRequests" | "maxTokens">;
 
-  private constructor(options: GlobalBudgetOptions, mode: "activate" | "open") {
+  private constructor(options: GlobalBudgetOptions, mode: "activate" | "open" | "inspect") {
     this.scope = { budgetId: options.budgetId, maxRequests: options.maxRequests, maxTokens: options.maxTokens };
     this.timeoutMs = options.timeoutMs ?? 10_000;
     if (!options.path || !Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1) throw new Error("global_budget_invalid");
@@ -68,6 +68,13 @@ export class GlobalBudget {
   static async open(options: GlobalBudgetOptions): Promise<GlobalBudget> {
     const store = new GlobalBudget(options, "open");
     try { const decision = await store.request<GlobalBudgetDecision>("verify", store.scope); if (!decision.ok) throw new Error(decision.code); return store; }
+    catch (error) { await store.close(); throw error; }
+  }
+
+  /** Audit an existing scope without activating it, including after closure. */
+  static async inspect(options: GlobalBudgetOptions): Promise<GlobalBudget> {
+    const store = new GlobalBudget(options, "inspect");
+    try { const decision = await store.request<GlobalBudgetDecision>("verifyInspection", store.scope); if (!decision.ok) throw new Error(decision.code); return store; }
     catch (error) { await store.close(); throw error; }
   }
 

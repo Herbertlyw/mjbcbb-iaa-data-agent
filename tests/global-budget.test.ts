@@ -54,6 +54,13 @@ test("跨进程并发、重启与重复派发不能绕过总请求预算", async
     await assert.rejects(GlobalBudget.activate({ ...options, budgetId: "another-session" }), /global_budget_active_mismatch/);
     await assert.rejects(GlobalBudget.open({ ...options, maxRequests: 2 }), /global_budget_active_mismatch/);
     assert.equal((await gate.closeScope()).code, "closed"); await gate.close();
+    const audit = await GlobalBudget.inspect(options);
+    assert.equal((await audit.stats())?.status, "closed");
+    assert.equal((await audit.step(winner))?.input_tokens, 150);
+    await assert.rejects(audit.reserve({ stepId: "forbidden", jobId: "job_forbidden", estimatedInput: 1, reservedOutput: 1 }), /global_budget_operation_failed/);
+    await assert.rejects(audit.closeScope(), /global_budget_operation_failed/);
+    await audit.close();
+    await assert.rejects(GlobalBudget.inspect({ ...options, maxRequests: 2 }), /global_budget_scope_mismatch/);
     await assert.rejects(GlobalBudget.activate(options), /global_budget_id_used/);
     const later = await GlobalBudget.activate({ ...options, budgetId: "explicit-later" });
     assert.equal((await later.stats())?.requests_reserved, 0); await later.close();

@@ -427,7 +427,13 @@ test("窗口预留拒绝应显示真实错误且不派发请求", async () => {
       assert.equal(job.error?.code, "context_window_exceeded");
       assert.equal(job.analysis, null);
       assert.equal(fake.observations.length, 0);
-      assert.equal(runtime.state.listProviderSteps(job.job_id).length, 0);
+      const steps = runtime.state.listProviderSteps(job.job_id);
+      assert.equal(steps.length, 1);
+      assert.equal(steps[0]?.status, "not_dispatched");
+      assert.equal(steps[0]?.error_code, "context_window_exceeded");
+      assert.equal(steps[0]?.reserved_total, 0);
+      assert.equal(job.usage?.model_calls, 0);
+      assert.equal(job.usage?.provider_not_dispatched, 1);
     });
   } finally {
     await fake.close();

@@ -609,15 +609,23 @@ async function beginProviderStep(input) {
     );
     const [budgets] = await conn.query("SELECT * FROM turn_budgets WHERE job_id = ? FOR UPDATE", [input.jobId]);
     const budget = budgets[0];
+    const rejectAttempt = async (code, reason = code) => {
+      await conn.query(`INSERT INTO provider_steps (
+        step_id, session_id, job_id, actor_id, fence, provider, model, status, usage_source, created_at,
+        estimated_input, reserved_output, reserved_total, estimate_source, settlement, error_code
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'not_dispatched', 'unknown', ?, ?, ?, 0, ?, 'settled', ?)
+      ON DUPLICATE KEY UPDATE step_id = step_id`, [input.stepId, input.sessionId, input.jobId, input.actorId, input.fence, input.provider, input.model, new Date().toISOString(), input.estimatedInput, input.reservedOutput, input.estimateSource, reason]);
+      return { ok: false, code };
+    };
     const [held] = await conn.query("SELECT status FROM provider_steps WHERE job_id = ? AND settlement = 'held_unknown' FOR UPDATE", [input.jobId]);
     if (held.length > 0) {
-      return { ok: false, code: held.some((step) => step.status === "outcome_unknown") ? "provider_outcome_unknown" : "token_budget_unknown" };
+      return rejectAttempt(held.some((step) => step.status === "outcome_unknown") ? "provider_outcome_unknown" : "token_budget_unknown");
     }
-    if (reserve > Number(budget.context_window)) return { ok: false, code: "context_window_exceeded" };
+    if (reserve > Number(budget.context_window)) return rejectAttempt("context_window_exceeded");
     const committed = Number(budget.settled_input) + Number(budget.settled_output) + Number(budget.reserved_tokens);
-    if (committed + reserve > Number(budget.max_tokens)) return { ok: false, code: "budget_exhausted" };
+    if (committed + reserve > Number(budget.max_tokens)) return rejectAttempt("budget_exhausted", "task_token_budget_exceeded");
     if (Number(budget.model_calls_settled) + Number(budget.model_calls_reserved) >= Number(budget.max_model_calls)) {
-      return { ok: false, code: "budget_exhausted" };
+      return rejectAttempt("budget_exhausted", "task_model_calls_exceeded");
     }
     await conn.query(
       `INSERT INTO provider_steps (
