@@ -133,7 +133,8 @@ function answerPerformance(turn: TurnResolution, facts: ToolFact[]): AssistantMe
     const calc = facts.find((fact) => fact.name === "calculate_session_cells" && fact.payload.source_resource_id === resourceId);
     if (!calc) {
       return call("calculate_session_cells", {
-        resource_id: resourceId,
+        operation: "cells",
+        input: { resource_id: resourceId, execution_id: String(query?.payload.execution_id ?? "") },
         operations: item.operations,
       });
     }

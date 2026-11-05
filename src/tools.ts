@@ -40,6 +40,7 @@ import { clickHouseColumns, clickHouseColumnTypes, clickHouseQueryBounded, click
 import { clickHousePreflightMessage, preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
 import { ResourceGraph } from "./resource-graph.js";
 import { savedResultView } from "./result-view.js";
+import { normalizeCalculation } from "./calculation-protocol.js";
 import { assertJoinKeys, guardSql, inspectSingleSourceProjection, parseReadonlySql, SqlRejected, type TableRule } from "./sql.js";
 import type { ClickHouseClient } from "@clickhouse/client";
 import type { DatabaseSync } from "node:sqlite";
@@ -85,6 +86,19 @@ export class ToolService {
   private readonly configuredScanLimit: number;
 
   constructor(private readonly ctx: ToolContext) { this.configuredScanLimit = ctx.config.clickhouseMaxRowsToRead; }
+
+  async calculateFromProtocol(sessionId: string, value: unknown, signal?: AbortSignal): Promise<ToolResult> {
+    const cancelled = await this.gate(sessionId, signal);
+    if (cancelled) return cancelled;
+    const session = await this.ctx.sessions.requireAsync(sessionId);
+    if (!session.active_job_id) return fail("missing_active_job", "计算需要当前任务及其独立证据。");
+    const normalized = await normalizeCalculation(value, async (id) => {
+      const found = await this.ctx.sessions.lookupResourceAsync(sessionId, id);
+      return found.ok && found.resource.job_id !== session.active_job_id ? { ok: false as const, code: "resource_from_other_execution" } : found;
+    });
+    if (!normalized.ok) return fail(normalized.code, normalized.code === "invalid_calculation_shape" ? "计算参数与 operation 分支不匹配；请只填写该分支要求的参数。" : normalized.code === "resource_from_other_execution" ? "资源不属于当前任务；请重新查询或计算。" : "资源不存在、不可访问或执行 ID 不匹配；请使用本次回执中的身份。");
+    return this.calculateSessionCells(sessionId, normalized.input, signal, normalized.hashes);
+  }
 
   async reserveToolCall(sessionId: string): Promise<"ok" | "budget_exhausted" | "lost"> {
     return this.ctx.sessions.reserveToolCall(sessionId, this.ctx.config.maxToolCalls);
@@ -636,6 +650,7 @@ export class ToolService {
     sessionId: string,
     input: { resource_id?: string; operations?: CellOperation[]; arithmetic?: { op: ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef }; transform?: { resource_id: string; steps: TransformStep[] }; align?: AlignmentSpec },
     signal?: AbortSignal,
+    expectedHashes?: Record<string, string>,
   ): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
@@ -645,25 +660,27 @@ export class ToolService {
       if (typeof id !== "string") continue;
       const resource = await this.ctx.sessions.lookupResourceAsync(sessionId, id);
       if (!resource.ok) return fail(resource.code, resource.message);
+      if (expectedHashes && expectedHashes[id] !== createHash("sha256").update(JSON.stringify(resource.resource)).digest("hex")) return fail("resource_version_changed", "输入资源在校验后发生变化，请重新读取。");
       if (!await this.resourceReadable(sessionId, resource.resource)) return fail("resource_authorization_changed", "资源引用的授权、契约或来源发生变化，不能继续读取或计算。");
     }
     if (input.align) {
       if (input.transform || input.arithmetic || input.resource_id || input.operations) return fail("invalid_alignment", "分组对齐须单独提交。");
-      return this.calculateAlignment(sessionId, input.align);
+      return this.calculateAlignment(sessionId, input.align, expectedHashes);
     }
     if (input.transform) {
       if (input.arithmetic || input.operations || (input.resource_id !== undefined && input.resource_id !== input.transform.resource_id)) return fail("invalid_transform", "表格变换须单独提交；如提供顶层 resource_id，必须与变换输入一致。");
-      return this.calculateTransform(sessionId, input.transform);
+      return this.calculateTransform(sessionId, input.transform, expectedHashes);
     }
     if (input.arithmetic) {
       if (input.operations || (input.resource_id !== undefined && (input.resource_id !== input.arithmetic.left?.resource_id || input.resource_id !== input.arithmetic.right?.resource_id))) return fail("invalid_arithmetic", "四则运算与单资源汇总须分开提交；顶层 resource_id 如存在，必须与两个输入一致。");
-      return this.calculateArithmetic(sessionId, input.arithmetic);
+      return this.calculateArithmetic(sessionId, input.arithmetic, expectedHashes);
     }
     if (!Array.isArray(input.operations) || input.operations.length < 1 || input.operations.length > 40) return fail("invalid_calculation", "每次须提供 1 到 40 个计算操作。");
     const found = await this.ctx.sessions.lookupResourceAsync(sessionId, input.resource_id ?? "");
     if (!found.ok) return fail(found.code, found.message);
     if (found.resource.kind !== "query_result") return fail("resource_not_calculable", "只能计算查询结果资源");
     const source = found.resource;
+    if (expectedHashes && expectedHashes[source.resource_id] !== createHash("sha256").update(JSON.stringify(source)).digest("hex")) return fail("resource_version_changed", "输入资源在校验后发生变化，请重新读取。");
     const activeJob = (await this.ctx.sessions.requireAsync(sessionId)).active_job_id;
     if (activeJob && source.job_id !== activeJob) return fail("resource_from_other_execution", "只能计算当前任务的查询结果；请重新查询并复核契约与新鲜度。");
     const cells: Record<string, number | string | null> = {};
@@ -712,7 +729,7 @@ export class ToolService {
     };
   }
 
-  private async calculateArithmetic(sessionId: string, expression: { op: ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef }): Promise<ToolResult> {
+  private async calculateArithmetic(sessionId: string, expression: { op: ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef }, expectedHashes?: Record<string, string>): Promise<ToolResult> {
     if (!expression || !["add", "subtract", "multiply", "divide"].includes(expression.op)) return fail("invalid_arithmetic", "未支持的运算。");
     const session = await this.ctx.sessions.requireAsync(sessionId);
     const jobId = session.active_job_id;
@@ -723,6 +740,7 @@ export class ToolService {
     const left = await this.resolveArithmetic(session, jobId, expression.left, fresh.publication, new Set());
     const right = await this.resolveArithmetic(session, jobId, expression.right, fresh.publication, new Set());
     if (!left || !right) return fail("arithmetic_lineage_unsupported", "输入不属于当前任务、已变化或不能证明完整血缘。引用多行结果中的明细行时请提供查询结果中的 execution_id、row 和列名；单行资源可使用其保存的执行 ID。不要使用历史任务资源。");
+    if (expectedHashes && (expectedHashes[expression.left.resource_id] !== left.hashes[expression.left.resource_id] || expectedHashes[expression.right.resource_id] !== right.hashes[expression.right.resource_id])) return fail("resource_version_changed", "计算输入在校验后发生变化，请重新读取。");
     const result = this.computeProvenArithmetic(expression.op, left.value, right.value);
     if (!result) return fail("arithmetic_scope_incompatible", "指标关系须由契约声明，且单位、粒度、实际/预测状态及范围须兼容。");
     const resource: ArithmeticResource = { resource_id: newId("res"), execution_id: newId("calc"), session_id: sessionId, job_id: jobId, kind: "arithmetic", created_at: new Date().toISOString(), operation: expression.op, left: expression.left, right: expression.right, input_hashes: { ...left.hashes, ...right.hashes }, result, input_truncated: false, complete_population: true };
@@ -755,7 +773,7 @@ export class ToolService {
     return computeArithmetic(op, left, right, declared);
   }
 
-  private async calculateTransform(sessionId: string, input: { resource_id: string; steps: TransformStep[] }): Promise<ToolResult> {
+  private async calculateTransform(sessionId: string, input: { resource_id: string; steps: TransformStep[] }, expectedHashes?: Record<string, string>): Promise<ToolResult> {
     if (!input || typeof input.resource_id !== "string" || !Array.isArray(input.steps)) return fail("invalid_transform", "变换须指定输入资源和操作列表。");
     const session = await this.ctx.sessions.requireAsync(sessionId);
     const jobId = session.active_job_id;
@@ -765,6 +783,7 @@ export class ToolService {
     if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
     const inputTable = await this.resolveTransform(session, jobId, input.resource_id, fresh.publication, new Set());
     if (!inputTable) return fail("transform_lineage_unsupported", `输入必须为当前任务完整、可验证的查询或变换资源；计算上限为 ${RESULT_CALCULATION_MAX_ROWS} 行和 ${RESULT_CALCULATION_MAX_BYTES} 字节。`);
+    if (expectedHashes && expectedHashes[input.resource_id] !== inputTable.hashes[input.resource_id]) return fail("resource_version_changed", "变换输入在校验后发生变化，请重新读取。");
     const transformed = this.applyProvenTransform(inputTable.table, input.steps);
     if (!transformed) return fail("invalid_transform", "变换参数、类型、契约指标关系或资源边界不受支持。");
     const result = transformed.table;
@@ -799,7 +818,7 @@ export class ToolService {
     return { table, undefinedArithmetic };
   }
 
-  private async calculateAlignment(sessionId: string, spec: AlignmentSpec): Promise<ToolResult> {
+  private async calculateAlignment(sessionId: string, spec: AlignmentSpec, expectedHashes?: Record<string, string>): Promise<ToolResult> {
     const session = await this.ctx.sessions.requireAsync(sessionId); const jobId = session.active_job_id;
     if (!jobId) return fail("missing_active_job", "分组对齐需要当前任务。");
     const fresh = await this.currentFreshness();
@@ -807,6 +826,7 @@ export class ToolService {
     if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
     const checked = await this.resolveAlignment(session, jobId, spec, fresh.publication);
     if (!checked) return fail("alignment_lineage_unsupported", "分组、指标口径、范围或完整来源无法证明。");
+    if (expectedHashes && [spec.left.resource_id, spec.right.resource_id].some((id) => expectedHashes[id] !== checked.hashes[id])) return fail("resource_version_changed", "对齐输入在校验后发生变化，请重新读取。");
     const resource: AlignmentResource = { resource_id: newId("res"), execution_id: newId("calc"), session_id: sessionId, job_id: jobId, kind: "alignment", created_at: new Date().toISOString(), spec, input_hashes: checked.hashes, rows: checked.rows, coverage_incomplete: checked.partial, input_truncated: false, complete_population: true };
     await this.ctx.sessions.saveResourceAsync(resource);
     const preview = previewRows(checked.rows, 100);
@@ -977,7 +997,7 @@ export class ToolService {
       // An ungrouped, independently verified aggregate has exactly one row.
       // Its stored resource already binds the execution and content hash, so
       // row 0 can be resolved without trusting a model-supplied execution ID.
-      if (ref.row === 0 && ref.execution_id === undefined && ref.aggregate === undefined && !ref.group && resource.execution_id && resource.rows.length === 1) {
+      if (ref.row === 0 && (ref.execution_id === undefined || ref.execution_id === resource.execution_id) && ref.aggregate === undefined && !ref.group && resource.execution_id && resource.rows.length === 1) {
         const matching = verifyDatabaseAggregates(evidence, contract)?.filter((item) => item.output_column === ref.cell && Object.keys(item.group).length === 0) ?? [];
         if (matching.length === 1) return { value: fromAggregate(matching[0]!), hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id] };
       }

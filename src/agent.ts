@@ -3,6 +3,7 @@ import { createModels, fauxProvider, type FauxResponseFactory, type Model } from
 import { Type } from "typebox";
 import type { AppConfig } from "./config.js";
 import { planFromTranscript } from "./planner.js";
+import { calculationSchema } from "./calculation-protocol.js";
 import type { SessionRecord } from "./session.js";
 import { ToolService, type AnalysisInput, type CellOperation } from "./tools.js";
 
@@ -194,41 +195,9 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     {
       name: "calculate_session_cells",
       label: "计算会话单元格",
-      description: "对当前任务结果做单资源计算、定点四则、按键对齐或表格变换，一次只选 operations、arithmetic、align、transform 一种。变换或对齐输出可作为四则输入，提供 resource_id、返回的 execution_id、cell 及 row，或 aggregate=sum；这类结果只证明数学运算与来源，不自动认证业务名称。单行查询可用 row=0，多行明细须提供执行 ID。正式交付可只引用最终结果；服务端追溯依赖。缺组、NULL、预测或截断不可补零。",
-      parameters: Type.Object({
-        resource_id: Type.Optional(Type.String({ description: "当前会话的查询资源 ID" })),
-        operations: Type.Optional(Type.Array(
-          Type.Object({
-            op: Type.Union([Type.Literal("sum"), Type.Literal("count_null"), Type.Literal("count_zero"), Type.Literal("count_rows")]),
-            column: Type.Optional(Type.String()),
-            predicted: Type.Optional(Type.Union([Type.Literal("actual_only"), Type.Literal("predicted_only"), Type.Literal("any")])),
-            as: Type.String(),
-          }),
-        )),
-        arithmetic: Type.Optional(Type.Object({
-          op: Type.Union([Type.Literal("add"), Type.Literal("subtract"), Type.Literal("multiply"), Type.Literal("divide")]),
-          left: Type.Object({ resource_id: Type.String(), cell: Type.String(), group: Type.Optional(Type.Record(Type.String(), Type.String())), execution_id: Type.Optional(Type.String()), row: Type.Optional(Type.Integer({ minimum: 0 })), aggregate: Type.Optional(Type.Literal("sum")) }),
-          right: Type.Object({ resource_id: Type.String(), cell: Type.String(), group: Type.Optional(Type.Record(Type.String(), Type.String())), execution_id: Type.Optional(Type.String()), row: Type.Optional(Type.Integer({ minimum: 0 })), aggregate: Type.Optional(Type.Literal("sum")) }),
-        })),
-        align: Type.Optional(Type.Object({
-          op: Type.Union([Type.Literal("add"), Type.Literal("subtract"), Type.Literal("multiply"), Type.Literal("divide")]),
-          keys: Type.Array(Type.String(), { minItems: 1, maxItems: 3 }),
-          left: Type.Object({ resource_id: Type.String(), cell: Type.String() }),
-          right: Type.Object({ resource_id: Type.String(), cell: Type.String() }),
-        })),
-        transform: Type.Optional(Type.Object({
-          resource_id: Type.String(),
-          steps: Type.Array(Type.Union([
-            Type.Object({ op: Type.Literal("filter"), column: Type.String(), comparison: Type.Union([Type.Literal("eq"), Type.Literal("ne"), Type.Literal("lt"), Type.Literal("le"), Type.Literal("gt"), Type.Literal("ge"), Type.Literal("is_null"), Type.Literal("is_not_null")]), value: Type.Optional(Type.Union([Type.String(), Type.Boolean(), Type.Null()])), other_column: Type.Optional(Type.String()) }),
-            Type.Object({ op: Type.Literal("compare"), left: Type.String(), right: Type.String(), comparison: Type.Union([Type.Literal("eq"), Type.Literal("ne"), Type.Literal("lt"), Type.Literal("le"), Type.Literal("gt"), Type.Literal("ge")]), as: Type.String() }),
-            Type.Object({ op: Type.Union([Type.Literal("add"), Type.Literal("subtract"), Type.Literal("multiply"), Type.Literal("divide")]), left: Type.String(), right: Type.String(), as: Type.String() }),
-            Type.Object({ op: Type.Literal("sort"), keys: Type.Array(Type.Object({ column: Type.String(), direction: Type.Union([Type.Literal("asc"), Type.Literal("desc")]), nulls: Type.Union([Type.Literal("first"), Type.Literal("last")]) }), { minItems: 1, maxItems: 8 }) }),
-            Type.Object({ op: Type.Literal("group"), by: Type.Array(Type.String(), { maxItems: 8 }), aggregates: Type.Array(Type.Object({ op: Type.Union([Type.Literal("count_all"), Type.Literal("count"), Type.Literal("sum"), Type.Literal("min"), Type.Literal("max")]), column: Type.Optional(Type.String()), as: Type.String() }), { minItems: 1, maxItems: 20 }) }),
-          ]), { minItems: 1, maxItems: 10 }),
-        })),
-      }),
-      execute: async (_toolCallId, params, signal) =>
-        pack(await tools.calculateSessionCells(sessionId, params as Parameters<ToolService["calculateSessionCells"]>[1], signal)),
+      description: "通过 operation 选择 cells、add、subtract、multiply、divide、align 或 transform。每个输入均使用回执中的 resource_id 和 execution_id；四则引用 column 加 row 或 aggregate=sum，divide 明确 numerator 和 denominator；对齐按 keys 进行。变换或对齐输出也可参与后续运算，数学结果不自动认证业务名称。正式交付可只引用最终结果；缺组、NULL、预测或截断不可补零。",
+      parameters: calculationSchema,
+      execute: async (_toolCallId, params, signal) => pack(await tools.calculateFromProtocol(sessionId, params, signal)),
     },
     {
       name: "read_session_resource",

@@ -284,7 +284,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(clarification.analysis?.sources?.length, 0);
     const supplement = "合成精确金额：纸灯美国 iOS 雾帆，比较 2026-10-06 和 2026-10-08。";
     const decimal = await postQuestion(apiPort, decimalSessionId, supplement);
-    assert.equal(decimal.status, "completed", JSON.stringify(decimal.error));
+    assert.equal(decimal.status, "completed", JSON.stringify({ error: decimal.error, tools: decimal.events.filter((event) => event.type === "tool_finished").map((event) => ({ tool: event.payload.tool_name, code: event.payload.code, is_error: event.payload.is_error })) }));
     assert.ok(fake.observations.some((item) => item.userMessages.length === 2 && item.userMessages[0] === "只说看看收入" && item.userMessages[1] === supplement && item.historySummaryCount > 0));
     assert.match(decimal.analysis?.answer ?? "", /不是同一原子快照/);
     assert.match(decimal.analysis?.answer ?? "", /90071992547409\.91/);

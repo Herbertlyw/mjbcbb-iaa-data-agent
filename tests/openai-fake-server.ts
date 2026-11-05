@@ -131,7 +131,8 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
         return;
       }
       const turnNumber = messages.filter((message) => message.role === "user").length;
-      writeToolStream(response, { ...call, id: `${call.id}_turn${turnNumber}`, arguments: shiftSyntheticDates(call.arguments, dateShift) }, true, options.deepseekThinking === true, options.cacheHitTokens);
+      const adapted = call.name === "calculate_session_cells" ? adaptScriptedCalculation(call.arguments, currentTurn(fixtureMessages)) : call.arguments;
+      writeToolStream(response, { ...call, id: `${call.id}_turn${turnNumber}`, arguments: shiftSyntheticDates(adapted, dateShift) }, true, options.deepseekThinking === true, options.cacheHitTokens);
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -145,6 +146,26 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
 }
 
 interface ProtocolMessage { role: string; content?: unknown; reasoning_content?: string; tool_calls?: Array<{ function?: { name?: string } }> }
+
+/** Upgrade only the test server's existing scripted fixtures. Model-facing
+ * production code receives just the discriminated calculation protocol. */
+function adaptScriptedCalculation(args: string, turn: ProtocolMessage[]): string {
+  const ids = new Map<string, string>();
+  for (const message of turn.filter((item) => item.role === "tool")) {
+    try { const value = JSON.parse(messageText(message)) as Record<string, unknown>; if (typeof value.resource_id === "string" && typeof value.execution_id === "string") ids.set(value.resource_id, value.execution_id); } catch { /* malformed fixture is exercised as-is */ }
+  }
+  try {
+    const value = JSON.parse(args) as Record<string, any>;
+    const identity = (id: string) => ({ resource_id: id, execution_id: ids.get(id) ?? "" });
+    const ref = (item: Record<string, any>) => ({ ...identity(item.resource_id), column: item.cell, ...(item.aggregate ? { aggregate: item.aggregate } : { row: item.row ?? 0 }) });
+    const source = (item: Record<string, any>) => ({ ...identity(item.resource_id), column: item.cell });
+    if (value.operations) return JSON.stringify({ operation: "cells", input: identity(value.resource_id), operations: value.operations });
+    if (value.transform) return JSON.stringify({ operation: "transform", input: identity(value.transform.resource_id), steps: value.transform.steps });
+    if (value.align) return JSON.stringify({ operation: "align", align_op: value.align.op, keys: value.align.keys, left: source(value.align.left), right: source(value.align.right) });
+    if (value.arithmetic) return JSON.stringify(value.arithmetic.op === "divide" ? { operation: "divide", numerator: ref(value.arithmetic.left), denominator: ref(value.arithmetic.right) } : { operation: value.arithmetic.op, left: ref(value.arithmetic.left), right: ref(value.arithmetic.right) });
+  } catch { /* malformed fixture is exercised as-is */ }
+  return args;
+}
 
 function messageText(message: ProtocolMessage): string {
   if (typeof message.content === "string") return message.content;
