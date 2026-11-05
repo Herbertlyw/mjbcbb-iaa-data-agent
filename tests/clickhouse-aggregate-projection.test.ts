@@ -18,12 +18,16 @@ test("分组 SUM 和非 NULL COUNT 的多层等价投影可生成独立授权的
   const count = sql.replace("SUM(new_users)", "COUNT(new_users)");
   assert.match(clickHouseAggregateProjection(count, contract) ?? "", /COUNT\(new_users\) AS total/u);
   assert.ok(reviewScopedClickHouse(count, contract, rule, "harborlight", 100));
+  for (const call of ["COUNT(*)", "COUNT()"]) {
+    const rows = sql.replace("SUM(new_users)", call);
+    assert.ok(clickHouseAggregateProjection(rows, contract));
+    assert.ok(reviewScopedClickHouse(rows, contract, rule, "harborlight", 100));
+  }
   for (const input of [
     sql.replace("SELECT country_code, total FROM b", "SELECT total FROM b"),
     sql.replace("SELECT country_code, total FROM b", "SELECT country_code, total FROM b WHERE total > 0"),
     sql.replace("SUM(new_users)", "SUM(device_token)"),
     sql.replace("SUM(new_users)", "sumIf(new_users, new_users > 0)"),
-    sql.replace("SUM(new_users)", "COUNT(*)"),
     sql.replace("SELECT country_code, total FROM b", "SELECT country_code, total FROM b LIMIT 1"),
     sql.replace("SELECT country_code, total FROM a", "SELECT country_code, total, total AS another FROM a"),
     sql.replace("SELECT country_code, total FROM a", "SELECT country_code AS total, total AS amount FROM a").replace("SELECT country_code, total FROM b", "SELECT total, amount FROM b"),

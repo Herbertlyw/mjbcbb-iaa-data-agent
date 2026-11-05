@@ -49,7 +49,7 @@ export function sumDecimalStrings(values: unknown[], scale: number): string | nu
 }
 
 export function fromAggregate(item: VerifiedAggregate): ArithmeticValue {
-  return { value: item.value, scale: item.scale, unit: item.unit, basis: { table: item.table, column: item.column, operation: item.operation, unit: item.unit, prediction: item.prediction, timezone: item.range.timezone }, scopes: [{ filters: { ...item.filters, ...item.group }, start: item.range.start, end: item.range.end }] };
+  return { value: item.value, scale: item.scale, unit: item.unit, basis: { table: item.table, column: item.column, operation: item.operation, unit: item.unit, prediction: item.prediction, timezone: item.range.timezone }, scopes: [{ filters: { ...item.filters, ...item.group }, start: item.range.start, end: item.range.end }], ...(item.coverage_incomplete ? { partial: true } : {}) };
 }
 
 /** Arithmetic is deliberately limited to one contracted metric and compatible

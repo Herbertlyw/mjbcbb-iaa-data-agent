@@ -11,7 +11,7 @@ export interface AggregateComparison {
 /** Exact base-10 comparison of two already verified decimal sums. The scope
  * restrictions deliberately mirror the existing integer comparison. */
 export function compareDecimalAggregates(left: VerifiedAggregate, right: VerifiedAggregate): AggregateComparison | null {
-  if (left.source_resource_id === right.source_resource_id || left.operation !== "sum" || right.operation !== "sum" || left.table !== right.table || left.column !== right.column || left.unit !== right.unit || left.prediction !== right.prediction || left.range.timezone !== right.range.timezone || left.scale < 1 || left.scale !== right.scale) return null;
+  if (left.coverage_incomplete || right.coverage_incomplete || left.source_resource_id === right.source_resource_id || left.operation !== "sum" || right.operation !== "sum" || left.table !== right.table || left.column !== right.column || left.unit !== right.unit || left.prediction !== right.prediction || left.range.timezone !== right.range.timezone || left.scale < 1 || left.scale !== right.scale) return null;
   const entries = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
   if (entries(left.group) !== entries(right.group)) return null;
   const changed = [...new Set([...Object.keys(left.filters), ...Object.keys(right.filters)])].filter((key) => left.filters[key] !== right.filters[key]);

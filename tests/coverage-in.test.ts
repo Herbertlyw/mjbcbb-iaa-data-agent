@@ -57,6 +57,17 @@ test("两个国家的 IN 分组在当前任务按覆盖和契约交付；缺组�
     assert.equal(result.status, "completed", JSON.stringify(result));
     assert.match(String(result.answer), /country_code=US/u); assert.match(String(result.answer), /数据库求和 215/u);
     assert.match(String(result.answer), /country_code=JP/u); assert.match(String(result.answer), /数据库求和 30/u);
+    const saved = runtime.sessions.lookupResource(session.session_id, String(query.resource_id));
+    assert.ok(saved.ok && saved.resource.kind === "query_result"); if (!saved.ok || saved.resource.kind !== "query_result") return;
+    const differingObservation = structuredClone(saved.resource);
+    differingObservation.rows = differingObservation.rows.filter((row) => row.country_code === "US");
+    differingObservation.total_rows = differingObservation.rows.length; differingObservation.returned_rows = differingObservation.rows.length;
+    runtime.state.saveResource(differingObservation);
+    const differingDelivery = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(query.resource_id)] });
+    assert.ok(differingDelivery.ok, JSON.stringify(differingDelivery)); if (!differingDelivery.ok) return;
+    assert.equal(differingDelivery.status, "partial");
+    assert.ok((differingDelivery.server_reasons as string[]).includes("aggregate_groups_incomplete"));
+    assert.match((differingDelivery.limitations as string[]).join(" "), /缺少请求的分组或日期组合/u);
     const missingQuery = await runtime.tools.query(session.session_id, { sql: sql.replace("'US','JP'", "'US','DE'") });
     assert.equal(missingQuery.ok, true, JSON.stringify(missingQuery)); if (!missingQuery.ok) return;
     const missing = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(missingQuery.resource_id)] });

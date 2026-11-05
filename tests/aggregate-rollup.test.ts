@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { verifyGroupRollup } from "../src/aggregate-rollup.js";
+import { verifyDatabaseAggregates } from "../src/aggregate-evidence.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import type { QueryResource } from "../src/types.js";
 import { analyst, bindTables, withRuntime } from "./helpers.js";
@@ -38,6 +39,30 @@ test("CK 原生审查的分组结果以 CK 投影形状复核后继续求和", (
   assert.equal(verifyGroupRollup(forged, contract, op, "220"), null);
   const hidden = structuredClone(native); hidden.sql = hidden.sql.replace("SUM(new_users)", "SUM(device_token)");
   assert.equal(verifyGroupRollup(hidden, contract, op, "220"), null);
+});
+
+test("独立 COUNT 只证明观测行数，分组结果数与底层行数分开", () => {
+  for (const call of ["COUNT(*)", "COUNT()"]) {
+    const source = structuredClone(base);
+    source.sql_review_engine = "clickhouse_ast_direct";
+    source.sql = source.sql.replace("SUM(new_users)", call);
+    source.column_types = { total: "UInt64" };
+    source.rows = source.rows.map((row) => ({ ...row, total: "1" }));
+    const values = verifyDatabaseAggregates(source, contract);
+    assert.equal(values?.length, 3);
+    assert.ok(values?.every((value) => value.operation === "count_rows" && value.unit === "行" && value.column === "*"));
+    const rollup = verifyGroupRollup(source, contract, { op: "sum", column: "total", as: "n" }, "3");
+    assert.equal(rollup?.input_operation, "count_rows");
+    assert.equal(rollup?.unit, "行");
+    const invalid = structuredClone(source); invalid.coverage.absent_dates = ["2026-10-07"];
+    assert.equal(verifyDatabaseAggregates(invalid, contract), null);
+    const wrongType = structuredClone(source); wrongType.column_types!.total = "String";
+    assert.equal(verifyDatabaseAggregates(wrongType, contract), null);
+    const impossibleZero = structuredClone(source); impossibleZero.rows[0]!.total = "0";
+    assert.equal(verifyDatabaseAggregates(impossibleZero, contract), null, "已返回分组的底层行数不能为零");
+    const truncated = structuredClone(source); truncated.sql_limited = true;
+    assert.equal(verifyDatabaseAggregates(truncated, contract), null);
+  }
 });
 
 test("SUM、COUNT 和空值辅助计数同查询时可核验汇总，辅助列不能冒充指标", () => {
@@ -109,10 +134,12 @@ test("多维 IN 分组不能丢失请求组合，且每个已返回分组必须�
   const missingDate = structuredClone(source);
   missingDate.rows.pop(); missingDate.returned_rows = 5; missingDate.total_rows = 5;
   assert.equal(verifyGroupRollup(missingDate, contract, operation, "320"), null);
+  assert.ok(verifyDatabaseAggregates(missingDate, contract)?.every((item) => item.coverage_incomplete), "单个已返回分组也不能掩盖实际结果缺日期");
   const missingCountry = structuredClone(source);
   missingCountry.rows = missingCountry.rows.filter((row) => row.country_code === "US");
   missingCountry.returned_rows = 3; missingCountry.total_rows = 3;
   assert.equal(verifyGroupRollup(missingCountry, contract, operation, "220"), null);
+  assert.ok(verifyDatabaseAggregates(missingCountry, contract)?.every((item) => item.coverage_incomplete), "另一条覆盖读取不能代替本次结果中缺失的请求分组");
 });
 
 test("分组求和使用定点十进制并拒绝不匹配的声明类型和数字精度", () => {

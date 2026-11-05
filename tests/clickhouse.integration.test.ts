@@ -267,6 +267,19 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
         assert.equal(groupedDelivery.status, "completed", JSON.stringify(groupedDelivery));
         assert.match(String(groupedDelivery.answer), /数据库求和 220；单位 人/u);
         assert.match(String(groupedDelivery.answer), /数据库求和 30；单位 人/u);
+        // Simulate a query/coverage observation mismatch without claiming that
+        // the two independent reads belong to an atomic database snapshot.
+        const groupedSaved = runtime.sessions.lookupResource(observedSession.session_id, String(groupedCte.resource_id));
+        assert.ok(groupedSaved.ok && groupedSaved.resource.kind === "query_result"); if (!groupedSaved.ok || groupedSaved.resource.kind !== "query_result") return;
+        const incompleteGroups = structuredClone(groupedSaved.resource);
+        incompleteGroups.rows = incompleteGroups.rows.filter((row) => row.country_code === "US");
+        incompleteGroups.total_rows = incompleteGroups.rows.length; incompleteGroups.returned_rows = incompleteGroups.rows.length;
+        runtime.state.saveResource(incompleteGroups);
+        const missingGroupDelivery = await runtime.tools.updateAnalysis(observedSession.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(groupedCte.resource_id)] });
+        assert.ok(missingGroupDelivery.ok, JSON.stringify(missingGroupDelivery)); if (!missingGroupDelivery.ok) return;
+        assert.equal(missingGroupDelivery.status, "partial");
+        assert.ok((missingGroupDelivery.server_reasons as string[]).includes("aggregate_groups_incomplete"));
+        assert.match(String(missingGroupDelivery.answer), /请求分组或日期组合不完整/u);
         const countSql = groupedSql.replace("SUM(new_users)", "COUNT(new_users)");
         const countedCte = await runtime.tools.query(observedSession.session_id, { sql: countSql });
         assert.ok(countedCte.ok, JSON.stringify(countedCte)); if (!countedCte.ok) return;
@@ -278,6 +291,22 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
         assert.ok(countedDelivery.ok, JSON.stringify(countedDelivery)); if (!countedDelivery.ok) return;
         assert.equal(countedDelivery.status, "completed", JSON.stringify(countedDelivery));
         assert.match(String(countedDelivery.answer), /数据库非 NULL 计数 3；单位 行/u);
+        for (const call of ["COUNT(*)", "COUNT()"]) {
+          const rowsSql = groupedSql.replace("SUM(new_users)", call);
+          const rowCount = await runtime.tools.query(observedSession.session_id, { sql: rowsSql });
+          assert.ok(rowCount.ok, JSON.stringify(rowCount)); if (!rowCount.ok) return;
+          assert.equal(rowCount.sql_review_engine, "clickhouse_ast_scoped");
+          const rowProof = clickHouseAggregateProjection(rowsSql, contract); assert.ok(rowProof);
+          assert.deepEqual(sortedRows(rowCount.rows as Array<Record<string, unknown>>), sortedRows(await clickHouseQuery(reader, rowProof)));
+          assert.deepEqual(sortedRows(rowCount.rows as Array<Record<string, unknown>>), [{ country_code: "JP", total: "3" }, { country_code: "US", total: "3" }]);
+          const rollup = await runtime.tools.calculateSessionCells(observedSession.session_id, { resource_id: String(rowCount.resource_id), operations: [{ op: "sum", column: "total", as: "observed_rows" }] });
+          assert.ok(rollup.ok, JSON.stringify(rollup)); if (!rollup.ok) return;
+          const rowDelivery = await runtime.tools.updateAnalysis(observedSession.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(rollup.resource_id)] });
+          assert.ok(rowDelivery.ok, JSON.stringify(rowDelivery)); if (!rowDelivery.ok) return;
+          assert.equal(rowDelivery.status, "completed", JSON.stringify(rowDelivery));
+          assert.match(String(rowDelivery.answer), /数据库观测行计数 3；单位 行/u);
+          assert.match(String(rowDelivery.answer), /分组观测行计数结果再求和 6；单位 行/u);
+        }
         const incompleteCte = await runtime.tools.query(observedSession.session_id, { sql: groupedSql.replace("2026-10-08", "2026-10-12") });
         assert.ok(incompleteCte.ok, JSON.stringify(incompleteCte)); if (!incompleteCte.ok) return;
         const incompleteDelivery = await runtime.tools.updateAnalysis(observedSession.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(incompleteCte.resource_id)] });

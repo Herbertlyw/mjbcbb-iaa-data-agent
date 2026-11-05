@@ -1,5 +1,6 @@
 import { coverageHasGap, provenCoverageScope } from "./coverage.js";
 import { isCalendarDate } from "./config.js";
+import { completeObservedGroups } from "./aggregate-group-coverage.js";
 import { queryEvidenceShape } from "./evidence-shape.js";
 import type { DataContract, QueryResource } from "./types.js";
 
@@ -8,7 +9,7 @@ export interface VerifiedAggregate {
   table: string;
   column: string;
   output_column: string;
-  operation: "sum" | "count_nonnull";
+  operation: "sum" | "count_nonnull" | "count_rows";
   value: string;
   scale: number;
   unit: string;
@@ -17,6 +18,9 @@ export interface VerifiedAggregate {
   group: Record<string, string>;
   range: QueryResource["time_range"];
   prediction: "actual_observed_only";
+  /** The returned individual group is observable, but the requested set or
+   * calendar combinations were not all present in this query response. */
+  coverage_incomplete?: boolean;
 }
 
 /** A deliberately narrow, database-computed aggregate. The SQL is already
@@ -24,7 +28,7 @@ export interface VerifiedAggregate {
  * String integers preserve ClickHouse Int64 results without Number conversion. */
 export function verifyDatabaseAggregates(source: QueryResource, contract: DataContract): VerifiedAggregate[] | null {
   const series = contract.series;
-  if (!series || series.predicted_column || series.prediction_mode !== "observed_only" || source.tables.length !== 1 || source.tables[0] !== contract.table || source.truncated || !source.complete_population || !source.rows.length || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length) return null;
+  if (!series || series.predicted_column || series.prediction_mode !== "observed_only" || source.tables.length !== 1 || source.tables[0] !== contract.table || source.truncated || source.sql_limited || !source.complete_population || !source.rows.length || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length) return null;
   const scope = provenCoverageScope(source.sql, contract, source.time_range);
   if (!scope) return null;
   const filters = scope.equalities;
@@ -97,9 +101,11 @@ export function verifyDatabaseAggregates(source: QueryResource, contract: DataCo
     names.add(output);
     metrics.push({ output, field: input, operation: fn === "sum" ? "sum" : "count_nonnull", scale });
   }
-  if (!metrics.length || groupOutputs.size !== groupColumns.length || (!groupColumns.length && source.rows.length !== 1)) return null;
+  const standaloneRows = !metrics.length && auxiliary.some((item) => item.operation === "all");
+  if (!metrics.length && !standaloneRows || groupOutputs.size !== groupColumns.length || (!groupColumns.length && source.rows.length !== 1)) return null;
   const verified: VerifiedAggregate[] = [];
   const seenGroups = new Set<string>();
+  const observedGroups: Array<Record<string, string>> = [];
   for (const row of source.rows) {
     if (Object.keys(row).length !== names.size || Object.keys(row).some((key) => !names.has(key))) return null;
     const group: Record<string, string> = {};
@@ -116,11 +122,17 @@ export function verifyDatabaseAggregates(source: QueryResource, contract: DataCo
     const groupKey = JSON.stringify(group);
     if (seenGroups.has(groupKey)) return null;
     seenGroups.add(groupKey);
+    observedGroups.push(group);
     const counts: Array<{ field: string | null; operation: string; value: bigint }> = [];
     for (const item of auxiliary) {
       const value = integerString(row[item.output]);
       if (value === null || value.startsWith("-") || BigInt(value) > BigInt(source.scan_limit!)) return null;
+      // A returned GROUP BY bucket cannot have zero source rows. For an
+      // ungrouped result, complete date coverage also requires observations;
+      // zero would contradict the independent coverage receipt.
+      if (item.operation === "all" && BigInt(value) === 0n) return null;
       counts.push({ field: item.field, operation: item.operation, value: BigInt(value) });
+      if (standaloneRows && item.operation === "all") verified.push({ source_resource_id: source.resource_id, table: contract.table, column: "*", output_column: item.output, operation: "count_rows", value, scale: 0, unit: "行", description: "查询观测行数", filters, group, range: source.time_range, prediction: "actual_observed_only" });
     }
     for (const metric of metrics) {
       const value = metric.scale ? decimalString(row[metric.output], metric.scale) : integerString(row[metric.output]);
@@ -141,7 +153,7 @@ export function verifyDatabaseAggregates(source: QueryResource, contract: DataCo
       if ([known, missing, zero].some((values) => values.some((value) => value !== values[0])) || all.length && forField.some((item) => item.value > all[0]!.value) || all.length && known.length && missing.length && known[0]! + missing[0]! !== all[0]!.value || known.length && zero.length && zero[0]! > known[0]!) return null;
     }
   }
-  return verified;
+  return completeObservedGroups(observedGroups, groupColumns as string[], scope.inSets, series.date_column, source.time_range) ? verified : verified.map((item) => ({ ...item, coverage_incomplete: true }));
 }
 
 function auxiliaryProjection(expr: Record<string, unknown>, column: (value: unknown) => string | null): { field: string | null; operation: "all" | "null" | "nonnull" | "zero" } | null {

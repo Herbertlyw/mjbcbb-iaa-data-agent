@@ -5,7 +5,7 @@ const obj = (value: unknown): Record<string, unknown> | null => value && typeof 
 const ident = (value: unknown): value is string => typeof value === "string" && /^[a-z_][a-z0-9_]*$/u.test(value) && !["__proto__", "prototype", "constructor"].includes(value);
 
 /** Build an internal proof projection for a chain of one-to-one projections
- * over a single physical grouped SUM or non-NULL COUNT. The query actually sent to ClickHouse
+ * over a single physical grouped SUM or COUNT. The query actually sent to ClickHouse
  * remains the original. Both SQL forms must be independently authorized. */
 export function clickHouseAggregateProjection(sql: string, contract: DataContract): string | null {
   if (!contract.series || !contract.grain?.length) return null;
@@ -73,7 +73,12 @@ export function clickHouseAggregateProjection(sql: string, contract: DataContrac
     const direct = field(node, innerAlias); const name = node.alias ?? direct;
     if (!ident(name) || outputs.has(name) || name !== direct && referenced.has(name) || contract.columns.some((column) => column.name === name) && name !== direct) return null;
     if (direct) { if (!groups.includes(direct)) return null; outputs.set(name, { kind: "key", field: direct, expression: structuredClone(node) }); continue; }
-    if (node.type !== "Function" || !["sum", "count"].includes(String(node.name).toLowerCase()) || node.is_window_function || node.window_definition || node.parameters || !Array.isArray(node.arguments) || node.arguments.length !== 1) return null;
+    if (node.type !== "Function" || !["sum", "count"].includes(String(node.name).toLowerCase()) || node.is_window_function || node.window_definition || node.parameters || !Array.isArray(node.arguments)) return null;
+    const star = node.arguments.length === 1 ? obj(node.arguments[0]) : null;
+    if (String(node.name).toLowerCase() === "count" && (node.arguments.length === 0 || star?.type === "Asterisk" && (!star.transformers || Array.isArray(star.transformers) && !star.transformers.length))) {
+      outputs.set(name, { kind: "metric", field: "*", expression: structuredClone(node) }); continue;
+    }
+    if (node.arguments.length !== 1) return null;
     const metric = field(node.arguments[0], innerAlias); if (!metric || !contract.series.metrics.includes(metric)) return null;
     outputs.set(name, { kind: "metric", field: metric, expression: structuredClone(node) });
   }

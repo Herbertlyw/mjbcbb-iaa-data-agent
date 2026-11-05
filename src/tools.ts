@@ -945,7 +945,7 @@ export class ToolService {
     const rows = alignAggregates(inputs[0]!.aggregates, inputs[1]!.aggregates, spec.keys, spec.op, (op, a, b) => this.computeProvenArithmetic(op, a, b));
     if (!rows) return null;
     const hashes = Object.fromEntries(inputs.map(({ source }) => [source.resource_id, createHash("sha256").update(JSON.stringify(source)).digest("hex")]));
-    return { rows, hashes, leaves: [...new Set(inputs.map(({ source }) => source.resource_id))], partial: false };
+    return { rows, hashes, leaves: [...new Set(inputs.map(({ source }) => source.resource_id))], partial: inputs.some((item) => item.aggregates?.some((aggregate) => aggregate.coverage_incomplete)) };
   }
 
   /** Keyed mathematical alignment of verified derived results. Physical key
@@ -1044,7 +1044,7 @@ export class ToolService {
           keys.forEach((key, index) => { filters[key] = values[index] as string; });
           return { value, scale: first.scale, unit: first.unit, basis: { table: first.table, column: first.column, operation: "sum", unit: first.unit, prediction: first.prediction, timezone: first.range.timezone }, scopes: [{ filters, start: first.range.start, end: first.range.end }] };
         };
-        prepared.push({ input: { table: normalized, valueColumn: ref.cell, keyColumns: keys, valueForGroup: make }, make, filters: first.filters, source, partial: false });
+        prepared.push({ input: { table: normalized, valueColumn: ref.cell, keyColumns: keys, valueForGroup: make }, make, filters: first.filters, source, partial: Boolean(first.coverage_incomplete) });
         continue;
       }
       const shape = verifyCell(evidence, contract, { op: "count_rows", as: "shape" }, source.rows.length);
@@ -1143,7 +1143,7 @@ export class ToolService {
       }
       let expressionOnly = false;
       if (!table && contract && evidence) { table = typedObservation(resource); expressionOnly = Boolean(table); }
-      const partial = coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length > 0 || resource.coverage.status !== "known" || !resource.rows.length;
+      const partial = coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length > 0 || resource.coverage.status !== "known" || !resource.rows.length || Boolean(aggregates?.some((item) => item.coverage_incomplete));
       return table ? { table, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial, ...(expressionOnly ? { expression_only: true } : {}), ...(partial ? { partial_reason: "transform_coverage_incomplete" as const } : {}) } : null;
     }
     if (resource.kind === "alignment") {
@@ -1619,6 +1619,7 @@ export class ToolService {
           for (const row of previewRows(observation.table.rows, 100)) expressionLines.push(`查询资源 ${source.resource_id} 的表达式结果：${observation.table.columns.map((column) => `${column.label}=${row[column.name] === null ? "NULL（未知）" : column.type === "text" ? JSON.stringify(row[column.name]) : String(row[column.name])}（单位未认证）`).join("；")}。`);
         }
         if (source.engine === "clickhouse-local") reasons.push("clickhouse_observation_nonatomic");
+        if (databaseAggregates?.some((item) => item.coverage_incomplete)) { reasons.push("aggregate_groups_incomplete"); if (status === "completed") status = "partial"; }
         if (databaseAggregates) aggregates.push(...databaseAggregates);
         if (conditional) conditionalAggregates.push(...conditional);
         // SQL aliases are model-controlled and can look like another metric or
@@ -1853,6 +1854,7 @@ export class ToolService {
     if (reasons.includes("comparison_unverifiable")) limitations.push("部分比较的范围、覆盖、单位、预测状态或整数精度无法证明，没有展示比较结果。");
     if (reasons.includes("arithmetic_lineage_unsupported")) limitations.push("部分四则运算的递归来源、资源哈希、授权或新鲜度无法证明，没有展示结果。");
     if (reasons.includes("arithmetic_input_incomplete")) limitations.push("部分数学输入包含缺失或覆盖不完整；非 NULL 合计不代表完整总体。");
+    if (reasons.includes("aggregate_groups_incomplete")) limitations.push("本次聚合结果缺少请求的分组或日期组合；已显示数值只描述返回的分组，不能代表完整总体。");
     if (reasons.includes("transform_lineage_unsupported")) limitations.push("部分结果变换的递归来源、资源哈希、授权或新鲜度无法证明，没有展示结果。");
     if (reasons.includes("alignment_lineage_unsupported")) limitations.push("部分分组对齐的完整来源、范围或口径无法证明，没有展示结果。");
     if (reasons.includes("alignment_incomplete")) limitations.push("对齐来源存在未出现的分组或零分母；变换未把未知结果当作零。");
@@ -2291,7 +2293,8 @@ function renderComparison(comparison: VerifiedComparison): string {
 function renderAggregate(item: VerifiedAggregate): string {
   const filters = Object.entries(item.filters).map(([key, value]) => `${key}=${value}`).join("，") || "无";
   const group = Object.entries(item.group).map(([key, value]) => `${key}=${value}`).join("，");
-  return `${item.table}.${item.column}（${item.description}）：数据库${item.operation === "sum" ? "求和" : "非 NULL 计数"} ${item.value}；单位 ${item.unit}；实际（契约声明仅观察值）；筛选 ${filters}${group ? `；分组 ${group}` : ""}；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${item.source_resource_id}。`;
+  const metric = item.operation === "count_rows" ? `${item.table}（查询观测行）` : `${item.table}.${item.column}（${item.description}）`;
+  return `${metric}：数据库${item.operation === "sum" ? "求和" : item.operation === "count_rows" ? "观测行计数" : "非 NULL 计数"} ${item.value}；单位 ${item.unit}；实际（契约声明仅观察值）；筛选 ${filters}${group ? `；分组 ${group}` : ""}；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${item.source_resource_id}。${item.coverage_incomplete ? "本次结果的请求分组或日期组合不完整，不能代表完整总体。" : ""}`;
 }
 
 function renderConditionalAggregate(item: VerifiedConditionalAggregate): string {
@@ -2380,7 +2383,7 @@ function aggregateTable(items: VerifiedAggregate[], contract?: DataContract): Re
   const metrics = new Map<string, ResultColumn>();
   for (const item of items) {
     if (item.table !== first.table || item.source_resource_id !== first.source_resource_id || JSON.stringify(Object.keys(item.group).sort()) !== JSON.stringify(groupKeys)) return null;
-    const metric: ResultColumn = { name: item.output_column, type: "decimal", unit: item.unit, label: `${item.table}.${item.column} ${item.operation === "sum" ? "合计" : "非 NULL 计数"}`, scale: item.scale, ...(contract && item.operation === "sum" ? { value_lineage: { table: item.table, column: item.column } } : {}) };
+    const metric: ResultColumn = { name: item.output_column, type: "decimal", unit: item.unit, label: item.operation === "count_rows" ? `${item.table} 查询观测行数` : `${item.table}.${item.column} ${item.operation === "sum" ? "合计" : "非 NULL 计数"}`, scale: item.scale, ...(contract && item.operation === "sum" ? { value_lineage: { table: item.table, column: item.column } } : {}) };
     const previous = metrics.get(metric.name);
     if (previous && JSON.stringify(previous) !== JSON.stringify(metric)) return null;
     if (groupKeys.includes(metric.name)) return null;
@@ -2477,8 +2480,8 @@ function renderGroupRollup(item: VerifiedGroupRollup): string {
     ...Object.entries(item.filters).map(([key, value]) => `${key}=${value}`),
     ...Object.entries(item.in_sets).map(([key, values]) => `${key} IN (${values.join("、")})`),
   ].join("，") || "未限定维度";
-  const metric = `${item.table}.${item.column}（${item.description}）`;
-  const input = item.input_operation === "sum" ? "求和" : "非 NULL 计数";
+  const metric = item.input_operation === "count_rows" ? `${item.table}（查询观测行）` : `${item.table}.${item.column}（${item.description}）`;
+  const input = item.input_operation === "sum" ? "求和" : item.input_operation === "count_rows" ? "观测行计数" : "非 NULL 计数";
   const action = item.operation === "sum" ? `分组${input}结果再求和` : item.operation === "count_rows" ? "查询返回的结果分组数" : item.operation === "count_null" ? "分组聚合输出为 NULL 的分组数" : "分组聚合输出为零的分组数";
   return `${metric}：${action} ${item.value}；单位 ${item.unit}；实际（契约声明仅观察值）；筛选 ${restrictions}；原查询按 ${item.grouped_by.join("、")} 分组；${item.range.start} 到 ${item.range.end}（${item.range.timezone}）；来源 ${item.source_resource_id}。${item.operation === "sum" ? "仅汇总查询已返回的分组，未出现的组合没有补零。" : "这是结果分组的计数，不是底层业务明细的计数。"}`;
 }

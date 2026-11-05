@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { verifyDatabaseAggregates } from "../src/aggregate-evidence.js";
+import { fromAggregate } from "../src/exact-arithmetic.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import type { QueryResource } from "../src/types.js";
 
@@ -16,6 +17,8 @@ test("数据库日期分组必须是契约日期且每个实际值有效、唯�
   } as unknown as QueryResource;
   const verified = verifyDatabaseAggregates(source, contract);
   assert.deepEqual(verified?.map((row) => [row.group.event_date, row.group.channel_id, row.value]), [["2026-10-06", "mist_ads", "3"], ["2026-10-07", "mist_ads", "0"]]);
+  assert.ok(verified?.every((row) => row.coverage_incomplete), "独立覆盖读取不能掩盖本次结果缺少日期分组");
+  assert.equal(verified && fromAggregate(verified[0]!).partial, true, "后续四则运算必须保留分组缺失状态");
   for (const bad of ["2026-02-30", "2026-10-05", "2026-10-09", "2026-10-6", null]) {
     const changed = structuredClone(source); changed.rows[0]!.event_date = bad;
     assert.equal(verifyDatabaseAggregates(changed, contract), null);

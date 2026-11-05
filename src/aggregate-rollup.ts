@@ -1,6 +1,7 @@
 import { verifyDatabaseAggregates } from "./aggregate-evidence.js";
 import { coverageHasGap, provenCoverageScope } from "./coverage.js";
 import { isCalendarDate } from "./config.js";
+import { completeObservedGroups } from "./aggregate-group-coverage.js";
 import type { CellOperation } from "./evidence.js";
 import { isExactZero, sumDecimalStrings } from "./exact-arithmetic.js";
 import type { DataContract, QueryResource } from "./types.js";
@@ -10,7 +11,7 @@ import type { DataContract, QueryResource } from "./types.js";
 export interface VerifiedGroupRollup {
   value: string;
   operation: CellOperation["op"];
-  input_operation: "sum" | "count_nonnull";
+  input_operation: "sum" | "count_nonnull" | "count_rows";
   table: string;
   column: string;
   description: string;
@@ -35,32 +36,7 @@ export function verifyGroupRollup(source: QueryResource, contract: DataContract,
   if (!groupedBy.length) return null;
   const selected = operation.op === "count_rows" ? aggregates.filter((item) => item.output_column === aggregates[0]!.output_column) : aggregates.filter((item) => item.output_column === operation.column);
   if (!selected.length || selected.length !== source.rows.length || selected.some((item) => item.table !== aggregates[0]!.table || item.column !== selected[0]!.column || item.operation !== selected[0]!.operation || item.unit !== selected[0]!.unit || item.scale !== selected[0]!.scale || JSON.stringify(Object.keys(item.group).sort()) !== JSON.stringify(groupedBy))) return null;
-  let expectedSets: Array<Record<string, string>> = [{}];
-  for (const [name, values] of Object.entries(scope.inSets)) {
-    if (!groupedBy.includes(name) || expectedSets.length * values.length > 200) return null;
-    expectedSets = expectedSets.flatMap((entry) => values.map((value) => ({ ...entry, [name]: value })));
-  }
-  if (Object.keys(scope.inSets).length && expectedSets.some((expected) => !selected.some((item) => Object.entries(expected).every(([name, value]) => item.group[name] === value)))) return null;
-  // When date is itself a grouping key, the saved grouped rows must represent
-  // each calendar day for every returned combination of the other keys. A
-  // separate coverage read alone cannot prove that a missing saved result row
-  // was present in this query response. This intentionally rejects sparse
-  // date/group combinations instead of filling them with zeros.
-  const dateColumn = contract.series?.date_column;
-  if (dateColumn && groupedBy.includes(dateColumn)) {
-    const start = Date.parse(`${source.time_range.start}T00:00:00Z`);
-    const end = Date.parse(`${source.time_range.end}T00:00:00Z`);
-    const days = (end - start) / 86_400_000 + 1;
-    if (!Number.isSafeInteger(days) || days < 1 || days > 100_000) return null;
-    const other = groupedBy.filter((key) => key !== dateColumn);
-    const datesByKey = new Map<string, Set<string>>();
-    for (const item of selected) {
-      const key = JSON.stringify(other.map((name) => item.group[name]));
-      const dates = datesByKey.get(key) ?? new Set<string>();
-      dates.add(item.group[dateColumn]!); datesByKey.set(key, dates);
-    }
-    if ([...datesByKey.values()].some((dates) => dates.size !== days)) return null;
-  }
+  if (!completeObservedGroups(selected.map((item) => item.group), groupedBy, scope.inSets, contract.series?.date_column, source.time_range)) return null;
   let value: string | null;
   switch (operation.op) {
     case "sum": value = sumDecimalStrings(selected.map((item) => item.value), selected[0]!.scale); break;
