@@ -252,6 +252,7 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成多层重命名投影")) return scripted(turn, renamedCteSteps);
   if (latest.includes("合成底层重命名投影")) return scripted(turn, baseRenamedCteSteps);
   if (latest.includes("合成常量日期查询")) return scripted(turn, constantDateSteps);
+  if (latest.includes("合成外层维度筛选")) return scripted(turn, outerFilterSteps);
   if (latest.includes("合成左关联产品")) return scripted(turn, leftTitleSteps);
   if (latest.includes("合成跨事实比率")) return scripted(turn, crossFactRatioSteps);
   if (latest.includes("合成三千六百行")) return scripted(turn, largerTransformSteps);
@@ -452,6 +453,15 @@ function constantDateSteps(ids: string[]) {
   const steps = cteSteps(ids);
   const original = JSON.parse(steps[1]!.arguments) as { sql: string };
   steps[1] = { ...steps[1]!, arguments: JSON.stringify({ sql: original.sql.replaceAll("'2026-10-06'", "toDate('2026-10-06')").replaceAll("'2026-10-12'", "toDate('2026-10-12')") }) };
+  return steps;
+}
+
+function outerFilterSteps(ids: string[]) {
+  const steps = cteSteps(ids);
+  const original = JSON.parse(steps[1]!.arguments) as { sql: string };
+  const inner = original.sql.replace(" AND country_code = 'JP'", "");
+  if (inner === original.sql) throw new Error("invalid_cte_fixture");
+  steps[1] = { ...steps[1]!, arguments: JSON.stringify({ sql: `${inner} WHERE country_code = 'JP'` }) };
   return steps;
 }
 

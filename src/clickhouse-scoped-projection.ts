@@ -10,7 +10,7 @@ export function clickHouseScopedProjection(sql: string, tableName: string): stri
   let statements: unknown[]; try { statements = parse(sql, { locations: false }); } catch { return null; }
   const root = obj(statements[0]); const branches = root?.selects;
   if (statements.length !== 1 || root?.type !== "SelectWithUnionQuery" || !Array.isArray(branches) || branches.length !== 1) return null;
-  const final = obj(branches[0]); if (!final || final.type !== "SelectQuery" || final.where || final.prewhere || final.having || final.limit || final.limit_by || final.distinct || final.qualify || final.group_by_all || final.group_by_grouping_sets || final.group_by_with_totals || final.group_by_with_rollup || final.group_by_with_cube || final.interpolate || Array.isArray(final.order_by) && final.order_by.some((item) => Boolean(obj(item)?.with_fill)) || !Array.isArray(final.select)) return null;
+  const final = obj(branches[0]); if (!final || final.type !== "SelectQuery" || final.prewhere || final.having || final.limit || final.limit_by || final.distinct || final.qualify || final.group_by_all || final.group_by_grouping_sets || final.group_by_with_totals || final.group_by_with_rollup || final.group_by_with_cube || final.interpolate || Array.isArray(final.order_by) && final.order_by.some((item) => Boolean(obj(item)?.with_fill)) || !Array.isArray(final.select)) return null;
   type Source = { base: Record<string, unknown>; available: Map<string, string>; physical: Set<string>; depth: number };
   const resolve = (query: Record<string, unknown>, depth: number): Source | null => {
     if (depth > 12 || query.type !== "SelectQuery" || query.distinct || query.having || query.limit || query.limit_by || query.qualify || query.group_by || query.order_by || !Array.isArray(query.select)) return null;
@@ -108,5 +108,34 @@ export function clickHouseScopedProjection(sql: string, tableName: string): stri
   const base = structuredClone(source.base); base.select = selection;
   if (grouping) base.group_by = grouping;
   else delete base.group_by;
+  if (final.where) {
+    const outer = structuredClone(final.where);
+    if (!rewrite(outer)) return null;
+    const equalities = (value: unknown): Array<{ field: string; literal: string; expression: Record<string, unknown> }> | null => {
+      const node = obj(value); if (node?.type !== "Function" || !Array.isArray(node.arguments)) return null;
+      if (String(node.name).toLowerCase() === "and") {
+        const parts = node.arguments.map(equalities); return parts.every((part) => part) ? parts.flatMap((part) => part!) : null;
+      }
+      const [left, right] = node.arguments.map(obj);
+      if (String(node.name).toLowerCase() !== "equals" || node.arguments.length !== 2 || left?.type !== "Identifier" || typeof left.name !== "string" || left.name.includes(".") || right?.type !== "Literal" || right.value_type !== "String" || typeof right.value !== "string") return null;
+      return [{ field: left.name, literal: right.value, expression: node }];
+    };
+    const additions = equalities(outer); if (!additions?.length) return null;
+    // A duplicate equality may be omitted, but a conflicting constraint must
+    // never be silently discarded. Other base predicates remain untouched.
+    const existing: Record<string, string> = Object.create(null) as Record<string, string>;
+    const collect = (value: unknown): void => {
+      const node = obj(value); if (!node || node.type !== "Function" || !Array.isArray(node.arguments)) return;
+      if (String(node.name).toLowerCase() === "and") { node.arguments.forEach(collect); return; }
+      const item = equalities(node); if (item?.length === 1) existing[item[0]!.field] = item[0]!.literal;
+    };
+    collect(base.where); collect(base.prewhere);
+    const append: Record<string, unknown>[] = [];
+    for (const item of additions) {
+      if (Object.hasOwn(existing, item.field)) { if (existing[item.field] !== item.literal) return null; continue; }
+      existing[item.field] = item.literal; append.push(item.expression);
+    }
+    if (append.length) base.where = { type: "Function", name: "and", arguments: [...(base.where ? [base.where] : []), ...append], is_operator: true };
+  }
   try { return format([{ type: "SelectWithUnionQuery", selects: [base] }] as Parameters<typeof format>[0]); } catch { return null; }
 }

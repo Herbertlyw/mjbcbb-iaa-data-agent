@@ -46,6 +46,12 @@ test("原生直接授权只接受契约、封闭日期和受限覆盖筛选的�
   const inner = query.replace("SUM(new_users) AS total", "event_date, title_id, platform, country_code, channel_id, new_users");
   const scoped = `WITH a AS (SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM (${inner})) SELECT event_date, new_users FROM a`;
   assert.ok(reviewScopedClickHouse(scoped, contract, rule, "synthetic", 1000));
+  const outerFiltered = scoped + " WHERE country_code = 'US'";
+  assert.ok(reviewScopedClickHouse(outerFiltered, contract, rule, "synthetic", 1000));
+  assert.ok(reviewScopedClickHouse(outerFiltered.replace(" AND country_code = 'US'", ""), contract, rule, "synthetic", 1000));
+  assert.equal(reviewScopedClickHouse(scoped + " WHERE country_code = 'JP'", contract, rule, "synthetic", 1000), null);
+  assert.equal(reviewScopedClickHouse(scoped + " WHERE device_token = 'x'", contract, rule, "synthetic", 1000), null);
+  assert.equal(reviewScopedClickHouse(scoped + " WHERE country_code = 'US' OR country_code = 'JP'", contract, rule, "synthetic", 1000), null);
   assert.equal(reviewScopedClickHouse(scoped.replace("event_date, new_users FROM a", "event_date, device_token FROM a"), contract, rule, "synthetic", 1000), null);
   assert.equal(reviewScopedClickHouse(scoped + " LIMIT 1", contract, rule, "synthetic", 1000), null);
   for (const invalid of [

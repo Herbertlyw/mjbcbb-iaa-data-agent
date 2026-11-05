@@ -621,6 +621,20 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.match(constantDate.analysis?.answer ?? "", /70/);
     const constantDateResource = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${constantDateSession}/resources/${constantDate.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
     assert.equal(((await constantDateResource.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, "clickhouse_ast_scoped");
+    const outerFilterSession = await createSyntheticSession();
+    const outerFilter = await postQuestion(apiPort, outerFilterSession, "合成外层维度筛选：纸灯日本七日新增。");
+    assert.equal(outerFilter.status, "completed", JSON.stringify({ error: outerFilter.error, answer: outerFilter.analysis?.answer, reasons: outerFilter.analysis?.server_reasons }));
+    assert.match(outerFilter.analysis?.answer ?? "", /70/);
+    const outerFilterResponse = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${outerFilterSession}/resources/${outerFilter.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
+    const outerFilterSource = ((await outerFilterResponse.json()) as { resource: { sql_review_engine?: string; sql: string } }).resource;
+    assert.equal(outerFilterSource.sql_review_engine, "clickhouse_ast_scoped");
+    const outerFilterProof = clickHouseScopedProjection(outerFilterSource.sql, "fact_fox_daily_install"); assert.ok(outerFilterProof);
+    const outerFilterReader = createClickHouseClient({ url: clickhouseUrl, username: "fox_reader", password: readerPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 10 }, true);
+    try {
+      const originalRows = await clickHouseQuery(outerFilterReader, outerFilterSource.sql);
+      const proofRows = await clickHouseQuery(outerFilterReader, outerFilterProof);
+      assert.deepEqual(originalRows.map((row) => JSON.stringify(row)).sort(), proofRows.map((row) => JSON.stringify(row)).sort());
+    } finally { await outerFilterReader.close(); }
     const nestedCteSessionId = await createSyntheticSession();
     const nestedCte = await postQuestion(apiPort, nestedCteSessionId, "合成多层恒等投影：纸灯日本七日新增。");
     assert.equal(nestedCte.status, "completed", JSON.stringify({ error: nestedCte.error, answer: nestedCte.analysis?.answer, reasons: nestedCte.analysis?.server_reasons }));
