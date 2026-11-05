@@ -1129,17 +1129,7 @@ export class ToolService {
         table = rawResultTable({ ...evidence, rows }, contract);
       }
       let expressionOnly = false;
-      if (!table && contract && evidence) {
-        // A failed business proof for an aggregate over a known incomplete
-        // population must not be bypassed by relabelling its result as an
-        // anonymous mathematical observation. Unknown coverage is separately
-        // disclosed as partial; explicit NULL, missing and predicted dates
-        // are stronger evidence that the requested population is incomplete.
-        const inspected = preflightClickHouseSql(resource.sql);
-        const aggregateWithKnownGap = resource.coverage.status === "known" && coverageHasGap(resource.coverage) && inspected.ok && inspected.functions.some((name) => ["sum", "sumif", "count", "countif", "avg", "min", "max"].includes(name));
-        if (!aggregateWithKnownGap) table = typedObservation(resource);
-        expressionOnly = Boolean(table);
-      }
+      if (!table && contract && evidence) { table = typedObservation(resource); expressionOnly = Boolean(table); }
       const partial = coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length > 0 || resource.coverage.status !== "known" || !resource.rows.length;
       return table ? { table, hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id], partial, ...(expressionOnly ? { expression_only: true } : {}), ...(partial ? { partial_reason: "transform_coverage_incomplete" as const } : {}) } : null;
     }
@@ -1604,6 +1594,12 @@ export class ToolService {
         eligible.add(source.resource_id);
         if (observation?.expression_only) {
           reasons.push("query_expression_semantics_unverified");
+          // A typed observation is mathematically reproducible but it does
+          // not prove the business aggregate's meaning or completeness.
+          // Preserve that distinction when known NULLs, missing days or
+          // forecasts caused the business proof to fail.
+          const inspected = original && preflightClickHouseSql(original.sql);
+          if (source.coverage.status === "known" && coverageHasGap(source.coverage) && inspected?.ok && inspected.functions.some((name) => ["sum", "sumif", "count", "countif", "avg", "min", "max"].includes(name))) reasons.push("query_lineage_unsupported");
           if (observation.table.columns.some((column) => column.approximate)) { reasons.push("floating_point_approximate"); if (status === "completed") status = "partial"; }
           if (observation.partial && status === "completed") status = "partial";
           if (!observation.table.rows.length) expressionLines.push(`查询资源 ${source.resource_id} 没有结果行；空结果不等于零。`);

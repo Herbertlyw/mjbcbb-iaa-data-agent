@@ -397,6 +397,19 @@ async function runGoldenCases(runtime: ReturnType<typeof createRuntime>) {
     } else {
       assert.doesNotMatch(String(analysis.answer), /数据库求和 670/u, item.id);
       assert.ok((analysis.server_reasons as string[]).includes("query_lineage_unsupported"), `${item.id}: ${JSON.stringify(analysis)}`);
+      if (item.id === "paper-us-missing") {
+        const calculated = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(query.resource_id), operations: [{ op: "sum", column: "total", as: "observed_sum" }] });
+        assert.ok(calculated.ok, JSON.stringify(calculated)); if (!calculated.ok) throw new Error("observed calculation failed");
+        const partial = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(calculated.resource_id)] });
+        assert.ok(partial.ok, JSON.stringify(partial)); if (!partial.ok) throw new Error("partial delivery failed");
+        assert.equal(partial.status, "partial");
+        assert.ok((partial.server_reasons as string[]).includes("query_expression_semantics_unverified"));
+        assert.ok((partial.server_reasons as string[]).includes("query_lineage_unsupported"));
+        assert.ok((partial.server_reasons as string[]).includes("transform_coverage_incomplete"));
+        assert.match(String(partial.answer), /数学计算 observed_sum：670/u);
+        assert.match((partial.limitations as string[]).join(" "), /业务含义未认证/u);
+        assert.doesNotMatch(String(partial.answer), /数据库求和 670/u);
+      }
     }
   }
 }
