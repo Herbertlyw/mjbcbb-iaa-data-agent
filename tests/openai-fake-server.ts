@@ -615,10 +615,11 @@ function derivedCrossFactSteps(ids: string[]) {
     { id: "cross_sort_installs", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[1] ?? "", steps: sort } }) },
     { id: "cross_align_derived", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "divide", keys: ["country_code", "channel_id"], left: { resource_id: ids[2] ?? "", cell: "total" }, right: { resource_id: ids[3] ?? "", cell: "total" } } }) },
     { id: "cross_sort_aligned", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[4] ?? "", steps: sort } }) },
-    { id: "cross_align_again", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "add", keys: ["country_code", "channel_id"], left: { resource_id: ids[5] ?? "", cell: "result_value" }, right: { resource_id: ids[5] ?? "", cell: "result_value" } } }) },
-    { id: "cross_sort_again", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[6] ?? "", steps: sort } }) },
-    { id: "cross_sum_aligned", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[7] ?? "", operations: [{ op: "sum", column: "result_value", as: "total_ratio" }] }) },
-    { id: "cross_add_aligned", name: "calculate_session_cells", arguments: JSON.stringify({ arithmetic: { op: "add", left: { resource_id: ids[8] ?? "", cell: "total_ratio" }, right: { resource_id: ids[8] ?? "", cell: "total_ratio" } } }) },
+    { id: "cross_sort_aligned_copy", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[4] ?? "", steps: sort } }) },
+    { id: "cross_align_again", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "add", keys: ["country_code", "channel_id"], left: { resource_id: ids[5] ?? "", cell: "result_value" }, right: { resource_id: ids[6] ?? "", cell: "result_value" } } }) },
+    { id: "cross_sort_again", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[7] ?? "", steps: sort } }) },
+    { id: "cross_sum_aligned", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[8] ?? "", operations: [{ op: "sum", column: "result_value", as: "total_ratio" }] }) },
+    { id: "cross_add_aligned", name: "calculate_session_cells", arguments: JSON.stringify({ arithmetic: { op: "add", left: { resource_id: ids[9] ?? "", cell: "total_ratio" }, right: { resource_id: ids[9] ?? "", cell: "total_ratio" } } }) },
   ];
 }
 

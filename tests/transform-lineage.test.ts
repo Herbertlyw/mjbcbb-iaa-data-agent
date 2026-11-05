@@ -275,6 +275,33 @@ test("同契约同范围的两个变换结果可按完整键数学对齐，篡�
   });
 });
 
+test("多来源对齐的独立变换可再次对齐，篡改任一来源仍失败关闭", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]); runtime.sessions.setActiveJob(session.session_id, "job_multileaf_realign");
+    const sql = "SELECT country_code, SUM(new_users) AS total FROM daily_installs WHERE event_date = '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads' GROUP BY country_code";
+    const first = await runtime.tools.query(session.session_id, { sql }); const second = await runtime.tools.query(session.session_id, { sql });
+    assert.ok(first.ok && second.ok, JSON.stringify({ first, second })); if (!first.ok || !second.ok) return;
+    const sorted = async (resource_id: string, execution_id: string, direction: "asc" | "desc") => runtime.tools.calculateFromProtocol(session.session_id, { operation: "transform", input: { resource_id, execution_id }, steps: [{ op: "sort", keys: [{ column: "country_code", direction, nulls: "last" }] }] });
+    const left = await sorted(String(first.resource_id), String(first.execution_id), "asc"); const right = await sorted(String(second.resource_id), String(second.execution_id), "desc");
+    assert.ok(left.ok && right.ok); if (!left.ok || !right.ok) return;
+    const aligned = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "align", align_op: "divide", keys: ["country_code"], left: { resource_id: String(left.resource_id), execution_id: String(left.execution_id), column: "total" }, right: { resource_id: String(right.resource_id), execution_id: String(right.execution_id), column: "total" } });
+    assert.ok(aligned.ok, JSON.stringify(aligned)); if (!aligned.ok) return;
+    const a = await sorted(String(aligned.resource_id), String(aligned.execution_id), "asc"); const b = await sorted(String(aligned.resource_id), String(aligned.execution_id), "desc");
+    assert.ok(a.ok && b.ok); if (!a.ok || !b.ok) return;
+    const ref = (value: typeof a) => ({ resource_id: String(value.resource_id), execution_id: String(value.execution_id), column: "result_value" });
+    const again = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "align", align_op: "subtract", keys: ["country_code"], left: ref(a), right: ref(b) });
+    assert.ok(again.ok, JSON.stringify(again)); if (!again.ok) return;
+    assert.ok((again.rows as Array<{ result: { value: string; interpretation?: string } | null }>).every((row) => row.result?.value === "0.000000000000000000" && row.result.interpretation === "mathematical_only"));
+    const delivered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(again.resource_id)] });
+    assert.ok(delivered.ok, JSON.stringify(delivered)); if (delivered.ok) assert.match(String(delivered.answer), /数学对齐/);
+    const saved = runtime.sessions.lookupResource(session.session_id, String(second.resource_id));
+    assert.ok(saved.ok && saved.resource.kind === "query_result"); if (!saved.ok || saved.resource.kind !== "query_result") return;
+    const altered = structuredClone(saved.resource); altered.rows[0]!.total = 999; runtime.state.saveResource(altered);
+    const rejected = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "align", align_op: "subtract", keys: ["country_code"], left: ref(a), right: ref(b) });
+    assert.equal(rejected.ok, false);
+  });
+});
+
 test("变换结果的全 NULL 与零分母向后续算术传播为未知，不自动补零", async () => {
   await withRuntime({}, async (runtime) => {
     const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]); runtime.sessions.setActiveJob(session.session_id, "job_derived_null");

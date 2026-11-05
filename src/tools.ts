@@ -976,8 +976,13 @@ export class ToolService {
         if (!current || !series || series.predicted_column || series.prediction_mode !== "observed_only" || series.date_column !== contract.series.date_column || JSON.stringify([...series.dimensions].sort()) !== JSON.stringify([...contract.series.dimensions].sort()) || JSON.stringify([...tableGrain(this.ctx.knowledge, current.table)].sort()) !== JSON.stringify([...tableGrain(this.ctx.knowledge, contract.table)].sort()) || !filters || stableHashes(filters) !== stableHashes(leftFilters) || !expected || expected !== firstType || !lineages.some((item) => item.table === current.table && item.column === key && item.physical_type === expected)) return null;
       }
     }
-    if ((groups[0]!.length > 1 || groups[1]!.length > 1) && spec.left.resource_id !== spec.right.resource_id) return null;
-    if (contract.table !== other.table && spec.left.resource_id !== spec.right.resource_id) {
+    const multipleLeaves = groups.some((sources) => sources.length > 1);
+    // A derived table can carry several independently revalidated leaves.
+    // The key lineage, contracts, ranges and filters for every leaf have all
+    // been checked above. Its value is still mathematical-only, not a newly
+    // certified business metric. Preserve the stricter declared-metric rule
+    // for directly aligning distinct single-source metrics.
+    if (!multipleLeaves && contract.table !== other.table && spec.left.resource_id !== spec.right.resource_id) {
       const leftMetric = checked[0]!.table.columns.find((column) => column.name === spec.left.cell);
       const rightMetric = checked[1]!.table.columns.find((column) => column.name === spec.right.cell);
       const a = leftMetric?.value_lineage; const b = rightMetric?.value_lineage;
