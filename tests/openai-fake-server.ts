@@ -249,6 +249,7 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成 CTE 查询")) return scripted(turn, cteSteps);
   if (latest.includes("合成多层恒等投影")) return scripted(turn, nestedCteSteps);
   if (latest.includes("合成多层重命名投影")) return scripted(turn, renamedCteSteps);
+  if (latest.includes("合成底层重命名投影")) return scripted(turn, baseRenamedCteSteps);
   if (latest.includes("合成左关联产品")) return scripted(turn, leftTitleSteps);
   if (latest.includes("合成跨事实比率")) return scripted(turn, crossFactRatioSteps);
   if (latest.includes("合成三千六百行")) return scripted(turn, largerTransformSteps);
@@ -462,6 +463,15 @@ function renamedCteSteps(ids: string[]) {
   if (!original.sql.startsWith(prefix) || !original.sql.endsWith(suffix)) throw new Error("invalid_cte_fixture");
   const inner = original.sql.slice(prefix.length, -suffix.length);
   steps[1] = { ...steps[1]!, arguments: JSON.stringify({ sql: `WITH scoped AS (SELECT event_date, new_users AS measure FROM (${inner})) SELECT event_date, measure AS new_users FROM scoped` }) };
+  return steps;
+}
+
+function baseRenamedCteSteps(ids: string[]) {
+  const steps = cteSteps(ids);
+  const original = JSON.parse(steps[1]!.arguments) as { sql: string };
+  const sql = original.sql.replace("channel_id, new_users FROM fact_fox_daily_install", "channel_id, new_users AS measure FROM fact_fox_daily_install").replace(") SELECT event_date, new_users FROM scoped", ") SELECT event_date, measure AS new_users FROM scoped");
+  if (sql === original.sql || !sql.includes("new_users AS measure") || !sql.includes("measure AS new_users")) throw new Error("invalid_cte_fixture");
+  steps[1] = { ...steps[1]!, arguments: JSON.stringify({ sql }) };
   return steps;
 }
 

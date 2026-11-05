@@ -640,6 +640,20 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       const proofRows = await clickHouseQuery(renamedReader, renamedProof);
       assert.deepEqual(originalRows.map((row) => JSON.stringify(row)).sort(), proofRows.map((row) => JSON.stringify(row)).sort());
     } finally { await renamedReader.close(); }
+    const baseRenamedSession = await createSyntheticSession();
+    const baseRenamed = await postQuestion(apiPort, baseRenamedSession, "合成底层重命名投影：纸灯日本七日新增。");
+    assert.equal(baseRenamed.status, "completed", JSON.stringify({ error: baseRenamed.error, answer: baseRenamed.analysis?.answer, reasons: baseRenamed.analysis?.server_reasons }));
+    assert.match(baseRenamed.analysis?.answer ?? "", /70/);
+    const baseRenamedResponse = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${baseRenamedSession}/resources/${baseRenamed.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
+    const baseRenamedSource = ((await baseRenamedResponse.json()) as { resource: { sql_review_engine?: string; sql: string } }).resource;
+    assert.equal(baseRenamedSource.sql_review_engine, "clickhouse_ast_scoped");
+    const baseRenamedProof = clickHouseScopedProjection(baseRenamedSource.sql, "fact_fox_daily_install"); assert.ok(baseRenamedProof);
+    const baseRenamedReader = createClickHouseClient({ url: clickhouseUrl, username: "fox_reader", password: readerPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 10 }, true);
+    try {
+      const originalRows = await clickHouseQuery(baseRenamedReader, baseRenamedSource.sql);
+      const proofRows = await clickHouseQuery(baseRenamedReader, baseRenamedProof);
+      assert.deepEqual(originalRows.map((row) => JSON.stringify(row)).sort(), proofRows.map((row) => JSON.stringify(row)).sort());
+    } finally { await baseRenamedReader.close(); }
     const left = await postQuestion(apiPort, await createSyntheticSession(), "合成左关联产品：保留未匹配产品。");
     assert.equal(left.status, "completed", `${JSON.stringify(left.error)} ${left.analysis?.answer ?? ""}`);
     assert.match(left.analysis?.answer ?? "", /JOIN 求和 70/);

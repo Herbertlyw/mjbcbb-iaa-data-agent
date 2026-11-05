@@ -11,16 +11,6 @@ export function clickHouseScopedProjection(sql: string, tableName: string): stri
   const root = obj(statements[0]); const branches = root?.selects;
   if (statements.length !== 1 || root?.type !== "SelectWithUnionQuery" || !Array.isArray(branches) || branches.length !== 1) return null;
   const final = obj(branches[0]); if (!final || final.type !== "SelectQuery" || final.where || final.prewhere || final.having || final.limit || final.limit_by || final.distinct || final.qualify || final.group_by_all || final.group_by_grouping_sets || final.group_by_with_totals || final.group_by_with_rollup || final.group_by_with_cube || final.interpolate || Array.isArray(final.order_by) && final.order_by.some((item) => Boolean(obj(item)?.with_fill)) || !Array.isArray(final.select)) return null;
-  const identity = (select: unknown): Set<string> | null => {
-    if (!Array.isArray(select) || !select.length) return null;
-    const names = new Set<string>();
-    for (const raw of select) {
-      const node = obj(raw); const parts = node && typeof node.name === "string" ? (Array.isArray(node.name_parts) ? node.name_parts : node.name.split(".")) : [];
-      if (node?.type !== "Identifier" || parts.length !== 1 || typeof parts[0] !== "string" || node.alias !== undefined && node.alias !== parts[0] || names.has(parts[0])) return null;
-      names.add(parts[0]);
-    }
-    return names;
-  };
   type Source = { base: Record<string, unknown>; available: Map<string, string>; physical: Set<string>; depth: number };
   const resolve = (query: Record<string, unknown>, depth: number): Source | null => {
     if (depth > 12 || query.type !== "SelectQuery" || query.distinct || query.having || query.limit || query.limit_by || query.qualify || query.group_by || query.order_by || !Array.isArray(query.select)) return null;
@@ -34,18 +24,32 @@ export function clickHouseScopedProjection(sql: string, tableName: string): stri
       if (node?.type !== "SelectWithUnionQuery" || !Array.isArray(list) || list.length !== 1 || query.with) return null;
       nested = obj(list[0]);
     } else if (table && !table.database && table.name === tableName && !query.with) {
-      // Keep the physical layer unchanged: aliases visible in its WHERE can
-      // have ClickHouse-specific substitution semantics.
-      const fields = identity(query.select); if (!fields) return null;
-      const physical = new Set(fields);
+      // Aliases visible in a ClickHouse WHERE can substitute for physical
+      // fields. Never remove or lift such an alias into a different scope.
+      if (!query.select.length) return null;
+      const physical = new Set<string>(); const filtered = new Set<string>();
       const collect = (value: unknown): void => {
         if (Array.isArray(value)) { value.forEach(collect); return; }
         const node = obj(value); if (!node) return;
-        if (node.type === "Identifier" && typeof node.name === "string") physical.add(node.name);
+        if (node.type === "Identifier" && typeof node.name === "string") filtered.add(node.name);
         Object.values(node).forEach(collect);
       };
       collect(query.where); collect(query.prewhere);
-      return { base: query, available: new Map([...fields].map((field) => [field, field])), physical, depth };
+      const items: Array<{ name: string; output: string }> = [];
+      for (const raw of query.select) {
+        const node = obj(raw); const parts = node && typeof node.name === "string" ? (Array.isArray(node.name_parts) ? node.name_parts : node.name.split(".")) : [];
+        if (node?.type !== "Identifier" || parts.length !== 1 || typeof parts[0] !== "string") return null;
+        const name = parts[0]; const output = node.alias === undefined ? name : node.alias;
+        if (typeof output !== "string" || !output) return null;
+        physical.add(name); items.push({ name, output });
+      }
+      filtered.forEach((field) => physical.add(field));
+      const available = new Map<string, string>();
+      for (const { name, output } of items) {
+        if (available.has(output) || output !== name && physical.has(output)) return null;
+        available.set(output, name);
+      }
+      return { base: query, available, physical, depth };
     } else if (table && !table.database && Array.isArray(query.with) && query.with.length === 1) {
       const entry = obj(query.with[0]); const source = obj(entry?.subquery); const node = obj(source?.query); const list = node?.selects;
       if (entry?.type !== "WithElement" || entry.name !== table.name || entry.aliases || node?.type !== "SelectWithUnionQuery" || !Array.isArray(list) || list.length !== 1) return null;

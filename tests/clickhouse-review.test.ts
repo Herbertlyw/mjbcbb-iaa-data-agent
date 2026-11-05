@@ -116,4 +116,11 @@ test("多层直接投影生成的内部证明保持物理筛选，错误作用�
   assert.equal(clickHouseScopedProjection(renamed.replace("amount AS measure", "amount AS market"), "daily_sales"), null);
   const hiddenWhere = renamed.replace("country = 'US'", "country = 'US' AND secret = 'x'").replace("AS total", "AS secret");
   assert.equal(clickHouseScopedProjection(hiddenWhere, "daily_sales"), null, "不能将外层别名提升为底层过滤字段的别名");
+  const renamedBase = "WITH c AS (SELECT day AS business_day, country AS market, amount AS measure FROM daily_sales WHERE day = '2026-10-01' AND country = 'US') SELECT market, SUM(measure) AS total FROM c GROUP BY market";
+  const renamedBaseProof = clickHouseScopedProjection(renamedBase, "daily_sales");
+  assert.ok(renamedBaseProof);
+  assert.equal(reviewSql(renamedBase, policy).ok, true, JSON.stringify(reviewSql(renamedBase, policy)));
+  assert.equal(reviewSql(renamedBaseProof, policy).ok, true, JSON.stringify(reviewSql(renamedBaseProof, policy)));
+  assert.equal(clickHouseScopedProjection(renamedBase.replace("country = 'US'", "market = 'US'"), "daily_sales"), null, "底层过滤引用投影别名不能改写作用域");
+  assert.equal(clickHouseScopedProjection(renamedBase.replace("country AS market", "country AS day"), "daily_sales"), null);
 });
