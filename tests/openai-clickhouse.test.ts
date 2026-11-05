@@ -615,6 +615,12 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     const cteResource = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${cteSessionId}/resources/${cte.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
     assert.equal(cteResource.status, 200);
     assert.equal(((await cteResource.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, "clickhouse_ast_scoped");
+    const constantDateSession = await createSyntheticSession();
+    const constantDate = await postQuestion(apiPort, constantDateSession, "合成常量日期查询：纸灯日本七日新增。");
+    assert.equal(constantDate.status, "completed", JSON.stringify({ error: constantDate.error, answer: constantDate.analysis?.answer, reasons: constantDate.analysis?.server_reasons }));
+    assert.match(constantDate.analysis?.answer ?? "", /70/);
+    const constantDateResource = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${constantDateSession}/resources/${constantDate.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
+    assert.equal(((await constantDateResource.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, "clickhouse_ast_scoped");
     const nestedCteSessionId = await createSyntheticSession();
     const nestedCte = await postQuestion(apiPort, nestedCteSessionId, "合成多层恒等投影：纸灯日本七日新增。");
     assert.equal(nestedCte.status, "completed", JSON.stringify({ error: nestedCte.error, answer: nestedCte.analysis?.answer, reasons: nestedCte.analysis?.server_reasons }));

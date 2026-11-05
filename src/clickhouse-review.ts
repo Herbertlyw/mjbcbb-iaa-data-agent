@@ -105,6 +105,12 @@ function scanHazards(root: unknown): Failure | null {
 }
 
 function dateValue(value: Expression): number | null {
+  if (value.type === 'Function' && key(value.name) === 'todate') {
+    if (value.arguments.length !== 1 || value.arguments[0]?.type !== 'Literal'
+        || value.arguments[0].value_type !== 'String' || typeof value.arguments[0].value !== 'string'
+        || value.arguments[0].value < '1970-01-01' || value.arguments[0].value > '2149-06-06') return null;
+    value = value.arguments[0];
+  }
   if (value.type !== 'Literal' || value.value_type !== 'String' || typeof value.value !== 'string'
       || !/^\d{4}-\d{2}-\d{2}$/.test(value.value)) return null;
   const stamp = Date.parse(`${value.value}T00:00:00Z`);

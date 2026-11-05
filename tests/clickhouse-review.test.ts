@@ -38,6 +38,11 @@ test("原生直接授权只接受契约、封闭日期和受限覆盖筛选的�
   const query = "SELECT SUM(new_users) AS total FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'";
   const review = (sql: string) => reviewDirectClickHouse(sql, contract, rule, "synthetic", 1000);
   assert.deepEqual(review(query)?.time_range, { start: "2026-10-06", end: "2026-10-08" });
+  const constantDates = query.replace("'2026-10-06'", "toDate('2026-10-06')").replace("'2026-10-08'", "toDate('2026-10-08')");
+  assert.deepEqual(review(constantDates)?.time_range, { start: "2026-10-06", end: "2026-10-08" });
+  assert.equal(review(constantDates.replace("toDate('2026-10-06')", "toDate('2026-02-30')")), null);
+  assert.equal(review(constantDates.replace("toDate('2026-10-06')", "toDate(event_date)")), null);
+  assert.equal(review(constantDates.replace("toDate('2026-10-06')", "toDate('1969-12-31')")), null);
   const inner = query.replace("SUM(new_users) AS total", "event_date, title_id, platform, country_code, channel_id, new_users");
   const scoped = `WITH a AS (SELECT event_date, title_id, platform, country_code, channel_id, new_users FROM (${inner})) SELECT event_date, new_users FROM a`;
   assert.ok(reviewScopedClickHouse(scoped, contract, rule, "synthetic", 1000));

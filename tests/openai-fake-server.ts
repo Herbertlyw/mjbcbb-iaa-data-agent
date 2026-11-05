@@ -251,6 +251,7 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成多层恒等投影")) return scripted(turn, nestedCteSteps);
   if (latest.includes("合成多层重命名投影")) return scripted(turn, renamedCteSteps);
   if (latest.includes("合成底层重命名投影")) return scripted(turn, baseRenamedCteSteps);
+  if (latest.includes("合成常量日期查询")) return scripted(turn, constantDateSteps);
   if (latest.includes("合成左关联产品")) return scripted(turn, leftTitleSteps);
   if (latest.includes("合成跨事实比率")) return scripted(turn, crossFactRatioSteps);
   if (latest.includes("合成三千六百行")) return scripted(turn, largerTransformSteps);
@@ -445,6 +446,13 @@ function cteSteps(ids: string[]) {
     { id: "cte_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "new_users", as: "total" }] }) },
     { id: "cte_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
   ];
+}
+
+function constantDateSteps(ids: string[]) {
+  const steps = cteSteps(ids);
+  const original = JSON.parse(steps[1]!.arguments) as { sql: string };
+  steps[1] = { ...steps[1]!, arguments: JSON.stringify({ sql: original.sql.replaceAll("'2026-10-06'", "toDate('2026-10-06')").replaceAll("'2026-10-12'", "toDate('2026-10-12')") }) };
+  return steps;
 }
 
 function nestedCteSteps(ids: string[]) {
