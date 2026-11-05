@@ -362,6 +362,51 @@ test("自然结束未选择结果且一次反馈无进展时失败，不把探�
   } finally { await fake.close(); }
 });
 
+test("候选快照后的墙钟超时不会再触发修订派发", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: "no-candidate", jobTimeoutMs: 350, candidateHoldMs: 1200 }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成问题");
+      assert.equal(job.status, "timed_out", JSON.stringify(job.error));
+      assert.equal(job.analysis, null);
+      assert.equal(job.events.filter((event) => event.type === "snapshot_saved" && event.payload.role === "assistant" && event.payload.stop_reason === "stop").length, 1);
+      assert.equal(job.events.filter((event) => event.type === "candidate_feedback").length, 0);
+      assert.equal(fake.observations.length, 1);
+      assert.equal(runtime.state.listProviderSteps(job.job_id).length, 1);
+      assert.equal(job.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
+    });
+  } finally { await fake.close(); }
+});
+
+test("保存候选反馈期间取消不会再派发修订请求", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: "no-candidate", jobTimeoutMs: 8000 }), async (runtime) => {
+      let release!: () => void; let entered!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const ready = new Promise<void>((resolve) => { entered = resolve; });
+      const original = runtime.state.saveAgentSnapshot.bind(runtime.state);
+      const state = runtime.state as unknown as { saveAgentSnapshot: (input: Parameters<StateStore["saveAgentSnapshot"]>[0]) => Promise<boolean> };
+      state.saveAgentSnapshot = async (input) => {
+        const saved = original(input);
+        if (input.kind === "progress" && typeof input.body.jsonl === "string" && input.body.jsonl.includes("lumenfox.candidate_feedback")) { entered(); await gate; }
+        return saved;
+      };
+      try {
+        const session = analyst(runtime); const submitted = runtime.jobs.submit(session.session_id, "合成问题", crypto.randomUUID());
+        await ready; runtime.jobs.cancel(submitted.job_id); release();
+        const job = await waitForJob(runtime, submitted.job_id);
+        assert.equal(job.status, "cancelled"); assert.equal(job.analysis, null);
+        assert.equal(job.events.filter((event) => event.type === "candidate_feedback").length, 1);
+        assert.equal(job.events.filter((event) => event.type === "job_cancelled").length, 1);
+        assert.equal(fake.observations.length, 1);
+        assert.equal(runtime.state.listProviderSteps(job.job_id).length, 1);
+      } finally { release(); }
+    });
+  } finally { await fake.close(); }
+});
+
 test("本地假 HTTP 服务经 Pi SDK 适配器处理错误、缺用量和非法工具参数", async () => {
   const fake = await startFakeOpenAI(token);
   try {

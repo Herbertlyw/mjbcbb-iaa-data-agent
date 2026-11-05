@@ -341,6 +341,7 @@ export class JobService {
             toolCalls += 1;
           },
           hasAnalysis: () => sessionAnalyses(session).some((item) => item.job_id === jobId),
+          shouldStop: () => timedOut || lost,
           rememberCandidate: (analysis) => {
             recoveredAnalysis = analysis;
           },
@@ -526,6 +527,7 @@ export class JobService {
     onModelCall: () => void;
     onToolCall: () => void;
     hasAnalysis: () => boolean;
+    shouldStop: () => boolean;
     rememberCandidate: (analysis: AnalysisRecord) => void;
   }): Promise<"ok" | "lost"> {
     if ((this.host.config.piProvider === "openai-compatible" || this.host.config.piProvider === "deepseek")) {
@@ -764,15 +766,16 @@ export class JobService {
         }
         await session.prompt(input.userText, { expandPromptTemplates: false, source: "rpc" });
       }
+      if (input.shouldStop()) return lost ? "lost" : "ok";
       if ((this.host.config.piProvider === "openai-compatible" || this.host.config.piProvider === "deepseek")) {
         const failedStep = (await this.stateCall("listProviderSteps", input.jobId)).find((step) => step.status === "error");
         if (failedStep) {
           fail({ code: failedStep.error_code ?? "provider_error", message: "供应商请求失败。日志不包含密钥、请求头或用户原文。" });
         }
       }
-      if (!lost && !failed && !input.hasAnalysis() && !candidate) {
+      if (!lost && !failed && !input.shouldStop() && !input.hasAnalysis() && !candidate) {
         let delivered = await this.deliverNaturalCandidate(input.jobId, input.fence, input.sessionId, session.sessionManager.buildSessionContext().messages, governed.analysisRecords.currentProjection()?.declaration, session.sessionManager.getLeafId());
-        if (delivered.error && ["model_stopped_without_candidate", "evidence_feedback"].includes(delivered.error.code)) {
+        if (!input.shouldStop() && delivered.error && ["model_stopped_without_candidate", "evidence_feedback"].includes(delivered.error.code)) {
           const state = await this.stateCall("getJob", input.jobId);
           if (state && !state.cancel_requested && state.fence === input.fence && !state.events.some((event) => event.type === "candidate_feedback")) {
             const candidateEntry = session.sessionManager.getLeafId();
@@ -782,16 +785,20 @@ export class JobService {
               await session.sendCustomMessage({ customType: "lumenfox.candidate_feedback", display: false, content: "宿主反馈：候选没有可核验的本次结果。请引用已成功生成的本次结果，或以 [[clarify]] 开头提出明确问题；不要编造数据。", details: { job_id: input.jobId, candidate_entry_id: candidateEntry } }, { triggerTurn: false });
               const saved = await this.stateCall("saveAgentSnapshot", { sessionId: input.sessionId, jobId: input.jobId, owner: this.owner, fence: input.fence, kind: "progress", body: captureSessionSnapshot(session, input.userText, input.jobId) as unknown as Record<string, unknown> });
               if (!saved) markLost();
-              else {
-                await session.agent.continue();
-                if (!lost && !failed) delivered = await this.deliverNaturalCandidate(input.jobId, input.fence, input.sessionId, session.sessionManager.buildSessionContext().messages, governed.analysisRecords.currentProjection()?.declaration, session.sessionManager.getLeafId());
+              else if (!input.shouldStop()) {
+                const latest = await this.stateCall("getJob", input.jobId);
+                if (!latest || latest.fence !== input.fence || latest.status !== "running") markLost();
+                else if (!latest.cancel_requested && !input.shouldStop()) {
+                  await session.agent.continue();
+                  if (!lost && !failed && !input.shouldStop()) delivered = await this.deliverNaturalCandidate(input.jobId, input.fence, input.sessionId, session.sessionManager.buildSessionContext().messages, governed.analysisRecords.currentProjection()?.declaration, session.sessionManager.getLeafId());
+                }
               }
             }
           }
         }
-        if (delivered.error && !lost) fail(delivered.error);
+        if (delivered.error && !lost && !input.shouldStop()) fail(delivered.error);
       }
-      if (!lost && !failed) {
+      if (!lost && !failed && !input.shouldStop()) {
         session.sessionManager.appendCustomEntry("lumenfox.host_turn", {
           job_id: input.jobId,
           user_message_sha256: snapshot?.user_message_sha256,
