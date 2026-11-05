@@ -18,8 +18,13 @@ export function naturalCandidate(messages: Message[], successfulResources: Reado
   if (clarify) {
     const question = clarify[1]!.trim();
     // A clarification is a question, not a vehicle for delivering an
-    // unverified numeric finding or a hidden selection.
-    if (question.length > 2000 || /\d|\[\[result:/.test(question) || !/[?？]$/.test(question)) return null;
+    // unverified numeric finding or a hidden selection. Numeric literals
+    // already present in user messages may be repeated as clarifying scope.
+    const userNumbers = new Set(messages.filter((item) => item.role === "user").flatMap((item) => {
+      const content = typeof item.content === "string" ? item.content : Array.isArray(item.content) ? item.content.map((block) => block && typeof block === "object" && typeof (block as { text?: unknown }).text === "string" ? (block as { text: string }).text : "").join("") : "";
+      return content.match(/\d+(?:\.\d+)?/g) ?? [];
+    }));
+    if (question.length > 2000 || (question.match(/\d+(?:\.\d+)?/g) ?? []).some((value) => !userNumbers.has(value)) || /\[\[result:/.test(question) || !/[?？]$/.test(question)) return null;
     return { kind: "clarification", question };
   }
   if (text === "[[failed]]") return { kind: "failed", text: "未能形成可验证的结论。" };

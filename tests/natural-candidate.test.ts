@@ -20,5 +20,6 @@ test("仅选择当前任务成功回执中的最终结果，不自动选择探�
 test("澄清是独立的无结果问句，不能承载数字或伪造结果选择", () => {
   assert.deepEqual(naturalCandidate([msg("[[clarify]] 请补充产品和日期范围？")], new Set()), { kind: "clarification", question: "请补充产品和日期范围？" });
   assert.equal(naturalCandidate([msg("[[clarify]] 收入是 70，请问产品？")], new Set()), null);
+  assert.deepEqual(naturalCandidate([{ role: "user", content: "看 2026 年收入" }, msg("[[clarify]] 请问 2026 年的哪个产品？")], new Set()), { kind: "clarification", question: "请问 2026 年的哪个产品？" });
   assert.equal(naturalCandidate([msg("[[clarify]] [[result:res_a]] 请问产品？")], new Set(["res_a"])), null);
 });
