@@ -21,20 +21,21 @@ import type { AnalysisRecord } from "./types.js";
 import { domainTools } from "./agent.js";
 import { planFromTranscript } from "./planner.js";
 import type { ToolService } from "./tools.js";
+import { SessionAnalysisRecords } from "./analysis-declaration.js";
 
 export const SESSION_SNAPSHOT_FORMAT = "pi-coding-agent-session-jsonl-v3";
 export const SDK_NAME = "@earendil-works/pi-coding-agent";
 export const SDK_VERSION = "1.1.0";
 
 export const DATA_ANALYSIS_SYSTEM_PROMPT = `你是本地只读数据分析代理。这里的数据和例子都是虚构的合成数据，不是任何公司的生产库。
-先理解问题要的指标、时间范围、粒度、分组和筛选。用户没有提供、上下文也无法确定的范围不得用示例或可用日期代替；需要澄清时通过 update_analysis 提交 needs_clarification 和 clarification_question，不要编造查询。
+先理解问题要的指标、时间范围、粒度、分组和筛选。用户没有提供、上下文也无法确定的范围不得用示例或可用日期代替；需要澄清时直接自然回复，以 [[clarify]] 开头并以问号结尾，不要编造查询。
 如果从用户原话和会话上下文已能判断缺少完成分析必需的信息，直接提出简洁的澄清问题；不要为猜测用户的产品或时间范围反复检索，也不要把搜索结果当成用户已选择的范围。
 追问只修改用户明确更改的条件，其他条件沿用可确定的上下文；不能确定时先澄清。
 需要事实时先搜索已发布资产；搜索结果已经足以定位资产时，直接读取所需表卡，不要对同一目标反复搜索。正文一次读不完就分页阅读，并在查询前读取对应数据契约。
 只有权限、封闭时间范围、粒度和已登记的连接键都成立时，才执行只读查询。不要使用编码、文件或 shell 工具。
 把四件事分开：值为 NULL 的缺失、根本没有行的日期、观测到的真实零、以及预测值。预测不计入实际，缺失和缺行不要补成零。
 通过会话资源回读和计算形成可溯源结论，并写明限制与覆盖。每个正式数字都要引用本次任务的查询或计算结果；对明细做合计、计数等计算时先使用 calculate_session_cells，提交最终结果资源，服务端会自行追溯其来源。分组查询若需要对结果列再次汇总，也可在 calculate_session_cells 中引用该查询资源及其输出列；只有范围、覆盖和血缘完整时才能交付，不能假设缺失分组为零。
-工作记录和摘录是可选的，不能确认引用的字段、执行号或原文时不要填写。草稿简洁即可，服务端会生成经核验的数字和标签。
+update_analysis 只保存工作记录，不会结束任务。工作记录和摘录是可选的，不能确认引用的字段、执行号或原文时不要填写。完成分析后自然回复，在正文中用 [[result:资源ID]] 选择本次任务的最终结果；可以只选最终派生结果。需要比较两个已选择的计算单元时，可明确写 [[compare:左资源ID.列名,右资源ID.列名]]。宿主重新验证来源并生成经核验的数字和标签，模型解释本身不经逐句认证。
 证据不足、契约失效、新鲜度不是已发布的新鲜状态、结果被截断或连接不成立时，明确说明不能得出结论。
 完成状态只是建议。服务端会核对主体、会话、任务、契约哈希、新鲜度回执、截断和覆盖。模型草稿里的数字不会自动变成已验证事实。`;
 
@@ -85,6 +86,8 @@ interface ContextMessage {
   toolName?: string;
   isError?: boolean;
   content?: unknown;
+  customType?: string;
+  details?: unknown;
 }
 
 export type ResumeDecision =
@@ -103,6 +106,7 @@ export function decideResume(input: {
   compactionInspected?: boolean;
   compactionHidesToolResults?: boolean;
   userTextPersisted?: boolean;
+  jobId?: string;
 }): ResumeDecision {
   if (!input.resumingProgress) return { action: "prompt", decision: "new_turn" };
   const last = input.contextMessages.at(-1);
@@ -144,8 +148,16 @@ export function decideResume(input: {
   if (last.role === "user") {
     return { action: "continue", decision: "model_turn_redone", query_may_rerun: false };
   }
+  if (last.role === "custom" && last.customType === "lumenfox.candidate_feedback" && input.jobId && last.details && typeof last.details === "object" && (last.details as { job_id?: unknown }).job_id === input.jobId) {
+    return { action: "continue", decision: "tool_result_reread", query_may_rerun: false };
+  }
   if (last.role === "toolResult") {
     if (last.toolName === "update_analysis" && last.isError !== true) {
+      let payload: Record<string, unknown> = {};
+      try { payload = JSON.parse(messageText(last)) as Record<string, unknown>; } catch { /* reject malformed receipt below */ }
+      if (payload.ok === true && payload.analysis_record && typeof payload.analysis_record === "object") {
+        return { action: "continue", decision: "tool_result_reread", query_may_rerun: false };
+      }
       if (!input.hasAnalysis) {
         return {
           action: "reject",
@@ -207,6 +219,7 @@ export function captureSessionSnapshot(session: AgentSession, userText: string, 
 
 export interface GovernedSession {
   session: AgentSession;
+  analysisRecords: SessionAnalysisRecords;
   root: string;
   dispose: () => void;
 }
@@ -333,6 +346,14 @@ export async function openGovernedSession(input: {
     systemPrompt: DATA_ANALYSIS_SYSTEM_PROMPT,
   });
   await resourceLoader.reload();
+  const records = new SessionAnalysisRecords();
+  // Notes from another task are conversation context, never the current
+  // task's declaration or its authority. Restore only this job's progress.
+  if (input.jobId && input.snapshot?.job_id === input.jobId && input.snapshot.user_message_entry_id) {
+    const branch = sessionManager.getBranch();
+    const first = branch.findIndex((entry) => entry.id === input.snapshot!.user_message_entry_id);
+    if (first >= 0) records.restoreFromPersistedMessages(branch.slice(first).flatMap((entry) => entry.type === "message" ? [entry.message] : []));
+  }
   const requestedLevel = selectedReasoning as ThinkingLevel;
   const { session } = await createAgentSession({
     cwd,
@@ -346,7 +367,7 @@ export async function openGovernedSession(input: {
     noTools: "all",
     tools: DOMAIN_TOOL_NAMES,
     excludeTools: [...CODING_TOOLS],
-    customTools: domainTools(input.appSessionId, input.tools).map(asDefinition),
+    customTools: domainTools(input.appSessionId, input.tools, records).map(asDefinition),
   });
   if (session.thinkingLevel !== requestedLevel) {
     session.dispose();
@@ -363,6 +384,7 @@ export async function openGovernedSession(input: {
   }
   return {
     session,
+    analysisRecords: records,
     root,
     dispose: () => {
       session.dispose();

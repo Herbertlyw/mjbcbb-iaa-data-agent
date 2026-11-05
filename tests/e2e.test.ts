@@ -9,9 +9,10 @@ test("提问、检索、契约、查询、引用和追问", async () => {
     const first = await ask(runtime, session.session_id, DEMO_QUESTIONS[0].text);
     assert.equal(first.status, "partial");
     const tools = first.events.filter((event) => event.type === "tool_finished").map((event) => event.payload.tool_name);
-    for (const name of ["search_assets", "read_assets", "read_data_contract_view", "query", "calculate_session_cells", "read_session_resource", "update_analysis"]) {
+    for (const name of ["search_assets", "read_assets", "read_data_contract_view", "query", "calculate_session_cells", "read_session_resource"]) {
       assert.ok(tools.includes(name), `缺少工具 ${name}`);
     }
+    assert.equal(first.events.filter((event) => event.type === "candidate_reviewed").length, 1);
     assert.match(first.analysis?.answer ?? "", /480/);
     assert.match(first.analysis?.answer ?? "", /43\.5/);
     assert.match(first.analysis?.answer ?? "", /27\.5/);

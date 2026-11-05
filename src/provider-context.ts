@@ -13,7 +13,13 @@ export function compactPreviousAnalyses(context: TranscriptContext): TranscriptC
   let settled = false;
   for (let i = currentUser - 1; i >= 0; i -= 1) {
     const message = context.messages[i];
-    if (message?.role === "user") { settled = false; continue; }
+    if (message?.role === "user") {
+      // Pi projects host custom messages as user-role transport content. This
+      // marker affects only compaction, never authorization or delivery.
+      const text = typeof message.content === "string" ? message.content : message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
+      try { const value: unknown = JSON.parse(text); if (value && typeof value === "object" && (value as { history_summary?: unknown }).history_summary === true) { settled = true; continue; } } catch { /* ordinary user text */ }
+      settled = false; continue;
+    }
     if (message?.role !== "toolResult" || message.isError || message.content.length !== 1 || message.content[0]?.type !== "text") continue;
     let receipt: Record<string, unknown>;
     try {

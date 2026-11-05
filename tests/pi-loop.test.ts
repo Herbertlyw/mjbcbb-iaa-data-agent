@@ -124,7 +124,8 @@ test("生产演示走 faux，真实 Pi 模式没有密钥时不会访问外部�
     const job = await ask(runtime, session.session_id, DEMO_QUESTIONS[2].text);
     const names = job.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name);
     assert.ok(names.indexOf("search_assets") < names.indexOf("query"));
-    assert.ok(names.indexOf("query") < names.indexOf("update_analysis"));
+    assert.ok(names.includes("query"));
+    assert.equal(job.events.filter((event) => event.type === "candidate_reviewed").length, 1);
     assert.equal(job.status, "partial");
     assert.ok(job.analysis?.server_reasons.includes("calculation_lineage_unsupported"));
     const bare = analyst(runtime);

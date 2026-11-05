@@ -213,6 +213,22 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       assert.equal(job.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === name).length, 1, name);
     }
     assert.equal(fake.observations.some((item) => item.sawUserText && item.sawKnowledgeBody && item.authorizationMatched), true);
+    const noteSessionResponse = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const noteSession = ((await noteSessionResponse.json()) as { session_id: string }).session_id;
+    const noted = await postQuestion(apiPort, noteSession, "合成工作记录后继续：纸灯美国 iOS 雾帆本周新增多少？");
+    // The seven-day synthetic fixture has one NULL: 670 is the sum of the
+    // observed values, not a complete seven-day population.
+    assert.equal(noted.status, "partial", JSON.stringify({ error: noted.error, answer: noted.analysis?.answer, reasons: noted.analysis?.server_reasons, events: noted.events.filter((event) => event.type === "tool_finished") }));
+    assert.match(noted.analysis?.answer ?? "", /670/);
+    assert.ok(noted.analysis?.server_reasons?.includes("completeness_gap"));
+    assert.match(noted.analysis?.answer ?? "", /排除了 1 行 NULL/);
+    assert.equal(noted.analysis?.analysis_declaration?.provenance, "model_declared");
+    const notedTools = noted.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name);
+    assert.equal(notedTools[0], "update_analysis");
+    assert.ok(notedTools.indexOf("query") > notedTools.indexOf("update_analysis"));
+    assert.ok(notedTools.indexOf("calculate_session_cells") > notedTools.indexOf("query"));
+    assert.equal(noted.events.filter((event) => event.type === "candidate_reviewed").length, 1);
+    assert.equal(noted.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
     if (process.env.TEST_DEEPSEEK_DIALECT === "1") assert.ok(fake.observations.every((item) => item.thinkingType === "disabled"));
     const followup = await postQuestion(apiPort, session.session_id, "那日本呢？");
     const followupTools = followup.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name);
@@ -220,7 +236,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.match(followup.analysis?.answer ?? "", /不是同一原子快照/);
     assert.match(followup.analysis?.answer ?? "", /70/);
     assert.equal(followup.analysis?.sources?.[0]?.engine, "clickhouse-local");
-    assert.deepEqual(followupTools, ["read_data_contract_view", "query", "calculate_session_cells", "update_analysis"]);
+    assert.deepEqual(followupTools, ["read_data_contract_view", "query", "calculate_session_cells"]);
     assert.ok(fake.observations.some((item) => item.userMessages.length === 2 && item.userMessages[0] === question && item.userMessages[1] === "那日本呢？" && item.currentTurnRoles.includes("tool")));
     assert.ok(fake.observations.some((item) => item.userMessages.length === 2 && item.historySummaryCount >= 1), "后续模型请求应携带精简的旧回合服务端结论");
     const source1 = job.analysis?.sources?.[0]?.resource_id;
@@ -234,7 +250,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     const branch = firstSnapshot.jsonl.trim().split("\n").map((line) => JSON.parse(line) as { id?: string; type?: string; message?: { role?: string; toolName?: string; content?: unknown } }).filter((entry) => entry.id && firstSnapshot.branch_entry_ids.includes(entry.id));
     assert.ok(branch.some((entry) => entry.message?.role === "user" && JSON.stringify(entry.message.content).includes(question)));
     assert.ok(branch.some((entry) => entry.message?.role === "toolResult"));
-    const previousReceipt = branch.find((entry) => entry.message?.role === "toolResult" && entry.message.toolName === "update_analysis");
+    const previousReceipt = branch.find((entry) => entry.message?.role === "toolResult" && entry.message.toolName === "calculate_session_cells");
     const previousQuery = branch.find((entry) => entry.message?.role === "toolResult" && entry.message.toolName === "query");
     const followObservation = fake.observations.find((item) => item.userMessages.length === 2 && item.historySummaryCount === 2);
     assert.ok(previousReceipt && previousQuery && followObservation);
@@ -267,7 +283,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(third.analysis?.sources?.[0]?.engine, "clickhouse-local");
     const source3 = third.analysis?.sources?.[0]?.resource_id;
     assert.ok(source3 && source3 !== source1 && source3 !== source2);
-    assert.deepEqual(third.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "query", "calculate_session_cells", "update_analysis"]);
+    assert.deepEqual(third.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "query", "calculate_session_cells"]);
     const thirdDb = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password: statePassword, database: "lumenfox_it" });
     const [thirdResources] = await thirdDb.query("SELECT body_json FROM resources WHERE resource_id = ?", [source3]);
     const thirdResource = JSON.parse(String((thirdResources as Array<{ body_json: string }>)[0]?.body_json)) as { session_id: string; job_id: string; freshness_receipts: unknown[] };
@@ -316,7 +332,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.match(ratio.analysis?.answer ?? "", /0\.500000000000000000 比值/);
     assert.equal(ratio.analysis?.sources?.length, 2);
     assert.equal(ratio.analysis?.sources?.every((source) => source.engine === "clickhouse-local" && source.freshness_receipts?.length), true);
-    assert.deepEqual(ratio.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "query", "query", "calculate_session_cells", "update_analysis"]);
+    assert.deepEqual(ratio.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "query", "query", "calculate_session_cells"]);
     const ratioDb = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password: statePassword, database: "lumenfox_it" });
     try {
       for (const source of ratio.analysis?.sources ?? []) {
@@ -343,7 +359,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.match(join.analysis?.answer ?? "", /dim_fox_title\.title_name=纸灯/);
     assert.equal(join.analysis?.sources?.[0]?.engine, "clickhouse-local");
     assert.equal(join.analysis?.sources?.[0]?.freshness_receipts?.length, 2);
-    assert.deepEqual(join.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "read_data_contract_view", "query", "update_analysis"]);
+    assert.deepEqual(join.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "read_data_contract_view", "query"]);
     assert.ok(join.events.some((event) => event.type === "tool_finished" && event.payload.tool_name === "query" && event.payload.is_error === false));
     const channelJoinSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const channelJoinSessionId = ((await channelJoinSession.json()) as { session_id: string }).session_id;
@@ -462,12 +478,13 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     const dailySession = await createSyntheticSession();
     const dailyCross = await postQuestion(apiPort, dailySession, "合成多日双渠道跨事实：按日期和渠道比较收入与新增。");
     assert.equal(dailyCross.status, "partial", `${JSON.stringify(dailyCross.error)} tools=${dailyCross.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name).join(">")}`);
+    assert.equal(dailyCross.events.find((event) => event.type === "candidate_reviewed")?.payload.selected_count, 1, "只选择最终变换，依赖由宿主展开");
     const dailyRows = dailyCross.analysis?.alignment_results?.[0]?.rows ?? [];
     const expectedDaily = [
       ["2026-10-06", "mist_ads", "2.000000000000000000", "matched"], ["2026-10-06", "pebble_net", "5.000000000000000000", "matched"],
       ["2026-10-07", "mist_ads", null, "zero_divisor"], ["2026-10-07", "pebble_net", "3.000000000000000000", "matched"],
     ];
-    assert.deepEqual(dailyRows.map((row) => [row.group.event_date, row.group.channel_id, row.result?.value ?? null, row.status]).sort(), expectedDaily.sort());
+    assert.deepEqual(dailyRows.map((row) => [row.group.event_date, row.group.channel_id, row.result?.value ?? null, row.status]).sort(), expectedDaily.sort(), JSON.stringify({ answer: dailyCross.analysis?.answer, reasons: dailyCross.analysis?.server_reasons, events: dailyCross.events.filter((event) => ["tool_finished", "candidate_reviewed", "candidate_feedback"].includes(event.type)) }));
     assert.equal(dailyCross.analysis?.sources?.length, 2);
     assert.equal(dailyCross.analysis?.sources?.every((source) => source.engine === "clickhouse-local"), true);
     for (const source of dailyCross.analysis?.sources ?? []) {
@@ -700,10 +717,10 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     const withoutRecordSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const withoutRecordId = ((await withoutRecordSession.json()) as { session_id: string }).session_id;
     const withoutRecord = await postQuestion(apiPort, withoutRecordId, "合成问题：不调用记录工具，查询日本新增。");
-    assert.equal(withoutRecord.status, "partial", JSON.stringify(withoutRecord.error));
+    assert.equal(withoutRecord.status, "completed", JSON.stringify(withoutRecord.error));
     assert.match(withoutRecord.analysis?.answer ?? "", /数据库求和 70；单位 人/);
     assert.equal(withoutRecord.events.some((event) => event.type === "tool_started" && event.payload.tool_name === "update_analysis"), false);
-    assert.equal(withoutRecord.events.filter((event) => event.type === "analysis_synthesized").length, 1);
+    assert.equal(withoutRecord.events.filter((event) => event.type === "candidate_reviewed").length, 1);
     // Optional manual browser regression: a loopback proxy really drops the first
     // SSE socket and records the browser's subsequent cursor and event IDs.
     if (process.env.BROWSER_TRACE_DIR) {
@@ -765,7 +782,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(sameResource.status, "completed", `${JSON.stringify(sameResource.error)} ${sameResource.analysis?.answer ?? ""} ${JSON.stringify(sameResource.events.filter((event) => event.type === "tool_finished").map((event) => ({ tool: event.payload.tool_name, code: event.payload.code })))}`);
     assert.match(sameResource.analysis?.answer ?? "", /四则运算 subtract：-1\.00 USD/u);
     assert.equal(sameResource.analysis?.sources?.[0]?.engine, "clickhouse-local");
-    assert.deepEqual(sameResource.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "query", "calculate_session_cells", "update_analysis"]);
+    assert.deepEqual(sameResource.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "query", "calculate_session_cells"]);
     assert.equal(sameResource.events.some((event) => event.type === "tool_finished" && event.payload.is_error === true), false);
     const rawSingle = await postQuestion(apiPort, await another(), "合成单明细比较：支付流水减成本。");
     assert.equal(rawSingle.status, "completed", `${JSON.stringify(rawSingle.error)} ${rawSingle.analysis?.answer ?? ""} ${JSON.stringify(rawSingle.events.filter((event) => event.type === "tool_finished").map((event) => ({ tool: event.payload.tool_name, code: event.payload.code })))}`);

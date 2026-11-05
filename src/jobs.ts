@@ -18,6 +18,8 @@ import { newId, storedSession, type SessionStore } from "./session.js";
 import type { StateStore, StoredSession } from "./state-store.js";
 import type { AsyncMysqlStateStore } from "./async-mysql-state-store.js";
 import { sessionAnalyses, type ToolService } from "./tools.js";
+import { naturalCandidate } from "./natural-candidate.js";
+import type { AnalysisDeclaration } from "./analysis-declaration.js";
 import { passthroughTurn, resolveTurn } from "./turn.js";
 import { isTerminal, type AnalysisRecord, type JobRecord, type JobStatus } from "./types.js";
 
@@ -344,22 +346,6 @@ export class JobService {
           },
         });
         if (outcome === "lost") lost = true;
-        // update_analysis is optional: if the model stopped successfully after
-        // producing resources, the host can assemble a conservative partial
-        // answer from the same evidence checks. It never promotes model prose.
-        if (!lost && !agentError && !timedOut && !recoveredAnalysis && !sessionAnalyses(session).some((item) => item.job_id === jobId)) {
-          const current = await this.stateCall("getJob", jobId);
-          if (current && !current.cancel_requested && current.fence === fence && current.status === "running") {
-            const ids = [...new Set(current.events.filter((event) => event.type === "tool_finished" && event.payload.is_error === false && typeof event.payload.resource_id === "string").map((event) => String(event.payload.resource_id)))];
-            if (ids.length) {
-              const candidate = await this.host.tools.updateAnalysis(session.session_id, { suggested_status: "partial", draft_answer: "", resource_ids: ids });
-              if (candidate.ok) {
-                const recorded = await this.stateCall("appendEvent", jobId, this.owner, fence, "analysis_synthesized", { resource_count: ids.length, status: "partial" });
-                if (!recorded) lostFence();
-              }
-            }
-          }
-        }
       } else {
       const progress = await this.stateCall("loadAgentSnapshot", session.session_id, { jobId, kind: "progress" });
       const settled = progress ? null : await this.stateCall("loadAgentSnapshot", session.session_id, { kind: "settled" });
@@ -436,6 +422,10 @@ export class JobService {
         if (snapshot && !await this.stateCall("appendEvent", jobId, this.owner, fence, "model_context", contextProof(agent.state.messages, false))) lostFence();
         if (!lost) await agent.prompt(modelPrompt(this.host.config.modelMode, claimed.turn, claimed.user_text, prior));
       }
+      if (!lost && !agentError && !timedOut && !sessionAnalyses(session).some((item) => item.job_id === jobId)) {
+        const delivered = await this.deliverNaturalCandidate(jobId, fence, session.session_id, agent.state.messages);
+        if (delivered.error) agentError = delivered.error;
+      }
       if (!lost) {
         const saved = await this.stateCall("saveAgentSnapshot", {
           sessionId: session.session_id,
@@ -491,13 +481,37 @@ export class JobService {
       status = "failed";
       error = agentError;
     } else if (!analysis) {
-      status = error?.code === "agent_failed" ? "failed" : "partial";
+      status = error ? "failed" : "partial";
       error = error ?? { code: "model_stopped_without_authoritative_update", message: "模型停止时没有形成可引用的证据结论。" };
     } else {
       status = analysis.status;
     }
     const steps = (this.host.config.piProvider === "openai-compatible" || this.host.config.piProvider === "deepseek") ? await this.stateCall("listProviderSteps", jobId) : [];
     if (await this.stateCall("finish", jobId, this.owner, fence, status, analysis, error, measuredUsage(this.host.config.modelMode, this.host.config.piProvider, modelCalls, toolCalls, steps))) await this.publish(jobId);
+  }
+
+  private async deliverNaturalCandidate(jobId: string, fence: number, sessionId: string, messages: Parameters<typeof naturalCandidate>[0], declaration?: AnalysisDeclaration, candidateEntryId?: string | null): Promise<{ error?: { code: string; message: string } }> {
+    const job = await this.stateCall("getJob", jobId);
+    if (!job || job.status !== "running" || job.fence !== fence || job.cancel_requested) return {};
+    const allowed = new Set(job.events.filter((event) => event.type === "tool_finished" && event.payload.is_error === false && typeof event.payload.resource_id === "string").map((event) => String(event.payload.resource_id)));
+    const candidate = naturalCandidate(messages, allowed);
+    if (!candidate) return { error: { code: "model_stopped_without_candidate", message: "模型未明确选择本次结果，也没有形成可交付的澄清。" } };
+    const beat = await this.stateCall("heartbeat", jobId, this.owner, fence, Date.now(), this.host.config.leaseMs);
+    if (!beat.ok || beat.cancel_requested) return {};
+    const failedExecution = job.events.some((event) => event.type === "tool_finished" && event.payload.is_error === true && ["query", "calculate_session_cells"].includes(String(event.payload.tool_name)));
+    const input = candidate.kind === "answer"
+      ? { suggested_status: failedExecution ? "partial" as const : "completed" as const, draft_answer: candidate.text, resource_ids: candidate.resourceIds, ...(failedExecution ? { limitations: ["本任务有查询或计算失败；已选证据不能证明所有请求都已完成。"] } : {}), ...(candidate.comparisons ? { comparisons: candidate.comparisons } : {}), ...(declaration ? { declaration } : {}) }
+      : candidate.kind === "clarification"
+      ? { suggested_status: "needs_clarification" as const, draft_answer: "", resource_ids: [], clarification_question: candidate.question }
+      : { suggested_status: "failed" as const, draft_answer: "", resource_ids: [] };
+    const result = await this.host.tools.updateAnalysis(sessionId, input);
+    if (!result.ok) return { error: { code: String(result.code ?? "candidate_delivery_failed"), message: "候选答案未通过服务端证据检查。" } };
+    if (!candidateEntryId || !job.events.some((event) => event.type === "candidate_reviewed" && event.payload.candidate_entry_id === candidateEntryId)) {
+      const event = await this.stateCall("appendEvent", jobId, this.owner, fence, "candidate_reviewed", { candidate_entry_id: candidateEntryId ?? null, status: result.status, selected_count: candidate.kind === "answer" ? candidate.resourceIds.length : 0 });
+      if (!event) return { error: { code: "execution_fence_rejected", message: "候选审查的任务围栏已失效。" } };
+      this.publishEvent(jobId, event);
+    }
+    return {};
   }
 
   private async runPiSession(input: {
@@ -708,6 +722,7 @@ export class JobService {
       compactionInspected: true,
       compactionHidesToolResults: inspection.hidesToolResults,
       userTextPersisted: inspection.userTextPersisted,
+      jobId: input.jobId,
     });
     const contextEvent = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "model_context", {
       restored: Boolean(record),
@@ -737,6 +752,14 @@ export class JobService {
         session.refreshContext();
         await session.agent.continue();
       } else if (decision.action === "prompt") {
+        // Only a previously committed terminal job may be projected into the
+        // next turn. A settled JSONL snapshot alone does not prove commit.
+        const priorMessages = (await this.stateCall("listMessages", input.sessionId)).filter((message) => message.job_id !== input.jobId);
+        const previousId = priorMessages.at(-1)?.job_id;
+        const previous = previousId ? await this.stateCall("getJob", previousId) : null;
+        if (previous?.analysis && ["completed", "partial", "needs_clarification"].includes(previous.status)) {
+          await session.sendCustomMessage({ customType: "lumenfox.historical_delivery", display: false, content: JSON.stringify({ history_summary: true, status: previous.status, answer: previous.analysis.answer.slice(0, 4000), clarification_question: previous.analysis.clarification_question, notice: "这是上一轮已提交结果，仅供理解对话；当前任务必须重新核验授权、契约、新鲜度并生成自己的证据。" }), details: { job_id: previous.job_id } }, { triggerTurn: false });
+        }
         await session.prompt(input.userText, { expandPromptTemplates: false, source: "rpc" });
       }
       if ((this.host.config.piProvider === "openai-compatible" || this.host.config.piProvider === "deepseek")) {
@@ -744,6 +767,27 @@ export class JobService {
         if (failedStep) {
           fail({ code: failedStep.error_code ?? "provider_error", message: "供应商请求失败。日志不包含密钥、请求头或用户原文。" });
         }
+      }
+      if (!lost && !failed && !input.hasAnalysis() && !candidate) {
+        let delivered = await this.deliverNaturalCandidate(input.jobId, input.fence, input.sessionId, session.sessionManager.buildSessionContext().messages, governed.analysisRecords.currentProjection()?.declaration, session.sessionManager.getLeafId());
+        if (delivered.error && ["model_stopped_without_candidate", "evidence_feedback"].includes(delivered.error.code)) {
+          const state = await this.stateCall("getJob", input.jobId);
+          if (state && !state.cancel_requested && state.fence === input.fence && !state.events.some((event) => event.type === "candidate_feedback")) {
+            const candidateEntry = session.sessionManager.getLeafId();
+            const recorded = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "candidate_feedback", { candidate_entry_id: candidateEntry, code: delivered.error.code });
+            if (!recorded) markLost();
+            else {
+              await session.sendCustomMessage({ customType: "lumenfox.candidate_feedback", display: false, content: "宿主反馈：候选没有可核验的本次结果。请引用已成功生成的本次结果，或以 [[clarify]] 开头提出明确问题；不要编造数据。", details: { job_id: input.jobId, candidate_entry_id: candidateEntry } }, { triggerTurn: false });
+              const saved = await this.stateCall("saveAgentSnapshot", { sessionId: input.sessionId, jobId: input.jobId, owner: this.owner, fence: input.fence, kind: "progress", body: captureSessionSnapshot(session, input.userText, input.jobId) as unknown as Record<string, unknown> });
+              if (!saved) markLost();
+              else {
+                await session.agent.continue();
+                if (!lost && !failed) delivered = await this.deliverNaturalCandidate(input.jobId, input.fence, input.sessionId, session.sessionManager.buildSessionContext().messages, governed.analysisRecords.currentProjection()?.declaration, session.sessionManager.getLeafId());
+              }
+            }
+          }
+        }
+        if (delivered.error && !lost) fail(delivered.error);
       }
       if (!lost && !failed) {
         session.sessionManager.appendCustomEntry("lumenfox.host_turn", {
@@ -822,6 +866,10 @@ function hardFailure(code: string): boolean {
   return [
     "budget_exhausted",
     "agent_failed",
+    "model_stopped_without_candidate",
+    "candidate_delivery_failed",
+    "evidence_feedback",
+    "execution_fence_rejected",
     "session_snapshot_corrupt",
     "session_branch_mismatch",
     "session_message_mismatch",

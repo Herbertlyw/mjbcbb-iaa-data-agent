@@ -54,16 +54,10 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
         assistantReasoning: messages.filter((message) => message.role === "assistant" && typeof message.reasoning_content === "string").map((message) => message.reasoning_content!),
         authorizationPresent: header.length > 0,
         authorizationMatched: matched,
-        userMessages: messages.filter((message) => message.role === "user").map(messageText),
+        userMessages: messages.filter((message) => message.role === "user" && !historySummary(message)).map(messageText),
         currentTurnRoles: currentTurn(messages).map((message) => message.role),
-        historySummaryCount: messages.filter((message) => {
-          if (message.role !== "tool" || typeof message.content !== "string") return false;
-          try { return (JSON.parse(message.content) as { history_summary?: boolean }).history_summary === true; } catch { return false; }
-        }).length,
-        historySummaryBytes: messages.filter((message) => {
-          if (message.role !== "tool" || typeof message.content !== "string") return false;
-          try { return (JSON.parse(message.content) as { history_summary?: boolean }).history_summary === true; } catch { return false; }
-        }).reduce((sum, message) => sum + Buffer.byteLength(message.content as string), 0),
+        historySummaryCount: messages.filter(historySummary).length,
+        historySummaryBytes: messages.filter(historySummary).reduce((sum, message) => sum + Buffer.byteLength(messageText(message)), 0),
         requestBytes: Buffer.byteLength(body),
         toolMessageBytes: messages.filter((message) => message.role === "tool").reduce((sum, message) => sum + Buffer.byteLength(JSON.stringify(message)), 0),
       });
@@ -96,6 +90,10 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
         writeTextStream(response);
         return;
       }
+      if (script === "no-candidate") {
+        writeTextStream(response, true, options.cacheHitTokens, "这只是没有结果来源的探索。 ");
+        return;
+      }
       const plainBody = body.replaceAll("\\", "");
       const holdTurn = plainBody.slice(Math.max(0, plainBody.lastIndexOf("请停住")));
       if (plainBody.includes("请停住") && !holdTurn.includes('"role":"tool"')) {
@@ -111,6 +109,10 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
       // Pi session and persisted user message always keep the original text.
       const fixtureMessages = dateShift ? JSON.parse(shiftSyntheticDates(JSON.stringify(messages), -dateShift)) as ProtocolMessage[] : messages;
       const turnTools = currentTurn(fixtureMessages).filter((message) => message.role === "tool");
+      if (script === "clarify-retry") {
+        writeTextStream(response, true, options.cacheHitTokens, JSON.stringify(fixtureMessages).includes("宿主反馈") ? "[[clarify]] 请说明分析范围？" : "[[result:res_invalid]]");
+        return;
+      }
       if (messageText(currentTurn(fixtureMessages)[0] ?? { role: "user" }).includes("合成并发契约") && turnTools.length === 0) {
         const names = ["contract.fact_fox_daily_install", "contract.fact_fox_daily_payment", "contract.dim_fox_channel"];
         response.writeHead(200, { "content-type": "text/event-stream" });
@@ -119,15 +121,36 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
         response.end("data: [DONE]\n\n");
         return;
       }
-      const call = script === "clarify-retry" && turnTools.length === 0
-        ? { id: "call_reject", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: [] }) }
-        : script === "minimal-clarification" && turnTools.length === 0
+      const call = script === "minimal-clarification" && turnTools.length === 0
         ? { id: "call_clarify_minimal", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "needs_clarification", clarification_question: "请补充产品和日期范围。" }) }
-        : (script === "clarification" && turnTools.length === 0 || script === "clarify-retry" && turnTools.length === 1)
+        : script === "clarification" && turnTools.length === 0
         ? { id: "call_clarify", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "needs_clarification", draft_answer: "", resource_ids: [], clarification_question: "请说明分析范围。" }) }
         : script === "bad-args" ? badCall(body) : happyCall(fixtureMessages);
       if (!call) {
+        const hasRecord = turnTools.some((message) => messageText(message).includes('"analysis_record"'));
+        const user = messageText(currentTurn(fixtureMessages)[0] ?? { role: "user" });
+        if (hasRecord || user.includes("不调用记录") || turnTools.length > 0) {
+          const last = turnTools.flatMap((message) => { try { const payload = JSON.parse(messageText(message)) as Record<string, unknown>; return typeof payload.resource_id === "string" ? [payload.resource_id] : []; } catch { return []; } }).at(-1);
+          if (last) { writeTextStream(response, true, options.cacheHitTokens, `[[result:${last}]]`); return; }
+        }
         writeTextStream(response, true, options.cacheHitTokens);
+        return;
+      }
+      if (call.name === "update_analysis") {
+        const value = JSON.parse(call.arguments) as Record<string, unknown>;
+        if (typeof value.scope === "string" && typeof value.grain === "string") {
+          writeToolStream(response, call, true, options.deepseekThinking === true, options.cacheHitTokens);
+          return;
+        }
+        if (value.declaration && typeof value.declaration === "object") {
+          writeToolStream(response, { ...call, arguments: JSON.stringify(value.declaration) }, true, options.deepseekThinking === true, options.cacheHitTokens);
+          return;
+        }
+        const question = typeof value.clarification_question === "string" ? value.clarification_question : "请补充分析范围？";
+        const ids = Array.isArray(value.resource_ids) ? value.resource_ids.filter((id): id is string => typeof id === "string") : [];
+        const comparisons = Array.isArray(value.comparisons) ? value.comparisons.flatMap((item) => item?.left?.resource_id && item?.left?.cell && item?.right?.resource_id && item?.right?.cell ? [`[[compare:${item.left.resource_id}.${item.left.cell},${item.right.resource_id}.${item.right.cell}]]`] : []) : [];
+        const answer = value.suggested_status === "needs_clarification" ? `[[clarify]] ${/[?？]$/.test(question) ? question : `${question.replace(/[。！]$/, "")}？`}` : ids.length ? [...ids.map((id) => `[[result:${id}]]`), ...comparisons].join(" ") : "[[failed]]";
+        writeTextStream(response, true, options.cacheHitTokens, answer);
         return;
       }
       const turnNumber = messages.filter((message) => message.role === "user").length;
@@ -146,6 +169,11 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
 }
 
 interface ProtocolMessage { role: string; content?: unknown; reasoning_content?: string; tool_calls?: Array<{ function?: { name?: string } }> }
+
+function historySummary(message: ProtocolMessage): boolean {
+  if (message.role !== "tool" && message.role !== "user") return false;
+  try { return (JSON.parse(messageText(message)) as { history_summary?: boolean }).history_summary === true; } catch { return false; }
+}
 
 /** Upgrade only the test server's existing scripted fixtures. Model-facing
  * production code receives just the discriminated calculation protocol. */
@@ -182,6 +210,13 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   const turn = currentTurn(messages);
   const latest = turn[0] ? messageText(turn[0]) : "";
   const earlierUsers = messages.slice(0, messages.length - turn.length).filter((message) => message.role === "user").map(messageText);
+  if (latest.includes("合成工作记录后继续")) {
+    const results = turn.filter((message) => message.role === "tool");
+    if (!results.length) return { id: "working_note", name: "update_analysis", arguments: JSON.stringify({ scope: "合成纸灯美国范围", grain: "日", expected_group_keys: [], unresolved_questions: [], assumptions: ["模型笔记不代表授权"] }) };
+    const resultText = results.map(messageText).join("\n");
+    const ids = [...resultText.matchAll(/resource_id[=:]"?(res_[0-9a-f-]{36})/g)].map((match) => match[1] ?? "");
+    return defaultSteps(ids)[results.length - 1] ?? null;
+  }
   const hasBase = earlierUsers.some((text) => text.includes("纸灯") && text.includes("美国") && text.includes("iOS") && text.includes("雾帆") && text.includes("2026-10-06") && text.includes("2026-10-12"));
   if (latest.includes("合成空值标记投影")) return scripted(turn, nullMarkerSteps);
   if (latest.includes("合成条件阈值")) return scripted(turn, conditionalThresholdSteps);
@@ -676,10 +711,9 @@ function badCall(body: string): { id: string; name: string; arguments: string } 
   return { id: "call_bad", name: "query", arguments: JSON.stringify({ sql: "DROP TABLE fact_fox_daily_install", purpose: "bad" }) };
 }
 
-function writeTextStream(response: ServerResponse, includeUsage = false, cacheHitTokens = 0): void {
+function writeTextStream(response: ServerResponse, includeUsage = false, cacheHitTokens = 0, text = "没有用量。"): void {
   response.writeHead(200, { "content-type": "text/event-stream" });
-  response.write(`data: ${JSON.stringify(chunkFrame({ role: "assistant", content: "没有" }))}\n\n`);
-  response.write(`data: ${JSON.stringify(chunkFrame({ content: "用量。" }))}\n\n`);
+  response.write(`data: ${JSON.stringify(chunkFrame({ role: "assistant", content: text }))}\n\n`);
   const done: Record<string, unknown> = { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] };
   if (includeUsage) done.usage = { prompt_tokens: 21, completion_tokens: 9, total_tokens: 30, prompt_cache_hit_tokens: cacheHitTokens };
   response.write(`data: ${JSON.stringify(done)}\n\n`);

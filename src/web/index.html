@@ -364,6 +364,7 @@
         <p class="muted">服务端判定：${escapeHtml(labels[analysis.status] || analysis.status)}。模型建议是 ${escapeHtml(analysis.model_suggested_status)}，不会单独生效。草稿中的数字不会自动视为已验证。</p>
         ${job.error ? `<p>${escapeHtml(job.error.message)}</p>` : ""}
         <div class="answer">${escapeHtml(analysis.answer)}</div>
+        ${analysis.model_draft && analysis.sources.some((source) => source.evidence_eligible) ? `<details><summary>模型解释（未逐句核验）</summary><p>${escapeHtml(analysis.model_draft.replace(/\[\[(?:result|compare):[^\]]+\]\]/g, ""))}</p><p class="muted">解释中的业务判断、自然语言范围和数字没有逐句认证；请以已核验的结果及来源为准。</p></details>` : ""}
         <ul>${limits}</ul>
         ${modelNotes}
         ${analysis.clarification_question ? `<p><strong>需要澄清：</strong>${escapeHtml(analysis.clarification_question)}</p>` : ""}

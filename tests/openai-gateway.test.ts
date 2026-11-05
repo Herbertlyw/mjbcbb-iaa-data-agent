@@ -296,14 +296,14 @@ test("DeepSeek 缓存命中的输入 token 仍计入任务预算", async () => {
   } finally { await fake.close(); }
 });
 
-test("Pi 成功提交候选后结束工具批次，不再派发多余模型请求", async () => {
+test("Pi 自然澄清无需调用工具，宿主提交且不多次派发", async () => {
   const fake = await startFakeOpenAI(token);
   try {
     await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "clarification" }), async (runtime) => {
       const session = analyst(runtime);
       const job = await ask(runtime, session.session_id, "合成问题，范围不清楚。");
       assert.equal(job.status, "needs_clarification", JSON.stringify(job.error));
-      assert.equal(job.analysis?.clarification_question, "请说明分析范围。");
+      assert.equal(job.analysis?.clarification_question, "请说明分析范围？");
       assert.equal(fake.observations.length, 1);
       assert.equal(runtime.state.listProviderSteps(job.job_id).length, 1);
       assert.equal(job.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
@@ -311,17 +311,17 @@ test("Pi 成功提交候选后结束工具批次，不再派发多余模型请�
   } finally { await fake.close(); }
 });
 
-test("Pi 接受只包含状态和问题的澄清参数，原话保留且不发查询", async () => {
+test("Pi 自然澄清保留原话且不发查询", async () => {
   const fake = await startFakeOpenAI(token);
   try {
     await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "minimal-clarification" }), async (runtime) => {
       const session = analyst(runtime);
       const job = await ask(runtime, session.session_id, "帮我看一下收入。");
       assert.equal(job.status, "needs_clarification", JSON.stringify(job.error));
-      assert.equal(job.analysis?.clarification_question, "请补充产品和日期范围。");
+      assert.equal(job.analysis?.clarification_question, "请补充产品和日期范围？");
       assert.match(job.analysis?.answer ?? "", /假设尚未核验/u);
       assert.equal(job.analysis?.sources.length, 0);
-      assert.deepEqual(job.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["update_analysis"]);
+      assert.deepEqual(job.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), []);
       assert.deepEqual(fake.observations[0]?.userMessages, ["帮我看一下收入。"]);
       assert.equal(fake.observations.length, 1);
     });
@@ -335,9 +335,28 @@ test("Pi 拒绝无证据候选后允许模型修订，成功澄清后结束", as
       const session = analyst(runtime);
       const job = await ask(runtime, session.session_id, "合成问题，范围不清楚。");
       assert.equal(job.status, "needs_clarification", JSON.stringify(job.error));
-      assert.equal(job.analysis?.clarification_question, "请说明分析范围。");
-      const updates = job.events.filter((event) => event.type === "tool_finished" && event.payload.tool_name === "update_analysis");
-      assert.deepEqual(updates.map((event) => event.payload.is_error), [true, false]);
+      assert.equal(job.analysis?.clarification_question, "请说明分析范围？");
+      const feedback = job.events.filter((event) => event.type === "candidate_feedback");
+      assert.equal(feedback.length, 1);
+      assert.equal(feedback[0]?.payload.code, "model_stopped_without_candidate");
+      assert.equal(job.events.filter((event) => event.type === "candidate_reviewed").length, 1);
+      assert.equal(fake.observations.length, 2);
+    });
+  } finally { await fake.close(); }
+});
+
+test("自然结束未选择结果且一次反馈无进展时失败，不把探索结果拼成答案", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: "no-candidate" }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成问题");
+      assert.equal(job.status, "failed");
+      assert.equal(job.error?.code, "model_stopped_without_candidate");
+      assert.equal(job.analysis, null);
+      assert.equal(job.events.filter((event) => event.type === "candidate_feedback").length, 1);
+      assert.equal(job.events.filter((event) => event.type === "candidate_reviewed").length, 0);
+      assert.equal(job.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
       assert.equal(fake.observations.length, 2);
     });
   } finally { await fake.close(); }

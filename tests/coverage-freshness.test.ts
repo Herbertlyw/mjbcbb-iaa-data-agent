@@ -331,11 +331,10 @@ test("部分查询失败时只提交成功资源", () => {
       tool("query", { purpose: "revenue", code: "query_execution_failed", message: "收入查询失败" }, true),
     ],
   } as never);
-  const call = message.content.find((block) => block.type === "toolCall");
-  assert.equal(call && call.type === "toolCall" ? call.name : "", "update_analysis");
-  const args = call && call.type === "toolCall" ? call.arguments : {};
-  assert.equal(args.suggested_status, "partial");
-  assert.deepEqual(args.resource_ids, ["res_ok"]);
+  assert.equal(message.stopReason, "stop");
+  const text = message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
+  assert.match(text, /\[\[result:res_ok\]\]/);
+  assert.doesNotMatch(text, /query_execution_failed|res_failed/);
 });
 
 test("真实模式不注入演示槽位，预算耗尽和 mock 身份有边界", async () => {

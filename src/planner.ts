@@ -287,6 +287,14 @@ function knowledgeBody(fact: ToolFact): boolean {
 }
 
 function call(name: string, args: JsonObject): AssistantMessage {
+  if (name === "update_analysis") {
+    if (args.suggested_status === "needs_clarification") {
+      const question = typeof args.clarification_question === "string" ? args.clarification_question : "请补充分析范围？";
+      return fauxAssistantMessage(`[[clarify]] ${/[?？]$/.test(question) ? question : `${question.replace(/[。！]$/, "")}？`}`, { stopReason: "stop" });
+    }
+    const ids = Array.isArray(args.resource_ids) ? args.resource_ids.filter((id): id is string => typeof id === "string") : [];
+    return fauxAssistantMessage(ids.length ? ids.map((id) => `[[result:${id}]]`).join(" ") : "[[failed]]", { stopReason: "stop" });
+  }
   return fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
 }
 

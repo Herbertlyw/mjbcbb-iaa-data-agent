@@ -27,3 +27,50 @@ export function isAnalysisDeclaration(value: unknown): value is AnalysisDeclarat
   if (value.result_cells !== undefined && (!Array.isArray(value.result_cells) || value.result_cells.length > 16 || value.result_cells.some((item: unknown) => !object(item) || Object.keys(item).some((key) => !["resource_id", "execution_id", "row", "column"].includes(key)) || typeof item.resource_id !== "string" || !item.resource_id || item.resource_id.length > 128 || typeof item.execution_id !== "string" || !item.execution_id || item.execution_id.length > 128 || !Number.isSafeInteger(item.row) || Number(item.row) < 0 || Number(item.row) > 1_000_000 || typeof item.column !== "string" || !item.column || item.column.length > 128))) return false;
   try { return Buffer.byteLength(JSON.stringify(value)) <= 32_000; } catch { return false; }
 }
+
+export interface ModelAnalysisRecord {
+  provenance: "model_declared";
+  revision: number;
+  declaration: AnalysisDeclaration;
+}
+
+/** A working note is recovered only from a matched successful native tool
+ * receipt. It grants no authorization and does not represent delivery. */
+export class SessionAnalysisRecords {
+  private current?: ModelAnalysisRecord;
+
+  update(next: AnalysisDeclaration): ModelAnalysisRecord {
+    if (!isAnalysisDeclaration(next)) throw new Error("analysis_declaration_invalid");
+    const declaration = structuredClone({
+      ...next,
+      ...(next.source_excerpts === undefined && this.current?.declaration.source_excerpts !== undefined ? { source_excerpts: this.current.declaration.source_excerpts } : {}),
+      ...(next.result_cells === undefined && this.current?.declaration.result_cells !== undefined ? { result_cells: this.current.declaration.result_cells } : {}),
+    });
+    if (this.current && JSON.stringify(this.current.declaration) === JSON.stringify(declaration)) return this.currentProjection()!;
+    this.current = { provenance: "model_declared", revision: (this.current?.revision ?? 0) + 1, declaration };
+    return this.currentProjection()!;
+  }
+
+  currentProjection(): ModelAnalysisRecord | undefined { return this.current ? structuredClone(this.current) : undefined; }
+
+  restoreFromPersistedMessages(messages: readonly unknown[]): void {
+    this.current = undefined;
+    const calls = new Map<string, string>();
+    for (const raw of messages) {
+      if (!object(raw)) continue;
+      if (raw.role === "assistant" && Array.isArray(raw.content)) {
+        for (const call of raw.content) if (object(call) && call.type === "toolCall" && typeof call.id === "string" && typeof call.name === "string") calls.set(call.id, call.name);
+      }
+      if (raw.role !== "toolResult" || typeof raw.toolCallId !== "string") continue;
+      const name = calls.get(raw.toolCallId); calls.delete(raw.toolCallId);
+      if (name !== "update_analysis" || raw.toolName !== name || raw.isError !== false || !object(raw.details) || !object(raw.details.analysis_record)) continue;
+      const record = raw.details.analysis_record;
+      if (record.provenance !== "model_declared" || !Number.isSafeInteger(record.revision) || Number(record.revision) <= 0 || !isAnalysisDeclaration(record.declaration)) continue;
+      const content = Array.isArray(raw.content) && raw.content.length === 1 ? raw.content[0] : undefined;
+      if (!object(content) || content.type !== "text" || typeof content.text !== "string") continue;
+      try { const parsed: unknown = JSON.parse(content.text); if (!object(parsed) || JSON.stringify(parsed.analysis_record) !== JSON.stringify(record)) continue; } catch { continue; }
+      if (this.current && Number(record.revision) <= this.current.revision) continue;
+      this.current = { provenance: "model_declared", revision: Number(record.revision), declaration: structuredClone(record.declaration) };
+    }
+  }
+}

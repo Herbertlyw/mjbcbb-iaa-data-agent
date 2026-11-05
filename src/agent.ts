@@ -4,8 +4,9 @@ import { Type } from "typebox";
 import type { AppConfig } from "./config.js";
 import { planFromTranscript } from "./planner.js";
 import { calculationSchema } from "./calculation-protocol.js";
+import { isAnalysisDeclaration, SessionAnalysisRecords } from "./analysis-declaration.js";
 import type { SessionRecord } from "./session.js";
-import { ToolService, type AnalysisInput, type CellOperation } from "./tools.js";
+import { ToolService } from "./tools.js";
 
 const SYSTEM_PROMPT = `你是 Lumenfox 本地数据分析代理，只分析虚构游戏 Starlane Drift 的合成数据。
 搜索资产不能当成读取或查询许可。资产 ID、表名和 SQL 都不是授权。
@@ -126,7 +127,7 @@ async function createLiveStream(_config: AppConfig): Promise<ModelStream> {
   throw new Error("未治理的旧供应商路径已禁用；Pi 模式须通过受治理的 AgentSession 派发。");
 }
 
-export function domainTools(sessionId: string, tools: ToolService): AgentTool[] {
+export function domainTools(sessionId: string, tools: ToolService, records = new SessionAnalysisRecords()): AgentTool[] {
   const pack = (result: { ok: boolean; [key: string]: unknown }) => ({
     content: [{ type: "text" as const, text: JSON.stringify(result) }],
     details: result,
@@ -215,49 +216,20 @@ export function domainTools(sessionId: string, tools: ToolService): AgentTool[] 
     },
     {
       name: "update_analysis",
-      label: "更新分析",
-      description: "提交分析建议，服务端根据本次任务证据决定终态并生成可信数字，草稿里的数字不会自动交付。明细合计须先用计算工具，resource_ids 可只列最终结果；服务端自行复核其来源。需要澄清时填写 needs_clarification 和具体的 clarification_question；没有查询证据时可省略 resource_ids 和 draft_answer。declaration、findings、comparisons 均可省略；不确定引用或摘录时不要填写。",
+      label: "更新分析工作记录",
+      description: "记录模型对范围、粒度、未解决问题和假设的理解，可以反复调用；这不是最终答案、授权或已验证事实。之后继续查询和计算，最终自然回答时明确选择本次任务结果。",
       parameters: Type.Object({
-        suggested_status: Type.Union([
-          Type.Literal("completed"),
-          Type.Literal("partial"),
-          Type.Literal("needs_clarification"),
-          Type.Literal("failed"),
-        ]),
-        draft_answer: Type.Optional(Type.String({ maxLength: 32000, description: "模型草稿，不是权威答案；没有草稿可省略" })),
-        resource_ids: Type.Optional(Type.Array(Type.String({ maxLength: 128 }), { maxItems: 40, description: "本任务证据资源；无证据可省略" })),
-        clarification_question: Type.Optional(Type.String({ maxLength: 2000 })),
-        limitations: Type.Optional(Type.Array(Type.String())),
-        declaration: Type.Optional(Type.Object({
-          scope: Type.String({ maxLength: 4000 }), grain: Type.String({ maxLength: 1000 }),
-          expected_group_keys: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 32, uniqueItems: true }),
-          unresolved_questions: Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { maxItems: 32 }),
-          assumptions: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { maxItems: 16 })),
-          source_excerpts: Type.Optional(Type.Array(Type.Object({ asset_id: Type.String(), content_hash: Type.String(), quote: Type.String() }), { maxItems: 16 })),
-          result_cells: Type.Optional(Type.Array(Type.Object({ resource_id: Type.String(), execution_id: Type.String(), row: Type.Integer({ minimum: 0 }), column: Type.String() }), { maxItems: 16 })),
-        }, { description: "模型工作记录，不是事实或权限；摘录必须逐字匹配当前可读版本，结果引用由服务端取值。" })),
-        comparisons: Type.Optional(Type.Array(Type.Object({
-          left: Type.Object({ resource_id: Type.String(), cell: Type.String() }),
-          right: Type.Object({ resource_id: Type.String(), cell: Type.String() }),
-        }), { maxItems: 20 })),
-        findings: Type.Optional(Type.Array(Type.Object({
-          label: Type.String(),
-          value: Type.Union([Type.Number(), Type.Null()]),
-          kind: Type.Union([Type.Literal("actual"), Type.Literal("missing"), Type.Literal("absent"), Type.Literal("zero"), Type.Literal("predicted")]),
-          resource_id: Type.String(),
-          cell: Type.Optional(Type.String()),
-          group: Type.Optional(Type.Record(Type.String(), Type.String())),
-          time_range: Type.Optional(Type.Object({ start: Type.String(), end: Type.String() })),
-        }))),
-      }),
+        scope: Type.String({ maxLength: 4000 }), grain: Type.String({ maxLength: 1000 }),
+        expected_group_keys: Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 32, uniqueItems: true }),
+        unresolved_questions: Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { maxItems: 32 }),
+        assumptions: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { maxItems: 16 })),
+        source_excerpts: Type.Optional(Type.Array(Type.Object({ asset_id: Type.String(), content_hash: Type.String(), quote: Type.String() }), { maxItems: 16 })),
+        result_cells: Type.Optional(Type.Array(Type.Object({ resource_id: Type.String(), execution_id: Type.String(), row: Type.Integer({ minimum: 0 }), column: Type.String() }), { maxItems: 16 })),
+      }, { additionalProperties: false }),
       executionMode: "sequential",
-      execute: async (_toolCallId, params, signal) => {
-        const input = params as Omit<AnalysisInput, "draft_answer" | "resource_ids"> & Partial<Pick<AnalysisInput, "draft_answer" | "resource_ids">>;
-        const result = await tools.updateAnalysis(sessionId, { ...input, draft_answer: input.draft_answer ?? "", resource_ids: input.resource_ids ?? [] }, signal);
-        // A successful submission is the model's explicit completion point.
-        // Pi ends only when every call in the batch requests termination;
-        // rejected candidates remain available for model correction.
-        return { ...pack(result), ...(result.ok ? { terminate: true } : {}) };
+      execute: async (_toolCallId, params) => {
+        if (!isAnalysisDeclaration(params)) return pack({ ok: false, code: "invalid_analysis_declaration" });
+        return pack({ ok: true, analysis_record: records.update(params), notice: "工作记录是模型自报，不是授权或证据；可继续调用工具。" });
       },
     },
   ];
