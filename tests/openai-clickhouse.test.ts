@@ -367,6 +367,21 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(join.analysis?.sources?.[0]?.freshness_receipts?.length, 2);
     assert.deepEqual(join.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "read_data_contract_view", "query"]);
     assert.ok(join.events.some((event) => event.type === "tool_finished" && event.payload.tool_name === "query" && event.payload.is_error === false));
+    for (const sample of [
+      { question: "合成常量日期查询", status: "completed", value: /70/, engine: "clickhouse_ast_scoped" },
+      { question: "合成外层维度筛选", status: "completed", value: /70/, engine: "clickhouse_ast_scoped" },
+      { question: "合成条件求和表达式", status: "completed", value: /440/, engine: "clickhouse_ast_direct" },
+      { question: "合成安全除法表达式", status: "partial", value: /146\.66666666666666/, engine: "clickhouse_ast_direct" },
+      { question: "合成显式空值替换", status: "partial", value: /670/, engine: "clickhouse_ast_direct" },
+      { question: "合成未知覆盖筛选", status: "partial", value: /440/, engine: "clickhouse_ast_direct" },
+    ]) {
+      const sessionId = ((await (await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json()) as { session_id: string }).session_id;
+      const answer = await postQuestion(apiPort, sessionId, sample.question);
+      assert.equal(answer.status, sample.status, JSON.stringify({ error: answer.error, answer: answer.analysis?.answer, reasons: answer.analysis?.server_reasons }));
+      assert.match(answer.analysis?.answer ?? "", sample.value);
+      const response = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${sessionId}/resources/${answer.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
+      assert.equal(((await response.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, sample.engine);
+    }
     const noLegacyLeftSession = ((await (await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json()) as { session_id: string }).session_id;
     const noLegacyLeft = await postQuestion(apiPort, noLegacyLeftSession, "合成左关联产品：保留未匹配产品。");
     assert.equal(noLegacyLeft.status, "completed", JSON.stringify({ error: noLegacyLeft.error, answer: noLegacyLeft.analysis?.answer, reasons: noLegacyLeft.analysis?.server_reasons }));
