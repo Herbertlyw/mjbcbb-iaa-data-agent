@@ -251,6 +251,7 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成多层恒等投影")) return scripted(turn, nestedCteSteps);
   if (latest.includes("合成多层重命名投影")) return scripted(turn, renamedCteSteps);
   if (latest.includes("合成底层重命名投影")) return scripted(turn, baseRenamedCteSteps);
+  if (latest.includes("合成多层预聚合")) return scripted(turn, layeredPreaggregateSteps);
   if (latest.includes("合成常量日期查询")) return scripted(turn, constantDateSteps);
   if (latest.includes("合成外层维度筛选")) return scripted(turn, outerFilterSteps);
   if (latest.includes("合成条件求和表达式")) return scripted(turn, (ids) => expressionSteps(ids, "sumif"));
@@ -441,6 +442,13 @@ function preaggregatedTitleSteps(ids: string[], unmatched: boolean) {
     ...(unmatched ? [{ id: "preaggregate_transform", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: [{ op: "filter", column: "label", comparison: "is_null" }, { op: "group", by: [], aggregates: [{ op: "sum", column: "total", as: "missing_total" }] }] } }) }] : []),
     { id: "preaggregate_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", draft_answer: "", resource_ids: ids }) },
   ];
+}
+
+function layeredPreaggregateSteps(ids: string[]) {
+  const base = preaggregatedTitleSteps(ids, false);
+  const sql = "WITH a AS (SELECT f.event_date, f.title_id, f.platform, f.country_code, f.channel_id, SUM(f.new_users) AS subtotal FROM fact_fox_daily_install f WHERE f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-12' AND f.platform = 'ios' AND f.country_code = 'JP' AND f.channel_id = 'mist_ads' GROUP BY f.event_date, f.title_id, f.platform, f.country_code, f.channel_id), b AS (SELECT event_date, title_id AS item, platform, country_code, channel_id, subtotal AS value FROM a), c AS (SELECT event_date, item AS product, platform, country_code, channel_id, value AS total_value FROM b) SELECT p.product, d.title_name AS label, SUM(p.total_value) AS total FROM c p LEFT JOIN dim_fox_title d ON p.product = d.title_id GROUP BY p.product, d.title_name ORDER BY p.product";
+  base[2] = { ...base[2]!, arguments: JSON.stringify({ sql }) };
+  return base;
 }
 
 function cteSteps(ids: string[]) {

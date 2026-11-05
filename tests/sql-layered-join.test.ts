@@ -8,6 +8,8 @@ import { loadKnowledge } from "../src/knowledge.js";
 import { prepareJoinEvidence, verifyJoinEvidence, verifyJoinExecutionSchema } from "../src/join-evidence.js";
 import { createClickHouseClient, clickHouseCommand, clickHouseInsert, clickHouseQueryBounded } from "../src/clickhouse-client.js";
 import { createTableSql, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
+import { reviewSql } from "../src/clickhouse-review.js";
+import { clickHouseReviewPolicy } from "../src/clickhouse-review-policy.js";
 
 const rules: TableRule[] = [
   { table: "facts", allowed_columns: ["event_date", "id", "channel", "value", "cost"], sensitive_columns: ["secret"], must_filter: ["event_date"] },
@@ -77,9 +79,24 @@ test("隔离 ClickHouse 多层 CTE/派生表的真实查询和证据 SQL 结果�
         assert.doesNotThrow(() => guardSql(sql, guards));
         assert.doesNotThrow(() => assertJoinKeys(sql, kb.joins, new Map([[fact.table, fact.grain!], [dim.table, dim.grain!]]), { leftJoinDimensions: new Set([dim.table]) }));
         const plan = prepareJoinEvidence(sql, fact, dim, kb.joins); assert.ok(plan);
+        const nativePlan = prepareJoinEvidence(sql, fact, dim, kb.joins, true); assert.ok(nativePlan, "多层 CTE/派生表应由 ClickHouse AST 生成证明");
+        const nativeRules = [fact, dim].map((contract) => ({ table: contract.table, allowed_columns: contract.columns.map((column) => column.name).filter((name) => !contract.sensitive_columns.includes(name)), sensitive_columns: contract.sensitive_columns, must_filter: contract.must_filter, column_types: Object.fromEntries(contract.columns.map((column) => [column.name, column.type])) }));
+        const policy = clickHouseReviewPolicy("default", nativeRules, 100);
+        assert.equal(reviewSql(sql, policy).ok, true, JSON.stringify(reviewSql(sql, policy)));
+        assert.ok(nativePlan.authorizationSql);
+        assert.equal(reviewSql(nativePlan.authorizationSql, policy).ok, true, JSON.stringify(reviewSql(nativePlan.authorizationSql, policy)));
+        for (const invalid of [
+          sql.replace("amount AS price, cost AS c", "amount AS price, amount AS c"),
+          sql.replace("p.product = d.title_id", "p.product = d.title_name"),
+          sql.replace("f.event_date >= '2026-10-06' AND f.event_date <= '2026-10-08'", "f.title_id = 'paper_lantern'"),
+          sql.replace("SUM(f.amount_usd)", "SUM(f.amount_usd AS hidden_alias)"),
+        ]) assert.ok(!prepareJoinEvidence(invalid, fact, dim, kb.joins, true) || !reviewSql(invalid, policy).ok, "不安全包装不得同时通过规划与授权");
         const original = await clickHouseQueryBounded(ch, sql, 100, 500_000); const proof = await clickHouseQueryBounded(ch, plan.executionSql, 100, 500_000);
         assert.equal(proof.truncated, false); assert.equal(verifyJoinExecutionSchema(plan, fact, dim, proof.column_types), true);
         assert.deepEqual(proof.rows.map(({ __da_join_proof: _ignored, ...row }) => row), original.rows);
+        const nativeProof = await clickHouseQueryBounded(ch, nativePlan.executionSql, 100, 500_000);
+        assert.equal(verifyJoinExecutionSchema(nativePlan, fact, dim, nativeProof.column_types), true);
+        assert.deepEqual(nativeProof.rows.map(({ __da_join_proof: _ignored, ...row }) => row), original.rows);
         const values = verifyJoinEvidence(plan, proof.rows); assert.ok(values);
         assert.deepEqual(values.map((x) => [x.column, x.value]), [["amount_usd", "90071992547411.00"], ["cost_usd", "2.13"]]);
       }

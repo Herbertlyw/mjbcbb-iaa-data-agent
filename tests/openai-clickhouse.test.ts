@@ -380,6 +380,12 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.match(noLegacyPreaggregate.analysis?.answer ?? "", /JOIN 求和 70/);
     const noLegacyPreaggregateResponse = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${noLegacyPreaggregateSession}/resources/${noLegacyPreaggregate.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
     assert.equal(((await noLegacyPreaggregateResponse.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, "clickhouse_ast_join");
+    const noLegacyLayeredSession = ((await (await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json()) as { session_id: string }).session_id;
+    const noLegacyLayered = await postQuestion(apiPort, noLegacyLayeredSession, "合成多层预聚合：日本产品七日新增。");
+    assert.equal(noLegacyLayered.status, "completed", JSON.stringify({ error: noLegacyLayered.error, answer: noLegacyLayered.analysis?.answer, reasons: noLegacyLayered.analysis?.server_reasons, events: noLegacyLayered.events.filter((event) => event.type === "tool_finished") }));
+    assert.match(noLegacyLayered.analysis?.answer ?? "", /JOIN 求和 70/);
+    const layeredResponse = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${noLegacyLayeredSession}/resources/${noLegacyLayered.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
+    assert.equal(((await layeredResponse.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, "clickhouse_ast_join");
     const noLegacyPreaggregateLeftSession = ((await (await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json()) as { session_id: string }).session_id;
     const noLegacyPreaggregateLeft = await postQuestion(apiPort, noLegacyPreaggregateLeftSession, "合成 CTE 左关联未匹配：纸灯产品七日新增。");
     assert.equal(noLegacyPreaggregateLeft.status, "completed", JSON.stringify({ error: noLegacyPreaggregateLeft.error, answer: noLegacyPreaggregateLeft.analysis?.answer, reasons: noLegacyPreaggregateLeft.analysis?.server_reasons }));
