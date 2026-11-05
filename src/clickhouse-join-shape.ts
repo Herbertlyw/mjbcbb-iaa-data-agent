@@ -20,8 +20,9 @@ export function clickHouseJoinShape(sql: string, fact: DataContract, dimension: 
   if (!identifier.test(fa) || !identifier.test(da) || fa === da) return null;
   const relation = joins.find((item) => item.tables.length === 2 && item.tables.includes(fact.table) && item.tables.includes(dimension.table));
   if (!relation || !relation.keys.length || !dimension.grain || [...relation.keys].sort().join("|") !== [...dimension.grain].sort().join("|") || !fact.series || relation.keys.some((key) => !fact.series!.dimensions.includes(key))) return null;
-  const column = (value: unknown): Record<string, unknown> | null => {
+  const column = (value: unknown, allowAlias = false): Record<string, unknown> | null => {
     const node = obj(value); if (node?.type !== "Identifier" || typeof node.name !== "string") return null;
+    if (!allowAlias && node.alias !== undefined) return null;
     const parts = Array.isArray(node.name_parts) ? node.name_parts : node.name.split(".");
     if (parts.length < 1 || parts.length > 2 || parts.some((part) => typeof part !== "string" || !identifier.test(part))) return null;
     return { type: "column_ref", table: parts.length === 2 ? parts[0] : null, column: parts.at(-1) };
@@ -53,14 +54,14 @@ export function clickHouseJoinShape(sql: string, fact: DataContract, dimension: 
   const columns: Array<Record<string, unknown>> = [];
   for (const value of query.select) {
     const node = obj(value); if (!node) return null;
-    let expression = column(node);
+    let expression = column(node, true);
     if (!expression && node.type === "Function" && ["sum", "count"].includes(String(node.name).toLowerCase()) && !node.is_window_function && !node.window_definition && !node.parameters && Array.isArray(node.arguments) && node.arguments.length === 1) {
       const input = column(node.arguments[0]); if (input) expression = { type: "aggr_func", name: String(node.name).toLowerCase(), args: { expr: input } };
     }
     if (!expression || node.alias !== undefined && typeof node.alias !== "string") return null;
     columns.push({ expr: expression, as: node.alias ?? null });
   }
-  const grouped = query.group_by.map(column); if (grouped.some((value) => !value)) return null;
+  const grouped = query.group_by.map((value) => column(value)); if (grouped.some((value) => !value)) return null;
   const order: Array<Record<string, unknown>> = [];
   if (query.order_by !== undefined) {
     if (!Array.isArray(query.order_by)) return null;

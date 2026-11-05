@@ -3,12 +3,16 @@ import { assertJoinKeys, parseReadonlySql, rewritePreaggregatedDimensionJoin } f
 import { sumDecimalStrings } from "./exact-arithmetic.js";
 import type { CoverageReport, DataContract, JoinConstraint } from "./types.js";
 import { clickHouseJoinShape } from "./clickhouse-join-shape.js";
+import { expandClickHousePreaggregate } from "./clickhouse-preaggregate.js";
+import { parse } from "@clickhouse/parser";
 
 /** Narrow one-fact/one-dimension JOIN whose aggregate can be recomputed from
  * the rows captured by the *same* ClickHouse SELECT. This is not an immutable
  * database version or a cross-table transaction snapshot. */
 export interface JoinEvidencePlan {
   originalSql: string;
+  /** Equivalent direct SQL independently reauthorized for native preaggregation. */
+  authorizationSql?: string;
   executionSql: string;
   fact: string;
   dimension: string;
@@ -131,7 +135,15 @@ function buildJoinEvidence(sql: string, fact: DataContract, dimension: DataContr
     const series = fact.series;
     if (!series || series.prediction_mode !== "observed_only" || series.predicted_column || dimension.series || fact.timezone !== dimension.timezone || !fact.grain || [...fact.grain].sort().join("|") !== [series.date_column, ...series.dimensions].sort().join("|")) return null;
     const nativeAst = native ? clickHouseJoinShape(sql, fact, dimension, joins) : null;
-    if (native && !nativeAst) return null;
+    if (native && !nativeAst) {
+      const expanded = expandClickHousePreaggregate(sql, fact); if (!expanded) return null;
+      const parsed = parse(expanded.sql, { locations: false }); const branch = object(object(parsed[0])?.selects && (object(parsed[0])!.selects as unknown[])[0]);
+      const groups = Array.isArray(branch?.group_by) ? branch.group_by : [];
+      const groupsDate = groups.some((value) => { const node = object(value); const parts = node && typeof node.name === "string" ? (Array.isArray(node.name_parts) ? node.name_parts : node.name.split(".")) : []; return node?.type === "Identifier" && parts.at(-1) === series.date_column; });
+      const isCoarse = groupsDate || JSON.stringify([...expanded.grain].sort()) !== JSON.stringify([...fact.grain].sort());
+      const proof = buildJoinEvidence(expanded.sql, fact, dimension, joins, isCoarse, aggregateProof, coverageProof, true);
+      return proof ? { ...proof, originalSql: sql, authorizationSql: expanded.sql } : null;
+    }
     const parsed = native ? { sql, ast: nativeAst! } : parseReadonlySql(sql);
     const ast = parsed.ast;
     const preaggregated = rewritePreaggregatedDimensionJoin(ast);

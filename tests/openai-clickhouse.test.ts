@@ -374,6 +374,23 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.match(noLegacyLeft.analysis?.answer ?? "", /JOIN 求和 21/);
     const noLegacyLeftResponse = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${noLegacyLeftSession}/resources/${noLegacyLeft.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
     assert.equal(((await noLegacyLeftResponse.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, "clickhouse_ast_join");
+    const noLegacyPreaggregateSession = ((await (await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json()) as { session_id: string }).session_id;
+    const noLegacyPreaggregate = await postQuestion(apiPort, noLegacyPreaggregateSession, "合成 CTE 预聚合关联：日本产品七日新增。");
+    assert.equal(noLegacyPreaggregate.status, "completed", JSON.stringify({ error: noLegacyPreaggregate.error, answer: noLegacyPreaggregate.analysis?.answer, reasons: noLegacyPreaggregate.analysis?.server_reasons, events: noLegacyPreaggregate.events.filter((event) => event.type === "tool_finished") }));
+    assert.match(noLegacyPreaggregate.analysis?.answer ?? "", /JOIN 求和 70/);
+    const noLegacyPreaggregateResponse = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${noLegacyPreaggregateSession}/resources/${noLegacyPreaggregate.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
+    assert.equal(((await noLegacyPreaggregateResponse.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, "clickhouse_ast_join");
+    const noLegacyPreaggregateLeftSession = ((await (await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json()) as { session_id: string }).session_id;
+    const noLegacyPreaggregateLeft = await postQuestion(apiPort, noLegacyPreaggregateLeftSession, "合成 CTE 左关联未匹配：纸灯产品七日新增。");
+    assert.equal(noLegacyPreaggregateLeft.status, "completed", JSON.stringify({ error: noLegacyPreaggregateLeft.error, answer: noLegacyPreaggregateLeft.analysis?.answer, reasons: noLegacyPreaggregateLeft.analysis?.server_reasons }));
+    assert.match(noLegacyPreaggregateLeft.analysis?.answer ?? "", /21/);
+    const preaggregatedSource = noLegacyPreaggregateLeft.analysis?.sources?.[0]; assert.ok(preaggregatedSource?.sql && preaggregatedSource.executed_sql);
+    const preaggregateReader = createClickHouseClient({ url: clickhouseUrl, username: "fox_reader", password: readerPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 10 }, true);
+    try {
+      const original = await clickHouseQuery(preaggregateReader, preaggregatedSource.sql);
+      const captured = await clickHouseQuery(preaggregateReader, preaggregatedSource.executed_sql);
+      assert.deepEqual(captured.map(({ __da_join_proof: _proof, ...row }) => JSON.stringify(row)).sort(), original.map((row) => JSON.stringify(row)).sort());
+    } finally { await preaggregateReader.close(); }
     const joinedSource = join.analysis?.sources?.[0]; assert.ok(joinedSource?.sql && joinedSource.executed_sql);
     const joinReader = createClickHouseClient({ url: clickhouseUrl, username: "fox_reader", password: readerPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 10 }, true);
     try {

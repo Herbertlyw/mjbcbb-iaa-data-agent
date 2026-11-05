@@ -424,6 +424,7 @@ export class ToolService {
         try {
           if (fact && dimension && reviewSql(normalized, clickHouseReviewPolicy(this.ctx.config.clickhouseDatabase, rules, this.ctx.config.maxResultRows)).ok) {
             nativeJoinPlan = (fact.series?.coverage_domains !== undefined ? prepareJoinCoverageEvidence(normalized, fact, dimension, this.ctx.knowledge.joins, true) : null) ?? prepareJoinEvidence(normalized, fact, dimension, this.ctx.knowledge.joins, true);
+            if (nativeJoinPlan?.authorizationSql && !reviewSql(nativeJoinPlan.authorizationSql, clickHouseReviewPolicy(this.ctx.config.clickhouseDatabase, rules, this.ctx.config.maxResultRows)).ok) nativeJoinPlan = null;
           }
         } catch { nativeJoinPlan = null; }
       }
@@ -2173,6 +2174,13 @@ function verifyJoinResource(resource: JoinQueryResource, session: SessionRecord,
     try { if (!reviewSql(resource.sql, clickHouseReviewPolicy(config.clickhouseDatabase, rules, config.maxResultRows)).ok) return null; } catch { return null; }
   }
   const plan = [prepareJoinEvidence(resource.sql, fact, dimension, knowledge.joins, native), prepareJoinCoverageEvidence(resource.sql, fact, dimension, knowledge.joins, native), prepareJoinAggregateEvidence(resource.sql, fact, dimension, knowledge.joins, native)].find((candidate) => candidate?.executionSql === resource.executed_sql);
+  if (native && plan?.authorizationSql) {
+    const rules = assets.map((asset) => {
+      const contract = asset!.contract!; const binding = session.bindings.find((item) => item.table === contract.table && item.queryable)!;
+      return { table: contract.table, allowed_columns: binding.allowed_columns, sensitive_columns: binding.sensitive_columns, must_filter: binding.must_filter, column_types: Object.fromEntries(contract.columns.map((column) => [column.name, column.type])) };
+    });
+    try { if (!reviewSql(plan.authorizationSql, clickHouseReviewPolicy(config.clickhouseDatabase, rules, config.maxResultRows)).ok) return null; } catch { return null; }
+  }
   if (!plan || plan.range.start !== resource.time_range.start || plan.range.end !== resource.time_range.end || plan.range.timezone !== resource.time_range.timezone || !verifyJoinExecutionSchema(plan, fact, dimension, resource.join_proof.column_types)) return null;
   if (plan.joinType === "left" && resource.execution_settings?.join_use_nulls !== true) return null;
   if (resource.executed_sql !== plan.executionSql || resource.join_proof.capture_hash !== joinCaptureHash(resource.sql, resource.executed_sql, resource.execution_id, resource.join_proof.rows, resource.join_proof.column_types)) return null;
