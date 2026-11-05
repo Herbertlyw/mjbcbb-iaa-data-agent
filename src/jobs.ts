@@ -19,6 +19,8 @@ import type { StateStore, StoredSession } from "./state-store.js";
 import type { AsyncMysqlStateStore } from "./async-mysql-state-store.js";
 import { sessionAnalyses, type ToolService } from "./tools.js";
 import { naturalCandidate } from "./natural-candidate.js";
+import { unresolvedCandidateFailures } from "./candidate-failures.js";
+import { ResourceGraph } from "./resource-graph.js";
 import type { AnalysisDeclaration } from "./analysis-declaration.js";
 import { passthroughTurn, resolveTurn } from "./turn.js";
 import { isTerminal, type AnalysisRecord, type JobRecord, type JobStatus } from "./types.js";
@@ -499,13 +501,19 @@ export class JobService {
     if (!candidate) return { error: { code: "model_stopped_without_candidate", message: "模型未明确选择本次结果，也没有形成可交付的澄清。" } };
     const beat = await this.stateCall("heartbeat", jobId, this.owner, fence, Date.now(), this.host.config.leaseMs);
     if (!beat.ok || beat.cancel_requested) return {};
-    const failedExecution = job.events.some((event) => event.type === "tool_finished" && event.payload.is_error === true && ["query", "calculate_session_cells"].includes(String(event.payload.tool_name)));
+    const closure = new Set<string>();
+    if (candidate.kind === "answer") {
+      const graph = new ResourceGraph((id) => this.host.sessions.lookupResourceAsync(sessionId, id), sessionId, jobId);
+      for (const id of candidate.resourceIds) if (await graph.add(id)) break;
+      for (const resource of graph.nodes()) closure.add(resource.resource_id);
+    }
+    const unresolvedFailures = candidate.kind === "answer" ? unresolvedCandidateFailures(job.events, closure) : 0;
     const input = candidate.kind === "answer"
-      ? { suggested_status: failedExecution ? "partial" as const : "completed" as const, draft_answer: candidate.text, resource_ids: candidate.resourceIds, ...(failedExecution ? { limitations: ["本任务有查询或计算失败；已选证据不能证明所有请求都已完成。"] } : {}), ...(candidate.comparisons ? { comparisons: candidate.comparisons } : {}), ...(declaration ? { declaration } : {}) }
+      ? { suggested_status: "completed" as const, draft_answer: candidate.text, resource_ids: candidate.resourceIds, ...(candidate.comparisons ? { comparisons: candidate.comparisons } : {}), ...(declaration ? { declaration } : {}) }
       : candidate.kind === "clarification"
       ? { suggested_status: "needs_clarification" as const, draft_answer: "", resource_ids: [], clarification_question: candidate.question }
       : { suggested_status: "failed" as const, draft_answer: "", resource_ids: [] };
-    const result = await this.host.tools.updateAnalysis(sessionId, input);
+    const result = await this.host.tools.updateAnalysis(sessionId, input, undefined, { unresolvedToolFailures: unresolvedFailures });
     if (!result.ok) return { error: { code: String(result.code ?? "candidate_delivery_failed"), message: "候选答案未通过服务端证据检查。" } };
     if (!candidateEntryId || !job.events.some((event) => event.type === "candidate_reviewed" && event.payload.candidate_entry_id === candidateEntryId)) {
       const event = await this.stateCall("appendEvent", jobId, this.owner, fence, "candidate_reviewed", { candidate_entry_id: candidateEntryId ?? null, status: result.status, selected_count: candidate.kind === "answer" ? candidate.resourceIds.length : 0 });

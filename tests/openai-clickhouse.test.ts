@@ -557,6 +557,15 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       return ((await response.json()) as { session_id: string }).session_id;
     };
     const dailySession = await createSyntheticSession();
+    const corrected = await postQuestion(apiPort, await createSyntheticSession(), "合成纠正查询错误：纸灯美国三日新增合计。");
+    assert.equal(corrected.status, "completed", JSON.stringify({ error: corrected.error, reasons: corrected.analysis?.server_reasons, answer: corrected.analysis?.answer }));
+    assert.match(corrected.analysis?.answer ?? "", /220/);
+    const queryEvents = corrected.events.filter((event) => event.type === "tool_finished" && event.payload.tool_name === "query");
+    assert.equal(queryEvents.length, 2); assert.equal(queryEvents[0]?.payload.is_error, true); assert.equal(queryEvents[1]?.payload.is_error, false);
+    assert.ok(!corrected.analysis?.server_reasons?.includes("unresolved_tool_failure"));
+    const incomplete = await postQuestion(apiPort, await createSyntheticSession(), "合成第二项未完成：查询纸灯美国三日新增及另一项指标。");
+    assert.equal(incomplete.status, "partial", JSON.stringify({ error: incomplete.error, reasons: incomplete.analysis?.server_reasons, answer: incomplete.analysis?.answer }));
+    assert.ok(incomplete.analysis?.server_reasons?.includes("unresolved_tool_failure"));
     const derivedAligned = await postQuestion(apiPort, await createSyntheticSession(), "合成变换结果对齐：比较纸灯 iOS 雾帆 2026-10-06 各国家新增分组的两个排序结果。");
     assert.equal(derivedAligned.status, "completed", JSON.stringify({ error: derivedAligned.error, answer: derivedAligned.analysis?.answer, reasons: derivedAligned.analysis?.server_reasons, tools: derivedAligned.events.filter((event) => event.type === "tool_finished") }));
     const derivedRows = derivedAligned.analysis?.alignment_results?.[0]?.rows ?? [];

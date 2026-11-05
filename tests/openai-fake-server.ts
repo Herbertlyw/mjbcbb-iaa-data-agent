@@ -218,6 +218,8 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
     return defaultSteps(ids)[results.length - 1] ?? null;
   }
   const hasBase = earlierUsers.some((text) => text.includes("纸灯") && text.includes("美国") && text.includes("iOS") && text.includes("雾帆") && text.includes("2026-10-06") && text.includes("2026-10-12"));
+  if (latest.includes("合成纠正查询错误")) return scriptedAllowError(turn, false);
+  if (latest.includes("合成第二项未完成")) return scriptedAllowError(turn, true);
   if (latest.includes("合成空值标记投影")) return scripted(turn, nullMarkerSteps);
   if (latest.includes("合成条件阈值")) return scripted(turn, conditionalThresholdSteps);
   if (latest.includes("合成单资源比较")) return scripted(turn, sameResourceComparisonSteps);
@@ -736,6 +738,17 @@ function scripted(turn: ProtocolMessage[], steps: (ids: string[]) => Array<{ id:
   const ids = [...resultText.matchAll(/resource_id[=:]"?(res_[0-9a-f-]{36})/g)].map((match) => match[1] ?? "");
   const planned = steps(ids);
   return planned[results.length] ?? null;
+}
+
+function scriptedAllowError(turn: ProtocolMessage[], unresolved: boolean): { id: string; name: string; arguments: string } | null {
+  const results = turn.filter((message) => message.role === "tool");
+  const resultText = results.map(messageText).join("\n");
+  const ids = [...resultText.matchAll(/resource_id[=:]"?(res_[0-9a-f-]{36})/g)].map((match) => match[1] ?? "");
+  const contract = { id: "retry_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) };
+  const invalid = { id: "retry_invalid", name: "query", arguments: JSON.stringify({ sql: "SELECT (" }) };
+  const valid = { id: "retry_valid", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'" }) };
+  const calculate = { id: "retry_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "new_users", as: "total" }] }) };
+  return (unresolved ? [contract, valid, invalid] : [contract, invalid, valid, calculate])[results.length] ?? null;
 }
 
 function defaultSteps(ids: string[]) {

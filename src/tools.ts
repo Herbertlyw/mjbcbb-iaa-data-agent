@@ -1412,7 +1412,7 @@ export class ToolService {
     };
   }
 
-  async updateAnalysis(sessionId: string, input: AnalysisInput, signal?: AbortSignal): Promise<ToolResult> {
+  async updateAnalysis(sessionId: string, input: AnalysisInput, signal?: AbortSignal, host?: { unresolvedToolFailures: number }): Promise<ToolResult> {
     const cancelled = await this.gate(sessionId, signal);
     if (cancelled) return cancelled;
     if (input.declaration !== undefined && !isAnalysisDeclaration(input.declaration)) return fail("invalid_analysis_declaration", "分析工作记录格式或长度不合法。");
@@ -1505,6 +1505,7 @@ export class ToolService {
       return { ok: true, ...exhausted, notice: "修订次数用完后，只交付有证据的部分。" };
     }
     let status: AnalysisStatus = input.suggested_status;
+    if (host && host.unresolvedToolFailures > 0 && (status === "completed" || status === "partial")) { reasons.push("unresolved_tool_failure"); if (status === "completed") status = "partial"; }
     if (invalidSelectedResource && status === "completed") status = "partial";
     if (input.clarification_question) {
       status = "needs_clarification";
@@ -1794,6 +1795,7 @@ export class ToolService {
       limitations.push("模型草稿及其数字、标签和解释未作为已验证事实；正式结论由本次证据生成。");
     }
     if (reasons.includes("model_declared_unresolved")) limitations.push("模型工作记录仍有待解决问题；其范围、粒度和假设均为自报，不作为已验证事实。");
+    if (reasons.includes("unresolved_tool_failure")) limitations.push("本任务仍有未与所选结果依赖对应的查询或计算失败，不能认定所有请求均已完成。");
     if (input.findings?.length || input.limitations?.length) limitations.push("模型提供的标签、分组、单位、状态和自由文字未作为事实采用；数值与范围由服务端元数据生成。");
     if (reasons.includes("calculation_lineage_unsupported") || reasons.includes("query_lineage_unsupported")) limitations.push("部分表达式或计算缺少可证明的血缘，没有作为已验证数值展示。");
     if (reasons.includes("comparison_unverifiable")) limitations.push("部分比较的范围、覆盖、单位、预测状态或整数精度无法证明，没有展示比较结果。");
