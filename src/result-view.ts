@@ -48,6 +48,11 @@ export function savedResultView(resource: SessionResource): SavedResultView | nu
     };
   }
   if (resource.kind === "calculation") {
+    if (resource.evaluated_table_v1) {
+      const table = resource.evaluated_table_v1.table;
+      return { ...common, columns: table.columns.map((column) => ({ name: column.name, type: column.type === "decimal" ? `Decimal(scale=${column.scale})` : column.type, unit: column.unit || null })), rows: table.rows, saved_rows: table.rows.length, source_truncated: resource.input_truncated, sql_limited: false, complete_population: resource.complete_population,
+        source: { input: resource.source_resource_id, input_hash: resource.source_resource_hash ?? null, operations: resource.operations ?? null } };
+    }
     const columns = Object.entries(resource.cells).map(([name, value]) => ({ name, type: value === null ? "Unknown" : typeof value === "string" ? "DecimalText" : Number.isSafeInteger(value) ? "SafeInteger" : "Float64", unit: null }));
     return { ...common, columns, rows: [{ ...resource.cells }], saved_rows: 1, source_truncated: resource.input_truncated, sql_limited: false, complete_population: resource.complete_population,
       source: { input: resource.source_resource_id, input_hash: resource.source_resource_hash ?? null, operations: resource.operations ?? null } };

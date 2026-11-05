@@ -213,6 +213,8 @@ export interface FreshnessReceipt {
 }
 
 export interface QueryResource {
+  /** Enables structured key provenance for newly created resources. */
+  key_lineage_version?: 1;
   resource_id: string;
   session_id: string;
   kind: "query_result";
@@ -266,6 +268,8 @@ export interface CalculationResource {
   source_resource_hash?: string;
   cells: Record<string, number | string | null>;
   operations?: Record<string, import("./evidence.js").CellOperation>;
+  /** Versioned recipe for cell operations over a verified result table. */
+  evaluated_table_v1?: { table: import("./result-transform.js").ResultTable; incomplete: boolean; input_hashes: Record<string, string> };
   input_truncated: boolean;
   complete_population: boolean;
   null_means: "missing";
@@ -366,7 +370,7 @@ export interface AnalysisRecord {
   calculations: Array<{
     resource_id: string;
     source_resource_id: string;
-    cells: Record<string, number | string>;
+    cells: Record<string, number | string | null>;
     verified_cells?: import("./evidence.js").VerifiedCell[];
     verified_decimal_cells?: import("./decimal-cell-evidence.js").VerifiedDecimalCell[];
     verified_group_rollups?: import("./aggregate-rollup.js").VerifiedGroupRollup[];

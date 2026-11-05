@@ -42,6 +42,7 @@ import { reviewDirectClickHouse, reviewScopedClickHouse } from "./clickhouse-dir
 import { queryEvidenceShape } from "./evidence-shape.js";
 import { ResourceGraph } from "./resource-graph.js";
 import { savedResultView } from "./result-view.js";
+import { calculateResultCells } from "./result-cells.js";
 import { normalizeCalculation } from "./calculation-protocol.js";
 import { assertJoinKeys, guardSql, inspectSingleSourceProjection, parseReadonlySql, SqlRejected, type TableRule } from "./sql.js";
 import type { ClickHouseClient } from "@clickhouse/client";
@@ -590,6 +591,7 @@ export class ToolService {
       resource_id: newId("res"),
       session_id: session.session_id,
       kind: "query_result",
+      key_lineage_version: 1,
       created_at: new Date().toISOString(),
       ...(session.active_job_id ? { job_id: session.active_job_id } : {}),
       engine: this.ctx.businessEngine === "clickhouse" ? "clickhouse-local" : "sqlite-local",
@@ -694,7 +696,7 @@ export class ToolService {
     if (!Array.isArray(input.operations) || input.operations.length < 1 || input.operations.length > 40) return fail("invalid_calculation", "每次须提供 1 到 40 个计算操作。");
     const found = await this.ctx.sessions.lookupResourceAsync(sessionId, input.resource_id ?? "");
     if (!found.ok) return fail(found.code, found.message);
-    if (found.resource.kind !== "query_result") return fail("resource_not_calculable", "只能计算查询结果资源");
+    if (found.resource.kind !== "query_result") return this.calculateTableCells(sessionId, found.resource, input.operations, expectedHashes);
     const source = found.resource;
     if (expectedHashes && expectedHashes[source.resource_id] !== createHash("sha256").update(JSON.stringify(source)).digest("hex")) return fail("resource_version_changed", "输入资源在校验后发生变化，请重新读取。");
     const activeJob = (await this.ctx.sessions.requireAsync(sessionId)).active_job_id;
@@ -743,6 +745,24 @@ export class ToolService {
       notes,
       notice: `resource_id=${resource.resource_id}`,
     };
+  }
+
+  private async calculateTableCells(sessionId: string, source: SessionResource, operations: CellOperation[], expectedHashes?: Record<string, string>): Promise<ToolResult> {
+    const session = await this.ctx.sessions.requireAsync(sessionId); const jobId = session.active_job_id;
+    if (!jobId || source.job_id !== jobId) return fail("resource_from_other_execution", "只能使用当前任务的结果。");
+    const fresh = await this.currentFreshness(); if (!fresh.ok) return fresh;
+    if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
+    const input = await this.resolveTransform(session, jobId, source.resource_id, fresh.publication, new Set());
+    if (!input) return fail("calculation_lineage_unsupported", "输入结果的身份、来源、权限或新鲜度无法复核。");
+    if (expectedHashes && expectedHashes[source.resource_id] !== input.hashes[source.resource_id]) return fail("resource_version_changed", "计算输入在校验后发生变化，请重新读取。");
+    const result = calculateResultCells(input.table, operations);
+    if (!result) return fail("invalid_calculation", "计算字段、类型、预测筛选或资源边界不受支持。");
+    const cells: Record<string, number | string | null> = Object.create(null) as Record<string, number | string | null>;
+    const recipe: Record<string, CellOperation> = Object.create(null) as Record<string, CellOperation>;
+    for (const operation of operations) { cells[operation.as] = result.table.rows[0]![operation.as] as string | null; recipe[operation.as] = { ...operation }; }
+    const resource: CalculationResource = { resource_id: newId("res"), execution_id: newId("calc"), session_id: sessionId, job_id: jobId, kind: "calculation", created_at: new Date().toISOString(), source_resource_id: source.resource_id, source_resource_hash: input.hashes[source.resource_id], cells, operations: recipe, evaluated_table_v1: { table: result.table, incomplete: result.incomplete, input_hashes: input.hashes }, input_truncated: false, complete_population: true, null_means: "missing", zero_means: "observed_zero", predicted_means: "forecast_not_actual", notes: [] };
+    await this.ctx.sessions.saveResourceAsync(resource);
+    return { ok: true, resource_id: resource.resource_id, execution_id: resource.execution_id, cells, columns: result.table.columns, input_truncated: false, complete_population: true, notice: `基于本任务已核验结果的数学计算；业务名称和完整性仍须单独证明。resource_id=${resource.resource_id}` };
   }
 
   private async calculateArithmetic(sessionId: string, expression: { op: ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef }, expectedHashes?: Record<string, string>): Promise<ToolResult> {
@@ -874,9 +894,9 @@ export class ToolService {
     return { rows, hashes, leaves: [...new Set(inputs.map(({ source }) => source.resource_id))], partial: false };
   }
 
-  /** Keyed mathematical alignment of verified derived results. Restrict both
-   * inputs to the same physical contract, compatible range and pinned filters;
-   * derived labels do not establish a new business metric. */
+  /** Keyed mathematical alignment of verified derived results. Physical key
+   * lineage and compatible contracts establish key equivalence; display
+   * labels do not establish a new business metric. */
   private async resolveDerivedAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication, path: Set<string>): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
     if (!Array.isArray(spec.keys) || !spec.keys.length || spec.keys.length > 3 || new Set(spec.keys).size !== spec.keys.length) return null;
     const checked = await Promise.all([spec.left, spec.right].map((ref) => this.resolveTransform(session, jobId, ref.resource_id, publication, new Set(path))));
@@ -885,16 +905,27 @@ export class ToolService {
     if (leafResults.some((item) => !item.ok || item.resource.kind !== "query_result" || item.resource.job_id !== jobId)) return null;
     const leftSource = (leafResults[0] as { ok: true; resource: QueryResource }).resource;
     const rightSource = (leafResults[1] as { ok: true; resource: QueryResource }).resource;
-    if (leftSource.tables.length !== 1 || rightSource.tables.length !== 1 || leftSource.tables[0] !== rightSource.tables[0] || leftSource.time_range.start !== rightSource.time_range.start || leftSource.time_range.end !== rightSource.time_range.end || leftSource.time_range.timezone !== rightSource.time_range.timezone) return null;
+    if (leftSource.tables.length !== 1 || rightSource.tables.length !== 1 || leftSource.time_range.start !== rightSource.time_range.start || leftSource.time_range.end !== rightSource.time_range.end || leftSource.time_range.timezone !== rightSource.time_range.timezone) return null;
     const contract = this.arithmeticContract(session, leftSource, publication);
-    if (!contract?.series || !this.arithmeticContract(session, rightSource, publication) || contract.series.predicted_column || contract.series.prediction_mode !== "observed_only") return null;
+    const other = this.arithmeticContract(session, rightSource, publication);
+    if (!contract?.series || !other?.series || contract.series.predicted_column || other.series.predicted_column || contract.series.prediction_mode !== "observed_only" || other.series.prediction_mode !== "observed_only" || contract.series.date_column !== other.series.date_column || JSON.stringify([...contract.series.dimensions].sort()) !== JSON.stringify([...other.series.dimensions].sort()) || JSON.stringify([...tableGrain(this.ctx.knowledge, contract.table)].sort()) !== JSON.stringify([...tableGrain(this.ctx.knowledge, other.table)].sort())) return null;
     const leftEvidence = this.evidenceSource(session, leftSource); const rightEvidence = this.evidenceSource(session, rightSource);
     const leftFilters = leftEvidence && provenCoverageFilters(leftEvidence.sql, contract, leftSource.time_range);
-    const rightFilters = rightEvidence && provenCoverageFilters(rightEvidence.sql, contract, rightSource.time_range);
+    const rightFilters = rightEvidence && provenCoverageFilters(rightEvidence.sql, other, rightSource.time_range);
     if (!leftFilters || !rightFilters || stableHashes(leftFilters) !== stableHashes(rightFilters) || spec.keys.some((key) => key !== contract.series!.date_column && !contract.series!.dimensions.includes(key) || Object.hasOwn(leftFilters, key)) || !contract.series.dimensions.every((key) => spec.keys.includes(key) || Object.hasOwn(leftFilters, key))) return null;
-    for (const item of checked) for (const key of spec.keys) {
-      const column = item!.table.columns.find((candidate) => candidate.name === key);
-      if (!column || column.type !== "text" || column.label !== `${contract.table}.${key}` || column.unit !== `维度 ${contract.table}.${key}`) return null;
+    for (let index = 0; index < checked.length; index++) for (const key of spec.keys) {
+      const current = index ? other : contract; const column = checked[index]!.table.columns.find((candidate) => candidate.name === key);
+      const expected = current.columns.find((item) => item.name === key)?.type.replace(/\s/gu, "").toLowerCase();
+      const otherType = (index ? contract : other).columns.find((item) => item.name === key)?.type.replace(/\s/gu, "").toLowerCase();
+      if (!column || column.type !== "text" || !expected || expected !== otherType || column.key_lineage?.table !== current.table || column.key_lineage.column !== key || column.key_lineage.physical_type !== expected) return null;
+    }
+    if (contract.table !== other.table) {
+      const leftMetric = checked[0]!.table.columns.find((column) => column.name === spec.left.cell);
+      const rightMetric = checked[1]!.table.columns.find((column) => column.name === spec.right.cell);
+      const a = leftMetric?.value_lineage; const b = rightMetric?.value_lineage;
+      const expectedUnit = leftMetric && rightMetric && arithmeticUnit(spec.op, leftMetric.unit, rightMetric.unit);
+      const declared = [...(contract.derived_metrics ?? []), ...(other.derived_metrics ?? [])].some((item) => item.operation === spec.op && item.prediction === "actual_only" && item.unit === expectedUnit && item.numerator === `${a?.table}.${a?.column}` && item.denominator === `${b?.table}.${b?.column}`);
+      if (!a || !b || a.table !== contract.table || b.table !== other.table || !expectedUnit || !declared) return null;
     }
     const inputs: CompleteKeyedInput[] = []; const makers: Array<(value: string | null) => ArithmeticValue> = [];
     for (let index = 0; index < 2; index++) {
@@ -903,7 +934,8 @@ export class ToolService {
       if (!metric || metric.type !== "decimal" || !Number.isInteger(metric.scale)) return null;
       const make = (value: string | null): ArithmeticValue => ({ value, scale: metric.scale!, unit: metric.unit || "未认证", basis: { table: "结果资源", column: `${ref.resource_id}.${ref.cell}`, operation: "result_cell", unit: metric.unit || "未认证", prediction: "未认证", timezone: "未认证" }, scopes: [], interpretation: "mathematical_only", formula: `${ref.resource_id}.${ref.cell}` });
       makers.push(make);
-      inputs.push({ table, valueColumn: ref.cell, keyColumns: spec.keys, valueForGroup: make });
+      const normalized = { ...table, columns: table.columns.map((column) => spec.keys.includes(column.name) ? { ...column, unit: `维度 ${column.name}` } : column) };
+      inputs.push({ table: normalized, valueColumn: ref.cell, keyColumns: spec.keys, valueForGroup: make });
     }
     const aligned = alignCompleteTables(inputs[0]!, inputs[1]!, spec.op, (op, left, right) => this.computeProvenArithmetic(op, left, right));
     if (!aligned) return null;
@@ -927,7 +959,7 @@ export class ToolService {
         const first = aggregates[0]!;
         const orderedKeys = [...keys].sort();
         if (first.operation !== "sum" || !series.metrics.includes(first.column) || JSON.stringify(Object.keys(first.group).sort()) !== JSON.stringify(orderedKeys) || !series.dimensions.every((key) => keys.includes(key) || Object.hasOwn(first.filters, key)) || keys.some((key) => !series.dimensions.includes(key) || Object.hasOwn(first.filters, key)) || aggregates.some((item) => item.operation !== "sum" || item.table !== first.table || item.column !== first.column || item.output_column !== first.output_column || item.unit !== first.unit || item.scale !== first.scale || stableHashes(item.filters) !== stableHashes(first.filters) || JSON.stringify(Object.keys(item.group).sort()) !== JSON.stringify(orderedKeys))) return null;
-        const table = aggregateTable(aggregates);
+        const table = aggregateTable(aggregates, source.key_lineage_version === 1 ? contract : undefined);
         if (!table) return null;
         const normalized: ResultTable = { ...table, columns: table.columns.map((column) => keys.includes(column.name) ? { ...column, unit: `维度 ${column.name}` } : column) };
         const make = (value: string | null, values: ReadonlyArray<ResultValue>): ArithmeticValue | null => {
@@ -998,7 +1030,7 @@ export class ToolService {
       const contract = this.arithmeticContract(session, resource, publication);
       const evidence = this.evidenceSource(session, resource);
       const aggregates = contract && evidence && verifyDatabaseAggregates(evidence, contract);
-      let table = aggregates && aggregateTable(aggregates);
+      let table = aggregates && aggregateTable(aggregates, resource.key_lineage_version === 1 ? contract! : undefined);
       if (!table && contract && evidence) {
         // Read the stored result through the same bounded, hash-bound pages
         // exposed to agents. A mutation between pages invalidates the input.
@@ -1029,6 +1061,16 @@ export class ToolService {
       const table = alignmentTable(resource.spec, checked.rows);
       const partial = checked.partial || checked.rows.some((row) => row.status !== "matched" || Object.values(row.group).some((value) => value === null));
       return table ? { table, hashes: { ...checked.hashes, [resource.resource_id]: ownHash }, leaves: checked.leaves, partial, ...(partial ? { partial_reason: "alignment_incomplete" as const } : {}) } : null;
+    }
+    if (resource.kind === "calculation" && resource.evaluated_table_v1) {
+      if (!resource.execution_id || !resource.operations || !resource.source_resource_hash) return null;
+      const next = new Set(path); next.add(resourceId);
+      const parent = await this.resolveTransform(session, jobId, resource.source_resource_id, publication, next);
+      if (!parent || parent.hashes[resource.source_resource_id] !== resource.source_resource_hash || stableHashes(parent.hashes) !== stableHashes(resource.evaluated_table_v1.input_hashes)) return null;
+      const result = calculateResultCells(parent.table, Object.values(resource.operations));
+      if (!result || result.incomplete !== resource.evaluated_table_v1.incomplete || JSON.stringify(result.table) !== JSON.stringify(resource.evaluated_table_v1.table) || JSON.stringify({ ...result.table.rows[0] }) !== JSON.stringify({ ...resource.cells })) return null;
+      const partial = parent.partial || result.incomplete;
+      return { table: result.table, hashes: { ...parent.hashes, [resourceId]: ownHash }, leaves: parent.leaves, partial, ...(partial ? { partial_reason: parent.partial_reason ?? "transform_coverage_incomplete" as const } : {}) };
     }
     if (resource.kind === "calculation" || resource.kind === "arithmetic") {
       if (!resource.execution_id) return null;
@@ -1075,6 +1117,12 @@ export class ToolService {
       if (ref.row === 0 && (ref.execution_id === undefined || ref.execution_id === resource.execution_id) && ref.aggregate === undefined && !ref.group && resource.execution_id && resource.rows.length === 1) {
         const matching = verifyDatabaseAggregates(evidence, contract)?.filter((item) => item.output_column === ref.cell && Object.keys(item.group).length === 0) ?? [];
         if (matching.length === 1) return { value: fromAggregate(matching[0]!), hashes: { [resource.resource_id]: ownHash }, leaves: [resource.resource_id] };
+      }
+      // A proven database grouping is already a typed, complete result. The
+      // same column sum must not depend on inserting an identity sort first.
+      if (ref.aggregate === "sum" && ref.row === undefined && !ref.group && ref.execution_id && ref.execution_id === resource.execution_id && verifyDatabaseAggregates(evidence, contract)?.some((item) => item.output_column === ref.cell && Object.keys(item.group).length > 0)) {
+        const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, path);
+        return checked ? this.selectTableArithmetic(checked, ref) : null;
       }
       if (ref.row !== undefined || ref.aggregate !== undefined || ref.execution_id !== undefined) {
         // Only a one-row resource can unambiguously select row zero without
@@ -1124,38 +1172,16 @@ export class ToolService {
       // from different resources as a matched business row.
       if (ref.group || !resource.execution_id || ref.execution_id !== resource.execution_id || (ref.row === undefined) === (ref.aggregate === undefined) || (ref.row !== undefined && (!Number.isSafeInteger(ref.row) || ref.row < 0)) || (ref.aggregate !== undefined && ref.aggregate !== "sum")) return null;
       const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, path);
-      const column = checked?.table.columns.find((item) => item.name === ref.cell);
-      if (!checked || !column || column.type !== "decimal" || !Number.isInteger(column.scale) || column.scale! < 0 || column.scale! > 38) return null;
-      let values: Array<string | null>;
-      if (ref.row !== undefined) {
-        const row = checked.table.rows[ref.row];
-        if (!row || !Object.hasOwn(row, ref.cell)) return null;
-        const value = row[ref.cell];
-        if (value !== null && typeof value !== "string") return null;
-        values = [value as string | null];
-      } else {
-        values = [];
-        for (const row of checked.table.rows) {
-          const value = row[ref.cell];
-          if (value !== null && typeof value !== "string") return null;
-          values.push(value as string | null);
-        }
-      }
-      const nonNull = values.filter((value): value is string => value !== null);
-      const value = nonNull.length ? sumDecimalStrings(nonNull, column.scale!) : null;
-      if (nonNull.length && value === null) return null;
-      const partial = checked.partial || !values.length || nonNull.length !== values.length;
-      const selection = ref.row !== undefined ? `第 ${ref.row} 行` : "整列非 NULL 合计";
-      const result: ArithmeticValue = {
-        value, scale: column.scale!, unit: column.unit || "未认证",
-        basis: { table: "结果资源", column: ref.cell, operation: "result_cell", unit: column.unit || "未认证", prediction: "未认证", timezone: "未认证" },
-        interpretation: "mathematical_only", ...(partial ? { partial: true } : {}),
-        formula: `${resource.resource_id} 的列 ${ref.cell}（${selection}）`, scopes: [],
-      };
-      return { value: result, hashes: checked.hashes, leaves: checked.leaves };
+      return checked ? this.selectTableArithmetic(checked, ref) : null;
     }
     if ((ref.execution_id !== undefined && ref.execution_id !== resource.execution_id) || ref.row !== undefined || ref.aggregate !== undefined) return null;
     if (resource.kind === "calculation") {
+      if (resource.evaluated_table_v1) {
+        const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, path);
+        const column = checked?.table.columns.find((item) => item.name === ref.cell); const value = checked?.table.rows[0]?.[ref.cell];
+        if (!checked || !column || column.type !== "decimal" || !Number.isInteger(column.scale) || value !== null && typeof value !== "string") return null;
+        return { value: { value: value as string | null, scale: column.scale!, unit: column.unit || "未认证", basis: { table: "结果资源", column: ref.cell, operation: "result_cell", unit: column.unit || "未认证", prediction: "未认证", timezone: "未认证" }, interpretation: "mathematical_only", ...(checked.partial || value === null ? { partial: true } : {}), formula: `${resource.resource_id} 的列 ${ref.cell}`, scopes: [] }, hashes: checked.hashes, leaves: checked.leaves };
+      }
       if (ref.group || !resource.operations || !Object.hasOwn(resource.operations, ref.cell)) return null;
       const foundSource = await this.ctx.sessions.lookupResourceAsync(session.session_id, resource.source_resource_id);
       if (!foundSource.ok || foundSource.resource.kind !== "query_result" || foundSource.resource.job_id !== jobId) return null;
@@ -1196,6 +1222,38 @@ export class ToolService {
     const value = this.computeProvenArithmetic(resource.operation, left.value, right.value);
     if (!value || JSON.stringify(value) !== JSON.stringify(resource.result)) return null;
     return { value, hashes: { ...hashes, [resource.resource_id]: ownHash }, leaves: [...new Set([...left.leaves, ...right.leaves])] };
+  }
+
+  private selectTableArithmetic(checked: { table: ResultTable; hashes: Record<string, string>; leaves: string[]; partial: boolean }, ref: ArithmeticRef): { value: ArithmeticValue; hashes: Record<string, string>; leaves: string[] } | null {
+      const column = checked.table.columns.find((item) => item.name === ref.cell);
+      if (!column || column.type !== "decimal" || !Number.isInteger(column.scale) || column.scale! < 0 || column.scale! > 38) return null;
+      let values: Array<string | null>;
+      if (ref.row !== undefined) {
+        const row = checked.table.rows[ref.row];
+        if (!row || !Object.hasOwn(row, ref.cell)) return null;
+        const value = row[ref.cell];
+        if (value !== null && typeof value !== "string") return null;
+        values = [value as string | null];
+      } else {
+        values = [];
+        for (const row of checked.table.rows) {
+          const value = row[ref.cell];
+          if (value !== null && typeof value !== "string") return null;
+          values.push(value as string | null);
+        }
+      }
+      const nonNull = values.filter((value): value is string => value !== null);
+      const value = nonNull.length ? sumDecimalStrings(nonNull, column.scale!) : null;
+      if (nonNull.length && value === null) return null;
+      const partial = checked.partial || !values.length || nonNull.length !== values.length;
+      const selection = ref.row !== undefined ? `第 ${ref.row} 行` : "整列非 NULL 合计";
+      const result: ArithmeticValue = {
+        value, scale: column.scale!, unit: column.unit || "未认证",
+        basis: { table: "结果资源", column: ref.cell, operation: "result_cell", unit: column.unit || "未认证", prediction: "未认证", timezone: "未认证" },
+        interpretation: "mathematical_only", ...(partial ? { partial: true } : {}),
+        formula: `${ref.resource_id} 的列 ${ref.cell}（${selection}）`, scopes: [],
+      };
+      return { value: result, hashes: checked.hashes, leaves: checked.leaves };
   }
 
   private arithmeticContract(session: SessionRecord, resource: QueryResource, publication: FreshnessPublication): DataContract | null {
@@ -1490,8 +1548,24 @@ export class ToolService {
     const verifiedDecimal: VerifiedDecimalCell[] = [];
     const verifiedGroupRollups: VerifiedGroupRollup[] = [];
     const verifiedByCalculation = new Map<string, Map<string, VerifiedCell>>();
+    const tableCellLines: string[] = [];
     for (const resource of resources) {
       if (resource.kind !== "calculation") continue;
+      if (resource.evaluated_table_v1) {
+        const checked = liveFreshness && jobId ? await this.resolveTransform(session, jobId, resource.resource_id, liveFreshness, new Set()) : null;
+        if (!checked || checked.leaves.some((id) => !eligible.has(id))) {
+          reasons.push("calculation_lineage_unsupported");
+          if (status === "completed") status = "partial";
+          continue;
+        }
+        if (checked.partial) { reasons.push("transform_coverage_incomplete"); if (status === "completed") status = "partial"; }
+        calculations.push({ resource_id: resource.resource_id, source_resource_id: resource.source_resource_id, cells: resource.cells, verified_cells: [], verified_decimal_cells: [], verified_group_rollups: [], input_truncated: resource.input_truncated, complete_population: resource.complete_population });
+        for (const column of checked.table.columns) {
+          const value = checked.table.rows[0]?.[column.name];
+          tableCellLines.push(`已复核结果的数学计算 ${column.name}：${value === null ? "NULL（未知）" : String(value)}；单位 ${column.unit || "未认证"}；来源 ${resource.source_resource_id}；计算资源 ${resource.resource_id}。该名称不认证业务含义。`);
+        }
+        continue;
+      }
       const original = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === resource.source_resource_id);
       const evidence = original && this.evidenceSource(session, original);
       const asset = original && original.tables.length === 1 ? this.ctx.knowledge.contract_by_table.get(original.tables[0] ?? "") : undefined;
@@ -1643,7 +1717,7 @@ export class ToolService {
     if (aggregates.some((item) => Object.keys(item.group).length)) limitations.push("分组只展示查询中出现的取值，未出现的组合没有补零。");
     if (joinLines.length) limitations.push("JOIN 分组只证明实际匹配键在本次查询捕获数据中没有放大；未出现的分组未补零，跨表不具备原子快照。");
     limitations.push("数据来自本地合成库，不是生产数据。");
-    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...verifiedDecimal.map(renderDecimalCell), ...verifiedGroupRollups.map(renderGroupRollup), ...comparisons.map(renderComparison), ...aggregates.slice(0, 100).map(renderAggregate), ...conditionalAggregates.slice(0, 100).map(renderConditionalAggregate), ...aggregateComparisons.map(renderAggregateComparison), ...arithmeticResults.map(renderArithmetic), ...transformLines];
+    const derivedLines = [...renderDerivedAndGroups(verified, resources, this.ctx.knowledge), ...verifiedDecimal.map(renderDecimalCell), ...verifiedGroupRollups.map(renderGroupRollup), ...tableCellLines, ...comparisons.map(renderComparison), ...aggregates.slice(0, 100).map(renderAggregate), ...conditionalAggregates.slice(0, 100).map(renderConditionalAggregate), ...aggregateComparisons.map(renderAggregateComparison), ...arithmeticResults.map(renderArithmetic), ...transformLines];
     if (aggregates.length > 100) derivedLines.push(`已验证聚合共 ${aggregates.length} 个，此处展示前 100 个；其余结果保存在当前查询资源中。`);
     if (conditionalAggregates.length > 100) derivedLines.push(`已验证条件计数共 ${conditionalAggregates.length} 个，此处展示前 100 个；其余结果保存在当前查询资源中。`);
     derivedLines.push(...alignmentLines);
@@ -2089,7 +2163,7 @@ function rawResultTable(source: QueryResource, contract: DataContract): ResultTa
     if (isMetric && (!declared.unit || kind === "text")) return null;
     if (decimal && (Number(decimal[1]) > 28 || Number(decimal[2]) > 28 || source.engine !== "clickhouse-local" || source.decimal_types?.[`${contract.table}.${field}`]?.replace(/\s/gu, "").toLowerCase() !== type || source.column_types?.[name]?.replace(/\s/gu, "").toLowerCase() !== type)) return null;
     if (source.engine === "clickhouse-local" && integer && source.column_types?.[name]?.replace(/\s/gu, "").toLowerCase() !== type) return null;
-    const column: ResultColumn = { name, type: kind === "text" ? "text" : "decimal", unit: isMetric ? declared.unit! : `维度 ${contract.table}.${field}`, label: `${contract.table}.${field}${isMetric ? "（实际观察）" : ""}`, ...(kind === "text" ? {} : { scale: decimal ? Number(decimal[2]) : 0 }) };
+    const column: ResultColumn = { name, type: kind === "text" ? "text" : "decimal", unit: isMetric ? declared.unit! : `维度 ${contract.table}.${field}`, label: `${contract.table}.${field}${isMetric ? "（实际观察）" : ""}`, ...(kind === "text" ? {} : { scale: decimal ? Number(decimal[2]) : 0 }), ...(source.key_lineage_version === 1 && (contract.series.date_column === field || contract.series.dimensions.includes(field)) ? { key_lineage: { table: contract.table, column: field, physical_type: type } } : {}), ...(source.key_lineage_version === 1 && isMetric ? { value_lineage: { table: contract.table, column: field } } : {}) };
     fields.push({ column, field, declared, kind });
   }
   const rows: Array<Record<string, ResultValue>> = [];
@@ -2116,16 +2190,16 @@ function rawResultTable(source: QueryResource, contract: DataContract): ResultTa
   return fitsResultCalculationBytes(result) ? result : null;
 }
 
-function aggregateTable(items: VerifiedAggregate[]): ResultTable | null {
+function aggregateTable(items: VerifiedAggregate[], contract?: DataContract): ResultTable | null {
   if (!items.length) return null;
   const first = items[0]!;
   const groupKeys = Object.keys(first.group).sort();
-  const columns: ResultColumn[] = groupKeys.map((name) => ({ name, type: "text", unit: `维度 ${first.table}.${name}`, label: `${first.table}.${name}` }));
+  const columns: ResultColumn[] = groupKeys.map((name) => ({ name, type: "text", unit: `维度 ${first.table}.${name}`, label: `${first.table}.${name}`, ...(contract?.columns.find((column) => column.name === name) ? { key_lineage: { table: first.table, column: name, physical_type: contract.columns.find((column) => column.name === name)!.type.replace(/\s/gu, "").toLowerCase() } } : {}) }));
   const grouped = new Map<string, Record<string, ResultValue>>();
   const metrics = new Map<string, ResultColumn>();
   for (const item of items) {
     if (item.table !== first.table || item.source_resource_id !== first.source_resource_id || JSON.stringify(Object.keys(item.group).sort()) !== JSON.stringify(groupKeys)) return null;
-    const metric: ResultColumn = { name: item.output_column, type: "decimal", unit: item.unit, label: `${item.table}.${item.column} ${item.operation === "sum" ? "合计" : "非 NULL 计数"}`, scale: item.scale };
+    const metric: ResultColumn = { name: item.output_column, type: "decimal", unit: item.unit, label: `${item.table}.${item.column} ${item.operation === "sum" ? "合计" : "非 NULL 计数"}`, scale: item.scale, ...(contract && item.operation === "sum" ? { value_lineage: { table: item.table, column: item.column } } : {}) };
     const previous = metrics.get(metric.name);
     if (previous && JSON.stringify(previous) !== JSON.stringify(metric)) return null;
     if (groupKeys.includes(metric.name)) return null;

@@ -57,7 +57,7 @@ export class ResourceGraph {
     }
     if (resource.kind === "calculation") {
       const parent = this.complete.get(resource.source_resource_id);
-      if (!parent || parent.kind !== "query_result" || !resource.source_resource_hash || resource.source_resource_hash !== resourceHash(parent)) return "resource_dependency_changed";
+      if (!parent || (!resource.evaluated_table_v1 && parent.kind !== "query_result") || !resource.source_resource_hash || resource.source_resource_hash !== resourceHash(parent)) return "resource_dependency_changed";
     }
     this.active.delete(id);
     this.complete.set(id, resource);

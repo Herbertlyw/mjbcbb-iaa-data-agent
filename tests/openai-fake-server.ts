@@ -231,6 +231,7 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成分组对齐")) return scripted(turn, alignmentSteps);
   if (latest.includes("合成两地区 IN")) return scripted(turn, inCountrySteps);
   if (latest.includes("合成多日双渠道跨事实")) return scripted(turn, dailyCrossFactSteps);
+  if (latest.includes("合成变换后跨事实对齐")) return scripted(turn, derivedCrossFactSteps);
   if (latest.includes("合成跨资源收入减成本")) return scripted(turn, crossResourceDifferenceSteps);
   if (latest.includes("合成未声明反向比率")) return scripted(turn, (ids) => coarseChannelRatioSteps(ids, true));
   if (latest.includes("合成多层过滤产品")) return scripted(turn, layeredFilterSteps);
@@ -559,6 +560,19 @@ function dailyCrossFactSteps(ids: string[]) {
       { op: "filter", column: "result_value", comparison: "gt", value: "0" },
       { op: "sort", keys: [{ column: "result_value", direction: "desc", nulls: "last" }] },
     ] } }) },
+  ];
+}
+
+function derivedCrossFactSteps(ids: string[]) {
+  const base = crossFactRatioSteps(ids).slice(0, 4);
+  const sort = [{ op: "sort", keys: [{ column: "country_code", direction: "asc", nulls: "last" }] }];
+  return [...base,
+    { id: "cross_sort_payment", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[0] ?? "", steps: sort } }) },
+    { id: "cross_sort_installs", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[1] ?? "", steps: sort } }) },
+    { id: "cross_align_derived", name: "calculate_session_cells", arguments: JSON.stringify({ align: { op: "divide", keys: ["country_code", "channel_id"], left: { resource_id: ids[2] ?? "", cell: "total" }, right: { resource_id: ids[3] ?? "", cell: "total" } } }) },
+    { id: "cross_sort_aligned", name: "calculate_session_cells", arguments: JSON.stringify({ transform: { resource_id: ids[4] ?? "", steps: sort } }) },
+    { id: "cross_sum_aligned", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[5] ?? "", operations: [{ op: "sum", column: "result_value", as: "total_ratio" }] }) },
+    { id: "cross_add_aligned", name: "calculate_session_cells", arguments: JSON.stringify({ arithmetic: { op: "add", left: { resource_id: ids[6] ?? "", cell: "total_ratio" }, right: { resource_id: ids[6] ?? "", cell: "total_ratio" } } }) },
   ];
 }
 

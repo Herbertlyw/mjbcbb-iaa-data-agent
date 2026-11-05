@@ -14,6 +14,33 @@ test("模型计算协议的 object 根和 operation 分支互斥，除法明确�
   assert.equal(Check(calculationSchema, { operation: "add", left: { ...ref, execution_id: "" }, right: ref }), false);
 });
 
+test("派生结果再计算可重算来源并供后续算术及交付", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]); runtime.sessions.setActiveJob(session.session_id, "job_derived_cells");
+    const query = await runtime.tools.query(session.session_id, { sql: "SELECT event_date, SUM(new_users) AS total FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads' GROUP BY event_date" });
+    assert.ok(query.ok, JSON.stringify(query)); if (!query.ok) return;
+    const directRef = { resource_id: query.resource_id, execution_id: query.execution_id, column: "total", aggregate: "sum" };
+    const direct = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: directRef, right: directRef });
+    assert.ok(direct.ok, JSON.stringify(direct)); if (direct.ok) assert.equal((direct.result as { value: string }).value, "430");
+    const sorted = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "transform", input: { resource_id: query.resource_id, execution_id: query.execution_id }, steps: [{ op: "sort", keys: [{ column: "event_date", direction: "asc", nulls: "last" }] }] });
+    assert.ok(sorted.ok, JSON.stringify(sorted)); if (!sorted.ok) return;
+    const cells = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "cells", input: { resource_id: sorted.resource_id, execution_id: sorted.execution_id }, operations: [{ op: "sum", column: "total", as: "grand_total" }] });
+    assert.ok(cells.ok, JSON.stringify(cells)); if (!cells.ok) return;
+    assert.equal((cells.cells as Record<string, unknown>).grand_total, "215");
+    const ref = { resource_id: cells.resource_id, execution_id: cells.execution_id, column: "grand_total", row: 0 };
+    const doubled = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: ref, right: ref });
+    assert.ok(doubled.ok, JSON.stringify(doubled)); if (!doubled.ok) return;
+    assert.equal((doubled.result as { value: string }).value, "430");
+    const delivered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(doubled.resource_id)] });
+    assert.ok(delivered.ok, JSON.stringify(delivered)); if (delivered.ok) assert.match(String(delivered.answer), /430/);
+    const parent = runtime.sessions.lookupResource(session.session_id, String(sorted.resource_id));
+    assert.ok(parent.ok && parent.resource.kind === "transform"); if (!parent.ok || parent.resource.kind !== "transform") return;
+    const altered = structuredClone(parent.resource); altered.result.rows[0]!.total = "999"; runtime.state.saveResource(altered);
+    const stale = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: ref, right: ref });
+    assert.equal(stale.ok, false, "篡改父节点不得继续计算");
+  });
+});
+
 test("新协议经过真实工具入口核验执行身份并组合分组与变换结果", async () => {
   await withRuntime({}, async (runtime) => {
     const session = analyst(runtime); await bindTables(runtime, session.session_id, ["contract.daily_installs"]); runtime.sessions.setActiveJob(session.session_id, "job_protocol");
