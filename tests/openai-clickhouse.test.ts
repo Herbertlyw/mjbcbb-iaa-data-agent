@@ -505,7 +505,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     const derivedCrossSession = ((await (await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json()) as { session_id: string }).session_id;
     const derivedCross = await postQuestion(apiPort, derivedCrossSession, "合成变换后跨事实对齐：按国家和渠道计算收入与新增比率，再对已观察比率求和并重复相加。");
     assert.equal(derivedCross.status, "partial", JSON.stringify({ error: derivedCross.error, reasons: derivedCross.analysis?.server_reasons, answer: derivedCross.analysis?.answer, events: derivedCross.events.filter((event) => event.type === "tool_finished") }));
-    assert.match(derivedCross.analysis?.answer ?? "", /0\.616666666666666666/);
+    assert.match(derivedCross.analysis?.answer ?? "", /1\.233333333333333332/);
     assert.equal(derivedCross.events.find((event) => event.type === "candidate_reviewed")?.payload.selected_count, 1);
     assert.equal(cross.analysis?.sources?.every((source) => source.engine === "clickhouse-local"), true);
     const createSyntheticSession = async () => {

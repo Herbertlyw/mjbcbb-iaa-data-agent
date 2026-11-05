@@ -867,7 +867,7 @@ export class ToolService {
     const checked = await this.resolveAlignment(session, jobId, spec, fresh.publication);
     if (!checked) return fail("alignment_lineage_unsupported", "分组、指标口径、范围或完整来源无法证明。");
     if (expectedHashes && [spec.left.resource_id, spec.right.resource_id].some((id) => expectedHashes[id] !== checked.hashes[id])) return fail("resource_version_changed", "对齐输入在校验后发生变化，请重新读取。");
-    const resource: AlignmentResource = { resource_id: newId("res"), execution_id: newId("calc"), session_id: sessionId, job_id: jobId, kind: "alignment", created_at: new Date().toISOString(), spec, input_hashes: checked.hashes, rows: checked.rows, coverage_incomplete: checked.partial, input_truncated: false, complete_population: true };
+    const resource: AlignmentResource = { resource_id: newId("res"), execution_id: newId("calc"), session_id: sessionId, job_id: jobId, kind: "alignment", key_lineage_version: 1, created_at: new Date().toISOString(), spec, input_hashes: checked.hashes, rows: checked.rows, coverage_incomplete: checked.partial, input_truncated: false, complete_population: true };
     await this.ctx.sessions.saveResourceAsync(resource);
     const preview = previewRows(checked.rows, 100);
     return { ok: true, resource_id: resource.resource_id, execution_id: resource.execution_id, rows: preview, result_total_rows: checked.rows.length, result_has_more: checked.rows.length > preview.length, coverage_incomplete: checked.partial, dependencies: Object.keys(checked.hashes), notice: `按完整结果的分组键全集对齐；预览限 100 行及 32 KB，某侧未出现的组不补零。${checked.partial ? "来源覆盖不完整或未知，结果只能部分交付。" : ""}resource_id=${resource.resource_id}` };
@@ -906,12 +906,19 @@ export class ToolService {
     // Evaluate sequentially so shared dependencies use the completed cache;
     // never cache an in-flight promise that could wait on its own cycle.
     const checked = [await this.evaluateVerifiedResult(session, jobId, spec.left.resource_id, publication, new Set(path), evaluation), await this.evaluateVerifiedResult(session, jobId, spec.right.resource_id, publication, new Set(path), evaluation)];
-    if (!checked[0] || !checked[1] || checked.some((item) => !item || item.leaves.length !== 1)) return null;
-    const leafResults = await Promise.all(checked.map((item) => this.ctx.sessions.lookupResourceAsync(session.session_id, item!.leaves[0]!)));
-    if (leafResults.some((item) => !item.ok || item.resource.kind !== "query_result" || item.resource.job_id !== jobId)) return null;
-    const leftSource = (leafResults[0] as { ok: true; resource: QueryResource }).resource;
-    const rightSource = (leafResults[1] as { ok: true; resource: QueryResource }).resource;
-    if (leftSource.tables.length !== 1 || rightSource.tables.length !== 1 || leftSource.time_range.start !== rightSource.time_range.start || leftSource.time_range.end !== rightSource.time_range.end || leftSource.time_range.timezone !== rightSource.time_range.timezone) return null;
+    if (!checked[0] || !checked[1] || checked.some((item) => !item || !item.leaves.length)) return null;
+    const groups: QueryResource[][] = [];
+    for (const evaluated of checked) {
+      const sources: QueryResource[] = [];
+      for (const id of evaluated!.leaves) {
+        const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, id);
+        if (!found.ok || found.resource.kind !== "query_result" || found.resource.job_id !== jobId || found.resource.tables.length !== 1) return null;
+        sources.push(found.resource);
+      }
+      groups.push(sources);
+    }
+    const leftSource = groups[0]![0]!; const rightSource = groups[1]![0]!;
+    if (groups.flat().some((source) => source.time_range.start !== leftSource.time_range.start || source.time_range.end !== leftSource.time_range.end || source.time_range.timezone !== leftSource.time_range.timezone)) return null;
     const contract = this.arithmeticContract(session, leftSource, publication);
     const other = this.arithmeticContract(session, rightSource, publication);
     if (!contract?.series || !other?.series || contract.series.predicted_column || other.series.predicted_column || contract.series.prediction_mode !== "observed_only" || other.series.prediction_mode !== "observed_only" || contract.series.date_column !== other.series.date_column || JSON.stringify([...contract.series.dimensions].sort()) !== JSON.stringify([...other.series.dimensions].sort()) || JSON.stringify([...tableGrain(this.ctx.knowledge, contract.table)].sort()) !== JSON.stringify([...tableGrain(this.ctx.knowledge, other.table)].sort())) return null;
@@ -920,12 +927,20 @@ export class ToolService {
     const rightFilters = rightEvidence && provenCoverageFilters(rightEvidence.sql, other, rightSource.time_range);
     if (!leftFilters || !rightFilters || stableHashes(leftFilters) !== stableHashes(rightFilters) || spec.keys.some((key) => key !== contract.series!.date_column && !contract.series!.dimensions.includes(key) || Object.hasOwn(leftFilters, key)) || !contract.series.dimensions.every((key) => spec.keys.includes(key) || Object.hasOwn(leftFilters, key))) return null;
     for (let index = 0; index < checked.length; index++) for (const key of spec.keys) {
-      const current = index ? other : contract; const column = checked[index]!.table.columns.find((candidate) => candidate.name === key);
-      const expected = current.columns.find((item) => item.name === key)?.type.replace(/\s/gu, "").toLowerCase();
-      const otherType = (index ? contract : other).columns.find((item) => item.name === key)?.type.replace(/\s/gu, "").toLowerCase();
-      if (!column || column.type !== "text" || !expected || expected !== otherType || column.key_lineage?.table !== current.table || column.key_lineage.column !== key || column.key_lineage.physical_type !== expected) return null;
+      const column = checked[index]!.table.columns.find((candidate) => candidate.name === key);
+      const lineages = column?.key_lineages ?? (column?.key_lineage ? [column.key_lineage] : []);
+      if (!column || column.type !== "text" || !lineages.length) return null;
+      for (const source of groups[index]!) {
+        const current = this.arithmeticContract(session, source, publication); const series = current?.series;
+        const evidence = current && this.evidenceSource(session, source);
+        const filters = evidence && current && provenCoverageFilters(evidence.sql, current, source.time_range);
+        const expected = current?.columns.find((item) => item.name === key)?.type.replace(/\s/gu, "").toLowerCase();
+        const firstType = contract.columns.find((item) => item.name === key)?.type.replace(/\s/gu, "").toLowerCase();
+        if (!current || !series || series.predicted_column || series.prediction_mode !== "observed_only" || series.date_column !== contract.series.date_column || JSON.stringify([...series.dimensions].sort()) !== JSON.stringify([...contract.series.dimensions].sort()) || JSON.stringify([...tableGrain(this.ctx.knowledge, current.table)].sort()) !== JSON.stringify([...tableGrain(this.ctx.knowledge, contract.table)].sort()) || !filters || stableHashes(filters) !== stableHashes(leftFilters) || !expected || expected !== firstType || !lineages.some((item) => item.table === current.table && item.column === key && item.physical_type === expected)) return null;
+      }
     }
-    if (contract.table !== other.table) {
+    if ((groups[0]!.length > 1 || groups[1]!.length > 1) && spec.left.resource_id !== spec.right.resource_id) return null;
+    if (contract.table !== other.table && spec.left.resource_id !== spec.right.resource_id) {
       const leftMetric = checked[0]!.table.columns.find((column) => column.name === spec.left.cell);
       const rightMetric = checked[1]!.table.columns.find((column) => column.name === spec.right.cell);
       const a = leftMetric?.value_lineage; const b = rightMetric?.value_lineage;
@@ -1078,7 +1093,17 @@ export class ToolService {
       const next = new Set(path); next.add(resourceId);
       const checked = await this.resolveAlignment(session, jobId, resource.spec, publication, next, evaluation);
       if (!checked || Boolean(resource.coverage_incomplete) !== checked.partial || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) return null;
-      const table = alignmentTable(resource.spec, checked.rows);
+      const keySources: Record<string, NonNullable<ResultColumn["key_lineages"]>> = {};
+      if (resource.key_lineage_version === 1) {
+        const a = await this.evaluateVerifiedResult(session, jobId, resource.spec.left.resource_id, publication, next, evaluation);
+        const b = await this.evaluateVerifiedResult(session, jobId, resource.spec.right.resource_id, publication, next, evaluation);
+        if (a && b) for (const key of resource.spec.keys) {
+          const columns = [a, b].map((item) => item.table.columns.find((column) => column.name === key));
+          const lineages = columns.flatMap((column) => column?.key_lineages ?? (column?.key_lineage ? [column.key_lineage] : []));
+          if (columns.every((column) => column && (column.key_lineage || column.key_lineages?.length))) keySources[key] = [...new Map(lineages.map((item) => [JSON.stringify(item), item])).values()];
+        }
+      }
+      const table = alignmentTable(resource.spec, checked.rows, keySources);
       const partial = checked.partial || checked.rows.some((row) => row.status !== "matched" || Object.values(row.group).some((value) => value === null));
       return table ? { table, hashes: { ...checked.hashes, [resource.resource_id]: ownHash }, leaves: checked.leaves, partial, ...(partial ? { partial_reason: "alignment_incomplete" as const } : {}) } : null;
     }
@@ -2241,7 +2266,7 @@ function aggregateTable(items: VerifiedAggregate[], contract?: DataContract): Re
   return { columns, rows };
 }
 
-function alignmentTable(spec: AlignmentSpec, rows: AlignedRow[]): ResultTable | null {
+function alignmentTable(spec: AlignmentSpec, rows: AlignedRow[], keySources: Record<string, NonNullable<ResultColumn["key_lineages"]>> = {}): ResultTable | null {
   const left = rows.find((row) => row.left)?.left;
   const right = rows.find((row) => row.right)?.right;
   const sample = (item: ArithmeticValue) => ({ ...item, value: item.scale ? `1.${"0".repeat(item.scale)}` : "1" });
@@ -2250,7 +2275,7 @@ function alignmentTable(spec: AlignmentSpec, rows: AlignedRow[]): ResultTable | 
   if (!left || !right || !output || spec.keys.some((key) => reserved.includes(key))) return null;
   const leftLabel = `${left.basis.table}.${left.basis.column}`; const rightLabel = `${right.basis.table}.${right.basis.column}`;
   const columns: ResultColumn[] = [
-    ...[...spec.keys].sort().map((name) => ({ name, type: "text" as const, unit: `维度 ${name}`, label: name })),
+    ...[...spec.keys].sort().map((name) => ({ name, type: "text" as const, unit: `维度 ${name}`, label: name, ...(keySources[name]?.length ? { key_lineages: keySources[name] } : {}) })),
     { name: "left_value", type: "decimal", unit: left.unit, label: `左侧 ${leftLabel}`, scale: left.scale },
     { name: "right_value", type: "decimal", unit: right.unit, label: `右侧 ${rightLabel}`, scale: right.scale },
     { name: "result_value", type: "decimal", unit: output.unit, label: `${leftLabel} ${spec.op} ${rightLabel}`, scale: output.scale },

@@ -312,6 +312,7 @@ export interface TransformResource {
 }
 
 export interface AlignmentResource {
+  key_lineage_version?: 1;
   resource_id: string;
   execution_id?: string;
   session_id: string;

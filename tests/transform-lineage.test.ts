@@ -251,6 +251,12 @@ test("同契约同范围的两个变换结果可按完整键数学对齐，篡�
     assert.ok(aligned.ok, JSON.stringify(aligned)); if (!aligned.ok) return;
     const rows = aligned.rows as Array<{ group: Record<string, string>; result: { value: string; interpretation?: string } | null }>;
     assert.ok(rows.length >= 2); assert.ok(rows.every((row) => row.result?.value === "1.000000000000000000" && row.result.interpretation === "mathematical_only"));
+    const sortedAlignment = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "transform", input: { resource_id: aligned.resource_id, execution_id: aligned.execution_id }, steps: [{ op: "sort", keys: [{ column: "country_code", direction: "asc", nulls: "last" }] }] });
+    assert.ok(sortedAlignment.ok, JSON.stringify(sortedAlignment)); if (!sortedAlignment.ok) return;
+    const alignmentRef = { resource_id: sortedAlignment.resource_id, execution_id: sortedAlignment.execution_id, column: "result_value" };
+    const realigned = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "align", align_op: "add", keys: ["country_code"], left: alignmentRef, right: alignmentRef });
+    assert.ok(realigned.ok, JSON.stringify(realigned)); if (!realigned.ok) return;
+    assert.ok((realigned.rows as Array<{ result: { value: string } | null }>).every((row) => row.result?.value === "2.000000000000000000"));
     const answer = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(aligned.resource_id)] });
     assert.ok(answer.ok, JSON.stringify(answer)); if (answer.ok) assert.match(String(answer.answer), /数学对齐/);
     const wrongKey = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "align", align_op: "add", keys: ["total"], left: { resource_id: String(left.resource_id), execution_id: String(left.execution_id), column: "total" }, right: { resource_id: String(right.resource_id), execution_id: String(right.execution_id), column: "total" } });

@@ -12,6 +12,7 @@ export interface ResultColumn {
   metric?: { table: string; column: string; operation: "sum" };
   /** Host-generated physical key identity; model labels are not authority. */
   key_lineage?: { table: string; column: string; physical_type: string };
+  key_lineages?: Array<{ table: string; column: string; physical_type: string }>;
   value_lineage?: { table: string; column: string };
 }
 export interface ResultTable { columns: ResultColumn[]; rows: Array<Record<string, ResultValue>> }
@@ -106,7 +107,7 @@ export function transformResult(input: ResultTable, steps: TransformStep[], auth
         if ((agg.op === "min" || agg.op === "max") && field?.type === "boolean") return null;
         outputs.push(agg.op === "count" || agg.op === "count_all"
           ? { name: agg.as, type: "decimal", unit: "结果行", label: agg.op === "count_all" ? "输入结果行数" : `${field!.label} 的非 NULL 结果行数`, scale: 0 }
-          : { ...field!, metric: undefined, key_lineage: undefined, ...(agg.op === "sum" ? {} : { value_lineage: undefined }), name: agg.as, label: `${field!.label} 的${{ sum: "合计", min: "最小值", max: "最大值" }[agg.op as "sum" | "min" | "max"]}` });
+          : { ...field!, metric: undefined, key_lineage: undefined, key_lineages: undefined, ...(agg.op === "sum" ? {} : { value_lineage: undefined }), name: agg.as, label: `${field!.label} 的${{ sum: "合计", min: "最小值", max: "最大值" }[agg.op as "sum" | "min" | "max"]}` });
       }
       const groups = new Map<string, Array<Record<string, ResultValue>>>();
       for (const row of table.rows) {
