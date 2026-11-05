@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -22,6 +23,7 @@ import { verifyDatabaseAggregates } from "../src/aggregate-evidence.js";
 import { isolatedDocker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
+const { Parser } = createRequire(import.meta.url)("node-sql-parser") as { Parser: { prototype: { astify: (...args: unknown[]) => unknown } } };
 const knowledgeDir = path.join(root, "knowledge", "harborlight");
 const adminPassword = randomBytes(18).toString("hex");
 const readerPassword = randomBytes(18).toString("hex");
@@ -315,15 +317,21 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
       }, controller.signal);
       assert.equal(cancelled.ok, false);
       if (!cancelled.ok) assert.equal(cancelled.code, "tool_cancelled");
-      const lookup = await runtime.tools.query(session.session_id, {
-        sql: `SELECT i.event_date, i.title_id, i.platform, i.country_code, i.channel_id, i.new_users, t.title_name
-          FROM fact_fox_daily_install AS i
-          JOIN dim_fox_title AS t ON i.title_id = t.title_id
-          WHERE i.event_date >= '2026-10-06' AND i.event_date <= '2026-10-12'
-            AND i.title_id = 'paper_lantern' AND i.platform = 'ios' AND i.country_code = 'US' AND i.channel_id = 'mist_ads'`,
-      });
+      const savedParser = Parser.prototype.astify;
+      let lookup: Awaited<ReturnType<typeof runtime.tools.query>>;
+      try {
+        Parser.prototype.astify = () => { throw new Error("test_sqlite_parser_forbidden"); };
+        lookup = await runtime.tools.query(session.session_id, {
+          sql: `SELECT i.event_date, i.title_id, i.platform, i.country_code, i.channel_id, i.new_users, t.title_name
+            FROM fact_fox_daily_install AS i
+            JOIN dim_fox_title AS t ON i.title_id = t.title_id
+            WHERE i.event_date >= '2026-10-06' AND i.event_date <= '2026-10-12'
+              AND i.title_id = 'paper_lantern' AND i.platform = 'ios' AND i.country_code = 'US' AND i.channel_id = 'mist_ads'`,
+        });
+      } finally { Parser.prototype.astify = savedParser; }
       assert.equal(lookup.ok, true, JSON.stringify(lookup));
       if (!lookup.ok) return;
+      assert.equal(lookup.sql_review_engine, "clickhouse_ast_join");
       const lookupSum = await runtime.tools.calculateSessionCells(session.session_id, {
         resource_id: String(lookup.resource_id),
         operations: [{ op: "sum", column: "new_users", as: "joined_new_users" }],

@@ -39,8 +39,9 @@ import type {
 import { clickHouseColumns, clickHouseColumnTypes, clickHouseQueryBounded, clickHousePreflightedQuery, ClickHousePlanError } from "./clickhouse-client.js";
 import { authorizeClickHouseDirect, authorizeClickHouseJoin, authorizeClickHouseScoped, clickHousePreflightMessage, preflightClickHouseSql } from "./clickhouse-sql-preflight.js";
 import { reviewDirectClickHouse, reviewScopedClickHouse } from "./clickhouse-direct-review.js";
-import { clickHouseReviewPolicy } from "./clickhouse-review-policy.js";
+import { clickHouseReviewPolicy, safeNativeConditionalAggregates, safeNativeDateFunctions } from "./clickhouse-review-policy.js";
 import { reviewSql } from "./clickhouse-review.js";
+import { clickHouseRawDimensionJoin } from "./clickhouse-raw-join.js";
 import { queryEvidenceShape } from "./evidence-shape.js";
 import { ResourceGraph } from "./resource-graph.js";
 import { savedResultView } from "./result-view.js";
@@ -403,6 +404,7 @@ export class ToolService {
     let nativeDirect = false;
     let nativeProofSql: string | undefined;
     let nativeJoinPlan: JoinEvidencePlan | null = null;
+    let nativeRawJoin: { start: string; end: string } | null = null;
     let guarded;
     try {
       // In ClickHouse mode, discover candidate physical sources from its own
@@ -431,11 +433,13 @@ export class ToolService {
           if (fact && dimension && reviewSql(normalized, clickHouseReviewPolicy(this.ctx.config.clickhouseDatabase, rules, this.ctx.config.maxResultRows)).ok) {
             nativeJoinPlan = (fact.series?.coverage_domains !== undefined ? prepareJoinCoverageEvidence(normalized, fact, dimension, this.ctx.knowledge.joins, true) : null) ?? prepareJoinEvidence(normalized, fact, dimension, this.ctx.knowledge.joins, true);
             if (nativeJoinPlan?.authorizationSql && !reviewSql(nativeJoinPlan.authorizationSql, clickHouseReviewPolicy(this.ctx.config.clickhouseDatabase, rules, this.ctx.config.maxResultRows)).ok) nativeJoinPlan = null;
+            const factRule = rules.find((rule) => rule.table === fact.table);
+            if (!nativeJoinPlan && factRule && safeNativeConditionalAggregates(normalized) && safeNativeDateFunctions(normalized, factRule)) nativeRawJoin = clickHouseRawDimensionJoin(normalized, fact, dimension, this.ctx.knowledge.joins);
           }
-        } catch { nativeJoinPlan = null; }
+        } catch { nativeJoinPlan = null; nativeRawJoin = null; }
       }
-      if (direct || scoped || nativeJoinPlan) {
-        guarded = direct ?? scoped?.guarded ?? { sql: normalized, tables: sources, columns: [], time_range: { start: nativeJoinPlan!.range.start, end: nativeJoinPlan!.range.end }, equalities: nativeJoinPlan!.factFilters };
+      if (direct || scoped || nativeJoinPlan || nativeRawJoin) {
+        guarded = direct ?? scoped?.guarded ?? { sql: normalized, tables: sources, columns: [], time_range: nativeRawJoin ?? { start: nativeJoinPlan!.range.start, end: nativeJoinPlan!.range.end }, equalities: nativeJoinPlan?.factFilters ?? {} };
         nativeDirect = true;
         nativeProofSql = scoped?.proofSql;
       } else {
@@ -491,7 +495,7 @@ export class ToolService {
     const joinContracts = guarded.tables.map((table) => this.ctx.knowledge.contract_by_table.get(table)?.contract);
     const joinFact = joinContracts.find((contract) => contract?.series);
     const joinDimension = joinContracts.find((contract) => contract && !contract.series);
-    let joinPlan = nativeJoinPlan ?? (this.ctx.businessEngine === "clickhouse" && guarded.tables.length === 2 && joinFact && joinDimension
+    let joinPlan = nativeJoinPlan ?? (!nativeRawJoin && this.ctx.businessEngine === "clickhouse" && guarded.tables.length === 2 && joinFact && joinDimension
       ? (joinFact.series?.coverage_domains !== undefined ? prepareJoinCoverageEvidence(guarded.sql, joinFact, joinDimension, this.ctx.knowledge.joins) : null) ?? prepareJoinEvidence(guarded.sql, joinFact, joinDimension, this.ctx.knowledge.joins) : null);
     const initialFreshness = await this.currentFreshness();
     if (!initialFreshness.ok) return initialFreshness;
@@ -618,7 +622,7 @@ export class ToolService {
       created_at: new Date().toISOString(),
       ...(session.active_job_id ? { job_id: session.active_job_id } : {}),
       engine: this.ctx.businessEngine === "clickhouse" ? "clickhouse-local" : "sqlite-local",
-      sql_review_engine: nativeJoinPlan ? "clickhouse_ast_join" : nativeProofSql ? "clickhouse_ast_scoped" : nativeDirect ? "clickhouse_ast_direct" : "legacy_guard",
+      sql_review_engine: nativeJoinPlan || nativeRawJoin ? "clickhouse_ast_join" : nativeProofSql ? "clickhouse_ast_scoped" : nativeDirect ? "clickhouse_ast_direct" : "legacy_guard",
       elapsed_ms: elapsedMs,
       execution_id: bounded?.query_id ?? newId("exec"),
       ...(bounded ? { column_types: bounded.column_types, execution_settings: { join_use_nulls: true as const } } : {}),
