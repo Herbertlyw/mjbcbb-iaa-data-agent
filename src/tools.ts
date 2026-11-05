@@ -732,6 +732,16 @@ export class ToolService {
     if (expectedHashes && expectedHashes[source.resource_id] !== createHash("sha256").update(JSON.stringify(source)).digest("hex")) return fail("resource_version_changed", "输入资源在校验后发生变化，请重新读取。");
     const activeJob = (await this.ctx.sessions.requireAsync(sessionId)).active_job_id;
     if (activeJob && source.job_id !== activeJob) return fail("resource_from_other_execution", "只能计算当前任务的查询结果；请重新查询并复核契约与新鲜度。");
+    let activePublication: FreshnessPublication | null = null;
+    if (activeJob) {
+      const current = await this.currentFreshness(); if (!current.ok) return current;
+      activePublication = current.publication;
+      if (!activePublication) return fail("freshness_not_published", "没有已发布新鲜度，不能继续计算查询结果。");
+      if (activePublication.valid_until < currentCalendarDate(this.ctx.config, this.ctx.knowledge.timezone)) return fail("freshness_expired", "已发布新鲜度已过期，不能继续计算查询结果。");
+      const required = source.tables.filter((table) => this.ctx.config.stateMode === "mysql" || Boolean(this.ctx.knowledge.contract_by_table.get(table)?.contract?.series));
+      const receipts = source.freshness_receipts;
+      if (!Array.isArray(receipts) || receipts.some((receipt) => !receipt || typeof receipt.table !== "string" || !source.tables.includes(receipt.table)) || required.some((table) => !receipts.some((receipt) => receipt.table === table)) || receipts.some((receipt) => receipt.status !== "fresh" || receipt.publication_id !== activePublication!.publication_id || receipt.version !== activePublication!.version || activePublication!.tables[receipt.table]?.status !== "fresh")) return fail("freshness_version_changed", "查询结果的新鲜度回执不是当前权威发布；请重新查询。");
+    }
     const cells: Record<string, number | string | null> = {};
     const notes: string[] = [];
     const operations: Record<string, CellOperation> = Object.create(null) as Record<string, CellOperation>;
@@ -766,8 +776,7 @@ export class ToolService {
     // existing consumers; unsupported historical shapes retain their adapter.
     if (activeJob && operations && Object.values(operations).every((operation) => operation.predicted === undefined || operation.predicted === "any")) {
       const session = await this.ctx.sessions.requireAsync(sessionId);
-      const fresh = await this.currentFreshness();
-      const input = fresh.ok && fresh.publication ? await this.evaluateVerifiedResult(session, activeJob, source.resource_id, fresh.publication, new Set()) : null;
+      const input = activePublication ? await this.evaluateVerifiedResult(session, activeJob, source.resource_id, activePublication, new Set()) : null;
       const typed = input && calculateResultCells(input.table, Object.values(operations));
       if (input && typed && Object.entries(cells).every(([key, value]) => (value === null ? null : String(value)) === typed.table.rows[0]?.[key])) {
         resource.evaluated_table_v1 = { table: typed.table, incomplete: typed.incomplete, input_hashes: input.hashes };

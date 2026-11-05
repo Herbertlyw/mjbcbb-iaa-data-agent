@@ -260,6 +260,9 @@ test("新鲜度只读已发布快照，版本变化后不能当成已验证事�
     publishFreshness(runtime.config.freshnessSourcePath, runtime.config.freshnessPath);
     const after = readPublication(runtime.config.freshnessPath);
     assert.notEqual(after?.version, before);
+    const staleCalculation = await runtime.tools.calculateSessionCells(session.session_id, { resource_id: String(queried.resource_id), operations: [{ op: "sum", column: "new_users", as: "total" }] });
+    assert.equal(staleCalculation.ok, false);
+    if (!staleCalculation.ok) assert.equal(staleCalculation.code, "freshness_version_changed");
     const analysis = await runtime.tools.updateAnalysis(session.session_id, {
       suggested_status: "completed",
       draft_answer: "模型忽略了发布版本。",

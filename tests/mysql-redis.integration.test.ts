@@ -198,6 +198,9 @@ test("隔离的 MySQL 与 Redis 分进程：权威状态、outbox、围栏和恢
           if (calc.ok) {
             const afterQuery = await freshnessA.begin(actualManifest);
             assert.equal(await freshnessA.publish(afterQuery.version, probeObservation()), "published");
+            const staleCalculation = await checkRuntime.tools.calculateSessionCells(session.session_id, { resource_id: String(query.resource_id), operations: [{ op: "sum", column: "new_users", as: "total_again" }] });
+            assert.equal(staleCalculation.ok, false);
+            if (!staleCalculation.ok) assert.equal(staleCalculation.code, "freshness_version_changed");
             const delivery = await checkRuntime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(query.resource_id), String(calc.resource_id)] });
             assert.equal(delivery.ok, true);
             if (delivery.ok) assert.ok((delivery.server_reasons as string[]).includes("freshness_version_changed"));
