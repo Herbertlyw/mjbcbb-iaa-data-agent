@@ -733,6 +733,18 @@ export class ToolService {
       predicted_means: "forecast_not_actual",
       notes,
     };
+    // New exact, observed-only query results use the same typed evaluation as
+    // derived tables. Keep legacy business proofs and serialized cells for
+    // existing consumers; unsupported historical shapes retain their adapter.
+    if (activeJob && operations && Object.values(operations).every((operation) => operation.predicted === undefined || operation.predicted === "any")) {
+      const session = await this.ctx.sessions.requireAsync(sessionId);
+      const fresh = await this.currentFreshness();
+      const input = fresh.ok && fresh.publication ? await this.evaluateVerifiedResult(session, activeJob, source.resource_id, fresh.publication, new Set()) : null;
+      const typed = input && calculateResultCells(input.table, Object.values(operations));
+      if (input && typed && Object.entries(cells).every(([key, value]) => (value === null ? null : String(value)) === typed.table.rows[0]?.[key])) {
+        resource.evaluated_table_v1 = { table: typed.table, incomplete: typed.incomplete, input_hashes: input.hashes };
+      }
+    }
     await this.ctx.sessions.saveResourceAsync(resource);
     return {
       ok: true,
@@ -1113,7 +1125,7 @@ export class ToolService {
       const parent = await this.evaluateVerifiedResult(session, jobId, resource.source_resource_id, publication, next, evaluation);
       if (!parent || parent.hashes[resource.source_resource_id] !== resource.source_resource_hash || stableHashes(parent.hashes) !== stableHashes(resource.evaluated_table_v1.input_hashes)) return null;
       const result = calculateResultCells(parent.table, Object.values(resource.operations));
-      if (!result || result.incomplete !== resource.evaluated_table_v1.incomplete || JSON.stringify(result.table) !== JSON.stringify(resource.evaluated_table_v1.table) || JSON.stringify({ ...result.table.rows[0] }) !== JSON.stringify({ ...resource.cells })) return null;
+      if (!result || result.incomplete !== resource.evaluated_table_v1.incomplete || JSON.stringify(result.table) !== JSON.stringify(resource.evaluated_table_v1.table) || Object.entries(resource.cells).some(([key, value]) => (value === null ? null : String(value)) !== result.table.rows[0]?.[key]) || Object.keys(resource.cells).length !== result.table.columns.length) return null;
       const partial = parent.partial || result.incomplete;
       return { table: result.table, hashes: { ...parent.hashes, [resourceId]: ownHash }, leaves: parent.leaves, partial, ...(partial ? { partial_reason: parent.partial_reason ?? "transform_coverage_incomplete" as const } : {}) };
     }
@@ -1221,14 +1233,17 @@ export class ToolService {
     }
     if ((ref.execution_id !== undefined && ref.execution_id !== resource.execution_id) || ref.row !== undefined || ref.aggregate !== undefined) return null;
     if (resource.kind === "calculation") {
-      if (resource.evaluated_table_v1) {
+      const directParent = await this.ctx.sessions.lookupResourceAsync(session.session_id, resource.source_resource_id);
+      if (!directParent.ok) return null;
+      if (resource.evaluated_table_v1 && directParent.resource.kind !== "query_result") {
         const checked = await this.evaluateVerifiedResult(session, jobId, resource.resource_id, publication, path, evaluation);
         const column = checked?.table.columns.find((item) => item.name === ref.cell); const value = checked?.table.rows[0]?.[ref.cell];
         if (!checked || !column || column.type !== "decimal" || !Number.isInteger(column.scale) || value !== null && typeof value !== "string") return null;
         return { value: { value: value as string | null, scale: column.scale!, unit: column.unit || "未认证", basis: { table: "结果资源", column: ref.cell, operation: "result_cell", unit: column.unit || "未认证", prediction: "未认证", timezone: "未认证" }, interpretation: "mathematical_only", ...(checked.partial || value === null ? { partial: true } : {}), formula: `${resource.resource_id} 的列 ${ref.cell}`, scopes: [] }, hashes: checked.hashes, leaves: checked.leaves };
       }
+      if (resource.evaluated_table_v1 && !await this.evaluateVerifiedResult(session, jobId, resource.resource_id, publication, path, evaluation)) return null;
       if (ref.group || !resource.operations || !Object.hasOwn(resource.operations, ref.cell)) return null;
-      const foundSource = await this.ctx.sessions.lookupResourceAsync(session.session_id, resource.source_resource_id);
+      const foundSource = directParent;
       if (!foundSource.ok || foundSource.resource.kind !== "query_result" || foundSource.resource.job_id !== jobId) return null;
       const source = foundSource.resource; const contract = this.arithmeticContract(session, source, publication);
       if (!resource.source_resource_hash || resource.source_resource_hash !== createHash("sha256").update(JSON.stringify(source)).digest("hex")) return null;
@@ -1597,7 +1612,8 @@ export class ToolService {
     const tableCellLines: string[] = [];
     for (const resource of resources) {
       if (resource.kind !== "calculation") continue;
-      if (resource.evaluated_table_v1) {
+      const parentResource = resources.find((item) => item.resource_id === resource.source_resource_id);
+      if (resource.evaluated_table_v1 && parentResource?.kind !== "query_result") {
         const checked = liveFreshness && jobId ? await this.evaluateVerifiedResult(session, jobId, resource.resource_id, liveFreshness, new Set(), evaluation) : null;
         if (!checked || checked.leaves.some((id) => !eligible.has(id))) {
           reasons.push("calculation_lineage_unsupported");
@@ -1611,6 +1627,9 @@ export class ToolService {
           tableCellLines.push(`已复核结果的数学计算 ${column.name}：${value === null ? "NULL（未知）" : String(value)}；单位 ${column.unit || "未认证"}；来源 ${resource.source_resource_id}；计算资源 ${resource.resource_id}。该名称不认证业务含义。`);
         }
         continue;
+      }
+      if (resource.evaluated_table_v1 && !(liveFreshness && jobId && await this.evaluateVerifiedResult(session, jobId, resource.resource_id, liveFreshness, new Set(), evaluation))) {
+        reasons.push("calculation_lineage_unsupported"); if (status === "completed") status = "partial"; continue;
       }
       const original = resources.find((item): item is QueryResource => item.kind === "query_result" && item.resource_id === resource.source_resource_id);
       const evidence = original && this.evidenceSource(session, original);

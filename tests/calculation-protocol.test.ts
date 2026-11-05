@@ -98,6 +98,7 @@ test("新协议经过真实工具入口核验执行身份并组合分组与变�
     assert.equal(badTransform.ok, false);
     const saved = runtime.sessions.lookupResource(session.session_id, String(sum.resource_id));
     assert.ok(saved.ok && saved.resource.kind === "calculation"); if (!saved.ok || saved.resource.kind !== "calculation") return;
+    assert.ok(saved.resource.evaluated_table_v1, "可核验查询的计算也应保存统一表评估配方");
     const altered = structuredClone(saved.resource); altered.cells.total = 999; runtime.state.saveResource(altered);
     const stale = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: twiceRef, right: twiceRef });
     assert.equal(stale.ok, false, "上游计算值变化后不能继续使用派生结果");
