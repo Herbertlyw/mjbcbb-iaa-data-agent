@@ -61,6 +61,9 @@ export interface ToolContext {
 type ToolResult = ToolFailure | { ok: true; [key: string]: unknown };
 type PrivateJoinProof = { rows: Array<Record<string, unknown>>; column_types: Record<string, string>; capture_hash: string };
 type JoinQueryResource = QueryResource & { join_proof?: PrivateJoinProof };
+type EvaluatedResult = { table: ResultTable; hashes: Record<string, string>; leaves: string[]; partial: boolean; partial_reason?: "alignment_incomplete" | "transform_coverage_incomplete" | "transform_undefined_division" };
+type EvaluationContext = { completed: Map<string, EvaluatedResult>; seen: Set<string>; rows: number; bytes: number };
+const evaluationContext = (): EvaluationContext => ({ completed: new Map(), seen: new Set(), rows: 0, bytes: 0 });
 
 /** Full coverage stays in the resource; model/API responses receive a bounded
  * preview with an explicit count, never a claim that omitted groups are absent. */
@@ -752,7 +755,7 @@ export class ToolService {
     if (!jobId || source.job_id !== jobId) return fail("resource_from_other_execution", "只能使用当前任务的结果。");
     const fresh = await this.currentFreshness(); if (!fresh.ok) return fresh;
     if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
-    const input = await this.resolveTransform(session, jobId, source.resource_id, fresh.publication, new Set());
+    const input = await this.evaluateVerifiedResult(session, jobId, source.resource_id, fresh.publication, new Set());
     if (!input) return fail("calculation_lineage_unsupported", "输入结果的身份、来源、权限或新鲜度无法复核。");
     if (expectedHashes && expectedHashes[source.resource_id] !== input.hashes[source.resource_id]) return fail("resource_version_changed", "计算输入在校验后发生变化，请重新读取。");
     const result = calculateResultCells(input.table, operations);
@@ -773,8 +776,9 @@ export class ToolService {
     const fresh = await this.currentFreshness();
     if (!fresh.ok) return fresh;
     if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
-    const left = await this.resolveArithmetic(session, jobId, expression.left, fresh.publication, new Set());
-    const right = await this.resolveArithmetic(session, jobId, expression.right, fresh.publication, new Set());
+    const evaluation = evaluationContext();
+    const left = await this.resolveArithmetic(session, jobId, expression.left, fresh.publication, new Set(), evaluation);
+    const right = await this.resolveArithmetic(session, jobId, expression.right, fresh.publication, new Set(), evaluation);
     if (!left || !right) return fail("arithmetic_lineage_unsupported", "输入不属于当前任务、已变化或不能证明完整血缘。引用多行结果中的明细行时请提供查询结果中的 execution_id、row 和列名；单行资源可使用其保存的执行 ID。不要使用历史任务资源。");
     if (expectedHashes && (expectedHashes[expression.left.resource_id] !== left.hashes[expression.left.resource_id] || expectedHashes[expression.right.resource_id] !== right.hashes[expression.right.resource_id])) return fail("resource_version_changed", "计算输入在校验后发生变化，请重新读取。");
     const result = this.computeProvenArithmetic(expression.op, left.value, right.value);
@@ -817,7 +821,7 @@ export class ToolService {
     const fresh = await this.currentFreshness();
     if (!fresh.ok) return fresh;
     if (!fresh.publication) return fail("freshness_not_published", "没有已发布新鲜度。");
-    const inputTable = await this.resolveTransform(session, jobId, input.resource_id, fresh.publication, new Set());
+    const inputTable = await this.evaluateVerifiedResult(session, jobId, input.resource_id, fresh.publication, new Set());
     if (!inputTable) return fail("transform_lineage_unsupported", `输入必须为当前任务完整、可验证的查询或变换资源；计算上限为 ${RESULT_CALCULATION_MAX_ROWS} 行和 ${RESULT_CALCULATION_MAX_BYTES} 字节。`);
     if (expectedHashes && expectedHashes[input.resource_id] !== inputTable.hashes[input.resource_id]) return fail("resource_version_changed", "变换输入在校验后发生变化，请重新读取。");
     const transformed = this.applyProvenTransform(inputTable.table, input.steps);
@@ -869,20 +873,20 @@ export class ToolService {
     return { ok: true, resource_id: resource.resource_id, execution_id: resource.execution_id, rows: preview, result_total_rows: checked.rows.length, result_has_more: checked.rows.length > preview.length, coverage_incomplete: checked.partial, dependencies: Object.keys(checked.hashes), notice: `按完整结果的分组键全集对齐；预览限 100 行及 32 KB，某侧未出现的组不补零。${checked.partial ? "来源覆盖不完整或未知，结果只能部分交付。" : ""}resource_id=${resource.resource_id}` };
   }
 
-  private async resolveAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication, path: Set<string> = new Set()): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
+  private async resolveAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication, path: Set<string> = new Set(), evaluation: EvaluationContext = evaluationContext()): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
     if (!spec || !spec.left || !spec.right || typeof spec.left.resource_id !== "string" || typeof spec.right.resource_id !== "string" || typeof spec.left.cell !== "string" || typeof spec.right.cell !== "string") return null;
     const inputs: Array<{ source: QueryResource; contract: DataContract; aggregates: VerifiedAggregate[] | null }> = [];
     for (const ref of [spec.left, spec.right]) {
       const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, ref.resource_id);
       if (!found.ok || found.resource.job_id !== jobId) return null;
-      if (found.resource.kind !== "query_result") return this.resolveDerivedAlignment(session, jobId, spec, publication, path);
+      if (found.resource.kind !== "query_result") return this.resolveDerivedAlignment(session, jobId, spec, publication, path, evaluation);
       const source = found.resource; const contract = this.arithmeticContract(session, source, publication);
       const evidence = contract && this.evidenceSource(session, source);
       if (!contract || !evidence) return null;
       const aggregates = verifyDatabaseAggregates(evidence, contract)?.filter((item) => item.output_column === ref.cell) ?? null;
       inputs.push({ source, contract, aggregates });
     }
-    if (!inputs[0]!.aggregates?.length || !inputs[1]!.aggregates?.length) return this.resolveCompleteRawAlignment(session, jobId, spec, publication, inputs);
+    if (!inputs[0]!.aggregates?.length || !inputs[1]!.aggregates?.length) return this.resolveCompleteRawAlignment(session, jobId, spec, publication, inputs, evaluation);
     const first = inputs[0]!.aggregates[0]!; const second = inputs[1]!.aggregates[0]!;
     if (stableHashes(first.filters) !== stableHashes(second.filters)) return null;
     const aScope = fromAggregate(first); const bScope = fromAggregate(second);
@@ -897,9 +901,11 @@ export class ToolService {
   /** Keyed mathematical alignment of verified derived results. Physical key
    * lineage and compatible contracts establish key equivalence; display
    * labels do not establish a new business metric. */
-  private async resolveDerivedAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication, path: Set<string>): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
+  private async resolveDerivedAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication, path: Set<string>, evaluation: EvaluationContext): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
     if (!Array.isArray(spec.keys) || !spec.keys.length || spec.keys.length > 3 || new Set(spec.keys).size !== spec.keys.length) return null;
-    const checked = await Promise.all([spec.left, spec.right].map((ref) => this.resolveTransform(session, jobId, ref.resource_id, publication, new Set(path))));
+    // Evaluate sequentially so shared dependencies use the completed cache;
+    // never cache an in-flight promise that could wait on its own cycle.
+    const checked = [await this.evaluateVerifiedResult(session, jobId, spec.left.resource_id, publication, new Set(path), evaluation), await this.evaluateVerifiedResult(session, jobId, spec.right.resource_id, publication, new Set(path), evaluation)];
     if (!checked[0] || !checked[1] || checked.some((item) => !item || item.leaves.length !== 1)) return null;
     const leafResults = await Promise.all(checked.map((item) => this.ctx.sessions.lookupResourceAsync(session.session_id, item!.leaves[0]!)));
     if (leafResults.some((item) => !item.ok || item.resource.kind !== "query_result" || item.resource.job_id !== jobId)) return null;
@@ -947,7 +953,7 @@ export class ToolService {
 
   /** Each side is a complete direct projection or a verified database SUM;
    * both are re-authorized and hash-bound on calculation and delivery. */
-  private async resolveCompleteRawAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication, inputs: Array<{ source: QueryResource; contract: DataContract; aggregates: VerifiedAggregate[] | null }>): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
+  private async resolveCompleteRawAlignment(session: SessionRecord, jobId: string, spec: AlignmentSpec, publication: FreshnessPublication, inputs: Array<{ source: QueryResource; contract: DataContract; aggregates: VerifiedAggregate[] | null }>, evaluation: EvaluationContext): Promise<{ rows: AlignedRow[]; hashes: Record<string, string>; leaves: string[]; partial: boolean } | null> {
     const keys = spec.keys;
     if (!Array.isArray(keys) || !keys.length || keys.length > 3 || new Set(keys).size !== keys.length || keys.some((key) => !/^[a-z_][a-z0-9_]{0,63}$/u.test(key))) return null;
     const prepared: Array<{ input: CompleteKeyedInput; make: (value: string | null, values: ReadonlyArray<ResultValue>) => ArithmeticValue | null; filters: Record<string,string>; source: QueryResource; partial: boolean }> = [];
@@ -978,7 +984,7 @@ export class ToolService {
       for (const entry of projections as Array<{ as?: string | null; expr?: { type?: string; column?: string } }>) if (entry.expr?.type === "column_ref" && entry.expr.column) fields.set(entry.as ?? entry.expr.column, entry.expr.column);
       const field = fields.get(ref.cell); const declared = contract.columns.find((item) => item.name === field);
       if (!field || !declared?.unit || !series.metrics.includes(field) || keys.some((key) => fields.get(key) !== key || key !== series.date_column && !series.dimensions.includes(key) || Object.hasOwn(shape.filters, key)) || !series.dimensions.every((key) => keys.includes(key) || Object.hasOwn(shape.filters, key))) return null;
-      const checked = await this.resolveTransform(session, jobId, source.resource_id, publication, new Set());
+      const checked = await this.evaluateVerifiedResult(session, jobId, source.resource_id, publication, new Set(), evaluation);
       const table = checked?.table; const metric = table?.columns.find((column) => column.name === ref.cell);
       if (!table || !metric || metric.type !== "decimal" || metric.scale === undefined || keys.some((key) => table.columns.find((column) => column.name === key)?.type !== "text") || table.rows.some((row) => keys.some((key) => key === series.date_column ? typeof row[key] !== "string" || !isCalendarDate(row[key]) || row[key] < source.time_range.start || row[key] > source.time_range.end : row[key] !== null && typeof row[key] !== "string"))) return null;
       // Normalize only after physical key names and contract types have been
@@ -1010,8 +1016,22 @@ export class ToolService {
     return { rows, hashes, leaves: [...new Set(inputs.map(({ source }) => source.resource_id))], partial: prepared.some((item) => item.partial) };
   }
 
-  private async resolveTransform(session: SessionRecord, jobId: string, resourceId: string, publication: FreshnessPublication, path: Set<string>): Promise<{ table: ResultTable; hashes: Record<string, string>; leaves: string[]; partial: boolean; partial_reason?: "alignment_incomplete" | "transform_coverage_incomplete" | "transform_undefined_division" } | null> {
+  /** One request-local entry for typed results. Only completed evaluations are
+   * cached; neither authority decisions nor in-flight promises cross calls. */
+  private async evaluateVerifiedResult(session: SessionRecord, jobId: string, resourceId: string, publication: FreshnessPublication, path: Set<string>, evaluation: EvaluationContext = evaluationContext()): Promise<EvaluatedResult | null> {
     if (typeof resourceId !== "string" || path.has(resourceId) || path.size >= 8) return null;
+    const prior = evaluation.completed.get(resourceId); if (prior) return prior;
+    evaluation.seen.add(resourceId); if (evaluation.seen.size > 128) return null;
+    const result = await this.evaluateResultNode(session, jobId, resourceId, publication, path, evaluation);
+    if (!result) return null;
+    const bytes = Buffer.byteLength(JSON.stringify(result.table));
+    if (evaluation.rows + result.table.rows.length > 100_000 || evaluation.bytes + bytes > 16_000_000) return null;
+    evaluation.rows += result.table.rows.length; evaluation.bytes += bytes;
+    evaluation.completed.set(resourceId, result);
+    return result;
+  }
+
+  private async evaluateResultNode(session: SessionRecord, jobId: string, resourceId: string, publication: FreshnessPublication, path: Set<string>, evaluation: EvaluationContext): Promise<EvaluatedResult | null> {
     const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, resourceId);
     if (!found.ok || found.resource.job_id !== jobId) return null;
     const resource = found.resource;
@@ -1056,7 +1076,7 @@ export class ToolService {
     }
     if (resource.kind === "alignment") {
       const next = new Set(path); next.add(resourceId);
-      const checked = await this.resolveAlignment(session, jobId, resource.spec, publication, next);
+      const checked = await this.resolveAlignment(session, jobId, resource.spec, publication, next, evaluation);
       if (!checked || Boolean(resource.coverage_incomplete) !== checked.partial || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) return null;
       const table = alignmentTable(resource.spec, checked.rows);
       const partial = checked.partial || checked.rows.some((row) => row.status !== "matched" || Object.values(row.group).some((value) => value === null));
@@ -1065,7 +1085,7 @@ export class ToolService {
     if (resource.kind === "calculation" && resource.evaluated_table_v1) {
       if (!resource.execution_id || !resource.operations || !resource.source_resource_hash) return null;
       const next = new Set(path); next.add(resourceId);
-      const parent = await this.resolveTransform(session, jobId, resource.source_resource_id, publication, next);
+      const parent = await this.evaluateVerifiedResult(session, jobId, resource.source_resource_id, publication, next, evaluation);
       if (!parent || parent.hashes[resource.source_resource_id] !== resource.source_resource_hash || stableHashes(parent.hashes) !== stableHashes(resource.evaluated_table_v1.input_hashes)) return null;
       const result = calculateResultCells(parent.table, Object.values(resource.operations));
       if (!result || result.incomplete !== resource.evaluated_table_v1.incomplete || JSON.stringify(result.table) !== JSON.stringify(resource.evaluated_table_v1.table) || JSON.stringify({ ...result.table.rows[0] }) !== JSON.stringify({ ...resource.cells })) return null;
@@ -1079,7 +1099,7 @@ export class ToolService {
       const columns: ResultColumn[] = []; const row: Record<string, string | null> = {};
       const hashes: Record<string, string> = {}; const leaves = new Set<string>(); let partial = false;
       for (const name of names) {
-        const checked = await this.resolveArithmetic(session, jobId, { resource_id: resourceId, execution_id: resource.execution_id, cell: name }, publication, path);
+        const checked = await this.resolveArithmetic(session, jobId, { resource_id: resourceId, execution_id: resource.execution_id, cell: name }, publication, path, evaluation);
         if (!checked || !Number.isInteger(checked.value.scale) || checked.value.scale < 0 || checked.value.scale > 38) return null;
         columns.push({ name, type: "decimal", scale: checked.value.scale, unit: checked.value.unit || "未认证", label: `已复核计算单元 ${name}` });
         row[name] = checked.value.value;
@@ -1091,7 +1111,7 @@ export class ToolService {
     }
     if (resource.kind !== "transform") return null;
     const next = new Set(path); next.add(resourceId);
-    const source = await this.resolveTransform(session, jobId, resource.source_resource_id, publication, next);
+    const source = await this.evaluateVerifiedResult(session, jobId, resource.source_resource_id, publication, next, evaluation);
     if (!source || stableHashes(source.hashes) !== stableHashes(resource.input_hashes)) return null;
     const transformed = this.applyProvenTransform(source.table, resource.steps);
     if (!transformed || JSON.stringify(transformed.table) !== JSON.stringify(resource.result)) return null;
@@ -1100,7 +1120,7 @@ export class ToolService {
     return { table: transformed.table, hashes: { ...source.hashes, [resource.resource_id]: ownHash }, leaves: source.leaves, partial, ...(partialReason ? { partial_reason: partialReason } : {}) };
   }
 
-  private async resolveArithmetic(session: SessionRecord, jobId: string, ref: ArithmeticRef, publication: FreshnessPublication, path: Set<string>): Promise<{ value: ArithmeticValue; hashes: Record<string, string>; leaves: string[] } | null> {
+  private async resolveArithmetic(session: SessionRecord, jobId: string, ref: ArithmeticRef, publication: FreshnessPublication, path: Set<string>, evaluation: EvaluationContext = evaluationContext()): Promise<{ value: ArithmeticValue; hashes: Record<string, string>; leaves: string[] } | null> {
     if (!ref || typeof ref.resource_id !== "string" || typeof ref.cell !== "string" || path.has(ref.resource_id) || path.size >= 8) return null;
     const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, ref.resource_id);
     if (!found.ok || found.resource.job_id !== jobId) return null;
@@ -1121,7 +1141,7 @@ export class ToolService {
       // A proven database grouping is already a typed, complete result. The
       // same column sum must not depend on inserting an identity sort first.
       if (ref.aggregate === "sum" && ref.row === undefined && !ref.group && ref.execution_id && ref.execution_id === resource.execution_id && verifyDatabaseAggregates(evidence, contract)?.some((item) => item.output_column === ref.cell && Object.keys(item.group).length > 0)) {
-        const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, path);
+        const checked = await this.evaluateVerifiedResult(session, jobId, resource.resource_id, publication, path, evaluation);
         return checked ? this.selectTableArithmetic(checked, ref) : null;
       }
       if (ref.row !== undefined || ref.aggregate !== undefined || ref.execution_id !== undefined) {
@@ -1130,7 +1150,7 @@ export class ToolService {
         // explicit mismatches and all multi-row references still fail closed.
         const executionId = ref.execution_id ?? (ref.row === 0 && resource.rows.length === 1 ? resource.execution_id : undefined);
         if (ref.group || !executionId || executionId !== resource.execution_id || (ref.row === undefined) === (ref.aggregate === undefined) || (ref.row !== undefined && (!Number.isSafeInteger(ref.row) || ref.row < 0)) || (ref.aggregate !== undefined && ref.aggregate !== "sum") || coverageHasGap(resource.coverage) || resource.coverage.unknown_prediction_dates.length) return null;
-        const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, path);
+        const checked = await this.evaluateVerifiedResult(session, jobId, resource.resource_id, publication, path, evaluation);
         const table = checked?.table; const column = table?.columns.find((candidate) => candidate.name === ref.cell);
         const shape = verifyCell(evidence, contract, { op: "count_rows", as: "shape" }, resource.rows.length);
         const projections = queryEvidenceShape(evidence, contract)?.columns;
@@ -1171,13 +1191,13 @@ export class ToolService {
       // Derived executions have their own identity; never interpret row zero
       // from different resources as a matched business row.
       if (ref.group || !resource.execution_id || ref.execution_id !== resource.execution_id || (ref.row === undefined) === (ref.aggregate === undefined) || (ref.row !== undefined && (!Number.isSafeInteger(ref.row) || ref.row < 0)) || (ref.aggregate !== undefined && ref.aggregate !== "sum")) return null;
-      const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, path);
+      const checked = await this.evaluateVerifiedResult(session, jobId, resource.resource_id, publication, path, evaluation);
       return checked ? this.selectTableArithmetic(checked, ref) : null;
     }
     if ((ref.execution_id !== undefined && ref.execution_id !== resource.execution_id) || ref.row !== undefined || ref.aggregate !== undefined) return null;
     if (resource.kind === "calculation") {
       if (resource.evaluated_table_v1) {
-        const checked = await this.resolveTransform(session, jobId, resource.resource_id, publication, path);
+        const checked = await this.evaluateVerifiedResult(session, jobId, resource.resource_id, publication, path, evaluation);
         const column = checked?.table.columns.find((item) => item.name === ref.cell); const value = checked?.table.rows[0]?.[ref.cell];
         if (!checked || !column || column.type !== "decimal" || !Number.isInteger(column.scale) || value !== null && typeof value !== "string") return null;
         return { value: { value: value as string | null, scale: column.scale!, unit: column.unit || "未认证", basis: { table: "结果资源", column: ref.cell, operation: "result_cell", unit: column.unit || "未认证", prediction: "未认证", timezone: "未认证" }, interpretation: "mathematical_only", ...(checked.partial || value === null ? { partial: true } : {}), formula: `${resource.resource_id} 的列 ${ref.cell}`, scopes: [] }, hashes: checked.hashes, leaves: checked.leaves };
@@ -1213,8 +1233,8 @@ export class ToolService {
       return { value: fromAggregate(aggregate), hashes: { [source.resource_id]: createHash("sha256").update(JSON.stringify(source)).digest("hex"), [resource.resource_id]: ownHash }, leaves: [source.resource_id] };
     }
     if (resource.kind !== "arithmetic" || ref.cell !== "result" || ref.group) return null;
-    const left = await this.resolveArithmetic(session, jobId, resource.left, publication, next);
-    const right = await this.resolveArithmetic(session, jobId, resource.right, publication, next);
+    const left = await this.resolveArithmetic(session, jobId, resource.left, publication, next, evaluation);
+    const right = await this.resolveArithmetic(session, jobId, resource.right, publication, next, evaluation);
     if (!left || !right) return null;
     const hashes = { ...left.hashes, ...right.hashes };
     const stable = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
@@ -1444,6 +1464,7 @@ export class ToolService {
     const deliveredFreshness = sources.length ? await this.currentFreshness() : { ok: true as const, publication: null };
     if (!deliveredFreshness.ok) return deliveredFreshness;
     const liveFreshness = deliveredFreshness.publication;
+    const evaluation = evaluationContext();
     const eligible = new Set<string>();
     const aggregates: VerifiedAggregate[] = [];
     const conditionalAggregates: VerifiedConditionalAggregate[] = [];
@@ -1552,7 +1573,7 @@ export class ToolService {
     for (const resource of resources) {
       if (resource.kind !== "calculation") continue;
       if (resource.evaluated_table_v1) {
-        const checked = liveFreshness && jobId ? await this.resolveTransform(session, jobId, resource.resource_id, liveFreshness, new Set()) : null;
+        const checked = liveFreshness && jobId ? await this.evaluateVerifiedResult(session, jobId, resource.resource_id, liveFreshness, new Set(), evaluation) : null;
         if (!checked || checked.leaves.some((id) => !eligible.has(id))) {
           reasons.push("calculation_lineage_unsupported");
           if (status === "completed") status = "partial";
@@ -1630,7 +1651,7 @@ export class ToolService {
     const arithmeticResults: NonNullable<AnalysisRecord["arithmetic_results"]> = [];
     for (const resource of resources) {
       if (resource.kind !== "arithmetic") continue;
-      const checked = liveFreshness && jobId ? await this.resolveArithmetic(session, jobId, { resource_id: resource.resource_id, cell: "result" }, liveFreshness, new Set()) : null;
+      const checked = liveFreshness && jobId ? await this.resolveArithmetic(session, jobId, { resource_id: resource.resource_id, cell: "result" }, liveFreshness, new Set(), evaluation) : null;
       if (!checked || checked.leaves.some((id) => !eligible.has(id))) {
         reasons.push("arithmetic_lineage_unsupported");
         if (status === "completed") status = "partial";
@@ -1645,8 +1666,8 @@ export class ToolService {
     const transformLines: string[] = [];
     for (const resource of resources) {
       if (resource.kind !== "transform") continue;
-      const checked = liveFreshness && jobId ? await this.resolveTransform(session, jobId, resource.resource_id, liveFreshness, new Set()) : null;
-      const source = liveFreshness && jobId ? await this.resolveTransform(session, jobId, resource.source_resource_id, liveFreshness, new Set()) : null;
+      const checked = liveFreshness && jobId ? await this.evaluateVerifiedResult(session, jobId, resource.resource_id, liveFreshness, new Set(), evaluation) : null;
+      const source = liveFreshness && jobId ? await this.evaluateVerifiedResult(session, jobId, resource.source_resource_id, liveFreshness, new Set(), evaluation) : null;
       if (!checked || !source || checked.leaves.some((id) => !eligible.has(id))) {
         reasons.push("transform_lineage_unsupported");
         if (status === "completed") status = "partial";
@@ -1662,7 +1683,7 @@ export class ToolService {
     const alignmentLines: string[] = [];
     for (const resource of resources) {
       if (resource.kind !== "alignment") continue;
-      const checked = liveFreshness && jobId ? await this.resolveAlignment(session, jobId, resource.spec, liveFreshness) : null;
+      const checked = liveFreshness && jobId ? await this.resolveAlignment(session, jobId, resource.spec, liveFreshness, new Set(), evaluation) : null;
       if (!checked || Boolean(resource.coverage_incomplete) !== checked.partial || checked.leaves.some((id) => !eligible.has(id)) || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) {
         reasons.push("alignment_lineage_unsupported");
         if (status === "completed") status = "partial";

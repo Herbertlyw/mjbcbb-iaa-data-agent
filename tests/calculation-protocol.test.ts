@@ -24,6 +24,17 @@ test("派生结果再计算可重算来源并供后续算术及交付", async ()
     assert.ok(direct.ok, JSON.stringify(direct)); if (direct.ok) assert.equal((direct.result as { value: string }).value, "430");
     const sorted = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "transform", input: { resource_id: query.resource_id, execution_id: query.execution_id }, steps: [{ op: "sort", keys: [{ column: "event_date", direction: "asc", nulls: "last" }] }] });
     assert.ok(sorted.ok, JSON.stringify(sorted)); if (!sorted.ok) return;
+    const instrumented = runtime.tools as unknown as { evaluateResultNode: (...args: unknown[]) => Promise<unknown> };
+    const original = instrumented.evaluateResultNode.bind(runtime.tools); let sortedEvaluations = 0;
+    instrumented.evaluateResultNode = (...args) => { if (args[2] === sorted.resource_id) sortedEvaluations++; return original(...args); };
+    const sortedRef = { resource_id: sorted.resource_id, execution_id: sorted.execution_id, column: "total", aggregate: "sum" };
+    const twiceSorted = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: sortedRef, right: sortedRef });
+    assert.ok(twiceSorted.ok, JSON.stringify(twiceSorted));
+    assert.equal(sortedEvaluations, 1, "同一次评估共享父节点只重算一次");
+    const twiceAgain = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: sortedRef, right: sortedRef });
+    assert.ok(twiceAgain.ok, JSON.stringify(twiceAgain));
+    assert.equal(sortedEvaluations, 2, "跨调用不得复用权限与新鲜度结论");
+    instrumented.evaluateResultNode = original;
     const cells = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "cells", input: { resource_id: sorted.resource_id, execution_id: sorted.execution_id }, operations: [{ op: "sum", column: "total", as: "grand_total" }] });
     assert.ok(cells.ok, JSON.stringify(cells)); if (!cells.ok) return;
     assert.equal((cells.cells as Record<string, unknown>).grand_total, "215");
