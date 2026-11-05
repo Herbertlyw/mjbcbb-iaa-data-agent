@@ -85,14 +85,15 @@ export function clickHouseScopedProjection(sql: string, tableName: string): stri
   }
   if (!nested) return null;
   const source = resolve(nested, 1); if (!source) return null;
+  const qualifier = subquery ? subquery.alias : table?.alias ?? table?.name;
   const rewrite = (value: unknown, topLevel = false): boolean => {
     if (Array.isArray(value)) return value.every((child) => rewrite(child, topLevel));
     const node = obj(value); if (!node) return true;
     if (node.type === "Subquery" || node.is_window_function || node.window_definition || node.parameters) return false;
     if (node.type === "Identifier") {
       const parts = typeof node.name === "string" ? (Array.isArray(node.name_parts) ? node.name_parts : node.name.split(".")) : [];
-      if (parts.length !== 1 || typeof parts[0] !== "string") return false;
-      const original = parts[0]; const physical = source.available.get(original);
+      if (parts.length < 1 || parts.length > 2 || typeof parts.at(-1) !== "string" || parts.length === 2 && (typeof qualifier !== "string" || parts[0] !== qualifier)) return false;
+      const original = parts.at(-1) as string; const physical = source.available.get(original);
       if (!physical) return false;
       if (node.alias !== undefined && (typeof node.alias !== "string" || node.alias !== original && node.alias !== physical && (source.available.has(node.alias) || source.physical.has(node.alias)))) return false;
       node.name = physical;

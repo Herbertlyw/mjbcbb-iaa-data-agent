@@ -374,11 +374,16 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       { question: "合成安全除法表达式", status: "partial", value: /146\.66666666666666/, engine: "clickhouse_ast_direct" },
       { question: "合成显式空值替换", status: "partial", value: /670/, engine: "clickhouse_ast_direct" },
       { question: "合成未知覆盖筛选", status: "partial", value: /440/, engine: "clickhouse_ast_direct" },
+      { question: "合成聚合 CTE 观察", status: "partial", value: /数学计算 observed：220/, engine: "clickhouse_ast_scoped_observation" },
     ]) {
       const sessionId = ((await (await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json()) as { session_id: string }).session_id;
       const answer = await postQuestion(apiPort, sessionId, sample.question);
       assert.equal(answer.status, sample.status, JSON.stringify({ error: answer.error, answer: answer.analysis?.answer, reasons: answer.analysis?.server_reasons }));
       assert.match(answer.analysis?.answer ?? "", sample.value);
+      if (sample.question.includes("聚合 CTE")) {
+        assert.ok(answer.analysis?.server_reasons?.includes("coverage_unknown"));
+        assert.ok(answer.analysis?.server_reasons?.includes("query_expression_semantics_unverified"));
+      }
       const response = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${sessionId}/resources/${answer.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
       assert.equal(((await response.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, sample.engine);
     }

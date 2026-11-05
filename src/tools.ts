@@ -42,6 +42,7 @@ import { reviewDirectClickHouse, reviewScopedClickHouse } from "./clickhouse-dir
 import { clickHouseReviewPolicy, safeNativeConditionalAggregates, safeNativeDateFunctions } from "./clickhouse-review-policy.js";
 import { reviewSql } from "./clickhouse-review.js";
 import { clickHouseRawDimensionJoin } from "./clickhouse-raw-join.js";
+import { reviewScopedObservation } from "./clickhouse-scoped-observation.js";
 import { queryEvidenceShape } from "./evidence-shape.js";
 import { ResourceGraph } from "./resource-graph.js";
 import { savedResultView } from "./result-view.js";
@@ -403,6 +404,7 @@ export class ToolService {
     let sqlLimited = false;
     let nativeDirect = false;
     let nativeProofSql: string | undefined;
+    let nativeScopedObservation = false;
     let nativeJoinPlan: JoinEvidencePlan | null = null;
     let nativeRawJoin: { start: string; end: string } | null = null;
     let guarded;
@@ -426,6 +428,7 @@ export class ToolService {
       const contract = sources.length === 1 ? this.ctx.knowledge.contract_by_table.get(sources[0]!)?.contract : undefined;
       const direct = inspected?.ok && contract && rules.length === 1 ? reviewDirectClickHouse(normalized, contract, rules[0]!, this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows) : null;
       const scoped = !direct && inspected?.ok && contract && rules.length === 1 ? reviewScopedClickHouse(normalized, contract, rules[0]!, this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows) : null;
+      const scopedObservation = !direct && !scoped && inspected?.ok && contract && rules.length === 1 ? reviewScopedObservation(normalized, contract, rules[0]!, this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows) : null;
       if (inspected?.ok && rules.length === 2) {
         const contracts = sources.map((table) => this.ctx.knowledge.contract_by_table.get(table)?.contract);
         const fact = contracts.find((item) => item?.series); const dimension = contracts.find((item) => item && !item.series);
@@ -438,10 +441,11 @@ export class ToolService {
           }
         } catch { nativeJoinPlan = null; nativeRawJoin = null; }
       }
-      if (direct || scoped || nativeJoinPlan || nativeRawJoin) {
-        guarded = direct ?? scoped?.guarded ?? { sql: normalized, tables: sources, columns: [], time_range: nativeRawJoin ?? { start: nativeJoinPlan!.range.start, end: nativeJoinPlan!.range.end }, equalities: nativeJoinPlan?.factFilters ?? {} };
+      if (direct || scoped || scopedObservation || nativeJoinPlan || nativeRawJoin) {
+        guarded = direct ?? scoped?.guarded ?? scopedObservation ?? { sql: normalized, tables: sources, columns: [], time_range: nativeRawJoin ?? { start: nativeJoinPlan!.range.start, end: nativeJoinPlan!.range.end }, equalities: nativeJoinPlan?.factFilters ?? {} };
         nativeDirect = true;
         nativeProofSql = scoped?.proofSql;
+        nativeScopedObservation = Boolean(scopedObservation);
       } else {
         const fallbackParsed = parsed ?? parseReadonlySql(sql);
         sqlLimited = containsSqlLimit(fallbackParsed.ast);
@@ -585,7 +589,7 @@ export class ToolService {
     let coverage;
     try {
       const projection = nativeDirect ? null : inspectSingleSourceProjection(guarded.sql, guarded.tables.map((table) => this.ruleFor(session, table)));
-      coverage = joinPlan && joinProof ? joinCoverage(joinPlan, joinProof.rows, joinFact) : await this.coverageForTables(nativeProofSql ?? projection?.proof_sql ?? guarded.sql, guarded.tables, guarded.time_range, bindings, querySignal);
+      coverage = nativeScopedObservation ? unknownCoverage("嵌套表达式的业务覆盖尚未证明；数据库观察不能当作完整指标。") : joinPlan && joinProof ? joinCoverage(joinPlan, joinProof.rows, joinFact) : await this.coverageForTables(nativeProofSql ?? projection?.proof_sql ?? guarded.sql, guarded.tables, guarded.time_range, bindings, querySignal);
     } catch {
       if (signal?.aborted) return fail("query_cancelled", "查询已取消");
       if (deadline.aborted) return fail("query_timeout", "查询超时，没有留下结果");
@@ -622,7 +626,7 @@ export class ToolService {
       created_at: new Date().toISOString(),
       ...(session.active_job_id ? { job_id: session.active_job_id } : {}),
       engine: this.ctx.businessEngine === "clickhouse" ? "clickhouse-local" : "sqlite-local",
-      sql_review_engine: nativeJoinPlan || nativeRawJoin ? "clickhouse_ast_join" : nativeProofSql ? "clickhouse_ast_scoped" : nativeDirect ? "clickhouse_ast_direct" : "legacy_guard",
+      sql_review_engine: nativeJoinPlan || nativeRawJoin ? "clickhouse_ast_join" : nativeProofSql ? "clickhouse_ast_scoped" : nativeScopedObservation ? "clickhouse_ast_scoped_observation" : nativeDirect ? "clickhouse_ast_direct" : "legacy_guard",
       elapsed_ms: elapsedMs,
       execution_id: bounded?.query_id ?? newId("exec"),
       ...(bounded ? { column_types: bounded.column_types, execution_settings: { join_use_nulls: true as const } } : {}),
@@ -2065,6 +2069,11 @@ export class ToolService {
       // JOIN evidence has its own native tuple planner and must not be sent
       // through the legacy single-source SQL parser.
       if (source.engine === "clickhouse-local" && source.sql_review_engine === "clickhouse_ast_join") return null;
+      if (source.engine === "clickhouse-local" && source.sql_review_engine === "clickhouse_ast_scoped_observation" && source.tables.length === 1 && source.executed_sql === source.sql) {
+        const contract = this.ctx.knowledge.contract_by_table.get(source.tables[0]!)?.contract;
+        const checked = contract && reviewScopedObservation(source.sql, contract, this.ruleFor(session, source.tables[0]!), this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows);
+        return checked && checked.time_range.start === source.time_range.start && checked.time_range.end === source.time_range.end ? source : null;
+      }
       if (source.engine === "clickhouse-local" && source.sql_review_engine === "clickhouse_ast_scoped" && source.tables.length === 1 && source.executed_sql === source.sql) {
         const contract = this.ctx.knowledge.contract_by_table.get(source.tables[0]!)?.contract;
         const checked = contract && reviewScopedClickHouse(source.sql, contract, this.ruleFor(session, source.tables[0]!), this.ctx.config.clickhouseDatabase, this.ctx.config.maxResultRows);

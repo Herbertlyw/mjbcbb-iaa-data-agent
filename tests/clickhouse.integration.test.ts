@@ -239,6 +239,36 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
       });
       assert.equal(staleCount.ok, false);
 
+      const observedSession = runtime.sessions.create("analyst");
+      await bindTables(runtime, observedSession.session_id, ["contract.fact_fox_daily_install"]);
+      runtime.sessions.setActiveJob(observedSession.session_id, "job_scoped_observation");
+      const originalParser = Parser.prototype.astify;
+      let forbiddenCalls = 0;
+      try {
+        Parser.prototype.astify = () => { forbiddenCalls++; throw new Error("test_sqlite_parser_forbidden"); };
+        const observation = await runtime.tools.query(observedSession.session_id, { sql: `WITH a AS (
+          SELECT country_code, SUM(new_users) AS total FROM fact_fox_daily_install
+          WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08'
+            AND title_id = 'paper_lantern' AND platform = 'ios' AND channel_id = 'mist_ads'
+          GROUP BY country_code
+        ), b AS (SELECT country_code, total FROM a)
+        SELECT country_code, total FROM b WHERE country_code = 'US'` });
+        assert.ok(observation.ok, JSON.stringify(observation)); if (!observation.ok) return;
+        assert.equal(observation.sql_review_engine, "clickhouse_ast_scoped_observation");
+        assert.equal(String((observation.rows as Array<Record<string, unknown>>)[0]?.total), "220");
+        assert.equal((observation.coverage as { status: string }).status, "unknown");
+        const calculated = await runtime.tools.calculateSessionCells(observedSession.session_id, { resource_id: String(observation.resource_id), operations: [{ op: "sum", column: "total", as: "observed" }] });
+        assert.ok(calculated.ok, JSON.stringify(calculated)); if (!calculated.ok) return;
+        const delivered = await runtime.tools.updateAnalysis(observedSession.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [String(calculated.resource_id)] });
+        assert.ok(delivered.ok, JSON.stringify(delivered)); if (!delivered.ok) return;
+        assert.equal(delivered.status, "partial");
+        assert.ok((delivered.server_reasons as string[]).includes("query_expression_semantics_unverified"));
+        assert.ok((delivered.server_reasons as string[]).includes("coverage_unknown"));
+        assert.match(String(delivered.answer), /数学计算 observed：220/u);
+        assert.doesNotMatch(String(delivered.answer), /数据库求和 220/u);
+        assert.equal(forbiddenCalls, 0, "受支持的聚合 CTE 查询、计算和交付不能调用旧解析器，即使异常会被捕获");
+      } finally { Parser.prototype.astify = originalParser; }
+
       const session = runtime.sessions.create("analyst");
       await bindTables(runtime, session.session_id, ["contract.fact_fox_daily_install", "contract.fact_fox_ad_receipt", "contract.fact_fox_daily_spend", "contract.fact_fox_experiment_metric", "contract.dim_fox_title"]);
       const installs = await runtime.tools.query(session.session_id, {
@@ -318,9 +348,10 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
       assert.equal(cancelled.ok, false);
       if (!cancelled.ok) assert.equal(cancelled.code, "tool_cancelled");
       const savedParser = Parser.prototype.astify;
+      let forbiddenJoinCalls = 0;
       let lookup: Awaited<ReturnType<typeof runtime.tools.query>>;
       try {
-        Parser.prototype.astify = () => { throw new Error("test_sqlite_parser_forbidden"); };
+        Parser.prototype.astify = () => { forbiddenJoinCalls++; throw new Error("test_sqlite_parser_forbidden"); };
         lookup = await runtime.tools.query(session.session_id, {
           sql: `SELECT i.event_date, i.title_id, i.platform, i.country_code, i.channel_id, i.new_users, t.title_name
             FROM fact_fox_daily_install AS i
@@ -331,6 +362,7 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
       } finally { Parser.prototype.astify = savedParser; }
       assert.equal(lookup.ok, true, JSON.stringify(lookup));
       if (!lookup.ok) return;
+      assert.equal(forbiddenJoinCalls, 0, "受支持的关联查询不能调用旧解析器，即使异常会被捕获");
       assert.equal(lookup.sql_review_engine, "clickhouse_ast_join");
       const lookupSum = await runtime.tools.calculateSessionCells(session.session_id, {
         resource_id: String(lookup.resource_id),

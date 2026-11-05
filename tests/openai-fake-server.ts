@@ -254,6 +254,7 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
   if (latest.includes("合成多层重命名投影")) return scripted(turn, renamedCteSteps);
   if (latest.includes("合成底层重命名投影")) return scripted(turn, baseRenamedCteSteps);
   if (latest.includes("合成多层预聚合")) return scripted(turn, layeredPreaggregateSteps);
+  if (latest.includes("合成聚合 CTE 观察")) return scripted(turn, scopedAggregateObservationSteps);
   if (latest.includes("合成常量日期查询")) return scripted(turn, constantDateSteps);
   if (latest.includes("合成外层维度筛选")) return scripted(turn, outerFilterSteps);
   if (latest.includes("合成条件求和表达式")) return scripted(turn, (ids) => expressionSteps(ids, "sumif"));
@@ -488,6 +489,14 @@ function expressionSteps(ids: string[], kind: "sumif" | "nullif" | "ifnull" | "f
     { id: "expr_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
     { id: "expr_query", name: "query", arguments: JSON.stringify({ sql: `SELECT ${select} FROM fact_fox_daily_install WHERE ${where}${kind === "filtered" ? " AND new_users > 0" : ""}` }) },
     { id: "expr_calculate", name: "calculate_session_cells", arguments: JSON.stringify(compute) },
+  ];
+}
+
+function scopedAggregateObservationSteps(ids: string[]) {
+  return [
+    { id: "scoped_observation_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "scoped_observation_query", name: "query", arguments: JSON.stringify({ sql: "WITH a AS (SELECT country_code, SUM(new_users) AS total FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND channel_id = 'mist_ads' GROUP BY country_code), b AS (SELECT country_code, total FROM a) SELECT country_code, total FROM b WHERE country_code = 'US'" }) },
+    { id: "scoped_observation_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "total", as: "observed" }] }) },
   ];
 }
 
