@@ -24,7 +24,7 @@ export function reviewDirectClickHouse(sql: string, contract: DataContract, rule
 }
 
 /** Review the original scoped query and independently derive a narrow,
- * equivalent direct or grouped-SUM projection proof. Only the original SQL is executed. */
+ * equivalent direct or grouped aggregate projection proof. Only the original SQL is executed. */
 export function reviewScopedClickHouse(sql: string, contract: DataContract, rule: TableRule, database: string, maxRows: number): { guarded: GuardedSql; proofSql: string } | null {
   const preflight = preflightClickHouseSql(sql);
   if (!preflight.ok || preflight.tables.length !== 1 || preflight.tables[0] !== rule.table || contract.table !== rule.table || !safeNativeConditionalAggregates(sql) || !safeNativeDateFunctions(sql, rule)) return null;
