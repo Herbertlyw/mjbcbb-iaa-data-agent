@@ -65,8 +65,9 @@ type ToolResult = ToolFailure | { ok: true; [key: string]: unknown };
 type PrivateJoinProof = { rows: Array<Record<string, unknown>>; column_types: Record<string, string>; capture_hash: string };
 type JoinQueryResource = QueryResource & { join_proof?: PrivateJoinProof };
 type EvaluatedResult = { table: ResultTable; hashes: Record<string, string>; leaves: string[]; partial: boolean; expression_only?: boolean; partial_reason?: "alignment_incomplete" | "transform_coverage_incomplete" | "transform_undefined_division" };
-type EvaluationContext = { completed: Map<string, EvaluatedResult>; seen: Set<string>; rows: number; bytes: number };
-const evaluationContext = (): EvaluationContext => ({ completed: new Map(), seen: new Set(), rows: 0, bytes: 0 });
+type EvaluatedValue = { value: ArithmeticValue; hashes: Record<string, string>; leaves: string[] };
+type EvaluationContext = { completed: Map<string, EvaluatedResult>; values: Map<string, EvaluatedValue>; seen: Set<string>; rows: number; bytes: number };
+const evaluationContext = (): EvaluationContext => ({ completed: new Map(), values: new Map(), seen: new Set(), rows: 0, bytes: 0 });
 
 /** Full coverage stays in the resource; model/API responses receive a bounded
  * preview with an explicit count, never a claim that omitted groups are absent. */
@@ -1153,7 +1154,7 @@ export class ToolService {
       const columns: ResultColumn[] = []; const row: Record<string, string | null> = {};
       const hashes: Record<string, string> = {}; const leaves = new Set<string>(); let partial = false;
       for (const name of names) {
-        const checked = await this.resolveArithmetic(session, jobId, { resource_id: resourceId, execution_id: resource.execution_id, cell: name }, publication, path, evaluation);
+        const checked = await this.resolveArithmetic(session, jobId, { resource_id: resourceId, execution_id: resource.execution_id, cell: name }, publication, path, evaluation, true);
         if (!checked || !Number.isInteger(checked.value.scale) || checked.value.scale < 0 || checked.value.scale > 38) return null;
         columns.push({ name, type: "decimal", scale: checked.value.scale, unit: checked.value.unit || "未认证", label: `已复核计算单元 ${name}`, ...(checked.value.approximate ? { approximate: true } : {}) });
         row[name] = checked.value.value;
@@ -1174,7 +1175,21 @@ export class ToolService {
     return { table: transformed.table, hashes: { ...source.hashes, [resource.resource_id]: ownHash }, leaves: source.leaves, partial, ...(partialReason ? { partial_reason: partialReason } : {}) };
   }
 
-  private async resolveArithmetic(session: SessionRecord, jobId: string, ref: ArithmeticRef, publication: FreshnessPublication, path: Set<string>, evaluation: EvaluationContext = evaluationContext()): Promise<{ value: ArithmeticValue; hashes: Record<string, string>; leaves: string[] } | null> {
+  private async resolveArithmetic(session: SessionRecord, jobId: string, ref: ArithmeticRef, publication: FreshnessPublication, path: Set<string>, evaluation: EvaluationContext = evaluationContext(), evaluatingScalar = false): Promise<EvaluatedValue | null> {
+    if (!ref || typeof ref.resource_id !== "string" || typeof ref.cell !== "string" || path.has(ref.resource_id) || path.size >= 8) return null;
+    const cacheKey = JSON.stringify([ref.resource_id, ref.execution_id ?? null, ref.cell, ref.row ?? null, ref.aggregate ?? null, ref.group ?? null]);
+    const cached = evaluation.values.get(cacheKey); if (cached) return cached;
+    if (!evaluatingScalar) {
+      const table = await this.evaluateVerifiedResult(session, jobId, ref.resource_id, publication, path, evaluation);
+      if (!table) return null;
+      const fromEvaluation = evaluation.values.get(cacheKey); if (fromEvaluation) return fromEvaluation;
+    }
+    const result = await this.resolveArithmeticNode(session, jobId, ref, publication, path, evaluation);
+    if (result) evaluation.values.set(cacheKey, result);
+    return result;
+  }
+
+  private async resolveArithmeticNode(session: SessionRecord, jobId: string, ref: ArithmeticRef, publication: FreshnessPublication, path: Set<string>, evaluation: EvaluationContext): Promise<EvaluatedValue | null> {
     if (!ref || typeof ref.resource_id !== "string" || typeof ref.cell !== "string" || path.has(ref.resource_id) || path.size >= 8) return null;
     const found = await this.ctx.sessions.lookupResourceAsync(session.session_id, ref.resource_id);
     if (!found.ok || found.resource.job_id !== jobId) return null;
@@ -1764,8 +1779,9 @@ export class ToolService {
     const alignmentLines: string[] = [];
     for (const resource of resources) {
       if (resource.kind !== "alignment") continue;
+      const evaluated = liveFreshness && jobId ? await this.evaluateVerifiedResult(session, jobId, resource.resource_id, liveFreshness, new Set(), evaluation) : null;
       const checked = liveFreshness && jobId ? await this.resolveAlignment(session, jobId, resource.spec, liveFreshness, new Set(), evaluation) : null;
-      if (!checked || Boolean(resource.coverage_incomplete) !== checked.partial || checked.leaves.some((id) => !eligible.has(id)) || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) {
+      if (!evaluated || !checked || Boolean(resource.coverage_incomplete) !== checked.partial || checked.leaves.some((id) => !eligible.has(id)) || stableHashes(checked.hashes) !== stableHashes(resource.input_hashes) || JSON.stringify(checked.rows) !== JSON.stringify(resource.rows)) {
         reasons.push("alignment_lineage_unsupported");
         if (status === "completed") status = "partial";
         continue;
