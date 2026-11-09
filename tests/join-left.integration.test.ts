@@ -119,6 +119,28 @@ test("隔离 ClickHouse LEFT 产品/渠道：真实 NULL、完整左侧、重复
           for (const sql of [productSql, channelSql]) {
             const query = await runtime.tools.query(session.session_id, { sql });
             assert.equal(query.ok, true, JSON.stringify(query)); if (!query.ok) throw new Error("left_query_rejected");
+            const saved = await runtime.sessions.lookupResourceAsync(session.session_id, String(query.resource_id));
+            assert.ok(saved.ok && saved.resource.kind === "query_result");
+            if (!saved.ok || saved.resource.kind !== "query_result") throw new Error("left_resource_missing");
+            const expectedDouble = String(BigInt(String(saved.resource.rows[0]!.total)) * 2n);
+            const ref = { resource_id: String(query.resource_id), execution_id: String(query.execution_id), column: "total", row: 0 };
+            const doubled = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: ref, right: ref });
+            assert.ok(doubled.ok, JSON.stringify(doubled));
+            if (doubled.ok) assert.equal((doubled.result as { value: string }).value, expectedDouble);
+            const wrongExecution = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: { ...ref, execution_id: "wrong" }, right: ref });
+            assert.equal(wrongExecution.ok, false);
+            const wrongRow = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: { ...ref, row: 999 }, right: ref });
+            assert.equal(wrongRow.ok, false);
+            const altered = structuredClone(saved.resource);
+            altered.rows[0]!.total = "999";
+            runtime.state.saveResource(altered);
+            const tampered = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: ref, right: ref });
+            assert.equal(tampered.ok, false, "篡改已核验 JOIN 结果后不能沿用旧证明");
+            runtime.state.saveResource(saved.resource);
+            runtime.sessions.setActiveJob(session.session_id, "other_join_job");
+            const foreign = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: ref, right: ref });
+            assert.equal(foreign.ok, false, "另一任务不能复用关联资源");
+            runtime.sessions.setActiveJob(session.session_id, "left_authority_test");
             const transformed = await runtime.tools.calculateSessionCells(session.session_id, { transform: { resource_id: String(query.resource_id), steps: [{ op: "filter", column: "label", comparison: "is_null" }, { op: "group", by: [], aggregates: [{ op: "sum", column: "total", as: "missing_total" }] }] } });
             assert.equal(transformed.ok, true, JSON.stringify(transformed)); if (!transformed.ok) throw new Error("left_transform_rejected");
             assert.equal((transformed.result as { rows: Array<{ missing_total: string }> }).rows[0]?.missing_total, "21");

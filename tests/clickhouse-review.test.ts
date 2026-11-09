@@ -45,7 +45,14 @@ test("原生直接授权只接受契约、封闭日期和受限覆盖筛选的�
   const strictDates = query.replace("event_date >= '2026-10-06'", "event_date > '2026-10-05'").replace("event_date <= '2026-10-08'", "event_date < '2026-10-09'");
   assert.deepEqual(review(strictDates)?.time_range, { start: "2026-10-06", end: "2026-10-08" });
   const dateSet = query.replace("event_date >= '2026-10-06' AND event_date <= '2026-10-08'", "event_date IN ('2026-10-06', '2026-10-08')");
-  assert.deepEqual(review(dateSet)?.time_range, { start: "2026-10-06", end: "2026-10-08" });
+  const sparseRange = { start: "2026-10-06", end: "2026-10-08", selected_dates: ["2026-10-06", "2026-10-08"] };
+  assert.deepEqual(review(dateSet)?.time_range, sparseRange, "保留精确日期集合，而不是声称连续日期均已查询");
+  const functionDateSet = dateSet.replace("'2026-10-06', '2026-10-08'", "toDate('2026-10-06'), toDate('2026-10-08')");
+  const scanPolicy = clickHouseReviewPolicy("synthetic", [rule], 1000);
+  assert.equal(reviewSql(functionDateSet, scanPolicy).ok, true, "常量日期集合只授予有界扫描；独立覆盖证明仍保持保守");
+  assert.equal(reviewSql(functionDateSet.replace("toDate('2026-10-08')", "toDate(event_date)"), scanPolicy).ok, false);
+  assert.equal(reviewSql(functionDateSet.replace("toDate('2026-10-08')", "toDate('2029-10-08')"), scanPolicy).ok, false);
+  assert.deepEqual(review(functionDateSet)?.time_range, sparseRange, "常量日期函数也须保留精确日期集合");
   assert.equal(review(constantDates.replace("toDate('2026-10-06')", "toDate('2026-02-30')")), null);
   assert.equal(review(constantDates.replace("toDate('2026-10-06')", "toDate(event_date)")), null);
   assert.equal(review(constantDates.replace("toDate('2026-10-06')", "toDate('1969-12-31')")), null);

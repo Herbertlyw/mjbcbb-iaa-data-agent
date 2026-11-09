@@ -1,0 +1,108 @@
+{
+  "asset_id": "contract.dim_experiment_arm",
+  "revision": "contract.dim_experiment_arm-v1",
+  "table": "dim_experiment_arm",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [],
+  "grain": [
+    "dataset_version",
+    "experiment_id",
+    "arm_id",
+    "config_version"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "experiment_id",
+      "type": "String",
+      "description": "虚构实验ID",
+      "nullable": false
+    },
+    {
+      "name": "arm_id",
+      "type": "String",
+      "description": "实验组ID，control或variant",
+      "nullable": false
+    },
+    {
+      "name": "config_version",
+      "type": "String",
+      "description": "冻结实验配置版本",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "experiment_type",
+      "type": "String",
+      "description": "product或monetization",
+      "nullable": false
+    },
+    {
+      "name": "allocation_unit",
+      "type": "String",
+      "description": "分配单位，synthetic_device_app",
+      "nullable": false
+    },
+    {
+      "name": "allocation_fraction",
+      "type": "Decimal(24,6)",
+      "description": "分配比例；同一实验配置所有组之和为1",
+      "nullable": false,
+      "unit": "比例"
+    },
+    {
+      "name": "eligibility_code",
+      "type": "String",
+      "description": "虚构参与条件版本",
+      "nullable": false
+    },
+    {
+      "name": "anchor_type",
+      "type": "String",
+      "description": "first_open或first_ad_show，不是统一安装日",
+      "nullable": false
+    },
+    {
+      "name": "control_arm_id",
+      "type": "String",
+      "description": "明确对照组ID",
+      "nullable": false
+    },
+    {
+      "name": "starts_at",
+      "type": "DateTime64(3, 'UTC')",
+      "description": "实验开始UTC时刻",
+      "nullable": false
+    },
+    {
+      "name": "ends_at",
+      "type": "DateTime64(3, 'UTC')",
+      "description": "实验结束UTC时刻",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "experiment_id + arm_id + config_version。产品实验和商业化实验使用明确type；入组锚点不是统一install_date。商业化配置只作补充参考。",
+  "aggregation_policy": {},
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": []
+}

@@ -1,0 +1,163 @@
+{
+  "asset_id": "contract.fact_creative_test_snapshot",
+  "revision": "contract.fact_creative_test_snapshot-v2",
+  "table": "fact_creative_test_snapshot",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [
+    "snapshot_date"
+  ],
+  "grain": [
+    "dataset_version",
+    "snapshot_date",
+    "app_id",
+    "creative_id",
+    "ua_channel_id"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "snapshot_date",
+      "type": "Date",
+      "description": "快照业务日期，不是收入发生日",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "creative_id",
+      "type": "Nullable(String)",
+      "description": "素材ID，可被多个广告复用",
+      "nullable": true
+    },
+    {
+      "name": "ua_channel_id",
+      "type": "Nullable(String)",
+      "description": "获客渠道ID，与广告变现network不同",
+      "nullable": true
+    },
+    {
+      "name": "test_window_cost_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "首次测试窗口折后美元消耗",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "test_window_registers",
+      "type": "Nullable(UInt64)",
+      "description": "同窗口AF报表注册",
+      "nullable": true,
+      "unit": "报表注册"
+    },
+    {
+      "name": "test_window_revenue_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "同cohort窗口内SDK美元回收",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "first_test_date",
+      "type": "Nullable(Date)",
+      "description": "此素材在媒体首次投放日，未测试为NULL",
+      "nullable": true
+    },
+    {
+      "name": "test_scope_state",
+      "type": "String",
+      "description": "assigned或unassigned，未分配不等于失败",
+      "nullable": false
+    },
+    {
+      "name": "is_eligible",
+      "type": "UInt8",
+      "description": "是否属于适用测试范围",
+      "nullable": false
+    },
+    {
+      "name": "eligible_at",
+      "type": "Nullable(DateTime64(3, 'UTC'))",
+      "description": "进入适用测试范围的UTC时刻",
+      "nullable": true
+    },
+    {
+      "name": "is_tested",
+      "type": "UInt8",
+      "description": "是否观察到投放",
+      "nullable": false
+    },
+    {
+      "name": "is_observable",
+      "type": "UInt8",
+      "description": "窗口是否成熟且有足够证据",
+      "nullable": false
+    },
+    {
+      "name": "is_graduated",
+      "type": "Nullable(UInt8)",
+      "description": "是否达到虚构出坡规则，证据不足为NULL",
+      "nullable": true
+    },
+    {
+      "name": "rule_version",
+      "type": "String",
+      "description": "合成状态规则版本",
+      "nullable": false
+    },
+    {
+      "name": "completeness_state",
+      "type": "String",
+      "description": "complete或partial；完整性与freshness分开",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "snapshot_date + app + creative + UA媒体。状态从投放与成熟度派生，不独立随机造；汇总跨媒体素材数要去重。 dataset_version属于完整物理粒度和关联键，列入series.dimensions；日期分区仍只使用date_column。",
+  "aggregation_policy": {
+    "test_window_cost_usd": [
+      "snapshot_date"
+    ],
+    "test_window_registers": [
+      "snapshot_date"
+    ],
+    "test_window_revenue_usd": [
+      "snapshot_date"
+    ]
+  },
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": [
+    "test_window_cost_usd",
+    "test_window_registers",
+    "test_window_revenue_usd"
+  ],
+  "series": {
+    "date_column": "snapshot_date",
+    "dimensions": [
+      "dataset_version",
+      "app_id",
+      "creative_id",
+      "ua_channel_id"
+    ],
+    "metrics": [],
+    "predicted_column": null,
+    "prediction_mode": "observed_only"
+  }
+}

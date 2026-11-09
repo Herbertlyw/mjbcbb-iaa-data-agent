@@ -50,9 +50,9 @@ export function clickHouseScanRange(sql: string, contract: DataContract, joinedD
       continue;
     }
     const day = date(node.arguments[1]);
-    if (day === null || !["equals", "greaterorequals", "greater", "lessorequals", "less"].includes(op)) return null;
-    if (op === "equals" || op === "greaterorequals" || op === "greater") low = Math.max(low ?? -Infinity, day + (op === "greater" ? 1 : 0));
-    if (op === "equals" || op === "lessorequals" || op === "less") high = Math.min(high ?? Infinity, day - (op === "less" ? 1 : 0));
+    if (day === null || !["equals", "in", "greaterorequals", "greater", "lessorequals", "less"].includes(op)) return null;
+    if (op === "equals" || op === "in" || op === "greaterorequals" || op === "greater") low = Math.max(low ?? -Infinity, day + (op === "greater" ? 1 : 0));
+    if (op === "equals" || op === "in" || op === "lessorequals" || op === "less") high = Math.min(high ?? Infinity, day - (op === "less" ? 1 : 0));
   }
   if (low === undefined || high === undefined || low > high || high - low + 1 > 400) return null;
   return { start: new Date(low * 86_400_000).toISOString().slice(0, 10), end: new Date(high * 86_400_000).toISOString().slice(0, 10) };

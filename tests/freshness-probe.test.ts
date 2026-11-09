@@ -3,12 +3,42 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { repoRoot } from "../src/config.js";
 import { openSimulatedDatabase } from "../src/database.js";
 import { dimensionSnapshotMatches, freshnessManifest, freshnessPeriodKey, matchesFreshnessManifest, probeAndPublish, probeClickHouseFreshness, probeSqliteFreshness, readPublication } from "../src/freshness.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import { createRuntime } from "../src/runtime.js";
+
+test("六列规则快照以完整键绑定，NULL 不等于空字符串或其他值", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "vv-dimension-probe-"));
+  try {
+    const knowledge = loadKnowledge(path.join(repoRoot(), "knowledge", "starhaven"));
+    const release = JSON.parse(readFileSync(path.join(repoRoot(), "knowledge", "starhaven", "freshness-targets.json"), "utf8"));
+    // Static knowledge is deliberately unpublished; select the generated target
+    // shape from a test fixture rather than asserting freshness of a real DB.
+    const contract = knowledge.contract_by_table.get("config_business_policy_snapshot")?.contract;
+    assert.ok(contract);
+    const keys = contract.grain!;
+    const columns = contract.columns.map((column) => column.name);
+    const target = { table: contract.table, engine: "clickhouse-local", kind: "dimension_snapshot", key_columns: keys, snapshot_columns: columns };
+    const targetsPath = path.join(dir, "targets.json");
+    writeFileSync(targetsPath, JSON.stringify({ ...release, valid_until: "2099-12-31", targets: [target] }));
+    assert.equal(keys.length, 6);
+    assert.deepEqual(freshnessManifest(knowledge, targetsPath).dimension_targets?.[contract.table]?.key_columns, keys);
+    const row = columns.map((column) => column === "effective_to" ? null : column === "scope_key" ? "app_a" : column);
+    const probe = async (rows: Array<Array<string | null>>) => probeClickHouseFreshness({ targetsPath, query: async () => rows.map((value) => ({ event_date: JSON.stringify(value) })) });
+    const snapshot = (await probe([row])).tables[contract.table];
+    assert.equal(snapshot?.status, "fresh");
+    const key = Object.fromEntries(keys.map((name) => [name, row[columns.indexOf(name)] as string]));
+    assert.equal(dimensionSnapshotMatches(snapshot, contract.table, key, "scope_key", "app_a"), true);
+    assert.equal(dimensionSnapshotMatches(snapshot, contract.table, key, "effective_to", ""), false);
+    assert.equal(dimensionSnapshotMatches(snapshot, contract.table, { ...key, scope_key: "app_b" }, "scope_key", "app_a"), false);
+    assert.equal((await probe([row, row])).tables[contract.table]?.status, "probe_failed");
+    const invalidKey = [...row]; invalidKey[columns.indexOf(keys[0]!)] = null;
+    assert.equal((await probe([invalidKey])).tables[contract.table]?.status, "probe_failed");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("新鲜度角色实际探测合成库，不把连接成功或上一版成功状态当成新发布", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "lumenfox-probe-"));

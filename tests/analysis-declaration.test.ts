@@ -8,8 +8,51 @@ import { DEMO_QUESTIONS } from "../src/demo.js";
 import { startServer } from "../src/server.js";
 import { analyst, ask, bindTables, withRuntime } from "./helpers.js";
 import type { AnalysisRecord, QueryResource } from "../src/types.js";
+import { domainTools } from "../src/agent.js";
+import { SessionAnalysisRecords } from "../src/analysis-declaration.js";
 
 const sql = "SELECT event_date, country_code, new_users FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads'";
+
+test("工作记录立即拒绝不支持的聚合单元，允许模型修正后继续", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    await bindTables(runtime, session.session_id, ["contract.daily_installs"]);
+    runtime.sessions.setActiveJob(session.session_id, "job_note_aggregate");
+    const aggregate = await runtime.tools.query(session.session_id, { sql: "SELECT country_code, SUM(new_users) AS total FROM daily_installs WHERE event_date = '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads' GROUP BY country_code" });
+    assert.equal(aggregate.ok, true, JSON.stringify(aggregate)); if (!aggregate.ok) return;
+    const records = new SessionAnalysisRecords();
+    const tool = domainTools(session.session_id, runtime.tools, records).find((item) => item.name === "update_analysis")!;
+    const base = { scope: "合成范围", grain: "国家", expected_group_keys: ["country_code"], unresolved_questions: [] };
+    const invalid = (await tool.execute("aggregate-note", { ...base, result_cells: [{ resource_id: String(aggregate.resource_id), execution_id: String(aggregate.execution_id), row: 0, column: "total" }] })).details as { ok: boolean; code?: string };
+    assert.equal(invalid.code, "analysis_declaration_cell_invalid");
+    assert.equal(records.currentProjection(), undefined);
+    const corrected = (await tool.execute("corrected-note", { ...base, result_cells: [] })).details as { ok: boolean };
+    assert.equal(corrected.ok, true);
+  });
+});
+
+test("工作记录的伪造摘录立即反馈，修正后才保存并仍在交付时复核", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    runtime.sessions.setActiveJob(session.session_id, "job_note_excerpts");
+    const records = new SessionAnalysisRecords();
+    const tool = domainTools(session.session_id, runtime.tools, records).find((item) => item.name === "update_analysis");
+    assert.ok(tool);
+    const asset = runtime.knowledge.by_id.get("metric.new_users")!;
+    const base = { scope: "合成范围", grain: "日", expected_group_keys: [], unresolved_questions: [] };
+    const result = async (source_excerpts: Array<{ asset_id: string; content_hash: string; quote: string }>) =>
+      (await tool.execute("note", { ...base, source_excerpts }, undefined, undefined)).details as { ok: boolean; code?: string };
+    assert.equal((await result([{ asset_id: asset.asset_id, content_hash: asset.content_hash, quote: "并不存在的摘录" }])).code, "analysis_declaration_source_invalid");
+    assert.equal(records.currentProjection(), undefined);
+    assert.equal((await result([{ asset_id: asset.asset_id, content_hash: "wrong", quote: asset.body.slice(0, 12) }])).ok, false);
+    assert.equal((await result([{ asset_id: "nonexistent", content_hash: asset.content_hash, quote: asset.body.slice(0, 12) }])).ok, false);
+    assert.equal((await result([{ asset_id: asset.asset_id, content_hash: asset.content_hash, quote: asset.body.slice(0, 12) }])).ok, true);
+    assert.equal(records.currentProjection()?.revision, 1);
+    const badCell = (await tool.execute("note", { ...base, result_cells: [{ resource_id: "res_missing", execution_id: "calc_missing", row: 0, column: "amount" }] }, undefined, undefined)).details as { ok: boolean; code?: string };
+    assert.equal(badCell.code, "analysis_declaration_cell_invalid");
+    assert.equal(records.currentProjection()?.revision, 1);
+  });
+});
 
 test("模型工作记录与核验单元分离，伪造摘录、执行号和跨任务来源不能交付", async () => {
   await withRuntime({}, async (runtime) => {
@@ -31,6 +74,9 @@ test("模型工作记录与核验单元分离，伪造摘录、执行号和跨�
       assert.equal(record.verified_cells[0]?.value, "120"); assert.match(record.verified_cells[0]?.field ?? "", /daily_installs\.new_users/);
       const candidate = result as unknown as AnalysisRecord;
       assert.equal(await runtime.tools.revalidateAnalysis(session.session_id, "job_declaration", candidate), true);
+      const forgedCell = structuredClone(candidate);
+      forgedCell.analysis_declaration!.verified_cells[0]!.value = "999";
+      assert.equal(await runtime.tools.revalidateAnalysis(session.session_id, "job_declaration", forgedCell), false);
       const saved = runtime.sessions.lookupResource(session.session_id, String(query.resource_id));
       assert.ok(saved.ok && saved.resource.kind === "query_result");
       if (saved.ok && saved.resource.kind === "query_result") {
@@ -108,8 +154,9 @@ test("历史 API 在权限文件变化后隐藏旧答案，但不改写保存记
         appendFileSync(path.join(knowledgeDir, "policy.json"), "\n");
         const after = await (await fetch(`http://127.0.0.1:${port}/api/jobs/${job.job_id}`)).json() as { analysis: unknown; error: { code: string }; user_text: string };
         assert.equal(after.analysis, null); assert.equal(after.error.code, "analysis_access_changed"); assert.equal(after.user_text, DEMO_QUESTIONS[0]!.text);
-        const list = await (await fetch(`http://127.0.0.1:${port}/api/sessions/${session.session_id}`)).json() as { jobs: Array<{ analysis: unknown }> };
-        assert.equal(list.jobs[0]?.analysis, null);
+        const list = await (await fetch(`http://127.0.0.1:${port}/api/sessions/${session.session_id}/jobs`)).json() as { jobs: Array<{ job_id: string; analysis?: unknown }> };
+        assert.equal(list.jobs[0]?.job_id, job.job_id);
+        assert.equal(Object.hasOwn(list.jobs[0]!, "analysis"), false, "历史摘要不承载答案；详情继续检查当前权限");
         assert.ok(runtime.state.getJob(job.job_id)?.analysis, "原始历史不得改写");
       } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
     });

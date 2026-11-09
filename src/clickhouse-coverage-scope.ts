@@ -32,7 +32,7 @@ export function clickHouseCoverageAnalysis(sql: string, contract: DataContract):
   const qualifier = typeof table.alias === "string" ? table.alias : contract.table;
   const dimensions = new Set(contract.series.dimensions);
   const equalities: Record<string, string> = {}; const inSets: Record<string, string[]> = {};
-  let start = ""; let end = "";
+  let start = ""; let end = ""; let selectedDates: string[] | undefined;
   const stringLiteral = (value: unknown): string | null => { const item = record(value); return item?.type === "Literal" && item.value_type === "String" && typeof item.value === "string" ? item.value : null; };
   const dateLiteral = (value: unknown): string | null => {
     const item = record(value);
@@ -49,8 +49,20 @@ export function clickHouseCoverageAnalysis(sql: string, contract: DataContract):
     if (parts.length > 2 || (parts.length === 2 && parts[0] !== qualifier)) return false;
     const column = String(parts.at(-1));
     if (column === contract.series!.date_column) {
+      const rhs = record(args[1]);
+      const tuple = op === "in" && rhs?.type === "Function" && String(rhs.name).toLowerCase() === "tuple" && Array.isArray(rhs.arguments) ? rhs.arguments
+        : op === "in" && rhs?.type === "Literal" && rhs.value_type === "Tuple" && Array.isArray(rhs.value) ? rhs.value.map((item) => ({ ...record(item), type: "Literal" })) : null;
+      if (tuple) {
+        if (start || end || tuple.length < 2 || tuple.length > 32) return false;
+        const dates = tuple.map(dateLiteral);
+        if (dates.some((date) => !date) || new Set(dates).size !== dates.length) return false;
+        selectedDates = (dates as string[]).sort();
+        start = selectedDates[0]!; end = selectedDates.at(-1)!;
+        return true;
+      }
       const date = dateLiteral(args[1]); if (!date) return false;
-      if (op === "equals" && !start && !end) { start = date; end = date; return true; }
+      // A singleton IN has the same exact day scope as equality.
+      if ((op === "equals" || op === "in") && !start && !end) { start = date; end = date; return true; }
       if (op === "greaterorequals" && !start) { start = date; return true; }
       if (op === "lessorequals" && !end) { end = date; return true; }
       return false;
@@ -66,5 +78,6 @@ export function clickHouseCoverageAnalysis(sql: string, contract: DataContract):
   };
   if (query.prewhere && !visit(query.prewhere)) return null;
   if (!visit(query.where) || !start || !end || start > end) return null;
-  return { scope: { equalities, inSets }, time_range: { start, end } };
+  if ((Date.parse(`${end}T00:00:00Z`) - Date.parse(`${start}T00:00:00Z`)) / 86_400_000 + 1 > 400) return null;
+  return { scope: { equalities, inSets, ...(selectedDates ? { selectedDates } : {}) }, time_range: { start, end } };
 }

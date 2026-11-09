@@ -22,4 +22,9 @@ test("澄清是独立的无结果问句，不能承载数字或伪造结果选�
   assert.equal(naturalCandidate([msg("[[clarify]] 收入是 70，请问产品？")], new Set()), null);
   assert.deepEqual(naturalCandidate([{ role: "user", content: "看 2026 年收入" }, msg("[[clarify]] 请问 2026 年的哪个产品？")], new Set()), { kind: "clarification", question: "请问 2026 年的哪个产品？" });
   assert.equal(naturalCandidate([msg("[[clarify]] [[result:res_a]] 请问产品？")], new Set(["res_a"])), null);
+  const followup = "目前无法确定口径。你希望看支付还是广告收入？另外请一并说明时间范围，以及想按哪个维度看。";
+  assert.deepEqual(naturalCandidate([msg(`[[clarify]] ${followup}`)], new Set()), { kind: "clarification", question: followup });
+  assert.equal(naturalCandidate([msg("[[clarify]] 你想看哪个产品？收入已经上涨。")], new Set()), null);
+  assert.equal(naturalCandidate([msg("[[clarify]] 你想看哪个产品？另外请确认收入 70 元。")], new Set()), null);
+  assert.equal(naturalCandidate([msg("[[clarify]] 你想看哪个产品？另外请参考 [[compare:res_a.x,res_b.y]]。")], new Set()), null);
 });

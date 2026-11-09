@@ -1,4 +1,5 @@
 import type { VerifiedAggregate } from "./aggregate-evidence.js";
+import { decimalOperation, sumDecimals } from "./decimal-kernel.js";
 
 export type ArithmeticOp = "add" | "subtract" | "multiply" | "divide";
 
@@ -28,6 +29,8 @@ export interface ArithmeticValue {
   interpretation?: "mathematical_only";
   approximate?: boolean;
   partial?: boolean;
+  /** Only an observed folded group, not proof of the complete business domain. */
+  scope_unverified?: true;
   undefined_reason?: "null_input" | "zero_divisor";
   /** Bound only for a directly verified row, never supplied by the model. */
   row_identity?: { resource_id: string; execution_id: string; row: number };
@@ -35,17 +38,15 @@ export interface ArithmeticValue {
 }
 
 export function sumDecimalStrings(values: unknown[], scale: number): string | null {
-  if (!values.length) return null;
-  let total = 0n;
+  if (!values.length || !Number.isInteger(scale) || scale < 0 || scale > 38) return null;
+  const checked: string[] = [];
   for (const value of values) {
     if (typeof value !== "string") return null;
     const match = /^(-?)(\d+)(?:\.(\d+))?$/u.exec(value);
-    if (!match || !Number.isInteger(scale) || scale < 0 || scale > 38 || (match[3]?.length ?? 0) > scale || match[2]!.length + scale > 76) return null;
-    const amount = BigInt(match[2]! + (match[3] ?? "").padEnd(scale, "0"));
-    total += match[1] ? -amount : amount;
+    if (!match || (match[3]?.length ?? 0) > scale || match[2]!.length + scale > 76) return null;
+    checked.push(value);
   }
-  if ((total < 0n ? -total : total).toString().length > 76) return null;
-  return fixed(total, scale);
+  return sumDecimals(checked, scale);
 }
 
 export function fromAggregate(item: VerifiedAggregate): ArithmeticValue {
@@ -62,34 +63,21 @@ export function computeArithmetic(op: ArithmeticOp, left: ArithmeticValue, right
   if (!mathematicalOnly && (sameBasis ? !left.scopes.every((a) => right.scopes.every((b) => compatible(a, b))) : !left.scopes.every((a) => right.scopes.every((b) => identicalScope(a, b))))) return null;
   if (!mathematicalOnly && (op === "add" || op === "subtract") && left.unit !== right.unit) return null;
   if (left.value === null || right.value === null) {
-    if (!mathematicalOnly) return null;
     const nullScale = op === "divide" ? 18 : op === "multiply" ? left.scale + right.scale : Math.max(left.scale, right.scale);
     if (nullScale > 38 || left.scopes.length + right.scopes.length > 32) return null;
     const unit = left.unit === right.unit && (op === "add" || op === "subtract") ? left.unit : "未认证";
-    return { value: null, scale: nullScale, unit, basis: left.basis, scopes: [...left.scopes, ...right.scopes], interpretation: "mathematical_only", partial: true, undefined_reason: "null_input", ...(left.approximate || right.approximate ? { approximate: true } : {}), formula: `(${left.formula ?? `${left.basis.table}.${left.basis.column}`} ${op} ${right.formula ?? `${right.basis.table}.${right.basis.column}`})` };
+    return { value: null, scale: nullScale, unit, basis: left.basis, scopes: [...left.scopes, ...right.scopes], ...(mathematicalOnly ? { interpretation: "mathematical_only" as const } : {}), ...(left.scope_unverified || right.scope_unverified ? { scope_unverified: true as const } : {}), partial: true, undefined_reason: "null_input", ...(left.approximate || right.approximate ? { approximate: true } : {}), formula: `(${left.formula ?? `${left.basis.table}.${left.basis.column}`} ${op} ${right.formula ?? `${right.basis.table}.${right.basis.column}`})` };
   }
-  const a = parse(left.value, left.scale); const b = parse(right.value, right.scale);
-  if (a === null || b === null) return null;
-  let result: bigint | null; let scale: number; let unit: string;
-  if (op === "add" || op === "subtract") {
-    scale = Math.max(left.scale, right.scale);
-    const x = a * 10n ** BigInt(scale - left.scale); const y = b * 10n ** BigInt(scale - right.scale);
-    result = op === "add" ? x + y : x - y; unit = left.unit === right.unit ? left.unit : "未认证";
-  } else if (op === "multiply") {
-    scale = left.scale + right.scale;
-    if (scale > 38) return null;
-    result = a * b; unit = `(${left.unit})×(${right.unit})`;
-  } else if (op === "divide") {
-    scale = 18; unit = left.unit === right.unit ? "比值" : `(${left.unit})/(${right.unit})`;
-    if (b === 0n) result = null;
-    else result = roundDivide(a * 10n ** BigInt(scale + right.scale), b * 10n ** BigInt(left.scale));
-  } else return null;
-  if (result !== null && (result < 0n ? -result : result).toString().length > 76) return null;
+  const scale = op === "divide" ? 18 : op === "multiply" ? left.scale + right.scale : Math.max(left.scale, right.scale);
+  if (scale > 38 || !validStoredDecimal(left.value, left.scale) || !validStoredDecimal(right.value, right.scale)) return null;
+  const result = decimalOperation(op, left.value, right.value, scale);
+  if (result === undefined) return null;
+  const unit = op === "add" || op === "subtract" ? left.unit === right.unit ? left.unit : "未认证" : arithmeticUnit(op, left.unit, right.unit) ?? "未认证";
   const scopes = [...left.scopes, ...right.scopes];
   if (scopes.length > 32) return null;
   const bases = [...new Map([...leftBases, ...rightBases].map((base) => [JSON.stringify(base), base])).values()];
   const label = (value: ArithmeticValue) => value.formula ?? `${value.basis.table}.${value.basis.column}`;
-  return { value: result === null ? null : fixed(result, scale), scale, unit, basis: left.basis, ...(bases.length > 1 ? { bases, formula: `(${label(left)} ${op} ${label(right)})` } : left.formula || right.formula ? { formula: `(${label(left)} ${op} ${label(right)})` } : {}), scopes, ...(mathematicalOnly ? { interpretation: "mathematical_only" as const } : {}), ...(left.approximate || right.approximate ? { approximate: true } : {}), ...(left.partial || right.partial ? { partial: true } : {}), ...(mathematicalOnly && result === null ? { undefined_reason: "zero_divisor" as const } : {}) };
+  return { value: result, scale, unit, basis: left.basis, ...(bases.length > 1 ? { bases, formula: `(${label(left)} ${op} ${label(right)})` } : left.formula || right.formula ? { formula: `(${label(left)} ${op} ${label(right)})` } : {}), scopes, ...(mathematicalOnly ? { interpretation: "mathematical_only" as const } : {}), ...(left.approximate || right.approximate ? { approximate: true } : {}), ...(left.partial || right.partial ? { partial: true } : {}), ...(left.scope_unverified || right.scope_unverified ? { scope_unverified: true as const } : {}), ...(result === null ? { undefined_reason: "zero_divisor" as const } : {}) };
 }
 
 function identicalScope(a: ArithmeticValue["scopes"][number], b: ArithmeticValue["scopes"][number]): boolean {
@@ -105,22 +93,7 @@ function compatible(a: ArithmeticValue["scopes"][number], b: ArithmeticValue["sc
   return Number.isFinite(span(a.start, a.end)) && span(a.start, a.end) === span(b.start, b.end);
 }
 
-function parse(value: string, scale: number): bigint | null {
-  if (!Number.isInteger(scale) || scale < 0 || scale > 38) return null;
+function validStoredDecimal(value: string, scale: number): boolean {
   const match = /^(-?)(\d+)(?:\.(\d+))?$/u.exec(value);
-  if (!match || (match[3]?.length ?? 0) !== scale || match[2]!.length + scale > 76) return null;
-  const result = BigInt(match[2]! + (match[3] ?? ""));
-  return match[1] ? -result : result;
-}
-
-function fixed(value: bigint, scale: number): string {
-  const sign = value < 0n ? "-" : ""; const digits = (value < 0n ? -value : value).toString().padStart(scale + 1, "0");
-  return scale ? `${sign}${digits.slice(0, -scale)}.${digits.slice(-scale)}` : `${sign}${digits}`;
-}
-
-function roundDivide(numerator: bigint, denominator: bigint): bigint {
-  const negative = (numerator < 0n) !== (denominator < 0n);
-  const a = numerator < 0n ? -numerator : numerator; const b = denominator < 0n ? -denominator : denominator;
-  const rounded = (a * 2n + b) / (2n * b);
-  return negative ? -rounded : rounded;
+  return Number.isInteger(scale) && scale >= 0 && scale <= 38 && Boolean(match && (match[3]?.length ?? 0) === scale && match[2]!.length + scale <= 76);
 }

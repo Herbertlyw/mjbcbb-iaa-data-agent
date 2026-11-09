@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { loadKnowledge } from "../src/knowledge.js";
-import { ToolService } from "../src/tools.js";
+import { ResultPolicy } from "../src/result-policy.js";
 import type { ResultTable, TransformStep } from "../src/result-transform.js";
 
 test("JOIN 比率必须有契约方向；NULL 或零分母在完整变换后仍标记部分", () => {
@@ -9,8 +9,7 @@ test("JOIN 比率必须有契约方向；NULL 或零分母在完整变换后仍�
   // Exercise the actual host policy, rather than granting the transform
   // callback unconditionally. Real resource construction is covered by the
   // separate ClickHouse/Pi integration test.
-  const service = Object.create(ToolService.prototype) as { ctx: unknown; applyProvenTransform: (table: ResultTable, steps: TransformStep[]) => { table: ResultTable; undefinedArithmetic: boolean } | null };
-  service.ctx = { knowledge };
+  const service = new ResultPolicy(knowledge);
   const metric = (column: string) => ({ table: "fact_fox_daily_payment", column, operation: "sum" as const });
   const input: ResultTable = { columns: [
     { name: "revenue", type: "decimal", unit: "USD", label: "收入", scale: 2, metric: metric("amount_usd") },
@@ -33,4 +32,26 @@ test("JOIN 比率必须有契约方向；NULL 或零分母在完整变换后仍�
   assert.equal(service.applyProvenTransform(input, [
     { op: "group", by: [], aggregates: [{ op: "sum", column: "revenue", as: "revenue" }, { op: "sum", column: "cost", as: "cost" }] }, ratio,
   ]), null, "聚合后不能自动声称原始粒度和指标关系");
+});
+
+test("已授权 JOIN 的观察分组比率保留部分状态，NULL 和零分母不变成零", () => {
+  const service = new ResultPolicy(loadKnowledge("knowledge/starhaven"));
+  const metric = (column: string) => ({ table: "fact_delivery_daily", column, operation: "sum" as const });
+  const input: ResultTable = { columns: [
+    { name: "cost", type: "decimal", unit: "USD", label: "折后成本", scale: 6, metric: metric("discounted_cost_usd") },
+    { name: "registrations", type: "decimal", unit: "报表注册", label: "注册", scale: 0, metric: metric("af_registers") },
+  ], rows: [{ cost: "3.362699", registrations: "2" }, { cost: "0.000000", registrations: "0" }, { cost: null, registrations: "1" }] };
+  const recipe: TransformStep[] = [{ op: "divide", left: "cost", right: "registrations", as: "ratio" }];
+  assert.equal(service.applyProvenTransform(input, recipe), null, "仅有指标标签不能代替来源授权");
+  const observed = service.applyProvenTransform(input, recipe, true); assert.ok(observed);
+  assert.equal(observed.observedPartialArithmetic, true);
+  assert.equal(observed.undefinedArithmetic, true);
+  assert.deepEqual(observed.table.rows.map((row) => row.ratio), ["1.681349500000000000", null, null]);
+  assert.equal(service.applyProvenTransform(input, [{ op: "divide", left: "registrations", right: "cost", as: "ratio" }], true), null);
+  const wrongUnit = structuredClone(input); wrongUnit.columns[0]!.unit = "人";
+  assert.equal(service.applyProvenTransform(wrongUnit, recipe, true), null);
+  const mixed = structuredClone(input); mixed.columns[1]!.metric!.table = "fact_activity_daily";
+  assert.equal(service.applyProvenTransform(mixed, recipe, true), null);
+  const unproven = structuredClone(input); delete unproven.columns[0]!.metric;
+  assert.equal(service.applyProvenTransform(unproven, recipe, true), null);
 });

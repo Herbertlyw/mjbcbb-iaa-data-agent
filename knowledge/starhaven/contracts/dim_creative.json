@@ -1,0 +1,82 @@
+{
+  "asset_id": "contract.dim_creative",
+  "revision": "contract.dim_creative-v1",
+  "table": "dim_creative",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [],
+  "grain": [
+    "dataset_version",
+    "creative_id"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "creative_id",
+      "type": "String",
+      "description": "素材ID，可被多个广告复用",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "creative_name",
+      "type": "String",
+      "description": "虚构素材名称",
+      "nullable": false
+    },
+    {
+      "name": "format_code",
+      "type": "String",
+      "description": "素材格式，video或image",
+      "nullable": false
+    },
+    {
+      "name": "upload_at",
+      "type": "DateTime64(3, 'UTC')",
+      "description": "素材上传UTC时刻",
+      "nullable": false
+    },
+    {
+      "name": "duration_seconds",
+      "type": "UInt32",
+      "description": "素材时长秒，图片为0",
+      "nullable": false,
+      "unit": "秒"
+    },
+    {
+      "name": "aspect_ratio",
+      "type": "String",
+      "description": "素材宽高比标签",
+      "nullable": false
+    },
+    {
+      "name": "tag_codes",
+      "type": "String",
+      "description": "受控标签，逗号分隔；拆标签后不可直接累加事实",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "creative_id。用合成标题和标签，不复用真实文件路径、上传人或素材文件。",
+  "aggregation_policy": {},
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": []
+}

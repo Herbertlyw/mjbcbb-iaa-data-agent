@@ -137,15 +137,18 @@ export function domainTools(sessionId: string, tools: ToolService, records = new
     {
       name: "search_assets",
       label: "搜索资产",
-      description: "按关键词发现资产卡片；可读取的资产可能附带简短匹配片段，不能代替完整正文，也不授予读取或查询权限。",
+      description: "按关键词发现资产卡片；默认每页 8 项，可用 next_offset 和 search_hash 续页，也可明确选择更大 limit。搜索只用于发现资产，不授予读取或查询权限。",
       parameters: Type.Object({
         query: Type.String({ description: "搜索词" }),
         kinds: Type.Optional(Type.Array(Type.String(), { description: "可选的资产类型过滤" })),
         offset: Type.Optional(Type.Integer({ minimum: 0 })),
-        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "默认 8 项；需要时显式增加或使用分页" })),
         expected_search_hash: Type.Optional(Type.String()),
       }),
-      execute: async (_toolCallId, params, signal) => pack(await tools.searchAssets(sessionId, params as { query?: string; kinds?: string[]; offset?: number; limit?: number; expected_search_hash?: string }, signal)),
+      execute: async (_toolCallId, params, signal) => {
+        const input = params as { query?: string; kinds?: string[]; offset?: number; limit?: number; expected_search_hash?: string };
+        return pack(await tools.searchAssets(sessionId, { ...input, limit: input.limit ?? 8 }, signal));
+      },
     },
     {
       name: "read_asset",
@@ -162,15 +165,17 @@ export function domainTools(sessionId: string, tools: ToolService, records = new
     {
       name: "read_assets",
       label: "批量读取资产",
-      description: "逐个授权读取多个资产正文。任一资产失败不会放开其余资产。",
+      description: "逐个授权读取多个资产正文；这不会创建查询绑定，每张待查询表仍须调用 read_data_contract_view 并等待成功。asset_ids 与 requests 二选一，不要同时提供；offset 是资产列表起点，默认每页 4 项。单个资产正文续页使用 requests 的 body_offset 和 content_hash。",
       parameters: Type.Object({
         asset_ids: Type.Optional(Type.Array(Type.String(), { description: "资产 ID 列表" })),
         requests: Type.Optional(Type.Array(Type.Object({ asset_id: Type.String(), body_offset: Type.Optional(Type.Integer({ minimum: 0 })), body_limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 4000 })), expected_content_hash: Type.Optional(Type.String()) }), { maxItems: 100 })),
         offset: Type.Optional(Type.Integer({ minimum: 0, description: "资产列表的分页起点，不是正文偏移" })),
-        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "本页资产条数" })),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "本页资产条数，默认 4；不是正文长度" })),
       }),
-      execute: async (_toolCallId, params, signal) =>
-        pack(await tools.readAssets(sessionId, params as { asset_ids?: string[]; requests?: Array<{ asset_id: string; body_offset?: number; body_limit?: number; expected_content_hash?: string }>; offset?: number; limit?: number }, signal)),
+      execute: async (_toolCallId, params, signal) => {
+        const input = params as { asset_ids?: string[]; requests?: Array<{ asset_id: string; body_offset?: number; body_limit?: number; expected_content_hash?: string }>; offset?: number; limit?: number };
+        return pack(await tools.readAssets(sessionId, { ...input, limit: input.limit ?? 4 }, signal));
+      },
     },
     {
       name: "read_data_contract_view",
@@ -183,7 +188,7 @@ export function domainTools(sessionId: string, tools: ToolService, records = new
     {
       name: "query",
       label: "受控查询",
-      description: "执行一条受治理的只读 SQL，必须先读取契约并等待结果，确认字段和区分大小写的值；不要把契约读取与依赖它的查询放在同一工具批次。支持封闭日期、常量 toDate、IN、直接字段、受限 SUM/COUNT/countIf、多维分组和登记键上的受限事实—维表 JOIN；具体字段、口径和键以契约为准。其他函数或结构可能拒绝；可读取有界明细后使用计算工具。查询成功不代表结果完整，注意覆盖、NULL、预测、截断及新鲜度。",
+      description: "执行一条受治理的只读 SQL，必须先对每张表调用 read_data_contract_view 并等待成功，确认字段和区分大小写的值；read_asset/read_assets 不创建查询绑定。不要把契约读取与依赖它的查询放在同一工具批次。事实表须有封闭日期；无分区维表可以独立读取主键和名称，使用已发布键值快照，不用给维表虚构统计日期。支持常量 toDate、IN、直接字段、受限 SUM/COUNT/countIf、多维分组和登记键上的受限事实—维表 JOIN；多表字段须限定别名，具体口径和键以契约为准。其他函数或结构可能拒绝；可读取有界明细后使用计算工具。查询成功不代表结果完整，注意覆盖、NULL、预测、截断及新鲜度。",
       parameters: Type.Object({
         sql: Type.String({ description: "单条只读 SQL" }),
         purpose: Type.Optional(Type.String({ description: "查询用途" })),
@@ -196,7 +201,7 @@ export function domainTools(sessionId: string, tools: ToolService, records = new
     {
       name: "calculate_session_cells",
       label: "计算会话单元格",
-      description: "通过 operation 选择 cells、add、subtract、multiply、divide、align 或 transform。每个输入均使用回执中的 resource_id 和 execution_id；四则引用 column 加 row 或 aggregate=sum，divide 明确 numerator 和 denominator；对齐按 keys 进行。变换或对齐输出也可参与后续运算，数学结果不自动认证业务名称。正式交付可只引用最终结果；缺组、NULL、预测或截断不可补零。",
+      description: "通过 operation 选择 cells、add、subtract、multiply、divide、align 或 transform。cells 只使用 input 和 operations；transform 只使用 input 和 steps，不要在同一次调用混用 operations 与 steps。每个输入均使用回执中的 resource_id 和 execution_id；四则引用 column 加 row 或 aggregate=sum，divide 明确 numerator 和 denominator。align 按 keys 对数值指标做运算，不是维表名称查找，不能对产品编码等文本列做 add；名称使用登记 JOIN 或在最终回答中同时引用独立维表与数值结果。变换或对齐输出也可参与后续运算，数学结果不自动认证业务名称。缺组、NULL、预测或截断不可补零。",
       parameters: calculationSchema,
       execute: async (_toolCallId, params, signal) => pack(await tools.calculateFromProtocol(sessionId, params, signal)),
     },
@@ -224,11 +229,17 @@ export function domainTools(sessionId: string, tools: ToolService, records = new
         unresolved_questions: Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { maxItems: 32 }),
         assumptions: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { maxItems: 16 })),
         source_excerpts: Type.Optional(Type.Array(Type.Object({ asset_id: Type.String(), content_hash: Type.String(), quote: Type.String() }), { maxItems: 16 })),
-        result_cells: Type.Optional(Type.Array(Type.Object({ resource_id: Type.String(), execution_id: Type.String(), row: Type.Integer({ minimum: 0 }), column: Type.String() }), { maxItems: 16 })),
+        result_cells: Type.Optional(Type.Array(Type.Object({ resource_id: Type.String(), execution_id: Type.String(), row: Type.Integer({ minimum: 0 }), column: Type.String() }), { maxItems: 16, description: "可选：引用本轮查询中可验证的直接字段或分组求和单元；计算资源在最终回答中引用，不填这里" })),
       }, { additionalProperties: false }),
       executionMode: "sequential",
-      execute: async (_toolCallId, params) => {
+      execute: async (_toolCallId, params, signal) => {
         if (!isAnalysisDeclaration(params)) return pack({ ok: false, code: "invalid_analysis_declaration" });
+        const excerpts = params.source_excerpts ?? records.currentProjection()?.declaration.source_excerpts ?? [];
+        const verified = await tools.validateWorkingExcerpts(sessionId, excerpts, signal);
+        if (!verified.ok) return pack(verified);
+        const cells = params.result_cells ?? records.currentProjection()?.declaration.result_cells ?? [];
+        const verifiedCells = await tools.validateWorkingCells(sessionId, cells, signal);
+        if (!verifiedCells.ok) return pack(verifiedCells);
         return pack({ ok: true, analysis_record: records.update(params), notice: "工作记录是模型自报，不是授权或证据；可继续调用工具。" });
       },
     },

@@ -1,0 +1,196 @@
+{
+  "asset_id": "contract.fact_cohort_quality_daily",
+  "revision": "contract.fact_cohort_quality_daily-v2",
+  "table": "fact_cohort_quality_daily",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [
+    "observe_date"
+  ],
+  "grain": [
+    "dataset_version",
+    "install_cohort_date",
+    "observe_date",
+    "app_id",
+    "acquisition_country_code",
+    "ua_channel_id",
+    "campaign_id",
+    "ad_group_id",
+    "ad_id",
+    "creative_id"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "install_cohort_date",
+      "type": "Date",
+      "description": "install_cohort_date：UTC业务日期；角色由表粒度定义，不与其他日期混用。",
+      "nullable": false
+    },
+    {
+      "name": "observe_date",
+      "type": "Date",
+      "description": "observe_date：UTC业务日期；角色由表粒度定义，不与其他日期混用。",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "acquisition_country_code",
+      "type": "String",
+      "description": "首次获客时国家，设备在本包体内分群固定",
+      "nullable": false
+    },
+    {
+      "name": "ua_channel_id",
+      "type": "String",
+      "description": "获客渠道ID，与广告变现network不同",
+      "nullable": false
+    },
+    {
+      "name": "campaign_id",
+      "type": "Nullable(String)",
+      "description": "全局唯一计划ID；自然来源不适用",
+      "nullable": true
+    },
+    {
+      "name": "ad_group_id",
+      "type": "Nullable(String)",
+      "description": "广告组ID；没有此层或自然来源为NULL",
+      "nullable": true
+    },
+    {
+      "name": "ad_id",
+      "type": "Nullable(String)",
+      "description": "全局唯一广告ID；自然来源不适用",
+      "nullable": true
+    },
+    {
+      "name": "creative_id",
+      "type": "Nullable(String)",
+      "description": "素材ID，可被多个广告复用",
+      "nullable": true
+    },
+    {
+      "name": "cohort_size_devices",
+      "type": "Nullable(UInt64)",
+      "description": "cohort设备基数，在多观察日重复，不跨观察日累加",
+      "nullable": true,
+      "unit": "设备×App"
+    },
+    {
+      "name": "retained_devices",
+      "type": "Nullable(UInt64)",
+      "description": "本cohort在观察日活跃设备数",
+      "nullable": true,
+      "unit": "设备×App"
+    },
+    {
+      "name": "game_count",
+      "type": "Nullable(UInt64)",
+      "description": "已结束局数",
+      "nullable": true,
+      "unit": "局"
+    },
+    {
+      "name": "gameplay_seconds",
+      "type": "Nullable(UInt64)",
+      "description": "已结束局时长总秒数",
+      "nullable": true,
+      "unit": "秒"
+    },
+    {
+      "name": "usage_seconds",
+      "type": "Nullable(UInt64)",
+      "description": "使用时长总秒数，包含局外时间",
+      "nullable": true,
+      "unit": "秒"
+    },
+    {
+      "name": "ad_impressions",
+      "type": "Nullable(UInt64)",
+      "description": "游戏内广告展示次数",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "ad_revenue_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "广告美元收入，不含IAP",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "age_days",
+      "type": "UInt32",
+      "description": "观察日距cohort锚点的自然日",
+      "nullable": false,
+      "unit": "天"
+    },
+    {
+      "name": "maturity_state",
+      "type": "String",
+      "description": "observed、mature或immature，不是freshness",
+      "nullable": false
+    },
+    {
+      "name": "completeness_state",
+      "type": "String",
+      "description": "complete或partial；完整性与freshness分开",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "install_cohort_date + observe_date + app + 首次获客国家/渠道/计划广告。cohort_size跨观察日重复不可累加；UTC设备cohort不冒充AF报表cohort。 dataset_version属于完整物理粒度和关联键，列入series.dimensions；日期分区仍只使用date_column。",
+  "aggregation_policy": {
+    "cohort_size_devices": [
+      "observe_date",
+      "age_days"
+    ]
+  },
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": [
+    "cohort_size_devices"
+  ],
+  "series": {
+    "date_column": "observe_date",
+    "dimensions": [
+      "dataset_version",
+      "install_cohort_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "campaign_id",
+      "ad_group_id",
+      "ad_id",
+      "creative_id"
+    ],
+    "metrics": [
+      "retained_devices",
+      "game_count",
+      "gameplay_seconds",
+      "usage_seconds",
+      "ad_impressions",
+      "ad_revenue_usd"
+    ],
+    "predicted_column": null,
+    "prediction_mode": "observed_only"
+  }
+}

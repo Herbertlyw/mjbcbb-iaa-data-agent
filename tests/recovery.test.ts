@@ -19,7 +19,8 @@ test("重启后仍能读取会话、消息、任务和证据", async () => {
     const session = first.sessions.create("analyst", "重启演示");
     const done = await ask(first, session.session_id, DEMO_QUESTIONS[2].text, "restart-key");
     assert.equal(done.status, "partial");
-    assert.ok(done.analysis?.server_reasons.includes("calculation_lineage_unsupported"));
+    assert.ok(done.analysis?.server_reasons.includes("calculation_input_incomplete"));
+    assert.ok(!done.analysis?.server_reasons.includes("calculation_lineage_unsupported"));
     await first.close();
     first = undefined;
 
@@ -34,6 +35,8 @@ test("重启后仍能读取会话、消息、任务和证据", async () => {
     const job = second.jobs.require(done.job_id);
     assert.equal(job.status, "partial");
     assert.match(job.analysis?.answer ?? "", /70/);
+    assert.equal(job.analysis?.calculations.find((item) => Object.hasOwn(item.cells, "revenue_predicted"))?.cells.revenue_predicted, null);
+    assert.deepEqual(job.analysis?.calculations, done.analysis?.calculations);
     assert.equal(job.events[0]?.type, "job_queued");
     assert.deepEqual(
       job.events.map((event) => event.seq),

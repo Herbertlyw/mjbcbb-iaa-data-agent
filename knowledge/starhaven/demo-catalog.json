@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "application": "VV Data Agent",
+  "release": null,
+  "categories": [
+    {
+      "id": "acquisition",
+      "label": "获客"
+    },
+    {
+      "id": "plans",
+      "label": "计划效果"
+    },
+    {
+      "id": "creative",
+      "label": "素材效果"
+    },
+    {
+      "id": "revenue",
+      "label": "广告收入"
+    },
+    {
+      "id": "retention",
+      "label": "活跃与留存"
+    },
+    {
+      "id": "value",
+      "label": "LTV / ROI"
+    }
+  ],
+  "questions": []
+}

@@ -1,0 +1,243 @@
+{
+  "asset_id": "contract.fact_delivery_daily",
+  "revision": "contract.fact_delivery_daily-v2",
+  "table": "fact_delivery_daily",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [
+    "business_date"
+  ],
+  "grain": [
+    "dataset_version",
+    "business_date",
+    "app_id",
+    "acquisition_country_code",
+    "ua_channel_id",
+    "account_id",
+    "campaign_id",
+    "ad_group_id",
+    "ad_id",
+    "creative_id"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "business_date",
+      "type": "Date",
+      "description": "business_date：UTC业务日期；角色由表粒度定义，不与其他日期混用。",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "acquisition_country_code",
+      "type": "String",
+      "description": "首次获客时国家，设备在本包体内分群固定",
+      "nullable": false
+    },
+    {
+      "name": "ua_channel_id",
+      "type": "String",
+      "description": "获客渠道ID，与广告变现network不同",
+      "nullable": false
+    },
+    {
+      "name": "account_id",
+      "type": "Nullable(String)",
+      "description": "全局唯一虚构广告账户ID；自然来源不适用",
+      "nullable": true
+    },
+    {
+      "name": "campaign_id",
+      "type": "Nullable(String)",
+      "description": "全局唯一计划ID；自然来源不适用",
+      "nullable": true
+    },
+    {
+      "name": "ad_group_id",
+      "type": "Nullable(String)",
+      "description": "广告组ID；没有此层或自然来源为NULL",
+      "nullable": true
+    },
+    {
+      "name": "ad_id",
+      "type": "Nullable(String)",
+      "description": "全局唯一广告ID；自然来源不适用",
+      "nullable": true
+    },
+    {
+      "name": "creative_id",
+      "type": "Nullable(String)",
+      "description": "素材ID，可被多个广告复用",
+      "nullable": true
+    },
+    {
+      "name": "raw_cost_local",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "未折扣原币消耗，不能跨币种直接相加",
+      "nullable": true,
+      "unit": "原币"
+    },
+    {
+      "name": "discounted_cost_local",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "折后原币消耗，不是美元",
+      "nullable": true,
+      "unit": "原币"
+    },
+    {
+      "name": "raw_cost_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "逐行按汇率换算的原始美元消耗",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "discounted_cost_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "逐行换算的折后美元消耗",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "impressions",
+      "type": "Nullable(UInt64)",
+      "description": "本事实范围的曝光或展示；投放与游戏内广告不是同一事件",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "clicks",
+      "type": "Nullable(UInt64)",
+      "description": "本事实范围的点击次数，不是去重点击用户",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "media_registers",
+      "type": "Nullable(UInt64)",
+      "description": "媒体报表注册，不等于AF报表注册或设备",
+      "nullable": true,
+      "unit": "报表注册"
+    },
+    {
+      "name": "af_registers",
+      "type": "Nullable(UInt64)",
+      "description": "AF报表注册计数，不是ODS安装事件数",
+      "nullable": true,
+      "unit": "报表注册"
+    },
+    {
+      "name": "source_currency",
+      "type": "String",
+      "description": "原始币种代码；XCU完全虚构",
+      "nullable": false
+    },
+    {
+      "name": "fx_rate_date",
+      "type": "Date",
+      "description": "汇率UTC业务日",
+      "nullable": false
+    },
+    {
+      "name": "cost_scope",
+      "type": "String",
+      "description": "成本范围，discounted_media_delivery",
+      "nullable": false
+    },
+    {
+      "name": "completeness_state",
+      "type": "String",
+      "description": "complete或partial；完整性与freshness分开",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "date + app + acquisition_country + UA账户/计划/组/广告/主素材。af_registers是报表计数，不改名成ODS去重安装；原币成本不跨币种相加。 dataset_version属于完整物理粒度和关联键，列入series.dimensions；日期分区仍只使用date_column。",
+  "aggregation_policy": {
+    "raw_cost_local": [
+      "source_currency"
+    ],
+    "discounted_cost_local": [
+      "source_currency"
+    ]
+  },
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": [
+    "discounted_cost_local",
+    "raw_cost_local"
+  ],
+  "series": {
+    "date_column": "business_date",
+    "dimensions": [
+      "dataset_version",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "account_id",
+      "campaign_id",
+      "ad_group_id",
+      "ad_id",
+      "creative_id"
+    ],
+    "metrics": [
+      "raw_cost_usd",
+      "discounted_cost_usd",
+      "impressions",
+      "clicks",
+      "media_registers",
+      "af_registers"
+    ],
+    "predicted_column": null,
+    "prediction_mode": "observed_only"
+  },
+  "derived_metrics": [
+    {
+      "id": "ctr",
+      "label": "投放CTR",
+      "operation": "divide",
+      "numerator": "clicks",
+      "denominator": "impressions",
+      "prediction": "actual_only",
+      "unit": "比值",
+      "scope": "observed_partial_only"
+    },
+    {
+      "id": "af_cvr",
+      "label": "AF注册/点击比",
+      "operation": "divide",
+      "numerator": "af_registers",
+      "denominator": "clicks",
+      "prediction": "actual_only",
+      "unit": "(报表注册)/(计数)",
+      "scope": "observed_partial_only"
+    },
+    {
+      "id": "af_cpi_usd",
+      "label": "AF报表CPI",
+      "operation": "divide",
+      "numerator": "discounted_cost_usd",
+      "denominator": "af_registers",
+      "prediction": "actual_only",
+      "unit": "(USD)/(报表注册)",
+      "scope": "observed_partial_only"
+    }
+  ]
+}

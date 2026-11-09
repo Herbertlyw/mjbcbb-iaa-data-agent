@@ -6,11 +6,19 @@ import { GlobalBudget } from "../src/global-budget.js";
 import path from "node:path";
 import test from "node:test";
 import { demoLocalModel } from "../src/demo-local-model.js";
+import { demoTaskLimits } from "../src/demo-task-limits.js";
 import { startFakeOpenAI } from "./openai-fake-server.js";
 import { stopProcess } from "./process-control.js";
 
 const token = "fictional-local-fixture";
 const settings = { PI_BASE_URL: "http://127.0.0.1:43123/v1", PI_MODEL: "synthetic-model", PI_API_KEY: token, PI_CONTEXT_WINDOW: "64000", PI_MAX_OUTPUT_TOKENS: "512" };
+
+test("隔离栈的单任务额度可显式设置并保持上限", () => {
+  assert.deepEqual(demoTaskLimits({}, true), { maxCalls: 10, maxKnownTokens: 120000 });
+  assert.deepEqual(demoTaskLimits({ DEMO_MAX_MODEL_CALLS: "20", DEMO_MAX_KNOWN_TOKENS: "400000" }, true), { maxCalls: 20, maxKnownTokens: 400000 });
+  for (const calls of ["0", "21", "1.5", "invalid"]) assert.throws(() => demoTaskLimits({ DEMO_MAX_MODEL_CALLS: calls }, true));
+  for (const tokens of ["0", "1000001", "invalid"]) assert.throws(() => demoTaskLimits({ DEMO_MAX_KNOWN_TOKENS: tokens }, true));
+});
 
 test("隔离栈在创建容器前拒绝无效的知识读取预算", () => {
   const result = spawnSync(process.execPath, ["--import", "tsx", "scripts/local-isolated-stack.ts"], {
@@ -67,7 +75,7 @@ test("显式本机服务模式接通隔离栈，假服务用量标为自报而�
     assert.equal(output.includes(token), false);
     assert.ok(fake.observations.length > 0 && fake.observations.every((item) => item.authorizationMatched));
   } finally {
-    await stopProcess(child, "SIGINT");
+    await stopProcess(child, "SIGINT", 30000);
     await fake.close();
   }
 });
@@ -78,7 +86,9 @@ test("DeepSeek 显式隔离栈启动和健康标识不触发模型请求", { tim
   const root = mkdtempSync(path.join(tmpdir(), "deepseek-launch-"));
   for (const item of ["src", "scripts", "knowledge", "package.json", "tsconfig.json"]) cpSync(path.resolve(item), path.join(root, item), { recursive: true });
   mkdirSync(path.join(root, "tests"));
-  cpSync(path.resolve("tests/openai-fake-server.ts"), path.join(root, "tests/openai-fake-server.ts"));
+  for (const fixture of ["openai-fake-server.ts", "real-model-f-sql.ts", "real-model-a-sql.ts", "grouped-a-fixture.ts"]) {
+    cpSync(path.resolve("tests", fixture), path.join(root, "tests", fixture));
+  }
   symlinkSync(path.resolve("node_modules"), path.join(root, "node_modules"), "dir");
   mkdirSync(path.join(root, ".local-runtime"), { mode: 0o700 });
   const budget = await GlobalBudget.activate({ path: path.join(root, ".local-runtime", "deepseek-budget.sqlite"), budgetId: "launch-fixture", maxRequests: 1, maxTokens: 10000 });
@@ -106,5 +116,5 @@ test("DeepSeek 显式隔离栈启动和健康标识不触发模型请求", { tim
     assert.equal(health.model_catalog.models[0]?.verified_here, false);
     assert.equal(output.includes(token), false);
     // No task is submitted, so even this fictional key is never dispatched.
-  } finally { await stopProcess(child, "SIGINT"); rmSync(root, { recursive: true, force: true }); }
+  } finally { await stopProcess(child, "SIGINT", 30000); rmSync(root, { recursive: true, force: true }); }
 });

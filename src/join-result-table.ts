@@ -1,8 +1,9 @@
-import type { JoinEvidencePlan, VerifiedJoinValue } from "./join-evidence.js";
+import { JOIN_ROW_COUNT_DESCRIPTION, type JoinEvidencePlan, type VerifiedJoinValue } from "./join-evidence.js";
 import { fitsResultCalculationBytes, RESULT_CALCULATION_MAX_ROWS, type ResultColumn, type ResultTable, type ResultValue } from "./result-transform.js";
 import type { DataContract } from "./types.js";
 import { isCalendarDate } from "./config.js";
 import { sumDecimalStrings } from "./exact-arithmetic.js";
+import { joinIntegerType } from "./join-integer.js";
 
 const identifier = /^[a-z_][a-z0-9_]{0,63}$/u;
 const dangerous = new Set(["__proto__", "prototype", "constructor"]);
@@ -32,20 +33,24 @@ export function joinResultTable(plan: JoinEvidencePlan, values: VerifiedJoinValu
   }
   const metrics = new Map<string, JoinEvidencePlan["metrics"][number]>();
   for (const metric of plan.metrics) {
-    if (!metric || !safeName(metric.output) || names.has(metric.output) || !safeName(metric.column) || !["sum", "count_nonnull"].includes(metric.operation) || !fact.series.metrics.includes(metric.column)) return null;
+    if (!metric || !safeName(metric.output) || names.has(metric.output) || !["sum", "count_nonnull", "count_null", "count_zero", "count_rows"].includes(metric.operation)) return null;
+    const rowCount = metric.operation === "count_rows";
+    if (rowCount ? metric.column !== "*" || metric.description !== JOIN_ROW_COUNT_DESCRIPTION || metric.precision !== undefined || metric.scale !== undefined || metric.integer_type !== undefined : !safeName(metric.column) || !fact.series.metrics.includes(metric.column)) return null;
     const declared = fact.columns.find((item) => item.name === metric.column);
     const unit = metric.operation === "sum" ? declared?.unit : "行";
     const type = declared?.type.replace(/\s/gu, "") ?? "";
-    const integer = /^(?:nullable\()?u?int(?:8|16|32)\)?$/iu.test(type);
+    const integer = joinIntegerType(type);
+    if (metric.integer_type !== undefined && metric.integer_type !== integer) return null;
     const decimal = /^(?:nullable\()?decimal\((\d+),(\d+)\)\)?$/iu.exec(type);
-    if (!declared || fact.sensitive_columns.includes(metric.column) || !unit || metric.unit !== unit || metric.description !== declared.description || !integer && !(decimal && metric.precision === Number(decimal[1]) && metric.scale === Number(decimal[2]) && Number(decimal[1]) <= 28)) return null;
+    if (!unit || metric.unit !== unit || !rowCount && (!declared || fact.sensitive_columns.includes(metric.column) || metric.description !== declared.description || !integer && !(decimal && metric.precision === Number(decimal[1]) && metric.scale === Number(decimal[2]) && Number(decimal[1]) <= 28))) return null;
     const scale = metric.operation === "sum" ? metric.scale ?? 0 : 0;
     const key = JSON.stringify([metric.column, metric.operation]);
     // Two aliases for the same expression cannot be unambiguously identified
     // in VerifiedJoinValue, so fail closed rather than guessing a mapping.
     if (metrics.has(key)) return null;
     metrics.set(key, metric); names.add(metric.output);
-    columns.push({ name: metric.output, type: "decimal", unit, label: `${fact.table}.${metric.column}（${declared.description}）的${metric.operation === "sum" ? "合计" : "非 NULL 计数"}`, scale,
+    const label = rowCount ? `${fact.table}（${JOIN_ROW_COUNT_DESCRIPTION}）` : `${fact.table}.${metric.column}（${declared!.description}）的${metric.operation === "sum" ? "合计" : metric.operation === "count_null" ? "NULL 计数" : metric.operation === "count_zero" ? "零值计数" : "非 NULL 计数"}`;
+    columns.push({ name: metric.output, type: "decimal", unit, label, scale,
       ...(metric.operation === "sum" ? { metric: { table: fact.table, column: metric.column, operation: "sum" as const } } : {}) });
   }
   const rows = new Map<string, { row: Record<string, ResultValue>; cells: Set<string>; unmatched: number }>();
@@ -55,7 +60,7 @@ export function joinResultTable(plan: JoinEvidencePlan, values: VerifiedJoinValu
     const metric = metrics.get(JSON.stringify([value.column, value.operation]));
     if (!metric || value.unit !== metric.unit || value.description !== metric.description || typeof value.value !== "string") return null;
     const canonical = sumDecimalStrings([value.value], value.operation === "sum" ? metric.scale ?? 0 : 0);
-    if (canonical === null || value.operation === "count_nonnull" && BigInt(canonical) < 0n) return null;
+    if (canonical === null || value.operation !== "sum" && BigInt(canonical) < 0n) return null;
     const parts: Array<string | null> = [];
     for (const group of plan.groups) {
       const table = group.table === "fact" ? fact.table : dimension.table;

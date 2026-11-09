@@ -1,0 +1,223 @@
+{
+  "asset_id": "contract.fact_roi_forecast_evaluation",
+  "revision": "contract.fact_roi_forecast_evaluation-v2",
+  "table": "fact_roi_forecast_evaluation",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [
+    "evaluation_as_of"
+  ],
+  "grain": [
+    "dataset_version",
+    "prediction_id",
+    "evaluation_as_of",
+    "snapshot_date",
+    "cohort_date",
+    "app_id",
+    "acquisition_country_code",
+    "ua_channel_id",
+    "campaign_id",
+    "horizon_days",
+    "model_version",
+    "revenue_source"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "prediction_id",
+      "type": "String",
+      "description": "跨发布稳定的预测快照身份",
+      "nullable": false
+    },
+    {
+      "name": "evaluation_as_of",
+      "type": "Date",
+      "description": "复验截止业务日",
+      "nullable": false
+    },
+    {
+      "name": "snapshot_date",
+      "type": "Date",
+      "description": "快照业务日期，不是收入发生日",
+      "nullable": false
+    },
+    {
+      "name": "cohort_date",
+      "type": "Date",
+      "description": "cohort_date：UTC业务日期；角色由表粒度定义，不与其他日期混用。",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "acquisition_country_code",
+      "type": "String",
+      "description": "首次获客时国家，设备在本包体内分群固定",
+      "nullable": false
+    },
+    {
+      "name": "ua_channel_id",
+      "type": "String",
+      "description": "获客渠道ID，与广告变现network不同",
+      "nullable": false
+    },
+    {
+      "name": "campaign_id",
+      "type": "Nullable(String)",
+      "description": "全局唯一计划ID；自然来源不适用",
+      "nullable": true
+    },
+    {
+      "name": "horizon_days",
+      "type": "UInt32",
+      "description": "累计业务天数N，对应日龄0..N-1",
+      "nullable": false,
+      "unit": "天"
+    },
+    {
+      "name": "model_version",
+      "type": "String",
+      "description": "baseline_linear_v1或baseline_tail_v2，不是公司模型",
+      "nullable": false
+    },
+    {
+      "name": "revenue_source",
+      "type": "String",
+      "description": "sdk或af，不可相加称总收入",
+      "nullable": false
+    },
+    {
+      "name": "predicted_roi_pct",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "预测收入/当时成本×100，不是实际ROI",
+      "nullable": true,
+      "unit": "%"
+    },
+    {
+      "name": "actual_revenue_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "成熟目标窗口实际SDK观测收入",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "actual_cost_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "复验时对应cohort完整成本",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "actual_roi_pct",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "成熟收入/完整成本×100",
+      "nullable": true,
+      "unit": "%"
+    },
+    {
+      "name": "roi_error_pp",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "实际ROI减预测ROI，百分点",
+      "nullable": true,
+      "unit": "百分点"
+    },
+    {
+      "name": "cost_weight_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "成本加权误差权重",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "maturity_state",
+      "type": "String",
+      "description": "observed、mature或immature，不是freshness",
+      "nullable": false
+    },
+    {
+      "name": "input_revision_state",
+      "type": "String",
+      "description": "unchanged或input_revised；回刷与模型误差分开",
+      "nullable": false
+    },
+    {
+      "name": "completeness_state",
+      "type": "String",
+      "description": "complete或partial；完整性与freshness分开",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "prediction_id + evaluation_as_of。从同一个预测ID复制不可变范围及预测值，方便单表查询；仅成熟完整且输入成本可比时评估模型误差，输入回刷单列。 dataset_version属于完整物理粒度和关联键，列入series.dimensions；日期分区仍只使用date_column。",
+  "aggregation_policy": {
+    "actual_cost_usd": [
+      "evaluation_as_of",
+      "prediction_id"
+    ],
+    "actual_revenue_usd": [
+      "evaluation_as_of",
+      "prediction_id"
+    ],
+    "actual_roi_pct": [
+      "evaluation_as_of",
+      "prediction_id"
+    ],
+    "predicted_roi_pct": [
+      "evaluation_as_of",
+      "prediction_id"
+    ],
+    "roi_error_pp": [
+      "evaluation_as_of",
+      "prediction_id"
+    ],
+    "cost_weight_usd": [
+      "evaluation_as_of",
+      "prediction_id"
+    ]
+  },
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": [
+    "actual_cost_usd",
+    "actual_revenue_usd",
+    "actual_roi_pct",
+    "cost_weight_usd",
+    "predicted_roi_pct",
+    "roi_error_pp"
+  ],
+  "series": {
+    "date_column": "evaluation_as_of",
+    "dimensions": [
+      "dataset_version",
+      "prediction_id",
+      "snapshot_date",
+      "cohort_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "campaign_id",
+      "horizon_days",
+      "model_version",
+      "revenue_source"
+    ],
+    "metrics": [],
+    "predicted_column": null,
+    "prediction_mode": "observed_only"
+  }
+}

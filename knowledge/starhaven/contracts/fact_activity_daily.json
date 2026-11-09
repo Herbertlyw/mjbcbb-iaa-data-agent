@@ -1,0 +1,215 @@
+{
+  "asset_id": "contract.fact_activity_daily",
+  "revision": "contract.fact_activity_daily-v2",
+  "table": "fact_activity_daily",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [
+    "activity_date"
+  ],
+  "grain": [
+    "dataset_version",
+    "activity_date",
+    "app_id",
+    "acquisition_country_code",
+    "ua_channel_id"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "activity_date",
+      "type": "Date",
+      "description": "activity_date：UTC业务日期；角色由表粒度定义，不与其他日期混用。",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "acquisition_country_code",
+      "type": "String",
+      "description": "首次获客时国家，设备在本包体内分群固定",
+      "nullable": false
+    },
+    {
+      "name": "ua_channel_id",
+      "type": "String",
+      "description": "获客渠道ID，与广告变现network不同",
+      "nullable": false
+    },
+    {
+      "name": "active_devices",
+      "type": "Nullable(UInt64)",
+      "description": "当日活跃设备×App；跨天相加为设备日",
+      "nullable": true,
+      "unit": "设备×App"
+    },
+    {
+      "name": "active_devices_7d",
+      "type": "Nullable(UInt64)",
+      "description": "锚点D-6..D精确去重活跃，不跨锚点相加",
+      "nullable": true,
+      "unit": "设备×App"
+    },
+    {
+      "name": "active_devices_30d",
+      "type": "Nullable(UInt64)",
+      "description": "锚点D-29..D精确去重活跃，不跨锚点相加",
+      "nullable": true,
+      "unit": "设备×App"
+    },
+    {
+      "name": "new_active_devices",
+      "type": "Nullable(UInt64)",
+      "description": "当日首次活跃设备×App",
+      "nullable": true,
+      "unit": "设备×App"
+    },
+    {
+      "name": "returning_active_devices",
+      "type": "Nullable(UInt64)",
+      "description": "当日活跃中此前已活跃的设备",
+      "nullable": true,
+      "unit": "设备×App"
+    },
+    {
+      "name": "sessions",
+      "type": "Nullable(UInt64)",
+      "description": "启动会话次数，不是去重设备",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "gameplay_seconds",
+      "type": "Nullable(UInt64)",
+      "description": "已结束局时长总秒数",
+      "nullable": true,
+      "unit": "秒"
+    },
+    {
+      "name": "game_count",
+      "type": "Nullable(UInt64)",
+      "description": "已结束局数",
+      "nullable": true,
+      "unit": "局"
+    },
+    {
+      "name": "ad_viewing_devices",
+      "type": "Nullable(UInt64)",
+      "description": "当日至少观看一次广告的去重设备",
+      "nullable": true,
+      "unit": "设备×App"
+    },
+    {
+      "name": "ad_impressions",
+      "type": "Nullable(UInt64)",
+      "description": "游戏内广告展示次数",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "ad_revenue_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "广告美元收入，不含IAP",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "device_identity_rule",
+      "type": "String",
+      "description": "synthetic_device_app_first_install_v1",
+      "nullable": false
+    },
+    {
+      "name": "completeness_state",
+      "type": "String",
+      "description": "complete或partial；完整性与freshness分开",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "activity_date + app + 首次获客国家/渠道。首版按首次获客国家/渠道固定分群；7/30日活跃在私有模拟设备上精确去重，只在同一锚点使用，不跨日相加或声称跨App人数。 dataset_version属于完整物理粒度和关联键，列入series.dimensions；日期分区仍只使用date_column。",
+  "aggregation_policy": {
+    "active_devices_7d": [
+      "activity_date"
+    ],
+    "active_devices_30d": [
+      "activity_date"
+    ]
+  },
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": [
+    "active_devices_30d",
+    "active_devices_7d"
+  ],
+  "series": {
+    "date_column": "activity_date",
+    "dimensions": [
+      "dataset_version",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id"
+    ],
+    "metrics": [
+      "active_devices",
+      "new_active_devices",
+      "returning_active_devices",
+      "sessions",
+      "gameplay_seconds",
+      "game_count",
+      "ad_viewing_devices",
+      "ad_impressions",
+      "ad_revenue_usd"
+    ],
+    "predicted_column": null,
+    "prediction_mode": "observed_only"
+  },
+  "derived_metrics": [
+    {
+      "id": "games_per_active_device",
+      "label": "活跃设备人均局数",
+      "operation": "divide",
+      "numerator": "game_count",
+      "denominator": "active_devices",
+      "prediction": "actual_only",
+      "unit": "(局)/(设备×App)",
+      "scope": "observed_partial_only"
+    },
+    {
+      "id": "arpdau_usd",
+      "label": "广告ARPDAU",
+      "operation": "divide",
+      "numerator": "ad_revenue_usd",
+      "denominator": "active_devices",
+      "prediction": "actual_only",
+      "unit": "(USD)/(设备×App)",
+      "scope": "observed_partial_only"
+    },
+    {
+      "id": "ad_view_penetration",
+      "label": "广告观看渗透率",
+      "operation": "divide",
+      "numerator": "ad_viewing_devices",
+      "denominator": "active_devices",
+      "prediction": "actual_only",
+      "unit": "比值",
+      "scope": "observed_partial_only"
+    }
+  ]
+}

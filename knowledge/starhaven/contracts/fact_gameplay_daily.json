@@ -1,0 +1,202 @@
+{
+  "asset_id": "contract.fact_gameplay_daily",
+  "revision": "contract.fact_gameplay_daily-v2",
+  "table": "fact_gameplay_daily",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [
+    "business_date"
+  ],
+  "grain": [
+    "dataset_version",
+    "business_date",
+    "app_id",
+    "activity_country_code",
+    "mode_code",
+    "level_bucket"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "business_date",
+      "type": "Date",
+      "description": "business_date：UTC业务日期；角色由表粒度定义，不与其他日期混用。",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "activity_country_code",
+      "type": "String",
+      "description": "事件发生时国家；不能自动替代获客国家",
+      "nullable": false
+    },
+    {
+      "name": "mode_code",
+      "type": "String",
+      "description": "产品内已定义模式",
+      "nullable": false
+    },
+    {
+      "name": "level_bucket",
+      "type": "String",
+      "description": "关卡区间，无关卡模式为not_applicable",
+      "nullable": false
+    },
+    {
+      "name": "games_started",
+      "type": "Nullable(UInt64)",
+      "description": "开局次数",
+      "nullable": true,
+      "unit": "局"
+    },
+    {
+      "name": "games_finished",
+      "type": "Nullable(UInt64)",
+      "description": "已结束局数",
+      "nullable": true,
+      "unit": "局"
+    },
+    {
+      "name": "eligible_win_games",
+      "type": "Nullable(UInt64)",
+      "description": "可判胜负的已结束局数",
+      "nullable": true,
+      "unit": "局"
+    },
+    {
+      "name": "games_won",
+      "type": "Nullable(UInt64)",
+      "description": "可判胜负局中的胜利数，不适用为NULL",
+      "nullable": true,
+      "unit": "局"
+    },
+    {
+      "name": "gameplay_seconds",
+      "type": "Nullable(UInt64)",
+      "description": "已结束局时长总秒数",
+      "nullable": true,
+      "unit": "秒"
+    },
+    {
+      "name": "total_score",
+      "type": "Nullable(UInt64)",
+      "description": "同一产品/模式/单位的分数和，不跨游戏比较",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "revive_prompts",
+      "type": "Nullable(UInt64)",
+      "description": "复活提示次数",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "revive_clicks",
+      "type": "Nullable(UInt64)",
+      "description": "复活点击次数，不等于成功看完广告",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "successful_revives",
+      "type": "Nullable(UInt64)",
+      "description": "成功复活次数",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "score_unit",
+      "type": "String",
+      "description": "产品与模式专用分数单位",
+      "nullable": false
+    },
+    {
+      "name": "gameplay_schema_version",
+      "type": "String",
+      "description": "合成玩法事件版本",
+      "nullable": false
+    },
+    {
+      "name": "completeness_state",
+      "type": "String",
+      "description": "complete或partial；完整性与freshness分开",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "date + app + country + mode + level_bucket。没有胜负定义的模式相关字段为不适用；不造轮/块明细，也不跨游戏直接比较分数。 dataset_version属于完整物理粒度和关联键，列入series.dimensions；日期分区仍只使用date_column。",
+  "aggregation_policy": {
+    "total_score": [
+      "app_id",
+      "mode_code",
+      "score_unit"
+    ]
+  },
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": [
+    "total_score"
+  ],
+  "series": {
+    "date_column": "business_date",
+    "dimensions": [
+      "dataset_version",
+      "app_id",
+      "activity_country_code",
+      "mode_code",
+      "level_bucket"
+    ],
+    "metrics": [
+      "games_started",
+      "games_finished",
+      "eligible_win_games",
+      "games_won",
+      "gameplay_seconds",
+      "revive_prompts",
+      "revive_clicks",
+      "successful_revives"
+    ],
+    "predicted_column": null,
+    "prediction_mode": "observed_only"
+  },
+  "derived_metrics": [
+    {
+      "id": "mode_win_rate",
+      "label": "可判胜负局胜率",
+      "operation": "divide",
+      "numerator": "games_won",
+      "denominator": "eligible_win_games",
+      "prediction": "actual_only",
+      "unit": "比值",
+      "scope": "observed_partial_only"
+    },
+    {
+      "id": "revive_click_rate",
+      "label": "复活提示点击率",
+      "operation": "divide",
+      "numerator": "revive_clicks",
+      "denominator": "revive_prompts",
+      "prediction": "actual_only",
+      "unit": "比值",
+      "scope": "observed_partial_only"
+    }
+  ]
+}

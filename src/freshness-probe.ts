@@ -17,7 +17,7 @@ async function probeMysql() {
     const batch = await store.begin(freshnessManifest(loadKnowledge(config.knowledgeDir), config.freshnessTargetsPath, clock));
     let observation;
     if (config.businessEngine === "clickhouse") {
-      const client = createClickHouseClient({ url: config.clickhouseUrl, username: config.clickhouseUser, password: config.clickhousePassword, database: config.clickhouseDatabase, maxRowsToRead: config.clickhouseMaxRowsToRead, timeoutSeconds: 30 }, true);
+      const client = createClickHouseClient({ url: config.clickhouseUrl, username: config.clickhouseUser, password: config.clickhousePassword, database: config.clickhouseDatabase, maxRowsToRead: config.clickhouseMaxRowsToRead, timeoutSeconds: 30, lockedReadonly: config.clickhouseLockedReadonly }, true);
       try {
         observation = await probeClickHouseFreshness({ targetsPath: config.freshnessTargetsPath, query: (sql) => clickHouseQuery(client, sql) as Promise<Array<{ event_date: string }>>, ...clock });
       } finally { await client.close(); }
@@ -40,6 +40,7 @@ async function probeClickHouse() {
     database: config.clickhouseDatabase,
     maxRowsToRead: config.clickhouseMaxRowsToRead,
     timeoutSeconds: 30,
+    lockedReadonly: config.clickhouseLockedReadonly,
   }, true);
   try {
     return await probeClickHouseAndPublish({

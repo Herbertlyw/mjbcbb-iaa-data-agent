@@ -701,7 +701,7 @@ async function postSession(port: number) {
   const response = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-demo-actor": "demo-analyst" },
-    body: JSON.stringify({ userId: "root", role: "viewer", title: "隔离会话" }),
+    body: JSON.stringify({ title: "隔离会话" }),
   });
   assert.equal(response.status, 201);
   const body = (await response.json()) as { session_id: string; role: string; actor_id: string };
@@ -714,7 +714,7 @@ async function postJob(port: number, sessionId: string, text: string, key: strin
   const response = await fetch(`http://127.0.0.1:${port}/api/sessions/${sessionId}/messages`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-demo-actor": "demo-analyst" },
-    body: JSON.stringify({ text, idempotency_key: key, userId: "root" }),
+    body: JSON.stringify({ text, idempotency_key: key }),
   });
   if (allowError) return { status: response.status, job_id: "" };
   assert.equal(response.status, 202);

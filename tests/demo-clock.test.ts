@@ -3,6 +3,15 @@ import test from "node:test";
 import { demoForScenario } from "../src/demo.js";
 import { shiftSyntheticDates, syntheticDayShift } from "../src/synthetic-clock.js";
 import { startFakeOpenAI } from "./openai-fake-server.js";
+import { loadVvDemo } from "../src/vv-demo.js";
+
+test("VV 数据包提供自己的标题和游戏名称，未绑定时不虚构日期示例", async () => {
+  const demo = await loadVvDemo("knowledge/starhaven");
+  assert.equal(demo.scenario, "VV Data Agent");
+  assert.match(demo.placeholder, /拼格 GridFit.*落块 BlockFall.*叠叠乐 StackJoy/u);
+  assert.equal(demo.release_state, "unbound");
+  assert.deepEqual(demo.questions, []);
+});
 
 test("滚动合成示例使用注入的业务日，固定示例和用户原文不受影响", () => {
   assert.match(demoForScenario(true).questions[0]!.text, /2026-10-06 到 2026-10-12/u);

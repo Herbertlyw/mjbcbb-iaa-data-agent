@@ -14,6 +14,7 @@ import { MysqlFreshnessStore } from "../src/mysql-freshness.js";
 import { syntheticDayShift } from "../src/synthetic-clock.js";
 import { largeSyntheticInstallSql } from "../src/synthetic-large.js";
 import { demoLocalModel } from "../src/demo-local-model.js";
+import { demoTaskLimits } from "../src/demo-task-limits.js";
 import { deepSeekKey } from "../src/deepseek-key.js";
 import { GlobalBudget } from "../src/global-budget.js";
 import { createTableSql, rollingWarehouse, smallWarehouse, WAREHOUSE_TABLES } from "../src/warehouse.js";
@@ -27,6 +28,7 @@ const rolling = args.includes("--rolling");
 const large = args.includes("--large");
 const localModel = args.includes("--local-model");
 const deepseek = args.includes("--deepseek");
+const taskLimits = demoTaskLimits(process.env, deepseek);
 const assetReadBytes = Number(process.env.MAX_ASSET_READ_BYTES ?? "200000");
 if (!Number.isSafeInteger(assetReadBytes) || assetReadBytes < 0) throw new Error("MAX_ASSET_READ_BYTES 必须是非负安全整数。");
 const dates = args.filter((arg) => arg.startsWith("--today="));
@@ -53,6 +55,7 @@ const password = randomBytes(18).toString("hex");
 const readerPassword = randomBytes(18).toString("hex");
 const token = `fictional-${randomBytes(18).toString("hex")}`;
 const created: string[] = [];
+let unconfirmedContainer = false;
 const children: ChildProcess[] = [];
 const dir = await mkdtemp(path.join(tmpdir(), "dataagent-stack-"));
 const watchdog = spawn(process.execPath, [path.join(root, "scripts", "stack-watchdog.mjs"), id, dir], { detached: true, stdio: ["pipe", "ignore", "ignore"] });
@@ -86,8 +89,9 @@ async function createContainer(name: string, args: string[]): Promise<void> {
   } catch (error) {
     // In case Docker created the container before reporting an error, only
     // claim it if its invocation-specific label matches.
-    const label = await command("docker", ["inspect", "--format", '{{ index .Config.Labels "dataagent.isolated" }}', name]).catch(() => "");
+    const label = await command("docker", ["inspect", "--format", '{{ index .Config.Labels "dataagent.isolated" }}', name]).catch(() => null);
     if (label === id) created.push(name);
+    else if (label === null) unconfirmedContainer = true;
     throw error;
   }
 }
@@ -173,7 +177,7 @@ try {
     FRESHNESS_PATH: path.join(dir, "freshness.json"), DATABASE_PATH: path.join(dir, "unused.sqlite"), RESEED_DATABASE: "false", PUBLISH_FRESHNESS_ON_START: "false",
     MYSQL_HOST: "127.0.0.1", MYSQL_PORT: String(mysqlPort), MYSQL_USER: "lumenfox_it", MYSQL_PASSWORD: password, MYSQL_DATABASE: "lumenfox_it",
     REDIS_HOST: "127.0.0.1", REDIS_PORT: String(redisPort), REDIS_PASSWORD: password, REDIS_QUEUE_KEY: `dataagent:stack:${id}`,
-    MODEL_MODE: "pi", ...model, ...(deepseek ? { DEEPSEEK_BUDGET_ID: budgetId, DEEPSEEK_BUDGET_MAX_REQUESTS: String(budgetRequests), DEEPSEEK_BUDGET_MAX_TOKENS: String(budgetTokens) } : {}), MAX_ASSET_READ_BYTES: String(assetReadBytes), RECOVERY_MS: "600", LEASE_MS: "4000", MAX_MODEL_CALLS: deepseek ? "10" : "24", MAX_KNOWN_TOKENS: deepseek ? "120000" : "200000", JOB_TIMEOUT_MS: deepseek ? "120000" : "60000",
+    MODEL_MODE: "pi", ...model, ...(deepseek ? { DEEPSEEK_BUDGET_ID: budgetId, DEEPSEEK_BUDGET_MAX_REQUESTS: String(budgetRequests), DEEPSEEK_BUDGET_MAX_TOKENS: String(budgetTokens) } : {}), MAX_ASSET_READ_BYTES: String(assetReadBytes), RECOVERY_MS: "600", LEASE_MS: "4000", MAX_MODEL_CALLS: String(taskLimits.maxCalls), MAX_KNOWN_TOKENS: String(taskLimits.maxKnownTokens), JOB_TIMEOUT_MS: deepseek ? "120000" : "60000",
   };
   launch("src/api.ts", env); launch("src/dispatcher.ts", env); launch("src/worker.ts", env);
   await waitUntil(async () => (await fetch(`http://127.0.0.1:${apiPort}/api/health`, { signal: AbortSignal.timeout(1000) })).ok, "API");
@@ -192,8 +196,16 @@ try {
     child.once("exit", () => { clearTimeout(timeout); resolve(); });
   })));
   if (fake) await fake.close();
-  for (const name of created.reverse()) await command("docker", ["rm", "-f", name]).catch(() => undefined);
+  let cleanupComplete = !unconfirmedContainer;
+  for (const name of created.reverse()) {
+    try { await command("docker", ["rm", "-f", name]); } catch { cleanupComplete = false; }
+  }
   await rm(dir, { recursive: true, force: true });
-  watchdog.stdin?.end();
+  const watchdogExit = watchdog.exitCode !== null || watchdog.signalCode !== null ? Promise.resolve() : new Promise<void>((resolve) => {
+    watchdog.once("exit", () => resolve());
+  });
+  watchdog.ref();
+  watchdog.stdin?.end(cleanupComplete ? "cleanup-complete\n" : undefined);
+  await watchdogExit;
   console.log("本轮隔离栈已停止。");
 }

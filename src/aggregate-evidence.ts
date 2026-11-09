@@ -1,4 +1,5 @@
 import { coverageHasGap, provenCoverageScope } from "./coverage.js";
+import { permitsAggregation } from "./aggregation-policy.js";
 import { isCalendarDate } from "./config.js";
 import { completeObservedGroups } from "./aggregate-group-coverage.js";
 import { queryEvidenceShape } from "./evidence-shape.js";
@@ -30,7 +31,7 @@ export function verifyDatabaseAggregates(source: QueryResource, contract: DataCo
   const series = contract.series;
   if (!series || series.predicted_column || series.prediction_mode !== "observed_only" || source.tables.length !== 1 || source.tables[0] !== contract.table || source.truncated || source.sql_limited || !source.complete_population || !source.rows.length || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length) return null;
   const scope = provenCoverageScope(source.sql, contract, source.time_range);
-  if (!scope) return null;
+  if (!scope || scope.selectedDates) return null;
   const filters = scope.equalities;
   const ast = queryEvidenceShape(source, contract); if (!ast) return null;
   if (ast.with || ast._next || ast.having || ast.limit || ast.distinct || ast.options) return null;
@@ -44,9 +45,9 @@ export function verifyDatabaseAggregates(source: QueryResource, contract: DataCo
   };
   const groupNode = object(ast.groupby);
   const groupList = groupNode && Array.isArray(groupNode.columns) ? groupNode.columns : [];
-  if (groupNode && (groupList.length < 1 || groupList.length > 3)) return null;
+  if (groupNode && (groupList.length < 1 || groupList.length > Math.min(8, series.dimensions.length + 1))) return null;
   const groupColumns = groupList.map(col);
-  if (groupColumns.some((column) => !column || column !== series.date_column && !series.dimensions.includes(column) || Object.hasOwn(filters, column)) || new Set(groupColumns).size !== groupColumns.length) return null;
+  if (groupColumns.some((column) => !column || column !== series.date_column && !series.dimensions.includes(column)) || new Set(groupColumns).size !== groupColumns.length) return null;
   if (!series.dimensions.every((dimension) => groupColumns.includes(dimension) || Object.hasOwn(filters, dimension))) return null;
   // Each requested member must remain a distinct, contract-labelled result
   // group. A SUM across multiple IN values needs a richer set-valued lineage
@@ -81,6 +82,7 @@ export function verifyDatabaseAggregates(source: QueryResource, contract: DataCo
     const args = object(expr.args);
     const input = col(args?.expr);
     if (!args || args.distinct || args.orderby || !input || !series.metrics.includes(input) || !["sum", "count"].includes(fn)) return null;
+    if (fn === "sum" && !permitsAggregation(contract, input, filters, groupColumns, source.time_range)) return null;
     const output = item.as;
     if (typeof output !== "string" || !safeAlias(output, input, contract) || names.has(output)) return null;
     const declared = contract.columns.find((column) => column.name === input);
@@ -114,6 +116,7 @@ export function verifyDatabaseAggregates(source: QueryResource, contract: DataCo
       const value = row[groupOutputs.get(column)!];
       if (typeof value !== "string" || !/^[A-Za-z0-9_-]{1,64}$/u.test(value)) return null;
       if (scope.inSets[column] && !scope.inSets[column]!.includes(value)) return null;
+      if (Object.hasOwn(filters, column) && value !== filters[column]) return null;
       // The query-wide date receipt bounds each observed grouped business day.
       // A model-controlled alias cannot change the physical date field.
       if (column === series.date_column && (!isCalendarDate(value) || value < source.time_range.start || value > source.time_range.end)) return null;

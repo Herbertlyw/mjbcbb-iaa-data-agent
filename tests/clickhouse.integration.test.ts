@@ -123,6 +123,44 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
       const rollSession = runtime.sessions.create("analyst");
       await bindTables(runtime, rollSession.session_id, ["contract.fact_fox_daily_install"]);
       runtime.sessions.setActiveJob(rollSession.session_id, "job_group_rollup_clickhouse");
+      const exactSession = runtime.sessions.create("analyst");
+      await bindTables(runtime, exactSession.session_id, ["contract.fact_fox_daily_payment"]);
+      runtime.sessions.setActiveJob(exactSession.session_id, "job_exact_cell_comparison");
+      const exactCalculations: string[] = [];
+      for (const day of ["2026-10-07", "2026-10-08"]) {
+        const q = await runtime.tools.query(exactSession.session_id, { sql: `SELECT event_date, amount_usd FROM fact_fox_daily_payment WHERE event_date = toDate('${day}') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'` });
+        assert.ok(q.ok, JSON.stringify(q)); if (!q.ok) return;
+        const calc = await runtime.tools.calculateSessionCells(exactSession.session_id, { resource_id: String(q.resource_id), operations: [{ op: 'sum', column: 'amount_usd', as: 'total' }] });
+        assert.ok(calc.ok, JSON.stringify(calc)); if (!calc.ok) return;
+        exactCalculations.push(String(calc.resource_id));
+      }
+      const compared = await runtime.tools.updateAnalysis(exactSession.session_id, { suggested_status: 'completed', draft_answer: '', resource_ids: exactCalculations, comparisons: [{ left: { resource_id: exactCalculations[1]!, cell: 'total' }, right: { resource_id: exactCalculations[0]!, cell: 'total' } }] });
+      assert.ok(compared.ok, JSON.stringify(compared)); if (!compared.ok) return;
+      assert.equal(compared.status, 'completed', JSON.stringify(compared.server_reasons));
+      assert.equal((compared.aggregate_comparisons as Array<{difference: string}>)[0]?.difference, '0.91');
+      assert.ok(!(compared.server_reasons as string[]).includes('comparison_unverifiable'));
+      // Real model shape: a business SUM accompanied by MIN/MAX auxiliary
+      // fields. The observed result must not become a completed certified
+      // metric if this aggregate shape cannot be proven from its contract.
+      const unprovenAggregate = await runtime.tools.query(rollSession.session_id, {
+        sql: "SELECT event_date, SUM(new_users) AS active_total, MIN(title_id) AS min_title, MAX(title_id) AS max_title, COUNT(*) AS row_count FROM fact_fox_daily_install WHERE event_date = toDate('2026-10-06') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads' GROUP BY event_date",
+      });
+      assert.ok(unprovenAggregate.ok, JSON.stringify(unprovenAggregate)); if (!unprovenAggregate.ok) return;
+      assert.match(String(unprovenAggregate.notice), /无法预先证明业务含义/);
+      const unprovenAnswer = await runtime.tools.updateAnalysis(rollSession.session_id, { suggested_status: "completed", draft_answer: "合计 100 人", resource_ids: [String(unprovenAggregate.resource_id)] });
+      assert.ok(unprovenAnswer.ok, JSON.stringify(unprovenAnswer)); if (!unprovenAnswer.ok) return;
+      assert.equal(unprovenAnswer.status, "partial");
+      assert.ok((unprovenAnswer.server_reasons as string[]).includes("query_expression_semantics_unverified"));
+      assert.match(String(unprovenAnswer.answer), /业务含义未认证/);
+      const sparseDates = await runtime.tools.query(rollSession.session_id, {
+        sql: "SELECT event_date, new_users FROM fact_fox_daily_install WHERE event_date IN (toDate('2026-10-06'), toDate('2026-10-08')) AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads' ORDER BY event_date",
+      });
+      assert.ok(sparseDates.ok, JSON.stringify(sparseDates)); if (!sparseDates.ok) return;
+      assert.deepEqual((sparseDates.rows as Array<{event_date: string}>).map(row => row.event_date), ['2026-10-06', '2026-10-08']);
+      assert.equal((sparseDates.coverage as {status: string}).status, 'unknown', '稀疏日期不能当作连续日期覆盖');
+      const sparseAnswer = await runtime.tools.updateAnalysis(rollSession.session_id, { suggested_status: 'completed', draft_answer: '', resource_ids: [String(sparseDates.resource_id)] });
+      assert.ok(sparseAnswer.ok, JSON.stringify(sparseAnswer)); if (!sparseAnswer.ok) return;
+      assert.equal(sparseAnswer.status, 'partial');
       const forbiddenOptions = await runtime.tools.query(rollSession.session_id, { sql: "SELECT new_users FROM fact_fox_daily_install WHERE event_date = '2026-10-06' SETTINGS max_threads=8" });
       assert.equal(forbiddenOptions.ok, false);
       if (!forbiddenOptions.ok) {
@@ -332,7 +370,9 @@ test("隔离 ClickHouse：真实查询、新鲜度、拒绝绕过，并走分进
         assert.equal(delivered.status, "partial");
         assert.ok((delivered.server_reasons as string[]).includes("query_expression_semantics_unverified"));
         assert.ok((delivered.server_reasons as string[]).includes("coverage_unknown"));
-        assert.match(String(delivered.answer), /数学计算 observed：220/u);
+        assert.match(String(delivered.answer), /数学计算 查询结果列 2（业务含义未认证） 的非 NULL 合计：220；单位 未认证/u);
+        assert.match(String(delivered.answer), /该计算不单独证明业务总体完整/u);
+        assert.doesNotMatch(String(delivered.answer), /数学计算 observed：/u);
         assert.doesNotMatch(String(delivered.answer), /数据库求和 220/u);
         assert.equal(forbiddenCalls, 0, "受支持的聚合 CTE 查询、计算和交付不能调用旧解析器，即使异常会被捕获");
       } finally { Parser.prototype.astify = originalParser; }
@@ -506,7 +546,9 @@ async function runGoldenCases(runtime: ReturnType<typeof createRuntime>) {
         assert.ok((partial.server_reasons as string[]).includes("query_expression_semantics_unverified"));
         assert.ok((partial.server_reasons as string[]).includes("query_lineage_unsupported"));
         assert.ok((partial.server_reasons as string[]).includes("transform_coverage_incomplete"));
-        assert.match(String(partial.answer), /数学计算 observed_sum：670/u);
+        assert.match(String(partial.answer), /数学计算 查询结果列 1（业务含义未认证） 的非 NULL 合计：670；单位 未认证/u);
+        assert.match(String(partial.answer), /该计算不单独证明业务总体完整/u);
+        assert.doesNotMatch(String(partial.answer), /数学计算 observed_sum：/u);
         assert.match((partial.limitations as string[]).join(" "), /业务含义未认证/u);
         assert.doesNotMatch(String(partial.answer), /数据库求和 670/u);
       }

@@ -1,0 +1,443 @@
+[
+  {
+    "id": "Q01",
+    "question": "三款产品两种平台分别有什么包体？",
+    "assets": [
+      "dim_app"
+    ],
+    "acceptance": "三产品与六App的关系明确，不合并game_id与app_id。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q02",
+    "question": "过去一周各产品、国家和渠道消耗与AF注册CPI是多少？",
+    "assets": [
+      "dim_app",
+      "dim_country",
+      "dim_ua_channel",
+      "fact_delivery_daily"
+    ],
+    "acceptance": "按分子分母汇总，保留成本与报表注册身份。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q03",
+    "question": "同一计划的曝光、点击、媒体注册和AF注册分别怎样？",
+    "assets": [
+      "dim_campaign",
+      "fact_delivery_daily"
+    ],
+    "acceptance": "不同计数身份并列，不强制相等。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q04",
+    "question": "欧元账户的原始与折后美元消耗如何核对？",
+    "assets": [
+      "dim_ad_account",
+      "fact_fx_rate_daily",
+      "fact_delivery_daily"
+    ],
+    "acceptance": "逐行除正确方向汇率，原币不混加。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q05",
+    "question": "什么广告组/广告贡献了消耗变化？",
+    "assets": [
+      "dim_ad_group",
+      "dim_ad",
+      "fact_delivery_daily"
+    ],
+    "acceptance": "父子关系有效，不重复放大事实。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q06",
+    "question": "首次安装设备、重装事件和行为D0为什么不一样？",
+    "assets": [
+      "fact_acquisition_daily",
+      "fact_activity_daily"
+    ],
+    "acceptance": "安装事件、首次设备和首次活跃分别对账。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q07",
+    "question": "安装到达延迟是否让昨天的安装看起来下降？",
+    "assets": [
+      "fact_acquisition_daily"
+    ],
+    "acceptance": "使用业务日和arrival_cutoff、late_install_events；不把未到当零。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q08",
+    "question": "DAU、最近7日和30日活跃设备及黏性如何？",
+    "assets": [
+      "fact_activity_daily"
+    ],
+    "acceptance": "精确去重由私有设备模拟产生；不把每日DAU相加成WAU。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q09",
+    "question": "买量与自然来源的D1/D7设备留存有什么差别？",
+    "assets": [
+      "dim_ua_channel",
+      "fact_cohort_quality_daily"
+    ],
+    "acceptance": "固定cohort分母与age，未成熟不补零。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q10",
+    "question": "同计划后续局数、使用时长、广告表现有何变化？",
+    "assets": [
+      "dim_campaign",
+      "fact_cohort_quality_daily"
+    ],
+    "acceptance": "获客与观察日分开，日观察不冒充累计。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q11",
+    "question": "拖消与落消在不同模式下的局时长和复活点击怎样？",
+    "assets": [
+      "dim_app",
+      "fact_gameplay_daily"
+    ],
+    "acceptance": "只比较有定义的模式；分数不同单位不强行比较。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q12",
+    "question": "为什么插屏ARPDAU下降，是展示变少还是eCPM降低？",
+    "assets": [
+      "fact_activity_daily",
+      "fact_ad_funnel_daily"
+    ],
+    "acceptance": "总活跃ARPDAU与格式收入贡献分别算；不把分格式观看人数加成总UV。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q13",
+    "question": "load成功、ready与show成功哪个环节变化？",
+    "assets": [
+      "fact_ad_funnel_daily"
+    ],
+    "acceptance": "请求/尝试/事件族和分母明确。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q14",
+    "question": "哪个变现network或广告格式的收入变化最大？",
+    "assets": [
+      "fact_ad_funnel_daily"
+    ],
+    "acceptance": "network不是获客媒体；仅在该事实支持的维度下回答。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q15",
+    "question": "SDK与AF的ROI7差异集中在哪里？",
+    "assets": [
+      "fact_cohort_revenue_daily",
+      "fact_delivery_daily"
+    ],
+    "acceptance": "分来源对照；0..6累计，不混预测。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q16",
+    "question": "这些设备cohort的LTV7与AF注册分母LTV7分别多少？",
+    "assets": [
+      "fact_cohort_quality_daily",
+      "fact_cohort_revenue_daily",
+      "fact_delivery_daily"
+    ],
+    "acceptance": "两个分母身份都展示，不互相替代。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q17",
+    "question": "零消耗自然来源的ROI是多少？",
+    "assets": [
+      "dim_ua_channel",
+      "fact_delivery_daily",
+      "fact_cohort_revenue_daily"
+    ],
+    "acceptance": "零分母未知，不造无限ROI或0。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q18",
+    "question": "新上传素材的测试、可观测与出坡比例是多少？",
+    "assets": [
+      "dim_creative",
+      "fact_creative_test_snapshot",
+      "config_business_policy_snapshot"
+    ],
+    "acceptance": "成熟窗口与规则版本固定，跨媒体素材去重。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q19",
+    "question": "一个素材被多个广告使用，会不会重复计算消耗？",
+    "assets": [
+      "dim_creative",
+      "dim_ad",
+      "fact_delivery_daily"
+    ],
+    "acceptance": "一个广告版本单主素材，多广告可复用；事实只计一次。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q20",
+    "question": "某素材随投放天数增长表现变差了吗？",
+    "assets": [
+      "dim_creative",
+      "fact_delivery_daily"
+    ],
+    "acceptance": "按上传日/投放日算年龄，只报关联，不自动认证疲劳或因果。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q21",
+    "question": "产品实验组和对照组的RR7、收入差异是多少？",
+    "assets": [
+      "dim_experiment_arm",
+      "fact_experiment_cohort_daily"
+    ],
+    "acceptance": "配置明确对照组、分配单位与观察窗；样本不足降级。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q22",
+    "question": "商业化实验触发后的次日表现怎样？",
+    "assets": [
+      "dim_experiment_arm",
+      "fact_experiment_cohort_daily"
+    ],
+    "acceptance": "entry锚点是触发而非安装，不能串用分母。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q23",
+    "question": "预算/状态变化前后的计划表现如何？",
+    "assets": [
+      "fact_ad_operation_event",
+      "dim_campaign",
+      "fact_delivery_daily"
+    ],
+    "acceptance": "操作按ID去重，前后窗明确，只称候选关联。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q24",
+    "question": "当时预测的ROI360，成熟后实际偏差怎样？",
+    "assets": [
+      "fact_roi_forecast_snapshot",
+      "fact_roi_forecast_evaluation"
+    ],
+    "acceptance": "追同一prediction_id、版本、目标；需足够长历史。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q25",
+    "question": "模型版本之间的预测误差怎样比较？",
+    "assets": [
+      "fact_roi_forecast_snapshot",
+      "fact_roi_forecast_evaluation"
+    ],
+    "acceptance": "只比较可比cohort/目标/成熟范围，按成本加权。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q26",
+    "question": "预测回收是否达到当前合成经营目标？",
+    "assets": [
+      "config_business_policy_snapshot",
+      "fact_roi_forecast_snapshot"
+    ],
+    "acceptance": "规则有效期和scope一致，结果不是自动投放动作。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q27",
+    "question": "某天NULL、真零和没有行应怎样解释？",
+    "assets": [
+      "fact_delivery_daily",
+      "fact_acquisition_daily",
+      "fact_cohort_revenue_daily"
+    ],
+    "acceptance": "按覆盖期望区分；不得统一补零。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q28",
+    "question": "计划暂停后没有消耗行是否算数据缺失？",
+    "assets": [
+      "fact_ad_operation_event",
+      "fact_delivery_daily"
+    ],
+    "acceptance": "期望域包含对象生效状态，不用全局笛卡尔积猜缺行。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q29",
+    "question": "跨天窗口对比CPI与ROI变化多少？",
+    "assets": [
+      "fact_delivery_daily",
+      "fact_cohort_revenue_daily"
+    ],
+    "acceptance": "等长/明确范围和成熟度，先汇总分子分母。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q30",
+    "question": "新批次发布后追问还能说明数据观察版本吗？",
+    "assets": [
+      "dim_app",
+      "fact_delivery_daily"
+    ],
+    "acceptance": "每轮资源绑定dataset_version与发布回执；不宣称跨库原子事务。",
+    "expected": "supported_after_implementation",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q31",
+    "question": "第三款未确认玩法的游戏胜率是多少？",
+    "assets": [
+      "dim_app",
+      "fact_gameplay_daily"
+    ],
+    "acceptance": "玩法/模式未定义时明确不可答，不杜撰胜负。",
+    "expected": "clarify_or_unsupported",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q32",
+    "question": "月内跨三款游戏总共多少真实独立玩家？",
+    "assets": [
+      "fact_activity_daily"
+    ],
+    "acceptance": "设备×App与人不是一个单位；公开聚合不足以跨App去重。",
+    "expected": "unsupported_without_new_identity_definition",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q33",
+    "question": "哪个获客渠道造成某变现network的load失败？",
+    "assets": [
+      "fact_ad_funnel_daily",
+      "dim_ua_channel"
+    ],
+    "acceptance": "当前funnel无获客渠道维度，不能靠国家/日期多对多JOIN断言。",
+    "expected": "unsupported_at_this_grain",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q34",
+    "question": "直接把投放明细与回收明细JOIN起来算ROI行不行？",
+    "assets": [
+      "fact_delivery_daily",
+      "fact_cohort_revenue_daily"
+    ],
+    "acceptance": "先按合同的共同键分别聚合后对齐；原始明细直接JOIN拒绝。",
+    "expected": "reject_unsafe_join",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q35",
+    "question": "把7个锚点的最近7日活跃相加是多少周活？",
+    "assets": [
+      "fact_activity_daily"
+    ],
+    "acceptance": "拒绝把重叠去重窗口求和称周活。",
+    "expected": "reject_nonadditive_rollup",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q36",
+    "question": "最新一天没有成熟ROI7，能否拿预测充当实际？",
+    "assets": [
+      "fact_roi_forecast_snapshot",
+      "fact_cohort_revenue_daily"
+    ],
+    "acceptance": "预测与实际分列，未成熟不改成真实回收。",
+    "expected": "reject_prediction_as_actual",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q37",
+    "question": "帮我看看收入。",
+    "assets": [
+      "dim_app"
+    ],
+    "acceptance": "询问产品、范围和收入来源，不猜默认完整口径。",
+    "expected": "needs_clarification",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q38",
+    "question": "把SDK和AF收入加起来就是总收入吗？",
+    "assets": [
+      "fact_cohort_revenue_daily"
+    ],
+    "acceptance": "拒绝观测来源重复相加。",
+    "expected": "reject_double_counting",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q39",
+    "question": "当前材料能否解释游戏内购买、退款和订阅续费？",
+    "assets": [
+      "fact_cohort_revenue_daily"
+    ],
+    "acceptance": "首版仅IAA；原IAP来源范围和元数据不足，不能冒充完整财务链。",
+    "expected": "extension_required",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  },
+  {
+    "id": "Q40",
+    "question": "某组本周收入低于上周，是不是预算调整导致？",
+    "assets": [
+      "fact_ad_operation_event",
+      "fact_delivery_daily",
+      "fact_cohort_revenue_daily"
+    ],
+    "acceptance": "显示变化和操作时间，保留其他因素与因果边界。",
+    "expected": "descriptive_not_causal_claim",
+    "runtime_status": "not_executed_for_this_proposed_dataset"
+  }
+]

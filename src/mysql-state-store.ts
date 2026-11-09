@@ -6,6 +6,7 @@ export interface MysqlConnection {
   user: string;
   password: string;
   database: string;
+  authority?: { mode: "local_mock" | "controlled_visitor"; policy?: import("./state-store.js").AuthorityPolicy };
 }
 
 /** A fail-fast guard for legacy synchronous callers. MySQL state I/O is

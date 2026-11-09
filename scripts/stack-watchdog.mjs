@@ -13,7 +13,13 @@ const resolved = path.resolve(directory ?? "");
 if (path.dirname(resolved) !== parent || !path.basename(resolved).startsWith("dataagent-stack-")) process.exit(1);
 const run = promisify(execFile);
 process.stdin.resume();
+let completion = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { completion = (completion + chunk).slice(0, 32); });
 process.stdin.once("end", async () => {
+  // The owner sends this only after it has removed its own containers and
+  // files. Unexpected EOF still triggers the independent cleanup below.
+  if (completion === "cleanup-complete\n") return;
   for (const service of ["redis", "mysql", "ch"]) {
     const name = `dataagent-stack-${service}-${id}`;
     try {

@@ -162,7 +162,7 @@ test("独立进程通过 HTTP/SSE 恢复任务，并拒绝错配的幂等键", a
     assert.ok(seqs.length > 0);
     assert.ok(seqs.every((seq, index) => index === 0 || seq > seqs[index - 1]!));
     assert.ok(seqs.every((seq) => seq > 2));
-    const foreign = await fetch(`${base}/api/sessions/${otherSession.session_id}`);
+    const foreign = await fetch(`${base}/api/sessions/${otherSession.session_id}/jobs`);
     const foreignBody = (await foreign.json()) as { jobs: Array<{ job_id: string }> };
     assert.equal(foreignBody.jobs.some((item) => item.job_id === queued.job_id), false);
 

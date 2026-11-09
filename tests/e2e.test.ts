@@ -48,7 +48,10 @@ test("证据完整时可以完成，敏感请求和澄清不会假装查到了",
     assert.match(done.analysis?.answer ?? "", /70/);
     assert.match(done.analysis?.answer ?? "", /21/);
     assert.equal(done.analysis?.calculations.flatMap((item) => item.verified_cells ?? []).some((cell) => cell.column === "revenue_usd" && cell.prediction.startsWith("预测") && cell.value === 0), false);
-    assert.ok(done.analysis?.server_reasons.includes("calculation_lineage_unsupported"));
+    assert.ok(done.analysis?.server_reasons.includes("calculation_input_incomplete"));
+    assert.ok(!done.analysis?.server_reasons.includes("calculation_lineage_unsupported"));
+    assert.equal(done.analysis?.calculations.find((item) => Object.hasOwn(item.cells, "revenue_predicted"))?.cells.revenue_predicted, null);
+    assert.match(done.analysis?.answer ?? "", /NULL（未知[^\n]*仅预测记录/);
 
     const sensitive = analyst(runtime);
     const denied = await ask(runtime, sensitive.session_id, DEMO_QUESTIONS[4].text);

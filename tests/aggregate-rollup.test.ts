@@ -29,6 +29,14 @@ test("可信日期分组精确汇总，分组的行数与零不能冒充事实�
   assert.equal(verifyGroupRollup(base, contract, { op: "sum", column: "total", predicted: "predicted_only", as: "n" }, "220"), null);
 });
 
+test("组后再汇总不能丢弃契约规定的非加性维度", () => {
+  const restricted = structuredClone(contract);
+  restricted.aggregation_policy = { new_users: ["event_date"] };
+  assert.equal(verifyDatabaseAggregates(base, restricted)?.length, 3);
+  assert.equal(verifyGroupRollup(base, restricted, { op: "sum", column: "total", as: "n" }, "220"), null);
+  assert.equal(verifyGroupRollup(base, restricted, { op: "count_rows", as: "n" }, 3)?.value, "3");
+});
+
 test("CK 原生审查的分组结果以 CK 投影形状复核后继续求和", () => {
   const native = { ...structuredClone(base), sql_review_engine: "clickhouse_ast_direct" as const };
   const op = { op: "sum" as const, column: "total", as: "result" };

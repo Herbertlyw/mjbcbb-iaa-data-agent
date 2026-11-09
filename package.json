@@ -14,6 +14,8 @@
     "start:freshness": "tsx src/freshness-probe.ts",
     "demo:stack": "tsx scripts/local-isolated-stack.ts",
     "budget": "tsx scripts/deepseek-budget.ts",
+    "eval:dashboard": "node scripts/evaluation-dashboard.mjs",
+    "eval:run": "tsx scripts/run-synthetic-evaluation.ts",
     "seed:clickhouse": "tsx src/seed-clickhouse.ts",
     "test": "node --import tsx --import ./tests/test-clock.mjs --test --test-concurrency=2 tests/*.test.ts",
     "typecheck": "tsc --noEmit",

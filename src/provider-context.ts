@@ -1,45 +1,51 @@
 import type { TranscriptContext } from "@earendil-works/pi-ai";
+import { DOMAIN_TOOL_NAMES } from "./domain-tool-names.js";
+
+/** Only host-created active-branch entries can prove a prior delivery. */
+export function trustedDeliveredToolCalls(entries: readonly unknown[]): ReadonlySet<string> {
+  const counts = new Map<string, number>();
+  for (const raw of entries) {
+    const e = raw as { type?: string; message?: { role?: string; toolCallId?: string } };
+    const id = e.type === "message" && e.message?.role === "toolResult" ? e.message.toolCallId : undefined;
+    if (id) counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  const calls = new Set<string>(); let delivered = false;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i] as { type?: string; customType?: string; details?: { job_id?: unknown }; message?: { role?: string; toolCallId?: string } };
+    if (e.type === "custom_message" && e.customType === "lumenfox.historical_delivery" && typeof e.details?.job_id === "string" && e.details.job_id.length > 0) { delivered = true; continue; }
+    if (e.type !== "message") continue;
+    if (e.message?.role === "user") { delivered = false; continue; }
+    const id = e.message?.role === "toolResult" ? e.message.toolCallId : undefined;
+    if (delivered && id && counts.get(id) === 1) calls.add(id);
+  }
+  return calls;
+}
 
 /** Project settled prior analyses and their query previews for provider
  * transport. The native session and full receipts stay untouched. User text,
  * tool calls, current-turn results and unfinished/failed receipts remain
  * intact. A historical summary is never current authorization or evidence. */
-export function compactPreviousAnalyses(context: TranscriptContext): TranscriptContext {
+export function compactPreviousAnalyses(context: TranscriptContext, trustedCalls: ReadonlySet<string> = new Set()): TranscriptContext {
   const currentUser = context.messages.findLastIndex((message) => message.role === "user");
-  if (currentUser < 0) return context;
-  // Only a settled analysis closes a turn. If it failed or was interrupted,
-  // keep its preceding query receipts intact for recovery and diagnosis.
-  const settledQueries = new Set<number>();
-  let settled = false;
-  for (let i = currentUser - 1; i >= 0; i -= 1) {
-    const message = context.messages[i];
-    if (message?.role === "user") {
-      // Pi projects host custom messages as user-role transport content. This
-      // marker affects only compaction, never authorization or delivery.
-      const text = typeof message.content === "string" ? message.content : message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
-      try { const value: unknown = JSON.parse(text); if (value && typeof value === "object" && (value as { history_summary?: unknown }).history_summary === true) { settled = true; continue; } } catch { /* ordinary user text */ }
-      settled = false; continue;
-    }
-    if (message?.role !== "toolResult" || message.isError || message.content.length !== 1 || message.content[0]?.type !== "text") continue;
-    let receipt: Record<string, unknown>;
-    try {
-      const value: unknown = JSON.parse(message.content[0].text);
-      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-      receipt = value as Record<string, unknown>;
-    } catch { continue; }
-    if (message.toolName === "update_analysis" && receipt.ok === true && typeof receipt.answer === "string" && ["completed", "partial", "needs_clarification"].includes(String(receipt.status))) settled = true;
-    if (message.toolName === "query" && settled && receipt.ok === true) settledQueries.add(i);
-  }
+  if (currentUser < 0 || trustedCalls.size === 0) return context;
+  const occurrences = new Map<string, number>();
+  for (const message of context.messages) if (message.role === "toolResult") occurrences.set(message.toolCallId, (occurrences.get(message.toolCallId) ?? 0) + 1);
+  const auxiliary: ReadonlySet<string> = new Set(DOMAIN_TOOL_NAMES.filter(name => name !== "query" && name !== "update_analysis"));
   let changed = false;
   const messages = context.messages.map((message, index) => {
-    if (index >= currentUser || message.role !== "toolResult" || (message.toolName !== "update_analysis" && !settledQueries.has(index)) || message.isError || message.content.length !== 1 || message.content[0]?.type !== "text") return message;
+    if (index >= currentUser || message.role !== "toolResult" || (!trustedCalls.has(message.toolCallId) || occurrences.get(message.toolCallId) !== 1 || !DOMAIN_TOOL_NAMES.includes(message.toolName as typeof DOMAIN_TOOL_NAMES[number])) || message.isError || message.content.length !== 1 || message.content[0]?.type !== "text") return message;
     let receipt: Record<string, unknown>;
     try {
       const value: unknown = JSON.parse(message.content[0].text);
       if (!value || typeof value !== "object" || Array.isArray(value)) return message;
       receipt = value as Record<string, unknown>;
     } catch { return message; }
-    if (settledQueries.has(index)) {
+    if (auxiliary.has(message.toolName) && receipt.ok === true) {
+      const { details: _details, nestedCalls: _nestedCalls, ...rest } = message;
+      changed = true;
+      return { ...rest, content: [{ type: "text" as const, text: JSON.stringify({ ok: true, history_summary: true, notice: "这是已结束的上一轮工具回执摘要，不是本次任务的授权或证据；需要时请重新读取并核验。" }) }] };
+    }
+    if (message.toolName === "query" && receipt.ok === true) {
       const range = receipt.time_range;
       const rangeRecord = range && typeof range === "object" && !Array.isArray(range) ? range as Record<string, unknown> : null;
       const safeRange = rangeRecord && ["start", "end", "timezone"].every((key) => typeof rangeRecord[key] === "string" && String(rangeRecord[key]).length <= 128) ? { start: rangeRecord.start, end: rangeRecord.end, timezone: rangeRecord.timezone } : null;
@@ -49,17 +55,10 @@ export function compactPreviousAnalyses(context: TranscriptContext): TranscriptC
       changed = true;
       return { ...rest, content: [{ type: "text" as const, text: JSON.stringify(summary) }] };
     }
-    if (receipt.ok !== true || typeof receipt.answer !== "string" || !["completed", "partial", "needs_clarification", "failed"].includes(String(receipt.status))) return message;
-    const answerFits = Array.from(receipt.answer).length <= 8000;
-    const summary = {
-      ok: true,
-      history_summary: true,
-      status: receipt.status,
-      answer: answerFits ? receipt.answer : null,
-      answer_omitted: !answerFits,
-      clarification_question: typeof receipt.clarification_question === "string" && receipt.clarification_question.length <= 2000 ? receipt.clarification_question : null,
-      notice: "这是上一轮当时的服务端结果摘要，仅供理解对话；当前任务必须重新核验授权、契约、新鲜度并生成自己的证据。",
-    };
+    if (message.toolName !== "update_analysis" || receipt.ok !== true) return message;
+    // update_analysis is a working record, not the committed delivery. The
+    // separate host-created historical_delivery entry carries that outcome.
+    const summary = { ok: true, history_summary: true, notice: "这是上一轮的工作记录摘要，不代表正式结论；请以宿主交付记录为准，当前任务须重新核验证据。" };
     const { details: _details, nestedCalls: _nestedCalls, ...rest } = message;
     changed = true;
     return { ...rest, content: [{ type: "text" as const, text: JSON.stringify(summary) }] };

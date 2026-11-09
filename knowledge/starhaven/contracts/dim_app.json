@@ -1,0 +1,87 @@
+{
+  "asset_id": "contract.dim_app",
+  "revision": "contract.dim_app-v1",
+  "table": "dim_app",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [],
+  "grain": [
+    "dataset_version",
+    "app_id"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "game_id",
+      "type": "String",
+      "description": "虚构游戏ID，可对应iOS与Android包体",
+      "nullable": false
+    },
+    {
+      "name": "game_name",
+      "type": "String",
+      "description": "虚构游戏中文名",
+      "nullable": false
+    },
+    {
+      "name": "game_kind",
+      "type": "String",
+      "description": "玩法分类；未确认玩法为unconfirmed",
+      "nullable": false
+    },
+    {
+      "name": "platform",
+      "type": "String",
+      "description": "平台，固定ios或android",
+      "nullable": false
+    },
+    {
+      "name": "bundle_id",
+      "type": "String",
+      "description": "虚构包名，不对应真实应用",
+      "nullable": false
+    },
+    {
+      "name": "launch_date",
+      "type": "Date",
+      "description": "launch_date：UTC业务日期；角色由表粒度定义，不与其他日期混用。",
+      "nullable": false
+    },
+    {
+      "name": "business_timezone",
+      "type": "String",
+      "description": "本数据包业务日统一UTC",
+      "nullable": false
+    },
+    {
+      "name": "supported_mode_codes",
+      "type": "String",
+      "description": "该包体已定义模式，逗号分隔",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "app_id；一款产品在一个平台上的虚构包体。三款产品、iOS/Android分别有身份；第三款玩法未定，不猜TPT含义。",
+  "aggregation_policy": {},
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": []
+}

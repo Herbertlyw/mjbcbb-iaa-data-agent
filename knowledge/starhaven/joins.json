@@ -1,0 +1,504 @@
+{
+  "revision": "starhaven-v1",
+  "simulated": true,
+  "joins": [
+    {
+      "join_id": "starhaven.fact_delivery_daily.dim_app",
+      "tables": [
+        "fact_delivery_daily",
+        "dim_app"
+      ],
+      "keys": [
+        "dataset_version",
+        "app_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_delivery_daily.dim_ua_channel",
+      "tables": [
+        "fact_delivery_daily",
+        "dim_ua_channel"
+      ],
+      "keys": [
+        "dataset_version",
+        "ua_channel_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_delivery_daily.dim_ad_account",
+      "tables": [
+        "fact_delivery_daily",
+        "dim_ad_account"
+      ],
+      "keys": [
+        "dataset_version",
+        "account_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_delivery_daily.dim_campaign",
+      "tables": [
+        "fact_delivery_daily",
+        "dim_campaign"
+      ],
+      "keys": [
+        "dataset_version",
+        "campaign_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_delivery_daily.dim_ad_group",
+      "tables": [
+        "fact_delivery_daily",
+        "dim_ad_group"
+      ],
+      "keys": [
+        "dataset_version",
+        "ad_group_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_delivery_daily.dim_ad",
+      "tables": [
+        "fact_delivery_daily",
+        "dim_ad"
+      ],
+      "keys": [
+        "dataset_version",
+        "ad_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_delivery_daily.dim_creative",
+      "tables": [
+        "fact_delivery_daily",
+        "dim_creative"
+      ],
+      "keys": [
+        "dataset_version",
+        "creative_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_acquisition_daily.dim_app",
+      "tables": [
+        "fact_acquisition_daily",
+        "dim_app"
+      ],
+      "keys": [
+        "dataset_version",
+        "app_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_acquisition_daily.dim_ua_channel",
+      "tables": [
+        "fact_acquisition_daily",
+        "dim_ua_channel"
+      ],
+      "keys": [
+        "dataset_version",
+        "ua_channel_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_acquisition_daily.dim_campaign",
+      "tables": [
+        "fact_acquisition_daily",
+        "dim_campaign"
+      ],
+      "keys": [
+        "dataset_version",
+        "campaign_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_acquisition_daily.dim_ad_group",
+      "tables": [
+        "fact_acquisition_daily",
+        "dim_ad_group"
+      ],
+      "keys": [
+        "dataset_version",
+        "ad_group_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_acquisition_daily.dim_ad",
+      "tables": [
+        "fact_acquisition_daily",
+        "dim_ad"
+      ],
+      "keys": [
+        "dataset_version",
+        "ad_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_acquisition_daily.dim_creative",
+      "tables": [
+        "fact_acquisition_daily",
+        "dim_creative"
+      ],
+      "keys": [
+        "dataset_version",
+        "creative_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_activity_daily.dim_app",
+      "tables": [
+        "fact_activity_daily",
+        "dim_app"
+      ],
+      "keys": [
+        "dataset_version",
+        "app_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_activity_daily.dim_ua_channel",
+      "tables": [
+        "fact_activity_daily",
+        "dim_ua_channel"
+      ],
+      "keys": [
+        "dataset_version",
+        "ua_channel_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_cohort_quality_daily.dim_app",
+      "tables": [
+        "fact_cohort_quality_daily",
+        "dim_app"
+      ],
+      "keys": [
+        "dataset_version",
+        "app_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_cohort_quality_daily.dim_ua_channel",
+      "tables": [
+        "fact_cohort_quality_daily",
+        "dim_ua_channel"
+      ],
+      "keys": [
+        "dataset_version",
+        "ua_channel_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_cohort_quality_daily.dim_campaign",
+      "tables": [
+        "fact_cohort_quality_daily",
+        "dim_campaign"
+      ],
+      "keys": [
+        "dataset_version",
+        "campaign_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_cohort_quality_daily.dim_ad_group",
+      "tables": [
+        "fact_cohort_quality_daily",
+        "dim_ad_group"
+      ],
+      "keys": [
+        "dataset_version",
+        "ad_group_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_cohort_quality_daily.dim_ad",
+      "tables": [
+        "fact_cohort_quality_daily",
+        "dim_ad"
+      ],
+      "keys": [
+        "dataset_version",
+        "ad_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_cohort_quality_daily.dim_creative",
+      "tables": [
+        "fact_cohort_quality_daily",
+        "dim_creative"
+      ],
+      "keys": [
+        "dataset_version",
+        "creative_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_gameplay_daily.dim_app",
+      "tables": [
+        "fact_gameplay_daily",
+        "dim_app"
+      ],
+      "keys": [
+        "dataset_version",
+        "app_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_ad_funnel_daily.dim_app",
+      "tables": [
+        "fact_ad_funnel_daily",
+        "dim_app"
+      ],
+      "keys": [
+        "dataset_version",
+        "app_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_cohort_revenue_daily.dim_app",
+      "tables": [
+        "fact_cohort_revenue_daily",
+        "dim_app"
+      ],
+      "keys": [
+        "dataset_version",
+        "app_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_cohort_revenue_daily.dim_ua_channel",
+      "tables": [
+        "fact_cohort_revenue_daily",
+        "dim_ua_channel"
+      ],
+      "keys": [
+        "dataset_version",
+        "ua_channel_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_cohort_revenue_daily.dim_campaign",
+      "tables": [
+        "fact_cohort_revenue_daily",
+        "dim_campaign"
+      ],
+      "keys": [
+        "dataset_version",
+        "campaign_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_cohort_revenue_daily.dim_ad_group",
+      "tables": [
+        "fact_cohort_revenue_daily",
+        "dim_ad_group"
+      ],
+      "keys": [
+        "dataset_version",
+        "ad_group_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_cohort_revenue_daily.dim_ad",
+      "tables": [
+        "fact_cohort_revenue_daily",
+        "dim_ad"
+      ],
+      "keys": [
+        "dataset_version",
+        "ad_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_cohort_revenue_daily.dim_creative",
+      "tables": [
+        "fact_cohort_revenue_daily",
+        "dim_creative"
+      ],
+      "keys": [
+        "dataset_version",
+        "creative_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_creative_test_snapshot.dim_app",
+      "tables": [
+        "fact_creative_test_snapshot",
+        "dim_app"
+      ],
+      "keys": [
+        "dataset_version",
+        "app_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_creative_test_snapshot.dim_ua_channel",
+      "tables": [
+        "fact_creative_test_snapshot",
+        "dim_ua_channel"
+      ],
+      "keys": [
+        "dataset_version",
+        "ua_channel_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_creative_test_snapshot.dim_creative",
+      "tables": [
+        "fact_creative_test_snapshot",
+        "dim_creative"
+      ],
+      "keys": [
+        "dataset_version",
+        "creative_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_experiment_cohort_daily.dim_app",
+      "tables": [
+        "fact_experiment_cohort_daily",
+        "dim_app"
+      ],
+      "keys": [
+        "dataset_version",
+        "app_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_ad_operation_event.dim_app",
+      "tables": [
+        "fact_ad_operation_event",
+        "dim_app"
+      ],
+      "keys": [
+        "dataset_version",
+        "app_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_ad_operation_event.dim_ad_account",
+      "tables": [
+        "fact_ad_operation_event",
+        "dim_ad_account"
+      ],
+      "keys": [
+        "dataset_version",
+        "account_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_roi_forecast_snapshot.dim_app",
+      "tables": [
+        "fact_roi_forecast_snapshot",
+        "dim_app"
+      ],
+      "keys": [
+        "dataset_version",
+        "app_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_roi_forecast_snapshot.dim_ua_channel",
+      "tables": [
+        "fact_roi_forecast_snapshot",
+        "dim_ua_channel"
+      ],
+      "keys": [
+        "dataset_version",
+        "ua_channel_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_roi_forecast_snapshot.dim_campaign",
+      "tables": [
+        "fact_roi_forecast_snapshot",
+        "dim_campaign"
+      ],
+      "keys": [
+        "dataset_version",
+        "campaign_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_roi_forecast_evaluation.dim_app",
+      "tables": [
+        "fact_roi_forecast_evaluation",
+        "dim_app"
+      ],
+      "keys": [
+        "dataset_version",
+        "app_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_roi_forecast_evaluation.dim_ua_channel",
+      "tables": [
+        "fact_roi_forecast_evaluation",
+        "dim_ua_channel"
+      ],
+      "keys": [
+        "dataset_version",
+        "ua_channel_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    },
+    {
+      "join_id": "starhaven.fact_roi_forecast_evaluation.dim_campaign",
+      "tables": [
+        "fact_roi_forecast_evaluation",
+        "dim_campaign"
+      ],
+      "keys": [
+        "dataset_version",
+        "campaign_id"
+      ],
+      "note": "仅一对多维表查找；维键唯一且同发布版本。"
+    }
+  ],
+  "role_mappings": {
+    "acquisition_country_code": "dim_country.country_code",
+    "activity_country_code": "dim_country.country_code",
+    "entry_country_code": "dim_country.country_code"
+  },
+  "role_mapping_note": "异名角色外键已参与离线和数据库对账，但当前宿主登记JOIN只消费同名keys；不能据此自动放行异名SQL JOIN。"
+}

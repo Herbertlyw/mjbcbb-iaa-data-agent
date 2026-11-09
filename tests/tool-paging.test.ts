@@ -2,6 +2,33 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { analyst, withRuntime } from "./helpers.js";
 import type { QueryResource } from "../src/types.js";
+import { domainTools } from "../src/agent.js";
+
+test("模型工具默认使用小页，同时保留完整的显式分页能力", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    const registered = domainTools(session.session_id, runtime.tools);
+    const search = registered.find((item) => item.name === "search_assets")!;
+    const first = (await search.execute("compact-search", { query: "" })).details as Record<string, unknown>;
+    assert.equal(first.ok, true);
+    assert.equal((first.hits as unknown[]).length, 8);
+    assert.equal(first.has_more, true);
+    const second = (await search.execute("compact-search-next", { query: "", offset: first.next_offset, expected_search_hash: first.search_hash })).details as Record<string, unknown>;
+    assert.equal(second.ok, true);
+    const ids = [...first.hits as Array<{ asset_id: string }>, ...second.hits as Array<{ asset_id: string }>].map((item) => item.asset_id);
+    assert.equal(new Set(ids).size, ids.length);
+    const expanded = (await search.execute("expanded-search", { query: "", limit: 30 })).details as Record<string, unknown>;
+    assert.equal(expanded.ok, true);
+    assert.ok((expanded.hits as unknown[]).length > 8);
+    const read = registered.find((item) => item.name === "read_assets")!;
+    const assetIds = (expanded.hits as Array<{ asset_id: string }>).slice(0, 6).map((item) => item.asset_id);
+    const batch = (await read.execute("compact-batch", { asset_ids: assetIds })).details as Record<string, unknown>;
+    assert.equal((batch.results as unknown[]).length, 4);
+    assert.equal(batch.next_offset, 4);
+    const rest = (await read.execute("compact-batch-next", { asset_ids: assetIds, offset: batch.next_offset })).details as Record<string, unknown>;
+    assert.equal((rest.results as unknown[]).length, 2);
+  });
+});
 
 test("宽行分页受字节上限约束，续页按实际返回行数推进", async () => {
   await withRuntime({}, async (runtime) => {

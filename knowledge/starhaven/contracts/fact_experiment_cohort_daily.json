@@ -1,0 +1,182 @@
+{
+  "asset_id": "contract.fact_experiment_cohort_daily",
+  "revision": "contract.fact_experiment_cohort_daily-v2",
+  "table": "fact_experiment_cohort_daily",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [
+    "observe_date"
+  ],
+  "grain": [
+    "dataset_version",
+    "experiment_id",
+    "arm_id",
+    "config_version",
+    "app_id",
+    "entry_cohort_date",
+    "observe_date",
+    "entry_country_code"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "experiment_id",
+      "type": "String",
+      "description": "虚构实验ID",
+      "nullable": false
+    },
+    {
+      "name": "arm_id",
+      "type": "String",
+      "description": "实验组ID，control或variant",
+      "nullable": false
+    },
+    {
+      "name": "config_version",
+      "type": "String",
+      "description": "冻结实验配置版本",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "entry_cohort_date",
+      "type": "Date",
+      "description": "entry_cohort_date：UTC业务日期；角色由表粒度定义，不与其他日期混用。",
+      "nullable": false
+    },
+    {
+      "name": "observe_date",
+      "type": "Date",
+      "description": "observe_date：UTC业务日期；角色由表粒度定义，不与其他日期混用。",
+      "nullable": false
+    },
+    {
+      "name": "entry_country_code",
+      "type": "String",
+      "description": "实验入组时国家",
+      "nullable": false
+    },
+    {
+      "name": "enrolled_units",
+      "type": "Nullable(UInt64)",
+      "description": "入组基数，重复观察日不可累加",
+      "nullable": true,
+      "unit": "实验分配单位"
+    },
+    {
+      "name": "observed_units",
+      "type": "Nullable(UInt64)",
+      "description": "本观察日有完整观测条件的入组单位",
+      "nullable": true,
+      "unit": "实验分配单位"
+    },
+    {
+      "name": "active_units",
+      "type": "Nullable(UInt64)",
+      "description": "本观察日活跃入组单位",
+      "nullable": true,
+      "unit": "实验分配单位"
+    },
+    {
+      "name": "gameplay_seconds",
+      "type": "Nullable(UInt64)",
+      "description": "已结束局时长总秒数",
+      "nullable": true,
+      "unit": "秒"
+    },
+    {
+      "name": "ad_impressions",
+      "type": "Nullable(UInt64)",
+      "description": "游戏内广告展示次数",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "ad_revenue_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "广告美元收入，不含IAP",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "anchor_type",
+      "type": "String",
+      "description": "first_open或first_ad_show，不是统一安装日",
+      "nullable": false
+    },
+    {
+      "name": "age_days",
+      "type": "UInt32",
+      "description": "观察日距cohort锚点的自然日",
+      "nullable": false,
+      "unit": "天"
+    },
+    {
+      "name": "assignment_version",
+      "type": "String",
+      "description": "实验哈希分配规则版本",
+      "nullable": false
+    },
+    {
+      "name": "completeness_state",
+      "type": "String",
+      "description": "complete或partial；完整性与freshness分开",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "experiment + arm + config_version + app + entry_cohort_date + observe_date + entry_country。入组基数跨日不可累加；产品安装锚点与商业化触发锚点分开；不自动给显著性/全量上线结论。 dataset_version属于完整物理粒度和关联键，列入series.dimensions；日期分区仍只使用date_column。",
+  "aggregation_policy": {
+    "enrolled_units": [
+      "observe_date",
+      "age_days"
+    ],
+    "observed_units": [
+      "observe_date",
+      "age_days"
+    ]
+  },
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": [
+    "enrolled_units",
+    "observed_units"
+  ],
+  "series": {
+    "date_column": "observe_date",
+    "dimensions": [
+      "dataset_version",
+      "experiment_id",
+      "arm_id",
+      "config_version",
+      "app_id",
+      "entry_cohort_date",
+      "entry_country_code"
+    ],
+    "metrics": [
+      "active_units",
+      "gameplay_seconds",
+      "ad_impressions",
+      "ad_revenue_usd"
+    ],
+    "predicted_column": null,
+    "prediction_mode": "observed_only"
+  }
+}

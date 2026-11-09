@@ -1,0 +1,81 @@
+{
+  "asset_id": "contract.dim_ad",
+  "revision": "contract.dim_ad-v1",
+  "table": "dim_ad",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [],
+  "grain": [
+    "dataset_version",
+    "ad_id"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "ad_id",
+      "type": "String",
+      "description": "全局唯一广告ID；自然来源不适用",
+      "nullable": false
+    },
+    {
+      "name": "media_code",
+      "type": "String",
+      "description": "虚构投放媒体代码",
+      "nullable": false
+    },
+    {
+      "name": "account_id",
+      "type": "String",
+      "description": "全局唯一虚构广告账户ID；自然来源不适用",
+      "nullable": false
+    },
+    {
+      "name": "campaign_id",
+      "type": "String",
+      "description": "全局唯一计划ID；自然来源不适用",
+      "nullable": false
+    },
+    {
+      "name": "ad_group_id",
+      "type": "String",
+      "description": "广告组ID；没有此层或自然来源为NULL",
+      "nullable": false
+    },
+    {
+      "name": "ad_name",
+      "type": "String",
+      "description": "虚构广告名称",
+      "nullable": false
+    },
+    {
+      "name": "primary_creative_id",
+      "type": "String",
+      "description": "该广告唯一主素材；替换时创建新广告ID",
+      "nullable": false
+    },
+    {
+      "name": "created_at",
+      "type": "DateTime64(3, 'UTC')",
+      "description": "对象创建UTC时刻",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "ad_id；个人合成ID全局唯一。首版每广告仅一个主素材；替换主素材创建新广告ID。素材可被多广告复用，多素材组合归因暂不承诺。",
+  "aggregation_policy": {},
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": []
+}

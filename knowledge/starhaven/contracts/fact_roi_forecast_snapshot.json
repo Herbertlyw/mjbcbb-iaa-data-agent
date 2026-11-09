@@ -1,0 +1,162 @@
+{
+  "asset_id": "contract.fact_roi_forecast_snapshot",
+  "revision": "contract.fact_roi_forecast_snapshot-v1",
+  "table": "fact_roi_forecast_snapshot",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [],
+  "grain": [
+    "dataset_version",
+    "snapshot_date",
+    "cohort_date",
+    "app_id",
+    "acquisition_country_code",
+    "ua_channel_id",
+    "campaign_id",
+    "horizon_days",
+    "model_version",
+    "revenue_source"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "snapshot_date",
+      "type": "Date",
+      "description": "快照业务日期，不是收入发生日",
+      "nullable": false
+    },
+    {
+      "name": "cohort_date",
+      "type": "Date",
+      "description": "cohort_date：UTC业务日期；角色由表粒度定义，不与其他日期混用。",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "acquisition_country_code",
+      "type": "String",
+      "description": "首次获客时国家，设备在本包体内分群固定",
+      "nullable": false
+    },
+    {
+      "name": "ua_channel_id",
+      "type": "String",
+      "description": "获客渠道ID，与广告变现network不同",
+      "nullable": false
+    },
+    {
+      "name": "campaign_id",
+      "type": "Nullable(String)",
+      "description": "全局唯一计划ID；自然来源不适用",
+      "nullable": true
+    },
+    {
+      "name": "horizon_days",
+      "type": "UInt32",
+      "description": "累计业务天数N，对应日龄0..N-1",
+      "nullable": false,
+      "unit": "天"
+    },
+    {
+      "name": "model_version",
+      "type": "String",
+      "description": "baseline_linear_v1或baseline_tail_v2，不是公司模型",
+      "nullable": false
+    },
+    {
+      "name": "revenue_source",
+      "type": "String",
+      "description": "sdk或af，不可相加称总收入",
+      "nullable": false
+    },
+    {
+      "name": "cost_as_of_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "预测当时已知成本",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "predicted_revenue_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "截至目标N日累计预测美元回收",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "predicted_roi_pct",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "预测收入/当时成本×100，不是实际ROI",
+      "nullable": true,
+      "unit": "%"
+    },
+    {
+      "name": "prediction_id",
+      "type": "String",
+      "description": "跨发布稳定的预测快照身份",
+      "nullable": false
+    },
+    {
+      "name": "input_cutoff",
+      "type": "DateTime64(3, 'UTC')",
+      "description": "预测输入截止，不得用之后真实值",
+      "nullable": false
+    },
+    {
+      "name": "observed_age_days",
+      "type": "UInt32",
+      "description": "预测时已完整观察的cohort日数",
+      "nullable": false,
+      "unit": "天"
+    },
+    {
+      "name": "prediction_state",
+      "type": "String",
+      "description": "predicted，不是实际收入",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "snapshot + cohort + app + 获客范围 + horizon + model_version + revenue_source。预测只能使用input_cutoff之前可见数据；禁止写未来真实收入作模型输入。 预测观测无实际指标series，不允许冒充实际收入。",
+  "aggregation_policy": {
+    "cost_as_of_usd": [
+      "snapshot_date",
+      "model_version",
+      "horizon_days"
+    ],
+    "predicted_revenue_usd": [
+      "snapshot_date",
+      "model_version",
+      "horizon_days"
+    ],
+    "predicted_roi_pct": [
+      "snapshot_date",
+      "model_version",
+      "horizon_days"
+    ]
+  },
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": [
+    "cost_as_of_usd",
+    "predicted_revenue_usd",
+    "predicted_roi_pct"
+  ]
+}

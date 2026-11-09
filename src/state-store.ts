@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { AnalysisRecord, ContractBinding, JobEvent, JobRecord, JobStatus, SessionResource, Slots, TurnResolution } from "./types.js";
 import { isTerminal } from "./types.js";
 import { cacheUsageFromMetadata } from "./provider-usage-metadata.mjs";
+import { finishEventPage, finishHistoryPage, type HistoryPageInput, type HistoryPage, type SessionSummary, type SessionMetadata, type JobSummary, type JobHead, type JobEventPage } from "./history-page.mjs";
 
 export interface StoredSession {
   session_id: string;
@@ -56,14 +57,55 @@ export interface ExecutionLease {
   fence: number;
 }
 
+export interface VisitorCreate {
+  visitorId: string;
+  credentialHash: string;
+  ttlMs: number;
+  windowMs: number;
+  maxCreates: number;
+}
+export interface VisitorIdentity { visitor_id: string; expires_at_ms: number }
+export interface AuthorityPolicy {
+  version: 1;
+  windowMs: number;
+  maxAccepted: number;
+  maxActive: number;
+  maxGlobalActive: number;
+  sessionWindowMs: number;
+  maxSessionsPerWindow: number;
+  maxSessions: number;
+  bootstrapWindowMs: number;
+  bootstrapMaxCreates: number;
+}
+export interface VisitorSessionAdmission { visitorId: string; credentialHash: string; creationKey: string }
+export interface VisitorAdmission {
+  visitorId: string;
+  credentialHash: string;
+  requestHash: string;
+}
+
 /**
  * 可替换的本地状态接口。默认实现是单机 SQLite。
  * 它不提供多机共识、跨主机时钟或分布式租约。
  */
 export interface StateStore {
-  createSession(session: StoredSession): StoredSession;
+  executorHeartbeat(kind: "worker" | "dispatcher", instanceId: string): void;
+  executorStop(kind: "worker" | "dispatcher", instanceId: string): void;
+  executorReadiness(maxAgeMs: number): { worker: boolean; dispatcher: boolean };
+  executorProgress(kind: "worker" | "dispatcher", instanceId: string): void;
+  executorProgressSummary(maxAgeMs: number, stallMs: number): { worker: string; dispatcher: string; blocked: boolean };
+  createVisitor(input: VisitorCreate): VisitorIdentity | null;
+  lookupVisitor(credentialHash: string): VisitorIdentity | null;
+  revokeVisitor(visitorId: string): boolean;
+  recoverVisitorSubmission(sessionId: string, admission: VisitorAdmission, idempotencyKey: string): JobRecord | null;
+  createSession(session: StoredSession, admission?: VisitorSessionAdmission): StoredSession;
   getSession(sessionId: string): StoredSession | undefined;
   listSessions(): StoredSession[];
+  listSessionSummaries(actorId: string, page: HistoryPageInput): HistoryPage<SessionSummary>;
+  getSessionMetadata(sessionId: string, actorId: string): SessionMetadata | undefined;
+  listJobSummaries(sessionId: string, actorId: string, page: HistoryPageInput): HistoryPage<JobSummary>;
+  getJobHead(jobId: string): JobHead | undefined;
+  readJobEvents(jobId: string, after: number): JobEventPage | undefined;
   saveSession(session: StoredSession, lease?: ExecutionLease): void;
   upsertContractBinding(sessionId: string, binding: ContractBinding, role: string, actorId: string | undefined, lease?: ExecutionLease): void;
   addMessage(message: StoredMessage): void;
@@ -75,6 +117,7 @@ export interface StateStore {
     job: JobRecord;
     session: StoredSession;
     message: StoredMessage;
+    visitorAdmission?: VisitorAdmission;
   }): JobRecord;
   getJob(jobId: string): JobRecord | undefined;
   listJobs(sessionId: string): JobRecord[];
@@ -254,6 +297,17 @@ export interface OutboxMessage {
 const TERMINAL_SQL = "('completed','needs_clarification','partial','failed','cancelled','timed_out')";
 
 export class SqliteStateStore implements StateStore {
+  executorHeartbeat(): void { throw new Error("executor_mysql_required"); }
+  executorStop(): void { throw new Error("executor_mysql_required"); }
+  executorReadiness(): { worker: boolean; dispatcher: boolean } { throw new Error("executor_mysql_required"); }
+  executorProgress(): void { throw new Error("executor_mysql_required"); }
+  executorProgressSummary(): { worker: string; dispatcher: string; blocked: boolean } { throw new Error("executor_mysql_required"); }
+  // Local SQLite remains a mock-only mode; it must not silently act as a
+  // multi-process authority for controlled visitor credentials.
+  createVisitor(_input: VisitorCreate): VisitorIdentity | null { throw new Error("visitor_mysql_required"); }
+  lookupVisitor(_credentialHash: string): VisitorIdentity | null { throw new Error("visitor_mysql_required"); }
+  revokeVisitor(_visitorId: string): boolean { throw new Error("visitor_mysql_required"); }
+  recoverVisitorSubmission(): JobRecord | null { throw new Error("visitor_mysql_required"); }
   private readonly db: DatabaseSync;
 
   constructor(filePath: string) {
@@ -386,6 +440,11 @@ export class SqliteStateStore implements StateStore {
     this.ensureColumn("jobs", "revision_count", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("jobs", "tool_call_count", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("jobs", "tool_call_limit", "INTEGER");
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_sessions_history ON sessions (actor_id, created_at, session_id);
+      CREATE INDEX IF NOT EXISTS idx_jobs_history ON jobs (session_id, created_at, job_id);
+      CREATE INDEX IF NOT EXISTS idx_jobs_active ON jobs (session_id, status, created_at, job_id);
+    `);
   }
 
   createSession(session: StoredSession): StoredSession {
@@ -402,6 +461,45 @@ export class SqliteStateStore implements StateStore {
 
   listSessions(): StoredSession[] {
     return (this.db.prepare("SELECT * FROM sessions ORDER BY created_at").all() as Array<Record<string, unknown>>).map((row) => this.sessionFromRow(row));
+  }
+
+  listSessionSummaries(actorId: string, page: HistoryPageInput): HistoryPage<SessionSummary> {
+    const snapshot = page.cursor?.snapshot ?? String((this.db.prepare("SELECT COALESCE(MAX(rowid), 0) AS n FROM sessions").get() as { n: number }).n);
+    const before = page.cursor;
+    const rows = this.db.prepare(`SELECT session_id, substr(title, 1, 200) AS title, role, actor_id, created_at FROM sessions
+      WHERE actor_id = ? AND rowid <= ? ${before ? "AND (created_at < ? OR (created_at = ? AND session_id < ?))" : ""}
+      ORDER BY created_at DESC, session_id DESC LIMIT ?`).all(actorId, snapshot, ...(before ? [before.at, before.at, before.id] : []), page.limit + 1) as unknown as SessionSummary[];
+    return finishHistoryPage(rows, page, "sessions", actorId, snapshot, "session_id");
+  }
+
+  getSessionMetadata(sessionId: string, actorId: string): SessionMetadata | undefined {
+    const session = this.db.prepare("SELECT session_id, substr(title, 1, 200) AS title, role, actor_id, created_at FROM sessions WHERE session_id = ? AND actor_id = ?").get(sessionId, actorId) as unknown as SessionSummary | undefined;
+    if (!session) return undefined;
+    const active = this.db.prepare("SELECT job_id FROM jobs WHERE session_id = ? AND status IN ('queued', 'running') ORDER BY created_at DESC, job_id DESC LIMIT 1").get(sessionId) as { job_id: string } | undefined;
+    return { ...session, active_job_id: active?.job_id ?? null };
+  }
+
+  listJobSummaries(sessionId: string, actorId: string, page: HistoryPageInput): HistoryPage<JobSummary> {
+    const snapshot = page.cursor?.snapshot ?? String((this.db.prepare("SELECT COALESCE(MAX(rowid), 0) AS n FROM jobs").get() as { n: number }).n);
+    const before = page.cursor;
+    const rows = this.db.prepare(`SELECT j.job_id, j.session_id, j.status, substr(j.user_text, 1, 240) AS user_text_preview, j.created_at
+      FROM jobs j WHERE j.session_id = ? AND j.rowid <= ? AND EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = j.session_id AND s.actor_id = ?)
+      ${before ? "AND (j.created_at < ? OR (j.created_at = ? AND j.job_id < ?))" : ""}
+      ORDER BY j.created_at DESC, j.job_id DESC LIMIT ?`).all(sessionId, snapshot, actorId, ...(before ? [before.at, before.at, before.id] : []), page.limit + 1) as unknown as JobSummary[];
+    return finishHistoryPage(rows, page, "jobs", `${actorId}/${sessionId}`, snapshot, "job_id");
+  }
+
+  getJobHead(jobId: string): JobHead | undefined {
+    const row = this.db.prepare("SELECT job_id, session_id, status, next_seq - 1 AS last_seq FROM jobs WHERE job_id = ?").get(jobId) as unknown as JobHead | undefined;
+    return row;
+  }
+
+  readJobEvents(jobId: string, after: number): JobEventPage | undefined {
+    const head = this.getJobHead(jobId);
+    if (!head) return undefined;
+    const rows = this.db.prepare(`SELECT seq, type, at, CASE WHEN length(CAST(payload_json AS BLOB)) <= 65536 THEN payload_json ELSE NULL END AS payload_json
+      FROM job_events WHERE job_id = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT 32`).all(jobId, after, head.last_seq);
+    return finishEventPage(head, rows as Array<{ seq: unknown; type: unknown; at: unknown; payload_json: unknown }>, after);
   }
 
   saveSession(session: StoredSession, lease?: ExecutionLease): void {
@@ -473,7 +571,8 @@ export class SqliteStateStore implements StateStore {
     return Number(row.n);
   }
 
-  createJob(input: { job: JobRecord; session: StoredSession; message: StoredMessage }): JobRecord {
+  createJob(input: { job: JobRecord; session: StoredSession; message: StoredMessage; visitorAdmission?: VisitorAdmission }): JobRecord {
+    if (input.visitorAdmission) throw new Error("visitor_mysql_required");
     return this.transaction(() => {
       const existing = this.db.prepare("SELECT job_id FROM jobs WHERE session_id = ? AND idempotency_key = ?").get(
         input.job.session_id,

@@ -24,7 +24,12 @@ export function naturalCandidate(messages: Message[], successfulResources: Reado
       const content = typeof item.content === "string" ? item.content : Array.isArray(item.content) ? item.content.map((block) => block && typeof block === "object" && typeof (block as { text?: unknown }).text === "string" ? (block as { text: string }).text : "").join("") : "";
       return content.match(/\d+(?:\.\d+)?/g) ?? [];
     }));
-    if (question.length > 2000 || (question.match(/\d+(?:\.\d+)?/g) ?? []).some((value) => !userNumbers.has(value)) || /\[\[result:/.test(question) || !/[?？]$/.test(question)) return null;
+    const lastQuestion = Math.max(question.lastIndexOf("?"), question.lastIndexOf("？"));
+    const trailingRequest = lastQuestion < 0 ? "" : question.slice(lastQuestion + 1).trim();
+    // A model may append a request for further scope after its question.
+    // Allow that request, but not an arbitrary declarative answer after it.
+    const safeTrailingRequest = !trailingRequest || /^(?:(?:另外|同时|此外|并且|以及|also|and)[，,\s]*)?(?:请|还请|也请|需要|please\b|could\b|would\b)[\s\S]*[。.!！]$/iu.test(trailingRequest);
+    if (question.length > 2000 || (question.match(/\d+(?:\.\d+)?/g) ?? []).some((value) => !userNumbers.has(value)) || /\[\[/.test(question) || lastQuestion < 0 || !safeTrailingRequest) return null;
     return { kind: "clarification", question };
   }
   if (text === "[[failed]]") return { kind: "failed", text: "未能形成可验证的结论。" };

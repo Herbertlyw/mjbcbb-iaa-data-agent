@@ -7,13 +7,36 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadConfig, repoRoot, type AppConfig } from "../src/config.js";
-import { fetchDeepSeekOnly, fetchLoopbackOnly } from "../src/openai-gateway.js";
+import { contextSizeStats, fetchDeepSeekOnly, fetchLoopbackOnly, safeProviderError } from "../src/openai-gateway.js";
 import { analyst, ask, openRuntime, waitForJob, withRuntime } from "./helpers.js";
 import { startFakeOpenAI } from "./openai-fake-server.js";
 import type { ProviderStepBegin, ProviderStepDecision, ProviderStepSettle, StateStore } from "../src/state-store.js";
 import { GlobalBudget } from "../src/global-budget.js";
 
 const token = "fictional-loopback-token";
+
+test("供应商连接错误只暴露固定类别并保留结果未知语义", () => {
+  for (const message of ["Connection error.", "fetch failed", "ECONNRESET", "provider_connection_error"]) {
+    const error = safeProviderError(new Error(`${message} ${token} 合成问题`));
+    assert.equal(error.code, "provider_connection_error");
+    assert.match(error.message, /未知/u);
+    assert.doesNotMatch(JSON.stringify(error), /fictional-loopback-token|合成问题/u);
+  }
+  assert.equal(safeProviderError(new Error("connection timed out")).code, "provider_timeout");
+});
+
+test("上下文大小诊断仅按受限类别统计，不保存问题、工具正文或未知工具名", () => {
+  const messages = [
+    { role: "user", content: "合成原话" },
+    { role: "toolResult", toolName: "query", content: "合成查询结果" },
+    { role: "toolResult", toolName: "不应记录的工具名", content: "合成正文" },
+  ];
+  const stats = contextSizeStats({ messages });
+  assert.equal(stats.user?.messages, 1);
+  assert.equal(stats["tool:query"]?.utf8_bytes, Buffer.byteLength(JSON.stringify(messages[1]), "utf8"));
+  assert.equal(stats["tool:other"]?.messages, 1);
+  assert.doesNotMatch(JSON.stringify(stats), /合成原话|合成查询结果|不应记录的工具名|合成正文/u);
+});
 
 test("模型派发前取消不访问供应商并明确记录未派发", async () => {
   const fake = await startFakeOpenAI(token);
@@ -328,6 +351,21 @@ test("Pi 自然澄清保留原话且不发查询", async () => {
   } finally { await fake.close(); }
 });
 
+test("Pi 保留问句后追加范围请求的自然澄清", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "clarify-trailing-request" }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "帮我看一下收入。");
+      assert.equal(job.status, "needs_clarification", JSON.stringify(job.error));
+      assert.match(job.analysis?.clarification_question ?? "", /支付金额，还是广告变现？另外请一并说明时间范围/u);
+      assert.equal(job.analysis?.sources.length, 0);
+      assert.equal(job.events.some((event) => event.type === "tool_started" && event.payload.tool_name === "query"), false);
+      assert.equal(fake.observations.length, 1);
+    });
+  } finally { await fake.close(); }
+});
+
 test("Pi 拒绝无证据候选后允许模型修订，成功澄清后结束", async () => {
   const fake = await startFakeOpenAI(token);
   try {
@@ -479,6 +517,51 @@ test("本地假 HTTP 服务经 Pi SDK 适配器处理错误、缺用量和非法
   } finally {
     await fake.close();
   }
+});
+
+test("供应商 HTTP 失败只保留安全状态类别，未知用量仍占额且不会重试", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    for (const [status, expected] of [[400, "provider_invalid_request"], [401, "provider_auth_rejected"], [402, "provider_balance_insufficient"], [403, "provider_auth_rejected"], [429, "provider_rate_limited"]] as const) {
+      await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: `status-${status}` }), async (runtime) => {
+        const before = fake.observations.length;
+        const session = analyst(runtime);
+        const job = await ask(runtime, session.session_id, "合成问题");
+        assert.equal(job.status, "failed");
+        assert.equal(job.error?.code, expected, JSON.stringify(job.error));
+        assert.equal(fake.observations.length - before, 1, "供应商错误不能自动重试");
+        assert.equal(job.usage?.usage_source, "unknown");
+        assert.equal(job.usage?.input_tokens, null);
+        const step = runtime.state.listProviderSteps(job.job_id)[0];
+        assert.equal(step?.settlement, "held_unknown");
+        assert.equal(step?.error_code, expected);
+        assert.doesNotMatch(JSON.stringify(job), /fictional private error text|sk-fictional-do-not-store/u);
+        for (const payload of runtime.state.listProviderPayloads(job.job_id, session.actor_id ?? "demo-analyst")) {
+          const page = runtime.state.readProviderPayload({ payloadId: payload.payload_id, actorId: session.actor_id ?? "demo-analyst", sessionId: session.session_id, offset: 0, limit: 4000 });
+          assert.ok(page);
+          assert.doesNotMatch(page.text, /fictional private error text|sk-fictional-do-not-store/u);
+        }
+      });
+    }
+  } finally { await fake.close(); }
+});
+
+test("供应商连接中断经 Pi 记录为连接错误，未知用量占额且不重试", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piProvider: "deepseek", piModel: "deepseek-flash", piBaseUrl: fake.url, protocolScript: "connection-reset" }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成问题");
+      assert.equal(job.status, "failed");
+      assert.equal(job.error?.code, "provider_connection_error");
+      assert.equal(fake.observations.length, 1);
+      assert.equal(job.usage?.usage_source, "unknown");
+      assert.equal(job.usage?.input_tokens, null);
+      const step = runtime.state.listProviderSteps(job.job_id)[0];
+      assert.equal(step?.settlement, "held_unknown");
+      assert.equal(step?.error_code, "provider_connection_error");
+    });
+  } finally { await fake.close(); }
 });
 
 test("窗口预留拒绝应显示真实错误且不派发请求", async () => {

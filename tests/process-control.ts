@@ -2,7 +2,7 @@ import type { ChildProcess } from "node:child_process";
 
 /** Stop only the child created by this test. A child terminated by a signal has
  * exitCode === null, even though its exit event has already fired. */
-export async function stopProcess(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
+export async function stopProcess(child: ChildProcess, signal: NodeJS.Signals = "SIGTERM", gracefulMs = 5000): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
   await new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -17,8 +17,8 @@ export async function stopProcess(child: ChildProcess, signal: NodeJS.Signals = 
     };
     const onExit = () => finish();
     const onError = () => finish(new Error("test_child_stop_failed"));
-    const force = setTimeout(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); }, 5000);
-    const deadline = setTimeout(() => finish(new Error("test_child_stop_timeout")), 10000);
+    const force = setTimeout(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); }, gracefulMs);
+    const deadline = setTimeout(() => finish(new Error("test_child_stop_timeout")), gracefulMs + 5000);
     child.once("exit", onExit);
     child.once("error", onError);
     // Recheck after adding the listeners so an already delivered exit is not

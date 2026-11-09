@@ -1,4 +1,5 @@
 import { verifyDatabaseAggregates } from "./aggregate-evidence.js";
+import { permitsAggregation } from "./aggregation-policy.js";
 import { coverageHasGap, provenCoverageScope } from "./coverage.js";
 import { isCalendarDate } from "./config.js";
 import { completeObservedGroups } from "./aggregate-group-coverage.js";
@@ -31,11 +32,12 @@ export function verifyGroupRollup(source: QueryResource, contract: DataContract,
   if (!Array.isArray(source.tables) || !Array.isArray(source.rows) || source.rows.some((row) => !row || typeof row !== "object" || Array.isArray(row)) || !source.time_range || source.time_range.timezone !== contract.timezone || !validCoverage(source.coverage) || source.truncated || source.sql_limited || !source.complete_population || source.total_rows_exact !== true || source.rows.length !== source.returned_rows || source.rows.length !== source.total_rows || source.rows.length < 1 || source.rows.length > 100_000 || coverageHasGap(source.coverage) || source.coverage.unknown_prediction_dates.length || operation.predicted === "predicted_only") return null;
   const aggregates = verifyDatabaseAggregates(source, contract);
   const scope = provenCoverageScope(source.sql, contract, source.time_range);
-  if (!aggregates?.length || !scope) return null;
+  if (!aggregates?.length || !scope || scope.selectedDates) return null;
   const groupedBy = Object.keys(aggregates[0]!.group).sort();
   if (!groupedBy.length) return null;
   const selected = operation.op === "count_rows" ? aggregates.filter((item) => item.output_column === aggregates[0]!.output_column) : aggregates.filter((item) => item.output_column === operation.column);
   if (!selected.length || selected.length !== source.rows.length || selected.some((item) => item.table !== aggregates[0]!.table || item.column !== selected[0]!.column || item.operation !== selected[0]!.operation || item.unit !== selected[0]!.unit || item.scale !== selected[0]!.scale || JSON.stringify(Object.keys(item.group).sort()) !== JSON.stringify(groupedBy))) return null;
+  if (operation.op === "sum" && selected[0]!.operation === "sum" && !permitsAggregation(contract, selected[0]!.column, scope.equalities, [], source.time_range)) return null;
   if (!completeObservedGroups(selected.map((item) => item.group), groupedBy, scope.inSets, contract.series?.date_column, source.time_range)) return null;
   let value: string | null;
   switch (operation.op) {

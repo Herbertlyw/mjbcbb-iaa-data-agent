@@ -28,7 +28,7 @@ export function clickHouseAggregateShape(sql: string, tableName: string): Record
     if (direct) { columns.push({ expr: direct, as }); continue; }
     if (projection.type !== "Function" || projection.is_window_function || projection.window_definition || projection.parameters || !Array.isArray(projection.arguments)) return null;
     const name = String(projection.name).toLowerCase(); const args = projection.arguments;
-    if (name === "sum" || name === "count") {
+    if (["sum", "count", "min", "max"].includes(name)) {
       const input = args.length === 1 ? column(args[0]) : null;
       const asterisk = args.length === 1 ? obj(args[0]) : null;
       const star = name === "count" && (args.length === 0 || asterisk?.type === "Asterisk" && (!asterisk.transformers || Array.isArray(asterisk.transformers) && asterisk.transformers.length === 0));
@@ -53,6 +53,7 @@ export function clickHouseAggregateShape(sql: string, tableName: string): Record
       const number = literal?.type === "Literal" && ["UInt64", "Int64"].includes(String(literal.value_type)) && typeof literal.value === "string" && /^-?\d+$/u.test(literal.value) ? Number(literal.value) : NaN;
       const operators: Record<string, string> = { equals: "=", notequals: "!=", less: "<", lessorequals: "<=", greater: ">", greaterorequals: ">=" };
       if (field && Number.isSafeInteger(number)) translated = { type: "binary_expr", operator: operators[op], left: field, right: { type: "number", value: number } };
+      if (field && ["equals", "notequals"].includes(op) && literal?.type === "Literal" && literal.value_type === "String" && typeof literal.value === "string" && literal.value.length <= 256) translated = { type: "binary_expr", operator: operators[op], left: field, right: { type: "single_quote_string", value: literal.value } };
     }
     if (!translated) return null;
     columns.push({ as, expr: { type: "function", name: { name: [{ value: "countif" }] }, args: { type: "expr_list", value: [translated] } } });

@@ -15,11 +15,11 @@ import {
 } from "./pi-session.js";
 import type { AppConfig } from "./config.js";
 import { newId, storedSession, type SessionStore } from "./session.js";
-import type { StateStore, StoredSession } from "./state-store.js";
+import type { StateStore, StoredSession, VisitorAdmission } from "./state-store.js";
 import type { AsyncMysqlStateStore } from "./async-mysql-state-store.js";
 import { sessionAnalyses, type ToolService } from "./tools.js";
 import { naturalCandidate } from "./natural-candidate.js";
-import { unresolvedCandidateFailures } from "./candidate-failures.js";
+import { queryRetryKey, safeToolResultCode, unresolvedCandidateFailures } from "./candidate-failures.js";
 import { ResourceGraph } from "./resource-graph.js";
 import type { AnalysisDeclaration } from "./analysis-declaration.js";
 import { passthroughTurn, resolveTurn } from "./turn.js";
@@ -39,6 +39,10 @@ export class RequestError extends Error {
 function submissionError(error: unknown): unknown {
   if (error instanceof Error && error.name === "session_busy") return new RequestError("session_busy", "这个会话还有未结束的任务", 409);
   if (error instanceof Error && error.name === "idempotency_conflict") return new RequestError("idempotency_conflict", "同一个幂等键对应了不同的问题内容", 409);
+  if (error instanceof Error && ["visitor_rate_limit", "visitor_active_limit"].includes(error.name)) return new RequestError(error.name, "访客任务数量已达上限，请稍后再试。", 429);
+  if (error instanceof Error && error.name === "global_active_limit") return new RequestError(error.name, "当前任务容量已满，请稍后再试。", 503);
+  if (error instanceof Error && error.name === "visitor_expired") return new RequestError(error.name, "访客身份已失效，请重新开始。", 401);
+  if (error instanceof Error && error.name === "visitor_not_owner") return new RequestError("session_not_found", "没有这个会话", 404);
   return error;
 }
 
@@ -118,10 +122,10 @@ export class JobService {
     } catch (error) { throw submissionError(error); }
   }
 
-  async submitAsync(state: AsyncMysqlStateStore, session: StoredSession, text: string, idempotencyKey: string, requested?: { modelId?: string; reasoning?: string }): Promise<JobRecord> {
+  async submitAsync(state: AsyncMysqlStateStore, session: StoredSession, text: string, idempotencyKey: string, requested?: { modelId?: string; reasoning?: string }, visitorAdmission?: VisitorAdmission): Promise<JobRecord> {
     const input = this.prepareSubmission(session, text, idempotencyKey, requested);
     try {
-      const stored = await state.call("createJob", input);
+      const stored = await state.call("createJob", { ...input, ...(visitorAdmission ? { visitorAdmission } : {}) });
       this.wake();
       return stored;
     } catch (error) { throw submissionError(error); }
@@ -397,7 +401,7 @@ export class JobService {
           }
         }
         if (event.type === "tool_execution_start") {
-          const started = await this.stateCall("appendEvent", jobId, this.owner, fence, "tool_started", { tool_name: event.toolName, args: sanitizeToolArgs(event.args) });
+          const started = await this.stateCall("appendEvent", jobId, this.owner, fence, "tool_started", { tool_name: event.toolName, tool_call_id: event.toolCallId, retry_key: queryRetryKey(event.toolName, event.args), args: sanitizeToolArgs(event.args) });
           if (!started) lostFence(); else this.publishEvent(jobId, started);
         }
         if (event.type === "tool_execution_end") {
@@ -405,8 +409,9 @@ export class JobService {
           const record = details && typeof details === "object" ? (details as Record<string, unknown>) : {};
           const finished = await this.stateCall("appendEvent", jobId, this.owner, fence, "tool_finished", {
               tool_name: event.toolName,
+              tool_call_id: event.toolCallId,
               is_error: event.isError,
-              code: record.code ?? null,
+              code: safeToolResultCode(event.toolName, event.result, event.isError),
               resource_id: record.resource_id ?? null,
             });
           if (!finished) lostFence(); else this.publishEvent(jobId, finished);
@@ -694,7 +699,7 @@ export class JobService {
             }
           }
           if (event.type === "tool_execution_start") {
-            const started = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "tool_started", { tool_name: event.toolName, tool_call_id: event.toolCallId, args: sanitizeToolArgs(event.args) });
+            const started = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "tool_started", { tool_name: event.toolName, tool_call_id: event.toolCallId, retry_key: queryRetryKey(event.toolName, event.args), args: sanitizeToolArgs(event.args) });
             if (!started) markLost(); else this.publishEvent(input.jobId, started);
           }
           if (event.type === "tool_execution_end") {
@@ -704,7 +709,7 @@ export class JobService {
               tool_name: event.toolName,
               tool_call_id: event.toolCallId,
               is_error: event.isError,
-              code: detailsRecord.code ?? null,
+              code: safeToolResultCode(event.toolName, event.result, event.isError),
               resource_id: detailsRecord.resource_id ?? null,
             });
             if (!finished) markLost(); else this.publishEvent(input.jobId, finished);

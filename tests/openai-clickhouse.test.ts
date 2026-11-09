@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { createServer } from "node:net";
@@ -18,6 +18,12 @@ import { startFakeOpenAI } from "./openai-fake-server.js";
 import { isolatedDocker, loopbackPort, runOwnedContainer } from "./isolated-docker.js";
 import { GlobalBudget } from "../src/global-budget.js";
 import { clickHouseScopedProjection } from "../src/clickhouse-scoped-projection.js";
+import type { AnalysisRecord, QueryResource, SessionResource } from "../src/types.js";
+import { REAL_F_FACT_SQL, REAL_F_JOIN_SQL } from "./real-model-f-sql.js";
+import { REAL_A_PAYMENT_SQL, REAL_A_SPEND_SQL } from "./real-model-a-sql.js";
+import { GROUPED_A_PAYMENT_SQL, GROUPED_A_SPEND_SQL } from "./grouped-a-fixture.js";
+import { prepareJoinEvidence, verifyJoinEvidence } from "../src/join-evidence.js";
+import { joinCoverage } from "../src/join-resource-proof.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const sourceKnowledgeDir = path.join(root, "knowledge", "harborlight");
@@ -41,7 +47,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     cpSync(sourceKnowledgeDir, knowledgeDir, { recursive: true });
     // These schema variants belong only to this integration run. They model an
     // explicitly nullable business dimension; the shipped contracts stay intact.
-    for (const name of ["fact_fox_daily_install", "fact_fox_daily_payment"]) {
+    for (const name of ["fact_fox_daily_install", "fact_fox_daily_payment", "fact_fox_daily_spend"]) {
       const file = path.join(knowledgeDir, "contracts", `${name}.json`);
       const contract = JSON.parse(readFileSync(file, "utf8"));
       const dimension = contract.columns.find((column: { name: string }) => column.name === "country_code");
@@ -62,7 +68,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     await bootstrap.close();
     const admin = createClickHouseClient({ url: clickhouseUrl, username: "default", password: adminPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 30 }, false);
     for (const table of WAREHOUSE_TABLES) {
-      const nullable = ["fact_fox_daily_install", "fact_fox_daily_payment"].includes(table.table);
+      const nullable = ["fact_fox_daily_install", "fact_fox_daily_payment", "fact_fox_daily_spend"].includes(table.table);
       const sql = createTableSql(table);
       await clickHouseCommand(admin, nullable ? sql.replace("country_code LowCardinality(String)", "country_code Nullable(String)") + " SETTINGS allow_nullable_key = 1" : sql);
     }
@@ -120,6 +126,26 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       assert.deepEqual(values.map((row) => row.new_users), [100, 0, 120, null, 140, 150, 160]);
     } finally { await rollingReader.close(); }
     const reader = createClickHouseClient({ url: clickhouseUrl, username: "fox_reader", password: readerPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 10 }, true);
+    const goldPayment = await clickHouseQuery(reader, "SELECT toString(amount_usd) AS amount, toString(cost_usd) AS cost FROM fact_fox_daily_payment WHERE event_date = '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'");
+    const goldSpend = await clickHouseQuery(reader, "SELECT spend_usd, is_predicted FROM fact_fox_daily_spend WHERE event_date = '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'");
+    assert.deepEqual(goldPayment, [{ amount: "1", cost: "2" }]);
+    assert.deepEqual(goldSpend, [{ spend_usd: null, is_predicted: 0 }]);
+    // Real ClickHouse NULL semantics: COUNT() counts seven joined rows while
+    // COUNT(nullable_metric) counts six values. Neither is rewritten as the other.
+    const countKnowledge = loadKnowledge(knowledgeDir);
+    const countFact = countKnowledge.contract_by_table.get("fact_fox_daily_install")!.contract!;
+    const countDimension = countKnowledge.contract_by_table.get("dim_fox_title")!.contract!;
+    const nullCountSql = REAL_F_JOIN_SQL.replace("SUM(f.new_users) AS new_users_sum", "COUNT(f.new_users) AS non_null_rows").replace("f.country_code = 'JP'", "f.country_code = 'US'");
+    for (const sql of [nullCountSql, nullCountSql.replace("count()", "COUNT(*)")]) {
+      const plan = prepareJoinEvidence(sql, countFact, countDimension, countKnowledge.joins, true);
+      assert.ok(plan);
+      const original = await clickHouseQuery(reader, sql);
+      const captured = await clickHouseQuery(reader, plan.executionSql);
+      assert.deepEqual(original.map(row => [row.null_rows, row.zero_rows, row.row_count, row.non_null_rows].map(String)), [["1", "1", "7", "6"]]);
+      assert.deepEqual(captured.map(({ __da_join_proof: _proof, ...row }) => row), original);
+      assert.deepEqual(verifyJoinEvidence(plan, captured)?.map(value => [value.operation, value.value]), [["count_null", "1"], ["count_zero", "1"], ["count_rows", "7"], ["count_nonnull", "6"]]);
+      assert.deepEqual(joinCoverage(plan, captured, countFact).null_dates, ["2026-10-09"]);
+    }
     const freshnessPath = path.join(dir, "freshness.json");
     await waitMysql(mysqlPort, statePassword);
     const freshness = await MysqlFreshnessStore.open({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password: statePassword, database: "lumenfox_it" });
@@ -253,7 +279,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.ok(branch.some((entry) => entry.message?.role === "toolResult"));
     const previousReceipt = branch.find((entry) => entry.message?.role === "toolResult" && entry.message.toolName === "calculate_session_cells");
     const previousQuery = branch.find((entry) => entry.message?.role === "toolResult" && entry.message.toolName === "query");
-    const followObservation = fake.observations.find((item) => item.userMessages.length === 2 && item.historySummaryCount === 2);
+    const followObservation = fake.observations.find((item) => item.userMessages.length === 2 && item.historySummaryCount >= 4);
     assert.ok(previousReceipt && previousQuery && followObservation);
     const fullBytes = Buffer.byteLength(JSON.stringify(previousReceipt.message?.content)) + Buffer.byteLength(JSON.stringify(previousQuery.message?.content));
     assert.ok(followObservation.historySummaryBytes < fullBytes, "模型请求应减小旧查询和分析回执，原生 JSONL 保留完整内容");
@@ -275,9 +301,9 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     happyWorker = spawn(process.execPath, ["--import", "tsx", "src/worker.ts"], { cwd: root, env: baseEnv, stdio: "ignore" });
     children.push(api, happyWorker);
     await waitHttp(`http://127.0.0.1:${apiPort}/api/health`);
-    const reopened = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${session.session_id}`);
-    const history = await reopened.json() as { jobs: Array<{ job_id: string; user_text: string }> };
-    assert.deepEqual(history.jobs.map((item) => item.user_text), [question, "那日本呢？"]);
+    const reopened = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${session.session_id}/jobs`);
+    const history = await reopened.json() as { jobs: Array<{ job_id: string; user_text_preview: string }> };
+    assert.deepEqual(history.jobs.map((item) => item.user_text_preview), ["那日本呢？", question.slice(0, 240)]);
     const third = await postQuestion(apiPort, session.session_id, "日期改成 2026-10-06 到 2026-10-08。");
     assert.equal(third.status, "completed", JSON.stringify(third.error));
     assert.match(third.analysis?.answer ?? "", /不是同一原子快照/);
@@ -294,6 +320,128 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.ok(thirdResource.freshness_receipts.length > 0);
     await thirdDb.end();
     assert.ok(fake.observations.some((item) => item.userMessages.length === 3 && item.userMessages[2] === "日期改成 2026-10-06 到 2026-10-08。"));
+    // Replay the real model's two queries and NULL subtraction through the
+    // independent API / outbox / Redis / worker / Pi HTTP protocol path.
+    for (const missingQuestion of ["请分析纸灯在 2026-10-08、美国、iOS、雾帆渠道的支付流水和投放成本，分别给出金额，并计算支付流水减投放成本的差额。请说明币种和数据来源。", "合成真实A单值日期IN"]) {
+      const missingSessionResponse = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      const missingSession = (await missingSessionResponse.json()) as { session_id: string };
+      const missing = await postQuestion(apiPort, missingSession.session_id, missingQuestion);
+      assert.equal(missing.status, "partial", JSON.stringify({ error: missing.error, events: missing.events.filter((event) => event.type === "tool_finished") }));
+      const missingAnalysis = missing.analysis as unknown as { answer: string; server_reasons: string[]; query_observations: Array<{ column: string; value: string | null; prediction: string }>; arithmetic_results: Array<{ resource_id: string; result: { value: string | null; undefined_reason: string } }>; sources: Array<{ resource_id: string; execution_id: string; sql: string; executed_sql?: string }> };
+      assert.deepEqual(missingAnalysis.query_observations.map((value) => [value.column, value.value, value.prediction]), [["amount_usd", "1.00", "actual"], ["spend_usd", null, "actual"]]);
+      assert.equal(missingAnalysis.arithmetic_results.length, 1);
+      assert.equal(missingAnalysis.arithmetic_results[0]!.result.value, null);
+      assert.equal(missingAnalysis.arithmetic_results[0]!.result.undefined_reason, "null_input");
+      assert.equal(missingAnalysis.sources.length, 2);
+      assert.ok(!missingAnalysis.server_reasons.includes("arithmetic_lineage_unsupported"));
+      assert.ok(!missingAnalysis.server_reasons.includes("unresolved_tool_failure"));
+      assert.ok(!missing.events.some(event => event.type === "tool_finished" && event.payload.is_error === true));
+      if (missingQuestion === "合成真实A单值日期IN") {
+        assert.deepEqual(missingAnalysis.sources.map(source => source.sql).sort(), [REAL_A_PAYMENT_SQL, REAL_A_SPEND_SQL].sort());
+        assert.ok(missingAnalysis.sources.every(source => source.executed_sql === source.sql));
+      }
+      assert.match(missingAnalysis.answer, /1\.00/);
+      assert.match(missingAnalysis.answer, /NULL/);
+      assert.doesNotMatch(missingAnalysis.answer, /-1\.00|fact_fox_daily_payment\.cost_usd/);
+      assert.equal(missing.events.filter((event) => ["job_finished", "job_failed", "job_cancelled"].includes(event.type)).length, 1);
+      const evidenceDb = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password: statePassword, database: "lumenfox_it" });
+      try {
+        const [savedRows] = await evidenceDb.query("SELECT resource_id, body_json FROM resources WHERE resource_id IN (?, ?, ?)", [missingAnalysis.arithmetic_results[0]!.resource_id, ...missingAnalysis.sources.map((source) => source.resource_id)]);
+        const resources = new Map((savedRows as Array<{ resource_id: string; body_json: string }>).map((row) => [row.resource_id, JSON.parse(String(row.body_json))]));
+        const calc = resources.get(missingAnalysis.arithmetic_results[0]!.resource_id);
+        assert.equal(calc.kind, "arithmetic");
+        assert.equal(calc.session_id, missingSession.session_id);
+        assert.equal(calc.job_id, missing.job_id);
+        assert.equal(calc.result.value, null);
+        assert.equal(calc.result.undefined_reason, "null_input");
+        assert.equal(Object.keys(calc.input_hashes).length, 2);
+        console.log(`合成 NULL 主链证据 ${JSON.stringify({ job_id: missing.job_id, session_id: missingSession.session_id, sources: missingAnalysis.sources.map((source) => ({ resource_id: source.resource_id, execution_id: source.execution_id })), calculation: calc.resource_id, input_hashes: calc.input_hashes, value: calc.result.value, undefined_reason: calc.result.undefined_reason, server_reasons: missingAnalysis.server_reasons })}`);
+        for (const source of missingAnalysis.sources) {
+          const saved = resources.get(source.resource_id)!;
+          assert.equal(saved.session_id, missingSession.session_id);
+          assert.equal(saved.job_id, missing.job_id);
+          assert.equal(saved.execution_id, source.execution_id);
+          assert.equal(calc.input_hashes[source.resource_id], createHash("sha256").update(JSON.stringify(saved)).digest("hex"));
+          assert.ok(Object.keys(saved.asset_hashes).length && Object.keys(saved.contract_revisions).length);
+          assert.ok(saved.freshness_receipts.some((receipt: { status: string }) => receipt.status === "fresh"));
+        }
+      } finally { await evidenceDb.end(); }
+      await stopChild(api);
+      await stopChild(happyWorker);
+      api = spawn(process.execPath, ["--import", "tsx", "src/api.ts"], { cwd: root, env: baseEnv, stdio: "ignore" });
+      happyWorker = spawn(process.execPath, ["--import", "tsx", "src/worker.ts"], { cwd: root, env: baseEnv, stdio: "ignore" });
+      children.push(api, happyWorker);
+      await waitHttp(`http://127.0.0.1:${apiPort}/api/health`);
+      const recoveredMissing = await waitJob(apiPort, missing.job_id);
+      assert.equal(recoveredMissing.status, "partial");
+      assert.deepEqual(recoveredMissing.analysis, missing.analysis);
+      assert.equal(recoveredMissing.events.filter((event) => ["job_finished", "job_failed", "job_cancelled"].includes(event.type)).length, 1);
+    }
+    // The live model changed A to grouped SUMs. Replay its complete batches,
+    // retaining the real Float/Decimal types and current execution identities.
+    for (const groupedQuestion of ["合成真实A分组聚合", "合成真实A聚合计算后差额"]) {
+      const response = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      const { session_id: sessionId } = await response.json() as { session_id: string };
+      const task = await postQuestion(apiPort, sessionId, groupedQuestion);
+      const analysis = task.analysis as AnalysisRecord | undefined;
+      assert.equal(task.status, "partial", JSON.stringify({ error: task.error, reasons: analysis?.server_reasons, tools: task.events.filter(event => event.type === "tool_finished") }));
+      assert.ok(analysis);
+      assert.deepEqual(analysis.query_observations?.map(item => [item.column, item.value, item.unit, item.prediction]), [["amount_usd", "1.00", "USD", "actual"], ["spend_usd", null, "USD", "actual"]]);
+      assert.equal(analysis.arithmetic_results?.length, 1);
+      assert.equal(analysis.arithmetic_results[0]!.result.value, null);
+      assert.equal(analysis.arithmetic_results[0]!.result.undefined_reason, "null_input");
+      assert.equal(analysis.arithmetic_results[0]!.result.unit, "USD");
+      assert.deepEqual(analysis.sources.map(source => source.sql).sort(), [GROUPED_A_PAYMENT_SQL, GROUPED_A_SPEND_SQL].sort());
+      assert.ok(analysis.sources.every(source => source.executed_sql === source.sql));
+      for (const reason of ["query_expression_semantics_unverified", "query_lineage_unsupported", "calculation_lineage_unsupported", "arithmetic_lineage_unsupported", "unresolved_tool_failure"]) assert.ok(!analysis.server_reasons.includes(reason), reason);
+      assert.ok(!task.events.some(event => event.type === "tool_finished" && event.payload.is_error === true));
+      assert.doesNotMatch(analysis.answer, /-1\.00|fact_fox_daily_payment\.cost_usd/);
+      assert.equal(task.events.filter(event => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
+      const db = await mysql.createConnection({ host: "127.0.0.1", port: mysqlPort, user: "lumenfox_it", password: statePassword, database: "lumenfox_it" });
+      try {
+        const [saved] = await db.query("SELECT resource_id, body_json FROM resources WHERE session_id = ?", [sessionId]);
+        const resources = new Map((saved as Array<{ resource_id: string; body_json: string }>).map(item => [item.resource_id, JSON.parse(String(item.body_json)) as SessionResource]));
+        const payment = [...resources.values()].find((item): item is QueryResource => item.kind === "query_result" && item.sql === GROUPED_A_PAYMENT_SQL);
+        const spend = [...resources.values()].find((item): item is QueryResource => item.kind === "query_result" && item.sql === GROUPED_A_SPEND_SQL);
+        assert.ok(payment && spend);
+        assert.match(payment.column_types!.amount_usd_sum!.replace(/\s/gu, ""), /^Nullable\(Decimal\(38,2\)\)$/u);
+        assert.equal(typeof payment.rows[0]!.amount_usd_sum, "string");
+        assert.equal(spend.column_types!.spend_usd_sum, "Nullable(Float64)");
+        assert.equal(spend.rows[0]!.spend_usd_sum, null);
+        assert.equal(spend.rows[0]!.is_predicted, 0);
+        for (const resource of resources.values()) {
+          assert.equal(resource.session_id, sessionId);
+          assert.equal(resource.job_id, task.job_id);
+          if (resource.kind === "query_result") {
+            assert.ok(resource.execution_id && Object.keys(resource.asset_hashes).length && Object.keys(resource.contract_revisions).length);
+            assert.ok(resource.freshness_receipts.some(receipt => receipt.status === "fresh"));
+          }
+          if ("input_hashes" in resource) for (const [id, hash] of Object.entries(resource.input_hashes)) {
+            assert.ok(resources.has(id));
+            assert.equal(hash, createHash("sha256").update(JSON.stringify(resources.get(id))).digest("hex"));
+          }
+        }
+        const calculations = [...resources.values()].filter(item => item.kind === "calculation");
+        assert.equal(calculations.length, 2);
+        const paymentCells = calculations.find(item => item.source_resource_id === payment.resource_id)!;
+        const spendCells = calculations.find(item => item.source_resource_id === spend.resource_id)!;
+        assert.equal(String(paymentCells.cells.payment_rows), "1");
+        assert.equal(String(paymentCells.cells.payment_null_cells), "0");
+        assert.equal(String(paymentCells.cells.payment_zero_cells), "0");
+        assert.equal(paymentCells.cells.payment_amount_sum, "1.00");
+        assert.equal(String(spendCells.cells.spend_rows), "1");
+        assert.equal(String(spendCells.cells.spend_null_cells), "1");
+        assert.equal(spendCells.cells.spend_actual_sum, null);
+      } finally { await db.end(); }
+      await stopChild(api); await stopChild(happyWorker);
+      api = spawn(process.execPath, ["--import", "tsx", "src/api.ts"], { cwd: root, env: baseEnv, stdio: "ignore" });
+      happyWorker = spawn(process.execPath, ["--import", "tsx", "src/worker.ts"], { cwd: root, env: baseEnv, stdio: "ignore" });
+      children.push(api, happyWorker);
+      await waitHttp(`http://127.0.0.1:${apiPort}/api/health`);
+      const recovered = await waitJob(apiPort, task.job_id);
+      assert.deepEqual(recovered.analysis, analysis);
+      assert.equal(recovered.events.filter(event => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
+    }
     const decimalSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const decimalSessionId = ((await decimalSession.json()) as { session_id: string }).session_id;
     const clarification = await postQuestion(apiPort, decimalSessionId, "只说看看收入");
@@ -368,13 +516,84 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.deepEqual(join.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name), ["read_data_contract_view", "read_data_contract_view", "query"]);
     assert.ok(join.events.some((event) => event.type === "tool_finished" && event.payload.tool_name === "query" && event.payload.is_error === false));
     for (const sample of [
+      { question: "合成独立维表名称：读取当前产品编码及名称。", dimension: true },
+      { question: "合成真实聚合维表轨迹：纸灯日本七日新增及辅助 NULL 计数。", dimension: false },
+    ]) {
+      const sessionId = ((await (await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json()) as { session_id: string }).session_id;
+      const result = await postQuestion(apiPort, sessionId, sample.question);
+      assert.equal(result.status, "completed", JSON.stringify({ error: result.error, reasons: result.analysis?.server_reasons, events: result.events }));
+      assert.match(result.analysis?.answer ?? "", /纸灯/u);
+      assert.ok(!result.analysis?.server_reasons?.includes("unresolved_tool_failure"));
+      assert.equal(result.events.filter(event => event.type === "tool_finished" && event.payload.is_error === true).length, 0);
+      if (sample.dimension) {
+        const analysis = result.analysis as unknown as AnalysisRecord;
+        assert.equal(analysis.dimension_observations?.find(item => item.key.title_id === "paper_lantern")?.values.find(value => value.column === "title_name")?.value, "纸灯");
+        assert.ok(analysis.sources[0]?.dimension_snapshot?.snapshot_hash);
+        assert.ok(!analysis.server_reasons.includes("coverage_unknown"));
+      } else {
+        assert.match(result.analysis?.answer ?? "", /JOIN 求和 70/u);
+        assert.match(result.analysis?.answer ?? "", /NULL 计数 0/u);
+        assert.equal(result.analysis?.sources?.[0]?.freshness_receipts?.length, 2);
+      }
+      const source = result.analysis?.sources?.[0];
+      const response = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${sessionId}/resources/${source?.resource_id}?offset=0&limit=100`);
+      assert.equal(response.status, 200);
+      const resource = (await response.json()) as { resource: { job_id: string; session_id: string; execution_id: string; dimension_snapshot?: { snapshot_hash: string } } };
+      assert.equal(resource.resource.job_id, result.job_id);
+      assert.equal(resource.resource.session_id, sessionId);
+      assert.equal(resource.resource.execution_id, source?.execution_id);
+      if (sample.dimension) assert.ok(resource.resource.dimension_snapshot?.snapshot_hash);
+    }
+    for (const question of ["合成真实F计数组合关联", "合成真实F分查并引用名称"]) {
+      const sessionId = ((await (await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json()) as { session_id: string }).session_id;
+      const result = await postQuestion(apiPort, sessionId, question);
+      assert.equal(result.status, "completed", JSON.stringify({ error: result.error, reasons: result.analysis?.server_reasons, events: result.events }));
+      const analysis = result.analysis as unknown as AnalysisRecord;
+      assert.match(analysis.answer, /70；单位 人|70（人）/u);
+      assert.match(analysis.answer, /纸灯/u);
+      assert.ok(!analysis.server_reasons.includes("query_expression_semantics_unverified"));
+      assert.ok(!analysis.server_reasons.includes("calculation_lineage_unsupported"));
+      assert.ok(!analysis.server_reasons.includes("unresolved_tool_failure"));
+      assert.equal(result.events.filter(event => event.type === "tool_finished" && event.payload.is_error === true).length, 0);
+      const joined = question.includes("关联");
+      const source = analysis.sources.find(source => source.tables.includes("fact_fox_daily_install"));
+      assert.ok(source);
+      assert.equal(source.sql, joined ? REAL_F_JOIN_SQL : REAL_F_FACT_SQL);
+      assert.equal(source.engine, "clickhouse-local");
+      assert.equal(source.freshness_receipts.length, joined ? 2 : 1);
+      if (joined) {
+        assert.equal(analysis.join_results?.[0]?.values.find(value => value.operation === "sum")?.group["dim_fox_title.title_name"], "纸灯");
+        assert.deepEqual(analysis.calculations[0]?.verified_result?.rows, [{ total_users: "70" }]);
+        assert.match(analysis.answer, /JOIN 零值计数 0；单位 行/u);
+        assert.match(analysis.answer, /JOIN 观测行计数 7；单位 行/u);
+        const comparisonReader = createClickHouseClient({ url: clickhouseUrl, username: "fox_reader", password: readerPassword, database: "harborlight", maxRowsToRead: 5_000_000, timeoutSeconds: 10 }, true);
+        try {
+          const originalRows = await clickHouseQuery(comparisonReader, source.sql);
+          const proofRows = await clickHouseQuery(comparisonReader, source.executed_sql!);
+          assert.deepEqual(proofRows.map(({ __da_join_proof: _proof, ...row }) => row), originalRows, "固定合成数据的证明 SQL 必须保留 COUNT、零计数和 SUM 的可见语义");
+        } finally { await comparisonReader.close(); }
+      } else {
+        assert.equal(analysis.dimension_observations?.find(item => item.key.title_id === "paper_lantern")?.values.find(value => value.column === "title_name")?.value, "纸灯");
+        assert.ok(analysis.sources.some(source => source.dimension_snapshot?.table === "dim_fox_title"));
+      }
+      for (const source of analysis.sources) {
+        const response = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${sessionId}/resources/${source.resource_id}?offset=0&limit=100`);
+        assert.equal(response.status, 200);
+        const saved = (await response.json()) as { resource: { session_id: string; job_id: string; execution_id: string } };
+        assert.equal(saved.resource.session_id, sessionId);
+        assert.equal(saved.resource.job_id, result.job_id);
+        assert.equal(saved.resource.execution_id, source.execution_id);
+      }
+      assert.equal(result.events.filter(event => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
+    }
+    for (const sample of [
       { question: "合成常量日期查询", status: "completed", value: /70/, engine: "clickhouse_ast_scoped" },
       { question: "合成外层维度筛选", status: "completed", value: /70/, engine: "clickhouse_ast_scoped" },
-      { question: "合成条件求和表达式", status: "completed", value: /440/, engine: "clickhouse_ast_direct" },
+      { question: "合成条件求和表达式", status: "partial", value: /440/, engine: "clickhouse_ast_direct" },
       { question: "合成安全除法表达式", status: "partial", value: /146\.66666666666666/, engine: "clickhouse_ast_direct" },
       { question: "合成显式空值替换", status: "partial", value: /670/, engine: "clickhouse_ast_direct" },
       { question: "合成未知覆盖筛选", status: "partial", value: /440/, engine: "clickhouse_ast_direct" },
-      { question: "合成聚合 CTE 观察", status: "partial", value: /数学计算 observed：220/, engine: "clickhouse_ast_scoped_observation" },
+      { question: "合成聚合 CTE 观察", status: "partial", value: /数学计算 查询结果列 2（业务含义未认证） 的非 NULL 合计：220；单位 未认证/, engine: "clickhouse_ast_scoped_observation" },
       { question: "合成聚合 CTE 证明", status: "completed", value: /250/, engine: "clickhouse_ast_scoped" },
       { question: "合成实际范围变换", status: "completed", value: /220/, engine: "clickhouse_ast_direct" },
     ]) {
@@ -385,6 +604,8 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
       if (sample.question.includes("聚合 CTE 观察")) {
         assert.ok(answer.analysis?.server_reasons?.includes("coverage_unknown"));
         assert.ok(answer.analysis?.server_reasons?.includes("query_expression_semantics_unverified"));
+        assert.match(answer.analysis?.answer ?? "", /该计算不单独证明业务总体完整/);
+        assert.doesNotMatch(answer.analysis?.answer ?? "", /数学计算 observed：/);
       }
       const response = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${sessionId}/resources/${answer.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
       assert.equal(((await response.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, sample.engine);
@@ -585,6 +806,29 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     const queryEvents = corrected.events.filter((event) => event.type === "tool_finished" && event.payload.tool_name === "query");
     assert.equal(queryEvents.length, 2); assert.equal(queryEvents[0]?.payload.is_error, true); assert.equal(queryEvents[1]?.payload.is_error, false);
     assert.ok(!corrected.analysis?.server_reasons?.includes("unresolved_tool_failure"));
+    const contractRecovery = await postQuestion(apiPort, await createSyntheticSession(), "合成补读支付契约恢复：纸灯美国单日支付流水和支付表对应成本。");
+    assert.equal(contractRecovery.status, "completed", JSON.stringify({ error: contractRecovery.error, reasons: contractRecovery.analysis?.server_reasons, events: contractRecovery.events }));
+    const recoveredAnalysis = contractRecovery.analysis as unknown as AnalysisRecord;
+    assert.equal(recoveredAnalysis.arithmetic_results?.[0]?.result.value, "-1.00");
+    assert.deepEqual(recoveredAnalysis.query_observations?.map(item => [item.column, item.value]), [["amount_usd", "1.00"], ["cost_usd", "2.00"]]);
+    assert.ok(!recoveredAnalysis.server_reasons.includes("unresolved_tool_failure"));
+    const recoveredQueries = contractRecovery.events.filter(event => event.type === "tool_finished" && event.payload.tool_name === "query");
+    const recoveredStarts = contractRecovery.events.filter(event => event.type === "tool_started" && event.payload.tool_name === "query");
+    assert.equal(recoveredQueries.length, 2);
+    assert.equal(recoveredQueries[0]?.payload.code, "missing_data_contract_evidence");
+    assert.equal(recoveredQueries[1]?.payload.is_error, false);
+    assert.equal(recoveredStarts[0]?.payload.retry_key, recoveredStarts[1]?.payload.retry_key);
+    assert.match(String(recoveredStarts[0]?.payload.retry_key), /^[a-f0-9]{64}$/u);
+    assert.equal(contractRecovery.events.filter(event => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
+    const excerptRepair = await postQuestion(apiPort, await createSyntheticSession(), "合成错误摘录修正：纸灯支付流水与对应成本差额。");
+    assert.equal(excerptRepair.status, "completed", JSON.stringify({ error: excerptRepair.error, reasons: excerptRepair.analysis?.server_reasons, events: excerptRepair.events.filter((event) => event.type === "tool_finished") }));
+    assert.match(excerptRepair.analysis?.answer ?? "", /-1\.00/);
+    const noteEvents = excerptRepair.events.filter((event) => event.type === "tool_finished" && event.payload.tool_name === "update_analysis");
+    assert.equal(noteEvents.length, 4);
+    assert.equal(noteEvents[0]?.payload.code, "analysis_declaration_source_invalid");
+    assert.equal(noteEvents[1]?.payload.is_error, false);
+    assert.equal(noteEvents[2]?.payload.code, "analysis_declaration_cell_invalid");
+    assert.equal(noteEvents[3]?.payload.is_error, false);
     const incomplete = await postQuestion(apiPort, await createSyntheticSession(), "合成第二项未完成：查询纸灯美国三日新增及另一项指标。");
     assert.equal(incomplete.status, "partial", JSON.stringify({ error: incomplete.error, reasons: incomplete.analysis?.server_reasons, answer: incomplete.analysis?.answer }));
     assert.ok(incomplete.analysis?.server_reasons?.includes("unresolved_tool_failure"));
@@ -697,7 +941,7 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     const constantDateResource = await fetch(`http://127.0.0.1:${apiPort}/api/sessions/${constantDateSession}/resources/${constantDate.analysis?.sources?.[0]?.resource_id}?offset=0&limit=1`);
     assert.equal(((await constantDateResource.json()) as { resource: { sql_review_engine?: string } }).resource.sql_review_engine, "clickhouse_ast_scoped");
     for (const sample of [
-      { question: "合成条件求和表达式", expected: /440/, status: "completed" },
+      { question: "合成条件求和表达式", expected: /440/, status: "partial" },
       { question: "合成安全除法表达式", expected: /146\.66666666666666/, status: "partial" },
       { question: "合成显式空值替换", expected: /670/, status: "partial" },
       { question: "合成未知覆盖筛选", expected: /440/, status: "partial" },
@@ -969,6 +1213,10 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.match(marker.analysis?.answer ?? "", /合计 220；单位 人/);
     assert.doesNotMatch(marker.analysis?.answer ?? "", /99999/);
     assert.ok(marker.analysis?.server_reasons?.includes("null_marker_preview_sanitized"));
+    const plainMarker = await postQuestion(apiPort, await another(), "合成无别名空值标记：三天每日新增和合计。");
+    assert.equal(plainMarker.status, "completed", JSON.stringify(plainMarker.error));
+    assert.match(plainMarker.analysis?.answer ?? "", /合计 220；单位 人/);
+    assert.ok(plainMarker.analysis?.server_reasons?.includes("null_marker_preview_sanitized"));
     const markerRows = marker.analysis?.sources?.[0]?.rows as Array<Record<string, unknown>>;
     assert.deepEqual(markerRows.map((row) => row.new_users), [100, 0, 120]);
     assert.ok(markerRows.every((row) => !Object.hasOwn(row, "is_null")));
@@ -1024,7 +1272,9 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
         assert.equal(lowFollowup.error?.code, "context_window_exceeded");
       }
     }
-    const oversized = await postQuestion(apiPort, await another(), question + "合成范围填充".repeat(6000));
+    // Remain within the HTTP 64 KiB and question length limits while exceeding
+    // this worker's independently configured 8k model window.
+    const oversized = await postQuestion(apiPort, await another(), question + "合成范围填充".repeat(2500));
     assert.equal(oversized.status, "failed", JSON.stringify(oversized.error));
     assert.equal(oversized.error?.code, "context_window_exceeded");
     assert.equal(oversized.analysis, null);

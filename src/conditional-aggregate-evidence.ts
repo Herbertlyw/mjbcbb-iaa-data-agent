@@ -1,7 +1,6 @@
 import { coverageHasGap, provenCoverageScope } from "./coverage.js";
 import { isCalendarDate } from "./config.js";
-import { guardSql, parseReadonlySql } from "./sql.js";
-import { queryEvidenceShape } from "./evidence-shape.js";
+import { clickHouseAggregateShape } from "./clickhouse-aggregate-shape.js";
 import { reviewDirectClickHouse } from "./clickhouse-direct-review.js";
 import type { DataContract, QueryResource } from "./types.js";
 
@@ -29,14 +28,14 @@ export function verifyConditionalAggregates(source: QueryResource, contract: Dat
   const series = contract.series;
   if (!series || series.predicted_column || series.prediction_mode !== "observed_only" || source.engine !== "clickhouse-local" || !source.session_id || !source.job_id || !source.execution_id || !Array.isArray(source.tables) || source.tables.length !== 1 || source.tables[0] !== contract.table || source.truncated || source.sql_limited || !source.complete_population || source.total_rows_exact !== true || !Array.isArray(source.rows) || !Array.isArray(source.columns) || source.rows.length !== source.returned_rows || source.rows.length !== source.total_rows || !source.rows.length || !source.time_range || source.time_range.timezone !== contract.timezone || !validCoverage(source.coverage) || source.coverage.status !== "known" || source.coverage.unknown_prediction_dates.length || !Number.isSafeInteger(source.scan_limit) || source.scan_limit! < 1 || source.scan_limit! > 2_000_000_000) return null;
   const scope = provenCoverageScope(source.sql, contract, source.time_range);
-  if (!scope) return null;
+  if (!scope || scope.selectedDates) return null;
   let ast: Record<string, unknown>;
   try {
     const rule = { table: contract.table, allowed_columns: contract.columns.map((c) => c.name).filter((name) => !contract.sensitive_columns.includes(name)), sensitive_columns: contract.sensitive_columns, must_filter: contract.must_filter, column_types: Object.fromEntries(contract.columns.map((column) => [column.name, column.type])) };
-    const guarded = source.sql_review_engine === "clickhouse_ast_direct" ? reviewDirectClickHouse(source.sql, contract, rule, "synthetic", 10_000) : guardSql(source.sql, [rule], "clickhouse");
+    const guarded = reviewDirectClickHouse(source.sql, contract, rule, "synthetic", 10_000);
     if (!guarded) return null;
     if (guarded.time_range.start !== source.time_range.start || guarded.time_range.end !== source.time_range.end) return null;
-    const parsed = source.sql_review_engine === "clickhouse_ast_direct" ? queryEvidenceShape(source, contract) : parseReadonlySql(source.sql).ast;
+    const parsed = clickHouseAggregateShape(source.sql, contract.table);
     if (!parsed) return null;
     ast = parsed;
   } catch { return null; }

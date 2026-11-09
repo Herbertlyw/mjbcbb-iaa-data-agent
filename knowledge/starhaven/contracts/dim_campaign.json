@@ -1,0 +1,81 @@
+{
+  "asset_id": "contract.dim_campaign",
+  "revision": "contract.dim_campaign-v1",
+  "table": "dim_campaign",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [],
+  "grain": [
+    "dataset_version",
+    "campaign_id"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "campaign_id",
+      "type": "String",
+      "description": "全局唯一计划ID；自然来源不适用",
+      "nullable": false
+    },
+    {
+      "name": "media_code",
+      "type": "String",
+      "description": "虚构投放媒体代码",
+      "nullable": false
+    },
+    {
+      "name": "account_id",
+      "type": "String",
+      "description": "全局唯一虚构广告账户ID；自然来源不适用",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "campaign_name",
+      "type": "String",
+      "description": "虚构计划名称",
+      "nullable": false
+    },
+    {
+      "name": "objective_code",
+      "type": "String",
+      "description": "计划固定优化目标",
+      "nullable": false
+    },
+    {
+      "name": "budget_level",
+      "type": "String",
+      "description": "预算所属层级，campaign",
+      "nullable": false
+    },
+    {
+      "name": "created_at",
+      "type": "DateTime64(3, 'UTC')",
+      "description": "对象创建UTC时刻",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "campaign_id；个人合成ID全局唯一。首版身份/层级/目标不改写；预算与状态另用事件记录，不用any()猜历史最新。",
+  "aggregation_policy": {},
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": []
+}

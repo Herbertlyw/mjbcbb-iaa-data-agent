@@ -1,6 +1,7 @@
 /** Transform only complete, already verified rows. Values are decimal strings;
  * no calculation here converts a numeric input through JavaScript Number. */
 import { arithmeticUnit, type ArithmeticOp } from "./exact-arithmetic.js";
+import { parseDecimal as decimal, normalizeDecimal, compareDecimals, decimalOperation, sumDecimals } from "./decimal-kernel.js";
 export type ResultValue = string | boolean | null;
 export interface ResultColumn {
   name: string;
@@ -16,9 +17,12 @@ export interface ResultColumn {
   key_lineage?: { table: string; column: string; physical_type: string };
   key_lineages?: Array<{ table: string; column: string; physical_type: string }>;
   value_lineage?: { table: string; column: string };
+  /** Host-derived dependencies survive arithmetic, so later grouping cannot
+   * erase a measure's non-additive dimensions. */
+  aggregation_lineage?: Array<{ table: string; column: string }>;
 }
 /** Host-derived classification of contributing rows; it is not a model label. */
-export interface ResultTable { columns: ResultColumn[]; rows: Array<Record<string, ResultValue>>; prediction_scope?: "observed_only" }
+export interface ResultTable { columns: ResultColumn[]; rows: Array<Record<string, ResultValue>>; prediction_scope?: "observed_only"; prediction?: { column: string; actual: string; predicted: string } }
 export type ComparisonOp = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 /** Limits apply to the complete input AND every intermediate result. They are
  * independent of preview-page size and of the query driver's storage cap. */
@@ -39,13 +43,13 @@ export type TransformStep =
   | { op: "sort"; keys: Array<{ column: string; direction: "asc" | "desc"; nulls: "first" | "last" }> }
   | { op: "group"; by: string[]; aggregates: Array<{ op: "count_all" | "count" | "sum" | "min" | "max"; column?: string; as: string }> };
 
-const namePattern = /^[a-z_][a-z0-9_]{0,63}$/u;
+const namePattern = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/u;
 const comparisons = new Set<ComparisonOp>(["eq", "ne", "lt", "le", "gt", "ge"]);
 
 /** Returns null for malformed instructions, incompatible units or overflow. */
 export function transformResult(input: ResultTable, steps: TransformStep[], authorizeArithmetic?: (left: ResultColumn, right: ResultColumn, op: ArithmeticOp) => boolean): ResultTable | null {
   if (!Array.isArray(steps) || steps.length < 1 || steps.length > RESULT_TRANSFORM_MAX_STEPS || !validTable(input)) return null;
-  let table: ResultTable = { columns: input.columns.map((c) => ({ ...c })), rows: input.rows.map((r) => ({ ...r })), ...(input.prediction_scope ? { prediction_scope: input.prediction_scope } : {}) };
+  let table: ResultTable = { ...input, columns: input.columns.map((c) => ({ ...c })), rows: input.rows.map((r) => ({ ...r })) };
   for (const step of steps) {
     if (!step || typeof step !== "object") return null;
     const column = (name: string) => table.columns.find((c) => c.name === name);
@@ -79,11 +83,12 @@ export function transformResult(input: ResultTable, steps: TransformStep[], auth
       const scale = step.op === "divide" ? 18 : step.op === "multiply" ? left.scale! + right.scale! : Math.max(left.scale!, right.scale!);
       if (!unit || scale > 38) return null;
       const symbol = { add: "+", subtract: "−", multiply: "×", divide: "/" }[step.op];
-      const output: ResultColumn = { name: step.as, type: "decimal", scale, unit, label: `（${left.label} ${symbol} ${right.label}）`, ...(left.approximate || right.approximate ? { approximate: true } : {}) };
+      const dependencies = [left, right].flatMap((item) => item.aggregation_lineage ?? (item.value_lineage ? [item.value_lineage] : item.metric ? [{ table: item.metric.table, column: item.metric.column }] : []));
+      const output: ResultColumn = { name: step.as, type: "decimal", scale, unit, label: `（${left.label} ${symbol} ${right.label}）`, ...(left.approximate || right.approximate ? { approximate: true } : {}), ...(dependencies.length ? { aggregation_lineage: dependencies } : {}) };
       const rows: Array<Record<string, ResultValue>> = [];
       for (const row of table.rows) {
         const x = row[left.name]; const y = row[right.name];
-        const value = x === null || y === null ? null : step.op === "divide" ? divide(x as string, y as string) : arithmetic(step.op, x as string, y as string, scale);
+        const value = x === null || y === null ? null : decimalOperation(step.op, x as string, y as string, scale);
         if (value === undefined) return null;
         rows.push({ ...row, [step.as]: value });
       }
@@ -110,14 +115,14 @@ export function transformResult(input: ResultTable, steps: TransformStep[], auth
         if ((agg.op === "min" || agg.op === "max") && field?.type === "boolean") return null;
         outputs.push(agg.op === "count" || agg.op === "count_all"
           ? { name: agg.as, type: "decimal", unit: "结果行", label: agg.op === "count_all" ? "输入结果行数" : `${field!.label} 的非 NULL 结果行数`, scale: 0 }
-          : { ...field!, metric: undefined, key_lineage: undefined, key_lineages: undefined, ...(agg.op === "sum" ? {} : { value_lineage: undefined }), name: agg.as, label: `${field!.label} 的${{ sum: "合计", min: "最小值", max: "最大值" }[agg.op as "sum" | "min" | "max"]}` });
+          : { ...field!, metric: undefined, key_lineage: undefined, key_lineages: undefined, ...(agg.op === "sum" ? {} : { value_lineage: undefined }), ...(!field!.aggregation_lineage && field!.value_lineage ? { aggregation_lineage: [field!.value_lineage] } : {}), name: agg.as, label: `${field!.label} 的${{ sum: "合计", min: "最小值", max: "最大值" }[agg.op as "sum" | "min" | "max"]}` });
       }
       const groups = new Map<string, Array<Record<string, ResultValue>>>();
       for (const row of table.rows) {
         // Numeric keys compare by value, so 1.0 and 1.00 are the same group.
         const key = JSON.stringify(step.by.map((name) => {
           const value = row[name]; const field = column(name)!;
-          return value !== null && field.type === "decimal" ? normalizedDecimal(value as string) : value;
+          return value !== null && field.type === "decimal" ? normalizeDecimal(value as string)! : value;
         }));
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key)!.push(row);
@@ -135,8 +140,8 @@ export function transformResult(input: ResultTable, steps: TransformStep[], auth
           if (agg.op === "count") { output[agg.as] = String(present.length); continue; }
           if (!present.length) { output[agg.as] = null; continue; }
           if (agg.op === "sum") {
-            const total = sum(present as string[], field.scale!);
-            if (total === undefined) return null;
+            const total = sumDecimals(present as string[], field.scale!);
+            if (total === null) return null;
             output[agg.as] = total;
           } else {
             output[agg.as] = present.reduce((a, b) => (agg.op === "min" ? order(a, b, field) <= 0 : order(a, b, field) >= 0) ? a : b);
@@ -144,35 +149,19 @@ export function transformResult(input: ResultTable, steps: TransformStep[], auth
         }
         rows.push(output);
       }
-      table = { columns: outputs, rows, ...(table.prediction_scope ? { prediction_scope: table.prediction_scope } : {}) };
+      table = { columns: outputs, rows, ...(table.prediction_scope ? { prediction_scope: table.prediction_scope } : {}), ...(table.prediction && step.by.includes(table.prediction.column) ? { prediction: table.prediction } : {}) };
     } else return null;
+    if (table.prediction && table.rows.length && table.rows.every(row => row[table.prediction!.column] === table.prediction!.actual)) table.prediction_scope = "observed_only";
     if (!validTable(table)) return null;
   }
   return table;
 }
 
-/** Exact fixed-scale non-division arithmetic, bounded before returning. */
-function arithmetic(op: "add" | "subtract" | "multiply", left: string, right: string, scale: number): string | undefined {
-  const a = decimal(left); const b = decimal(right);
-  if (!a || !b || a.scale > scale || b.scale > scale) return undefined;
-  let n: bigint;
-  if (op === "multiply") {
-    if (a.scale + b.scale > scale) return undefined;
-    n = a.n * b.n * 10n ** BigInt(scale - a.scale - b.scale);
-  } else {
-    const x = a.n * 10n ** BigInt(scale - a.scale); const y = b.n * 10n ** BigInt(scale - b.scale);
-    n = op === "add" ? x + y : x - y;
-  }
-  const sign = n < 0n ? "-" : ""; const digits = (n < 0n ? -n : n).toString();
-  if (digits.length > 76) return undefined;
-  const padded = digits.padStart(scale + 1, "0");
-  return scale ? `${sign}${padded.slice(0, -scale)}.${padded.slice(-scale)}` : `${sign}${padded}`;
-}
-
-function validName(name: unknown, columns: ResultColumn[]): name is string { return typeof name === "string" && namePattern.test(name) && !["__proto__", "constructor", "prototype"].includes(name) && !columns.some((c) => c.name === name); }
+function validName(name: unknown, columns: ResultColumn[]): name is string { return typeof name === "string" && namePattern.test(name) && !["__proto__", "constructor", "prototype"].includes(name.toLowerCase()) && !columns.some((c) => c.name === name); }
 function validTable(table: ResultTable): boolean {
   if (!table || table.prediction_scope !== undefined && table.prediction_scope !== "observed_only" || !Array.isArray(table.columns) || !table.columns.length || table.columns.length > 40 || !Array.isArray(table.rows) || table.rows.length > RESULT_CALCULATION_MAX_ROWS || !fitsResultCalculationBytes(table)) return false;
   const names: ResultColumn[] = [];
+  if (table.prediction && (!table.columns.some(column => column.name === table.prediction!.column) || table.prediction.actual === table.prediction.predicted)) return false;
   for (const field of table.columns) {
     if (!field || !validName(field.name, names) || !["text", "decimal", "boolean"].includes(field.type) || typeof field.label !== "string" || typeof field.unit !== "string" || (field.type === "decimal" && (!Number.isInteger(field.scale) || field.scale! < 0 || field.scale! > 76))) return false;
     names.push(field);
@@ -185,33 +174,9 @@ function validValue(value: unknown, field: ResultColumn): value is ResultValue {
   if (typeof value !== "string" || value.length > 256) return false;
   return field.type === "text" || decimal(value) !== null;
 }
-function decimal(value: string): { n: bigint; scale: number } | null {
-  // Preserve the source wire decimal; Float values have already been rounded
-  // by their database type and must not be labelled as exact currency.
-  const m = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d{1,3}))?$/u.exec(value);
-  if (!m || (!m[2] && !m[3]) || value.length > 84) return null;
-  const digits = `${m[2] || "0"}${m[3] || ""}`.replace(/^0+/u, "") || "0";
-  const exponent = Number(m[4] || 0);
-  if (digits.length > 76 || Math.abs(exponent) > 76) return null;
-  let n = BigInt(digits) * (m[1] === "-" ? -1n : 1n);
-  let scale = (m[3]?.length ?? 0) - exponent;
-  if (scale < 0) { n *= 10n ** BigInt(-scale); scale = 0; }
-  while (scale > 0 && n % 10n === 0n) { n /= 10n; scale -= 1; }
-  if (scale > 76 || (n < 0n ? -n : n).toString().length > 76) return null;
-  return { n, scale };
-}
-
-function normalizedDecimal(value: string): string {
-  const parsed = decimal(value)!;
-  const sign = parsed.n < 0n ? "-" : "";
-  const digits = (parsed.n < 0n ? -parsed.n : parsed.n).toString().padStart(parsed.scale + 1, "0");
-  return parsed.scale ? `${sign}${digits.slice(0, -parsed.scale)}.${digits.slice(-parsed.scale)}` : `${sign}${digits}`;
-}
 function order(a: Exclude<ResultValue, null>, b: Exclude<ResultValue, null>, field: ResultColumn): number {
   if (field.type === "decimal") {
-    const x = decimal(a as string)!; const y = decimal(b as string)!; const scale = Math.max(x.scale, y.scale);
-    const left = x.n * 10n ** BigInt(scale - x.scale); const right = y.n * 10n ** BigInt(scale - y.scale);
-    return left < right ? -1 : left > right ? 1 : 0;
+    return compareDecimals(decimal(a as string)!, decimal(b as string)!);
   }
   return a < b ? -1 : a > b ? 1 : 0;
 }
@@ -219,32 +184,4 @@ function compare(a: ResultValue, b: ResultValue, field: ResultColumn, op: Compar
   if (a === null || b === null) return null;
   const result = order(a, b, field);
   return { eq: result === 0, ne: result !== 0, lt: result < 0, le: result <= 0, gt: result > 0, ge: result >= 0 }[op];
-}
-function sum(values: string[], scale: number): string | undefined {
-  let n = 0n;
-  for (const value of values) {
-    const parsed = decimal(value);
-    if (!parsed || parsed.scale > scale) return undefined;
-    n += parsed.n * 10n ** BigInt(scale - parsed.scale);
-  }
-  const negative = n < 0n; const digits = (negative ? -n : n).toString();
-  if (digits.length > 76) return undefined;
-  const padded = digits.padStart(scale + 1, "0");
-  return `${negative ? "-" : ""}${scale ? `${padded.slice(0, -scale)}.${padded.slice(-scale)}` : padded}`;
-}
-
-/** Exact fixed-scale division, with halves rounded away from zero. */
-function divide(left: string, right: string): string | null | undefined {
-  const a = decimal(left); const b = decimal(right);
-  if (!a || !b) return undefined;
-  if (b.n === 0n) return null;
-  const numerator = a.n * 10n ** BigInt(18 + b.scale);
-  const denominator = b.n * 10n ** BigInt(a.scale);
-  const negative = (numerator < 0n) !== (denominator < 0n);
-  const x = numerator < 0n ? -numerator : numerator;
-  const y = denominator < 0n ? -denominator : denominator;
-  const magnitude = (x * 2n + y) / (2n * y);
-  if (magnitude.toString().length > 76) return undefined;
-  const digits = magnitude.toString().padStart(19, "0");
-  return `${negative && magnitude !== 0n ? "-" : ""}${digits.slice(0, -18)}.${digits.slice(-18)}`;
 }

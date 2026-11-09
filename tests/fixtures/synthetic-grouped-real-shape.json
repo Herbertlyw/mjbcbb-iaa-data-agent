@@ -1,0 +1,710 @@
+{
+  "oracle": {
+    "kind": "channel_cpi",
+    "app_id": "stackjoy_ios",
+    "date": "2026-10-26",
+    "unit": "USD/AF报表注册",
+    "groups": [
+      {
+        "ua_channel_id": "breeze",
+        "discounted_cost_usd": "1.374492",
+        "af_registers": 1,
+        "cpi_usd_per_register": "1.374492",
+        "rows": 1
+      },
+      {
+        "ua_channel_id": "organic",
+        "discounted_cost_usd": "0.000000",
+        "af_registers": 0,
+        "cpi_usd_per_register": null,
+        "rows": 3
+      }
+    ],
+    "source": "synthetic JSONL; Decimal cost / summed AF registrations; zero denominator unknown"
+  },
+  "job": {
+    "job_id": "job_839857a9-537d-4b3c-b21b-de28193755ef",
+    "session_id": "ses_bb7f07b0-51ba-4c29-b1b0-fe8bbf4bbc80",
+    "status": "completed",
+    "analysis": {
+      "sources": [
+        {
+          "resource_id": "res_a6b44179-b7bf-4576-a4dc-89bae14f4aae",
+          "evidence_eligible": true
+        }
+      ],
+      "join_results": [
+        {
+          "resource_id": "res_a6b44179-b7bf-4576-a4dc-89bae14f4aae",
+          "execution_id": "64ddf53a-0a55-469a-b264-24b0fac20e3e",
+          "values": [
+            {
+              "fact": "fact_delivery_daily",
+              "dimension": "dim_ua_channel",
+              "column": "discounted_cost_usd",
+              "operation": "sum",
+              "value": "0.000000",
+              "unit": "USD",
+              "description": "逐行换算的折后美元消耗",
+              "group": {
+                "fact_delivery_daily.app_id": "stackjoy_ios",
+                "dim_ua_channel.ua_channel_id": "organic",
+                "dim_ua_channel.channel_name": "自然来源",
+                "dim_ua_channel.channel_category": "organic"
+              },
+              "unmatched_rows": 0,
+              "factFilters": {
+                "app_id": "stackjoy_ios"
+              },
+              "dimensionFilters": {},
+              "range": {
+                "start": "2026-10-26",
+                "end": "2026-10-26",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "fact": "fact_delivery_daily",
+              "dimension": "dim_ua_channel",
+              "column": "af_registers",
+              "operation": "sum",
+              "value": "0",
+              "unit": "报表注册",
+              "description": "AF报表注册计数，不是ODS安装事件数",
+              "group": {
+                "fact_delivery_daily.app_id": "stackjoy_ios",
+                "dim_ua_channel.ua_channel_id": "organic",
+                "dim_ua_channel.channel_name": "自然来源",
+                "dim_ua_channel.channel_category": "organic"
+              },
+              "unmatched_rows": 0,
+              "factFilters": {
+                "app_id": "stackjoy_ios"
+              },
+              "dimensionFilters": {},
+              "range": {
+                "start": "2026-10-26",
+                "end": "2026-10-26",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "fact": "fact_delivery_daily",
+              "dimension": "dim_ua_channel",
+              "column": "af_registers",
+              "operation": "count_null",
+              "value": "0",
+              "unit": "行",
+              "description": "AF报表注册计数，不是ODS安装事件数",
+              "group": {
+                "fact_delivery_daily.app_id": "stackjoy_ios",
+                "dim_ua_channel.ua_channel_id": "organic",
+                "dim_ua_channel.channel_name": "自然来源",
+                "dim_ua_channel.channel_category": "organic"
+              },
+              "unmatched_rows": 0,
+              "factFilters": {
+                "app_id": "stackjoy_ios"
+              },
+              "dimensionFilters": {},
+              "range": {
+                "start": "2026-10-26",
+                "end": "2026-10-26",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "fact": "fact_delivery_daily",
+              "dimension": "dim_ua_channel",
+              "column": "discounted_cost_usd",
+              "operation": "count_null",
+              "value": "0",
+              "unit": "行",
+              "description": "逐行换算的折后美元消耗",
+              "group": {
+                "fact_delivery_daily.app_id": "stackjoy_ios",
+                "dim_ua_channel.ua_channel_id": "organic",
+                "dim_ua_channel.channel_name": "自然来源",
+                "dim_ua_channel.channel_category": "organic"
+              },
+              "unmatched_rows": 0,
+              "factFilters": {
+                "app_id": "stackjoy_ios"
+              },
+              "dimensionFilters": {},
+              "range": {
+                "start": "2026-10-26",
+                "end": "2026-10-26",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "fact": "fact_delivery_daily",
+              "dimension": "dim_ua_channel",
+              "column": "*",
+              "operation": "count_rows",
+              "value": "3",
+              "unit": "行",
+              "description": "关联查询观测行数",
+              "group": {
+                "fact_delivery_daily.app_id": "stackjoy_ios",
+                "dim_ua_channel.ua_channel_id": "organic",
+                "dim_ua_channel.channel_name": "自然来源",
+                "dim_ua_channel.channel_category": "organic"
+              },
+              "unmatched_rows": 0,
+              "factFilters": {
+                "app_id": "stackjoy_ios"
+              },
+              "dimensionFilters": {},
+              "range": {
+                "start": "2026-10-26",
+                "end": "2026-10-26",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "fact": "fact_delivery_daily",
+              "dimension": "dim_ua_channel",
+              "column": "discounted_cost_usd",
+              "operation": "sum",
+              "value": "1.374492",
+              "unit": "USD",
+              "description": "逐行换算的折后美元消耗",
+              "group": {
+                "fact_delivery_daily.app_id": "stackjoy_ios",
+                "dim_ua_channel.ua_channel_id": "breeze",
+                "dim_ua_channel.channel_name": "风帆广告",
+                "dim_ua_channel.channel_category": "paid_ads"
+              },
+              "unmatched_rows": 0,
+              "factFilters": {
+                "app_id": "stackjoy_ios"
+              },
+              "dimensionFilters": {},
+              "range": {
+                "start": "2026-10-26",
+                "end": "2026-10-26",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "fact": "fact_delivery_daily",
+              "dimension": "dim_ua_channel",
+              "column": "af_registers",
+              "operation": "sum",
+              "value": "1",
+              "unit": "报表注册",
+              "description": "AF报表注册计数，不是ODS安装事件数",
+              "group": {
+                "fact_delivery_daily.app_id": "stackjoy_ios",
+                "dim_ua_channel.ua_channel_id": "breeze",
+                "dim_ua_channel.channel_name": "风帆广告",
+                "dim_ua_channel.channel_category": "paid_ads"
+              },
+              "unmatched_rows": 0,
+              "factFilters": {
+                "app_id": "stackjoy_ios"
+              },
+              "dimensionFilters": {},
+              "range": {
+                "start": "2026-10-26",
+                "end": "2026-10-26",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "fact": "fact_delivery_daily",
+              "dimension": "dim_ua_channel",
+              "column": "af_registers",
+              "operation": "count_null",
+              "value": "0",
+              "unit": "行",
+              "description": "AF报表注册计数，不是ODS安装事件数",
+              "group": {
+                "fact_delivery_daily.app_id": "stackjoy_ios",
+                "dim_ua_channel.ua_channel_id": "breeze",
+                "dim_ua_channel.channel_name": "风帆广告",
+                "dim_ua_channel.channel_category": "paid_ads"
+              },
+              "unmatched_rows": 0,
+              "factFilters": {
+                "app_id": "stackjoy_ios"
+              },
+              "dimensionFilters": {},
+              "range": {
+                "start": "2026-10-26",
+                "end": "2026-10-26",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "fact": "fact_delivery_daily",
+              "dimension": "dim_ua_channel",
+              "column": "discounted_cost_usd",
+              "operation": "count_null",
+              "value": "0",
+              "unit": "行",
+              "description": "逐行换算的折后美元消耗",
+              "group": {
+                "fact_delivery_daily.app_id": "stackjoy_ios",
+                "dim_ua_channel.ua_channel_id": "breeze",
+                "dim_ua_channel.channel_name": "风帆广告",
+                "dim_ua_channel.channel_category": "paid_ads"
+              },
+              "unmatched_rows": 0,
+              "factFilters": {
+                "app_id": "stackjoy_ios"
+              },
+              "dimensionFilters": {},
+              "range": {
+                "start": "2026-10-26",
+                "end": "2026-10-26",
+                "timezone": "UTC"
+              }
+            },
+            {
+              "fact": "fact_delivery_daily",
+              "dimension": "dim_ua_channel",
+              "column": "*",
+              "operation": "count_rows",
+              "value": "1",
+              "unit": "行",
+              "description": "关联查询观测行数",
+              "group": {
+                "fact_delivery_daily.app_id": "stackjoy_ios",
+                "dim_ua_channel.ua_channel_id": "breeze",
+                "dim_ua_channel.channel_name": "风帆广告",
+                "dim_ua_channel.channel_category": "paid_ads"
+              },
+              "unmatched_rows": 0,
+              "factFilters": {
+                "app_id": "stackjoy_ios"
+              },
+              "dimensionFilters": {},
+              "range": {
+                "start": "2026-10-26",
+                "end": "2026-10-26",
+                "timezone": "UTC"
+              }
+            }
+          ]
+        }
+      ],
+      "arithmetic_results": [
+        {
+          "resource_id": "res_805344fc-00a4-467c-9de4-576302fab3c4",
+          "operation": "divide",
+          "left": {
+            "resource_id": "res_a6b44179-b7bf-4576-a4dc-89bae14f4aae",
+            "execution_id": "64ddf53a-0a55-469a-b264-24b0fac20e3e",
+            "cell": "cost_usd",
+            "row": 1
+          },
+          "right": {
+            "resource_id": "res_a6b44179-b7bf-4576-a4dc-89bae14f4aae",
+            "execution_id": "64ddf53a-0a55-469a-b264-24b0fac20e3e",
+            "cell": "af_registers",
+            "row": 1
+          },
+          "result": {
+            "value": "1.374492000000000000",
+            "scale": 18,
+            "unit": "(USD)/(报表注册)",
+            "basis": {
+              "table": "结果资源",
+              "column": "cost_usd",
+              "operation": "result_cell",
+              "unit": "USD",
+              "prediction": "未认证",
+              "timezone": "未认证"
+            },
+            "bases": [
+              {
+                "table": "结果资源",
+                "column": "cost_usd",
+                "operation": "result_cell",
+                "unit": "USD",
+                "prediction": "未认证",
+                "timezone": "未认证"
+              },
+              {
+                "table": "结果资源",
+                "column": "af_registers",
+                "operation": "result_cell",
+                "unit": "报表注册",
+                "prediction": "未认证",
+                "timezone": "未认证"
+              }
+            ],
+            "formula": "(res_a6b44179-b7bf-4576-a4dc-89bae14f4aae 的列 cost_usd（第 1 行） divide res_a6b44179-b7bf-4576-a4dc-89bae14f4aae 的列 af_registers（第 1 行）)",
+            "scopes": [],
+            "interpretation": "mathematical_only"
+          }
+        }
+      ],
+      "citations": [
+        {
+          "resource_id": "res_a6b44179-b7bf-4576-a4dc-89bae14f4aae",
+          "note": "query_result"
+        },
+        {
+          "resource_id": "res_805344fc-00a4-467c-9de4-576302fab3c4",
+          "note": "arithmetic"
+        }
+      ],
+      "resource_hashes": {
+        "res_a6b44179-b7bf-4576-a4dc-89bae14f4aae": "955307c032dbcd600a34095a4dbe1b60d81bab9bc0f062dc78ca6fb28123c3f0",
+        "res_805344fc-00a4-467c-9de4-576302fab3c4": "c0fe6638fa7cdeb854c5ce6d77d081114ec6c8d2235fbe2400a2d25bc2468055"
+      },
+      "answer": "以下数字由当前任务的已授权查询和计算生成。\n(res_a6b44179-b7bf-4576-a4dc-89bae14f4aae 的列 cost_usd（第 1 行） divide res_a6b44179-b7bf-4576-a4dc-89bae14f4aae 的列 af_registers（第 1 行）) 可复核数学运算 divide：1.374492000000000000 (USD)/(报表注册)；输入 res_a6b44179-b7bf-4576-a4dc-89bae14f4aae、res_a6b44179-b7bf-4576-a4dc-89bae14f4aae；计算资源 res_805344fc-00a4-467c-9de4-576302fab3c4。仅认证计算与来源，不认证业务指标名称、用户意图或完整范围。\n结果基于各次 ClickHouse 观测；查询和覆盖统计不是同一原子快照，未证明共同数据版本。\nfact_delivery_daily.discounted_cost_usd（逐行换算的折后美元消耗）：已核验 JOIN 求和 0.000000；单位 USD；分组 fact_delivery_daily.app_id=stackjoy_ios，dim_ua_channel.ua_channel_id=organic，dim_ua_channel.channel_name=自然来源，dim_ua_channel.channel_category=organic；事实筛选 app_id=stackjoy_ios；维表筛选 无；2026-10-26 到 2026-10-26（UTC）；来源 res_a6b44179-b7bf-4576-a4dc-89bae14f4aae。结果与维表匹配证明来自同次查询，非跨表原子快照。\nfact_delivery_daily.af_registers（AF报表注册计数，不是ODS安装事件数）：已核验 JOIN 求和 0；单位 报表注册；分组 fact_delivery_daily.app_id=stackjoy_ios，dim_ua_channel.ua_channel_id=organic，dim_ua_channel.channel_name=自然来源，dim_ua_channel.channel_category=organic；事实筛选 app_id=stackjoy_ios；维表筛选 无；2026-10-26 到 2026-10-26（UTC）；来源 res_a6b44179-b7bf-4576-a4dc-89bae14f4aae。结果与维表匹配证明来自同次查询，非跨表原子快照。\nfact_delivery_daily.af_registers（AF报表注册计数，不是ODS安装事件数）：已核验 JOIN NULL 计数 0；单位 行；分组 fact_delivery_daily.app_id=stackjoy_ios，dim_ua_channel.ua_channel_id=organic，dim_ua_channel.channel_name=自然来源，dim_ua_channel.channel_category=organic；事实筛选 app_id=stackjoy_ios；维表筛选 无；2026-10-26 到 2026-10-26（UTC）；来源 res_a6b44179-b7bf-4576-a4dc-89bae14f4aae。结果与维表匹配证明来自同次查询，非跨表原子快照。\nfact_delivery_daily.discounted_cost_usd（逐行换算的折后美元消耗）：已核验 JOIN NULL 计数 0；单位 行；分组 fact_delivery_daily.app_id=stackjoy_ios，dim_ua_channel.ua_channel_id=organic，dim_ua_channel.channel_name=自然来源，dim_ua_channel.channel_category=organic；事实筛选 app_id=stackjoy_ios；维表筛选 无；2026-10-26 到 2026-10-26（UTC）；来源 res_a6b44179-b7bf-4576-a4dc-89bae14f4aae。结果与维表匹配证明来自同次查询，非跨表原子快照。\nfact_delivery_daily（关联查询观测行数）：已核验 JOIN 观测行计数 3；单位 行；分组 fact_delivery_daily.app_id=stackjoy_ios，dim_ua_channel.ua_channel_id=organic，dim_ua_channel.channel_name=自然来源，dim_ua_channel.channel_category=organic；事实筛选 app_id=stackjoy_ios；维表筛选 无；2026-10-26 到 2026-10-26（UTC）；来源 res_a6b44179-b7bf-4576-a4dc-89bae14f4aae。结果与维表匹配证明来自同次查询，非跨表原子快照。\nfact_delivery_daily.discounted_cost_usd（逐行换算的折后美元消耗）：已核验 JOIN 求和 1.374492；单位 USD；分组 fact_delivery_daily.app_id=stackjoy_ios，dim_ua_channel.ua_channel_id=breeze，dim_ua_channel.channel_name=风帆广告，dim_ua_channel.channel_category=paid_ads；事实筛选 app_id=stackjoy_ios；维表筛选 无；2026-10-26 到 2026-10-26（UTC）；来源 res_a6b44179-b7bf-4576-a4dc-89bae14f4aae。结果与维表匹配证明来自同次查询，非跨表原子快照。\nfact_delivery_daily.af_registers（AF报表注册计数，不是ODS安装事件数）：已核验 JOIN 求和 1；单位 报表注册；分组 fact_delivery_daily.app_id=stackjoy_ios，dim_ua_channel.ua_channel_id=breeze，dim_ua_channel.channel_name=风帆广告，dim_ua_channel.channel_category=paid_ads；事实筛选 app_id=stackjoy_ios；维表筛选 无；2026-10-26 到 2026-10-26（UTC）；来源 res_a6b44179-b7bf-4576-a4dc-89bae14f4aae。结果与维表匹配证明来自同次查询，非跨表原子快照。\nfact_delivery_daily.af_registers（AF报表注册计数，不是ODS安装事件数）：已核验 JOIN NULL 计数 0；单位 行；分组 fact_delivery_daily.app_id=stackjoy_ios，dim_ua_channel.ua_channel_id=breeze，dim_ua_channel.channel_name=风帆广告，dim_ua_channel.channel_category=paid_ads；事实筛选 app_id=stackjoy_ios；维表筛选 无；2026-10-26 到 2026-10-26（UTC）；来源 res_a6b44179-b7bf-4576-a4dc-89bae14f4aae。结果与维表匹配证明来自同次查询，非跨表原子快照。\nfact_delivery_daily.discounted_cost_usd（逐行换算的折后美元消耗）：已核验 JOIN NULL 计数 0；单位 行；分组 fact_delivery_daily.app_id=stackjoy_ios，dim_ua_channel.ua_channel_id=breeze，dim_ua_channel.channel_name=风帆广告，dim_ua_channel.channel_category=paid_ads；事实筛选 app_id=stackjoy_ios；维表筛选 无；2026-10-26 到 2026-10-26（UTC）；来源 res_a6b44179-b7bf-4576-a4dc-89bae14f4aae。结果与维表匹配证明来自同次查询，非跨表原子快照。\nfact_delivery_daily（关联查询观测行数）：已核验 JOIN 观测行计数 1；单位 行；分组 fact_delivery_daily.app_id=stackjoy_ios，dim_ua_channel.ua_channel_id=breeze，dim_ua_channel.channel_name=风帆广告，dim_ua_channel.channel_category=paid_ads；事实筛选 app_id=stackjoy_ios；维表筛选 无；2026-10-26 到 2026-10-26（UTC）；来源 res_a6b44179-b7bf-4576-a4dc-89bae14f4aae。结果与维表匹配证明来自同次查询，非跨表原子快照。\nfact_delivery_daily 数值为零的日期：2026-10-26。\n新鲜度发布 fp_4ecc7c30-2d11-44bd-bb6f-c03e6eba8b79 版本 19。",
+      "transform_results": [],
+      "alignment_results": [],
+      "calculations": [],
+      "comparisons": [],
+      "aggregate_comparisons": [],
+      "conditional_aggregates": []
+    }
+  },
+  "resources": [
+    {
+      "resource_id": "res_a6b44179-b7bf-4576-a4dc-89bae14f4aae",
+      "session_id": "ses_bb7f07b0-51ba-4c29-b1b0-fe8bbf4bbc80",
+      "kind": "query_result",
+      "key_lineage_version": 1,
+      "result_semantics_version": 2,
+      "created_at": "2026-11-09T14:12:30.651Z",
+      "job_id": "job_839857a9-537d-4b3c-b21b-de28193755ef",
+      "engine": "clickhouse-local",
+      "sql_review_engine": "clickhouse_ast_join",
+      "review_plan": {
+        "version": 1,
+        "sql_hash": "60cab6670b6fe83f1a08650626613db3ae48905fa094fbf1600314a49e570b68",
+        "engine": "clickhouse_ast_join",
+        "tables": [
+          "fact_delivery_daily",
+          "dim_ua_channel"
+        ],
+        "time_range": {
+          "start": "2026-10-26",
+          "end": "2026-10-26"
+        },
+        "sql_limited": false
+      },
+      "elapsed_ms": 18,
+      "execution_id": "64ddf53a-0a55-469a-b264-24b0fac20e3e",
+      "column_types": {
+        "app_id": "String",
+        "ua_channel_id": "Nullable(String)",
+        "channel_name": "Nullable(String)",
+        "channel_category": "Nullable(String)",
+        "cost_usd": "Nullable(Decimal(38, 6))",
+        "af_registers": "Nullable(UInt64)",
+        "null_reg_rows": "UInt64",
+        "null_cost_rows": "UInt64",
+        "rows": "UInt64"
+      },
+      "execution_settings": {
+        "join_use_nulls": true
+      },
+      "scan_limit": 5000000,
+      "decimal_types": {
+        "fact_delivery_daily.raw_cost_local": "Nullable(Decimal(24, 6))",
+        "fact_delivery_daily.discounted_cost_local": "Nullable(Decimal(24, 6))",
+        "fact_delivery_daily.raw_cost_usd": "Nullable(Decimal(24, 6))",
+        "fact_delivery_daily.discounted_cost_usd": "Nullable(Decimal(24, 6))"
+      },
+      "simulated": true,
+      "sql": "SELECT f.app_id, c.ua_channel_id, c.channel_name, c.channel_category, sum(f.discounted_cost_usd) AS cost_usd, sum(f.af_registers) AS af_registers, countIf(f.af_registers IS NULL) AS null_reg_rows, countIf(f.discounted_cost_usd IS NULL) AS null_cost_rows, count() AS rows FROM fact_delivery_daily AS f LEFT JOIN dim_ua_channel AS c ON f.dataset_version = c.dataset_version AND f.ua_channel_id = c.ua_channel_id WHERE f.business_date = toDate('2026-10-26') AND f.app_id = 'stackjoy_ios' GROUP BY f.app_id, c.ua_channel_id, c.channel_name, c.channel_category ORDER BY c.channel_name",
+      "executed_sql": "SELECT f.app_id AS app_id, c.ua_channel_id AS ua_channel_id, c.channel_name AS channel_name, c.channel_category AS channel_category, SUM(f.discounted_cost_usd) AS cost_usd, SUM(f.af_registers) AS af_registers, countIf(isNull(f.af_registers)) AS null_reg_rows, countIf(isNull(f.discounted_cost_usd)) AS null_cost_rows, COUNT() AS rows, groupArray(10001)(tuple(f.business_date, f.discounted_cost_usd, f.af_registers, f.dataset_version, f.app_id, f.acquisition_country_code, f.ua_channel_id, f.account_id, f.campaign_id, f.ad_group_id, f.ad_id, f.creative_id, c.dataset_version, c.ua_channel_id, c.channel_name, c.channel_category)) AS __da_join_proof FROM fact_delivery_daily AS f LEFT JOIN dim_ua_channel AS c ON f.dataset_version = c.dataset_version AND f.ua_channel_id = c.ua_channel_id WHERE f.business_date = '2026-10-26' AND f.app_id = 'stackjoy_ios' GROUP BY f.app_id, c.ua_channel_id, c.channel_name, c.channel_category ORDER BY c.channel_name ASC",
+      "tables": [
+        "fact_delivery_daily",
+        "dim_ua_channel"
+      ],
+      "contract_revisions": {
+        "fact_delivery_daily": "contract.fact_delivery_daily-v2",
+        "dim_ua_channel": "contract.dim_ua_channel-v1"
+      },
+      "asset_hashes": {
+        "contract.fact_delivery_daily": "2a2b6bf01fca3c0d525d2df9ccf81e151967b223700088b594be541ac7dab56f",
+        "contract.dim_ua_channel": "bb2834f491eca1aa8abb474ec4abb4f3ad7a0e3ab4b7527937e8d5dd76d8d4a2"
+      },
+      "registry_revision": "starhaven-v1",
+      "receipt_ids": [
+        "rcpt_604e0d70-e880-4a58-80cd-5a5f32e8b551",
+        "rcpt_457d0ac6-0331-496c-bd04-a56700d041c2"
+      ],
+      "time_range": {
+        "start": "2026-10-26",
+        "end": "2026-10-26",
+        "timezone": "UTC"
+      },
+      "freshness": [
+        {
+          "as_of": null,
+          "status": "unknown",
+          "note": "仅使用受控发布；本文件不授予fresh。"
+        },
+        {
+          "as_of": null,
+          "status": "unknown",
+          "note": "仅使用受控发布；本文件不授予fresh。"
+        }
+      ],
+      "truncated": false,
+      "sql_limited": false,
+      "total_rows": 2,
+      "total_rows_exact": true,
+      "returned_rows": 2,
+      "complete_population": true,
+      "value_semantics": {
+        "null": "missing",
+        "zero": "observed_zero",
+        "predicted_flag": "is_predicted"
+      },
+      "columns": [
+        "app_id",
+        "ua_channel_id",
+        "channel_name",
+        "channel_category",
+        "cost_usd",
+        "af_registers",
+        "null_reg_rows",
+        "null_cost_rows",
+        "rows"
+      ],
+      "rows": [
+        {
+          "app_id": "stackjoy_ios",
+          "ua_channel_id": "organic",
+          "channel_name": "自然来源",
+          "channel_category": "organic",
+          "cost_usd": "0",
+          "af_registers": "0",
+          "null_reg_rows": "0",
+          "null_cost_rows": "0",
+          "rows": "3"
+        },
+        {
+          "app_id": "stackjoy_ios",
+          "ua_channel_id": "breeze",
+          "channel_name": "风帆广告",
+          "channel_category": "paid_ads",
+          "cost_usd": "1.374492",
+          "af_registers": "1",
+          "null_reg_rows": "0",
+          "null_cost_rows": "0",
+          "rows": "1"
+        }
+      ],
+      "coverage": {
+        "status": "known",
+        "reason": "本次 JOIN 查询捕获的已出现分组按完整事实粒度逐日验证；未出现的分组不补零。",
+        "table": "fact_delivery_daily",
+        "expected_days": 1,
+        "absent_dates": [],
+        "null_dates": [],
+        "zero_dates": [
+          "2026-10-26"
+        ],
+        "predicted_dates": [],
+        "actual_dates": [
+          "2026-10-26"
+        ],
+        "unknown_prediction_dates": [],
+        "groups": []
+      },
+      "freshness_receipts": [
+        {
+          "publication_id": "fp_4ecc7c30-2d11-44bd-bb6f-c03e6eba8b79",
+          "version": 19,
+          "table": "fact_delivery_daily",
+          "status": "fresh",
+          "published_at": "2026-11-09T14:11:42.916000Z"
+        },
+        {
+          "publication_id": "fp_4ecc7c30-2d11-44bd-bb6f-c03e6eba8b79",
+          "version": 19,
+          "table": "dim_ua_channel",
+          "status": "fresh",
+          "published_at": "2026-11-09T14:11:42.916000Z"
+        }
+      ],
+      "join_proof": {
+        "rows": [
+          {
+            "app_id": "stackjoy_ios",
+            "ua_channel_id": "organic",
+            "channel_name": "自然来源",
+            "channel_category": "organic",
+            "cost_usd": "0",
+            "af_registers": "0",
+            "null_reg_rows": "0",
+            "null_cost_rows": "0",
+            "rows": "3",
+            "__da_join_proof": [
+              [
+                "2026-10-26",
+                "0",
+                "0",
+                "sv_55c525926d882d7044f9",
+                "stackjoy_ios",
+                "DE",
+                "organic",
+                null,
+                null,
+                null,
+                null,
+                null,
+                "sv_55c525926d882d7044f9",
+                "organic",
+                "自然来源",
+                "organic"
+              ],
+              [
+                "2026-10-26",
+                "0",
+                "0",
+                "sv_55c525926d882d7044f9",
+                "stackjoy_ios",
+                "JP",
+                "organic",
+                null,
+                null,
+                null,
+                null,
+                null,
+                "sv_55c525926d882d7044f9",
+                "organic",
+                "自然来源",
+                "organic"
+              ],
+              [
+                "2026-10-26",
+                "0",
+                "0",
+                "sv_55c525926d882d7044f9",
+                "stackjoy_ios",
+                "US",
+                "organic",
+                null,
+                null,
+                null,
+                null,
+                null,
+                "sv_55c525926d882d7044f9",
+                "organic",
+                "自然来源",
+                "organic"
+              ]
+            ]
+          },
+          {
+            "app_id": "stackjoy_ios",
+            "ua_channel_id": "breeze",
+            "channel_name": "风帆广告",
+            "channel_category": "paid_ads",
+            "cost_usd": "1.374492",
+            "af_registers": "1",
+            "null_reg_rows": "0",
+            "null_cost_rows": "0",
+            "rows": "1",
+            "__da_join_proof": [
+              [
+                "2026-10-26",
+                "1.374492",
+                "1",
+                "sv_55c525926d882d7044f9",
+                "stackjoy_ios",
+                "DE",
+                "breeze",
+                "acct_breeze",
+                "stackjoy_ios_breeze_camp",
+                "stackjoy_ios_breeze_camp_group",
+                "stackjoy_ios_breeze_camp_ad0",
+                "stackjoy_ios_cr0",
+                "sv_55c525926d882d7044f9",
+                "breeze",
+                "风帆广告",
+                "paid_ads"
+              ]
+            ]
+          }
+        ],
+        "column_types": {
+          "app_id": "String",
+          "ua_channel_id": "Nullable(String)",
+          "channel_name": "Nullable(String)",
+          "channel_category": "Nullable(String)",
+          "cost_usd": "Nullable(Decimal(38, 6))",
+          "af_registers": "Nullable(UInt64)",
+          "null_reg_rows": "UInt64",
+          "null_cost_rows": "UInt64",
+          "rows": "UInt64",
+          "__da_join_proof": "Array(Tuple(Date, Nullable(Decimal(24, 6)), Nullable(UInt64), String, String, String, String, Nullable(String), Nullable(String), Nullable(String), Nullable(String), Nullable(String), Nullable(String), Nullable(String), Nullable(String), Nullable(String)))"
+        },
+        "capture_hash": "6ba49d2cc94d0931d3745456bb0d1f4bfc5e7156726fc057ba2bdfc40396ddf8"
+      }
+    },
+    {
+      "resource_id": "res_805344fc-00a4-467c-9de4-576302fab3c4",
+      "execution_id": "calc_3167b137-dbd0-4a34-b89d-239f12cce051",
+      "session_id": "ses_bb7f07b0-51ba-4c29-b1b0-fe8bbf4bbc80",
+      "job_id": "job_839857a9-537d-4b3c-b21b-de28193755ef",
+      "kind": "arithmetic",
+      "created_at": "2026-11-09T14:12:33.258Z",
+      "operation": "divide",
+      "left": {
+        "resource_id": "res_a6b44179-b7bf-4576-a4dc-89bae14f4aae",
+        "execution_id": "64ddf53a-0a55-469a-b264-24b0fac20e3e",
+        "cell": "cost_usd",
+        "row": 1
+      },
+      "right": {
+        "resource_id": "res_a6b44179-b7bf-4576-a4dc-89bae14f4aae",
+        "execution_id": "64ddf53a-0a55-469a-b264-24b0fac20e3e",
+        "cell": "af_registers",
+        "row": 1
+      },
+      "input_hashes": {
+        "res_a6b44179-b7bf-4576-a4dc-89bae14f4aae": "955307c032dbcd600a34095a4dbe1b60d81bab9bc0f062dc78ca6fb28123c3f0"
+      },
+      "result": {
+        "value": "1.374492000000000000",
+        "scale": 18,
+        "unit": "(USD)/(报表注册)",
+        "basis": {
+          "table": "结果资源",
+          "column": "cost_usd",
+          "operation": "result_cell",
+          "unit": "USD",
+          "prediction": "未认证",
+          "timezone": "未认证"
+        },
+        "bases": [
+          {
+            "table": "结果资源",
+            "column": "cost_usd",
+            "operation": "result_cell",
+            "unit": "USD",
+            "prediction": "未认证",
+            "timezone": "未认证"
+          },
+          {
+            "table": "结果资源",
+            "column": "af_registers",
+            "operation": "result_cell",
+            "unit": "报表注册",
+            "prediction": "未认证",
+            "timezone": "未认证"
+          }
+        ],
+        "formula": "(res_a6b44179-b7bf-4576-a4dc-89bae14f4aae 的列 cost_usd（第 1 行） divide res_a6b44179-b7bf-4576-a4dc-89bae14f4aae 的列 af_registers（第 1 行）)",
+        "scopes": [],
+        "interpretation": "mathematical_only"
+      },
+      "input_truncated": false,
+      "complete_population": true
+    }
+  ]
+}

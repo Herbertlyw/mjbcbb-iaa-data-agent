@@ -1,0 +1,5 @@
+# 实验配置与观察
+
+dim_experiment_arm明确control_arm_id、allocation_unit、config_version和anchor_type。product以first_open为锚点；monetization以first_ad_show为锚点，触发可能晚于安装。
+
+enrolled_units跨观察日重复不可累加。不同experiment可重叠，不得相加称全部用户。组间差异不自动代表统计显著或推广到所有玩家。

@@ -1,0 +1,5 @@
+# 预测与复验
+
+baseline_linear_v1和baseline_tail_v2是透明合成基线，不是公司算法。prediction_id固定快照、cohort、范围、来源、horizon和版本。input_cutoff之后的收入不能作为输入。
+
+只在目标成熟且完整时计算实际误差。成本输入回刷需标input_revision_state，不能直接归为模型错误；权重用cost_weight_usd。旧预测不被最新预测覆盖，行均值不能代替成本加权总体误差。

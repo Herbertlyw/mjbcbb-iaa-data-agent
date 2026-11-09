@@ -1,0 +1,971 @@
+[
+  {
+    "asset": "dim_app",
+    "role": "产品包体",
+    "grain": "app_id；一款产品在一个平台上的虚构包体",
+    "dimensions": [
+      "app_id"
+    ],
+    "measures": [],
+    "attributes": [
+      "game_id",
+      "game_name",
+      "game_kind",
+      "platform",
+      "bundle_id",
+      "launch_date",
+      "business_timezone",
+      "supported_mode_codes"
+    ],
+    "boundary": "三款产品、iOS/Android分别有身份；第三款玩法未定，不猜TPT含义。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "app_id",
+      "game_id",
+      "game_name",
+      "game_kind",
+      "platform",
+      "bundle_id",
+      "launch_date",
+      "business_timezone",
+      "supported_mode_codes"
+    ]
+  },
+  {
+    "asset": "dim_country",
+    "role": "地域",
+    "grain": "country_code",
+    "dimensions": [
+      "country_code"
+    ],
+    "measures": [],
+    "attributes": [
+      "country_name",
+      "region",
+      "tier_code"
+    ],
+    "boundary": "国家代码、中文名和区域分别定义；tier是明确配置，不推导为全球统一标准。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "country_code",
+      "country_name",
+      "region",
+      "tier_code"
+    ]
+  },
+  {
+    "asset": "dim_ua_channel",
+    "role": "获客渠道",
+    "grain": "ua_channel_id",
+    "dimensions": [
+      "ua_channel_id"
+    ],
+    "measures": [],
+    "attributes": [
+      "channel_name",
+      "media_code",
+      "channel_category",
+      "is_paid",
+      "classification_version"
+    ],
+    "boundary": "获客渠道与广告变现network是两种不同维度。unknown不改叫organic。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "ua_channel_id",
+      "channel_name",
+      "media_code",
+      "channel_category",
+      "is_paid",
+      "classification_version"
+    ]
+  },
+  {
+    "asset": "dim_ad_account",
+    "role": "广告账户",
+    "grain": "account_id；个人合成ID全局唯一",
+    "dimensions": [
+      "account_id"
+    ],
+    "measures": [],
+    "attributes": [
+      "media_code",
+      "account_name",
+      "account_currency",
+      "account_timezone"
+    ],
+    "boundary": "账户和币种均虚构；首版报表统一UTC业务日，源时区保留元数据。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "account_id",
+      "media_code",
+      "account_name",
+      "account_currency",
+      "account_timezone"
+    ]
+  },
+  {
+    "asset": "dim_campaign",
+    "role": "投放计划",
+    "grain": "campaign_id；个人合成ID全局唯一",
+    "dimensions": [
+      "campaign_id"
+    ],
+    "measures": [],
+    "attributes": [
+      "media_code",
+      "account_id",
+      "app_id",
+      "campaign_name",
+      "objective_code",
+      "budget_level",
+      "created_at"
+    ],
+    "boundary": "首版身份/层级/目标不改写；预算与状态另用事件记录，不用any()猜历史最新。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "campaign_id",
+      "media_code",
+      "account_id",
+      "app_id",
+      "campaign_name",
+      "objective_code",
+      "budget_level",
+      "created_at"
+    ]
+  },
+  {
+    "asset": "dim_ad_group",
+    "role": "广告组",
+    "grain": "ad_group_id；个人合成ID全局唯一",
+    "dimensions": [
+      "ad_group_id"
+    ],
+    "measures": [],
+    "attributes": [
+      "media_code",
+      "account_id",
+      "campaign_id",
+      "ad_group_name",
+      "optimization_event_code",
+      "created_at"
+    ],
+    "boundary": "没有广告组层的媒体允许该键NULL，不虚构一个真实组。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "ad_group_id",
+      "media_code",
+      "account_id",
+      "campaign_id",
+      "ad_group_name",
+      "optimization_event_code",
+      "created_at"
+    ]
+  },
+  {
+    "asset": "dim_ad",
+    "role": "广告对象",
+    "grain": "ad_id；个人合成ID全局唯一",
+    "dimensions": [
+      "ad_id"
+    ],
+    "measures": [],
+    "attributes": [
+      "media_code",
+      "account_id",
+      "campaign_id",
+      "ad_group_id",
+      "ad_name",
+      "primary_creative_id",
+      "created_at"
+    ],
+    "boundary": "首版每广告仅一个主素材；替换主素材创建新广告ID。素材可被多广告复用，多素材组合归因暂不承诺。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "ad_id",
+      "media_code",
+      "account_id",
+      "campaign_id",
+      "ad_group_id",
+      "ad_name",
+      "primary_creative_id",
+      "created_at"
+    ]
+  },
+  {
+    "asset": "dim_creative",
+    "role": "素材",
+    "grain": "creative_id",
+    "dimensions": [
+      "creative_id"
+    ],
+    "measures": [],
+    "attributes": [
+      "app_id",
+      "creative_name",
+      "format_code",
+      "upload_at",
+      "duration_seconds",
+      "aspect_ratio",
+      "tag_codes"
+    ],
+    "boundary": "用合成标题和标签，不复用真实文件路径、上传人或素材文件。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "creative_id",
+      "app_id",
+      "creative_name",
+      "format_code",
+      "upload_at",
+      "duration_seconds",
+      "aspect_ratio",
+      "tag_codes"
+    ]
+  },
+  {
+    "asset": "dim_experiment_arm",
+    "role": "实验与分组配置",
+    "grain": "experiment_id + arm_id + config_version",
+    "dimensions": [
+      "experiment_id",
+      "arm_id",
+      "config_version"
+    ],
+    "measures": [],
+    "attributes": [
+      "app_id",
+      "experiment_type",
+      "allocation_unit",
+      "allocation_fraction",
+      "eligibility_code",
+      "anchor_type",
+      "control_arm_id",
+      "starts_at",
+      "ends_at"
+    ],
+    "boundary": "产品实验和商业化实验使用明确type；入组锚点不是统一install_date。商业化配置只作补充参考。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "experiment_id",
+      "arm_id",
+      "config_version",
+      "app_id",
+      "experiment_type",
+      "allocation_unit",
+      "allocation_fraction",
+      "eligibility_code",
+      "anchor_type",
+      "control_arm_id",
+      "starts_at",
+      "ends_at"
+    ]
+  },
+  {
+    "asset": "fact_delivery_daily",
+    "role": "投放前端事实",
+    "grain": "date + app + acquisition_country + UA账户/计划/组/广告/主素材",
+    "dimensions": [
+      "business_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "account_id",
+      "campaign_id",
+      "ad_group_id",
+      "ad_id",
+      "creative_id"
+    ],
+    "measures": [
+      "raw_cost_local",
+      "discounted_cost_local",
+      "raw_cost_usd",
+      "discounted_cost_usd",
+      "impressions",
+      "clicks",
+      "media_registers",
+      "af_registers"
+    ],
+    "attributes": [
+      "source_currency",
+      "fx_rate_date",
+      "cost_scope",
+      "completeness_state"
+    ],
+    "boundary": "af_registers是报表计数，不改名成ODS去重安装；原币成本不跨币种相加。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "business_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "account_id",
+      "campaign_id",
+      "ad_group_id",
+      "ad_id",
+      "creative_id",
+      "raw_cost_local",
+      "discounted_cost_local",
+      "raw_cost_usd",
+      "discounted_cost_usd",
+      "impressions",
+      "clicks",
+      "media_registers",
+      "af_registers",
+      "source_currency",
+      "fx_rate_date",
+      "cost_scope",
+      "completeness_state"
+    ]
+  },
+  {
+    "asset": "fact_acquisition_daily",
+    "role": "安装与归因",
+    "grain": "cohort_date + app + acquisition_country + UA计划广告素材范围",
+    "dimensions": [
+      "cohort_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "campaign_id",
+      "ad_group_id",
+      "ad_id",
+      "creative_id"
+    ],
+    "measures": [
+      "unique_install_events",
+      "first_install_devices",
+      "reinstall_events",
+      "late_install_events",
+      "unattributed_install_events"
+    ],
+    "attributes": [
+      "arrival_cutoff",
+      "completeness_state"
+    ],
+    "boundary": "保留事件、首次设备、重装和迟到的不同身份；私有模拟标识不在公开表中输出。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "cohort_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "campaign_id",
+      "ad_group_id",
+      "ad_id",
+      "creative_id",
+      "unique_install_events",
+      "first_install_devices",
+      "reinstall_events",
+      "late_install_events",
+      "unattributed_install_events",
+      "arrival_cutoff",
+      "completeness_state"
+    ]
+  },
+  {
+    "asset": "fact_activity_daily",
+    "role": "产品活跃",
+    "grain": "activity_date + app + 首次获客国家/渠道",
+    "dimensions": [
+      "activity_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id"
+    ],
+    "measures": [
+      "active_devices",
+      "active_devices_7d",
+      "active_devices_30d",
+      "new_active_devices",
+      "returning_active_devices",
+      "sessions",
+      "gameplay_seconds",
+      "game_count",
+      "ad_viewing_devices",
+      "ad_impressions",
+      "ad_revenue_usd"
+    ],
+    "attributes": [
+      "device_identity_rule",
+      "completeness_state"
+    ],
+    "boundary": "首版按首次获客国家/渠道固定分群；7/30日活跃在私有模拟设备上精确去重，只在同一锚点使用，不跨日相加或声称跨App人数。",
+    "dataset_version_required": true,
+    "aggregation_rules": [
+      "active_devices_7d/30d不可跨activity_date相加；同一App、同一锚点的固定获客分群才可汇总。",
+      "日活跨天求和是设备日，不是窗口去重设备。"
+    ],
+    "declared_column_names": [
+      "dataset_version",
+      "activity_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "active_devices",
+      "active_devices_7d",
+      "active_devices_30d",
+      "new_active_devices",
+      "returning_active_devices",
+      "sessions",
+      "gameplay_seconds",
+      "game_count",
+      "ad_viewing_devices",
+      "ad_impressions",
+      "ad_revenue_usd",
+      "device_identity_rule",
+      "completeness_state"
+    ]
+  },
+  {
+    "asset": "fact_cohort_quality_daily",
+    "role": "留存与获客后质量",
+    "grain": "install_cohort_date + observe_date + app + 首次获客国家/渠道/计划广告",
+    "dimensions": [
+      "install_cohort_date",
+      "observe_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "campaign_id",
+      "ad_group_id",
+      "ad_id",
+      "creative_id"
+    ],
+    "measures": [
+      "cohort_size_devices",
+      "retained_devices",
+      "game_count",
+      "gameplay_seconds",
+      "usage_seconds",
+      "ad_impressions",
+      "ad_revenue_usd"
+    ],
+    "attributes": [
+      "age_days",
+      "maturity_state",
+      "completeness_state"
+    ],
+    "boundary": "cohort_size跨观察日重复不可累加；UTC设备cohort不冒充AF报表cohort。",
+    "dataset_version_required": true,
+    "aggregation_rules": [
+      "cohort_size_devices不可跨observe_date或age_days相加。",
+      "retained_devices按单一age或明确观察日使用，留存率从同cohort分母重算。"
+    ],
+    "declared_column_names": [
+      "dataset_version",
+      "install_cohort_date",
+      "observe_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "campaign_id",
+      "ad_group_id",
+      "ad_id",
+      "creative_id",
+      "cohort_size_devices",
+      "retained_devices",
+      "game_count",
+      "gameplay_seconds",
+      "usage_seconds",
+      "ad_impressions",
+      "ad_revenue_usd",
+      "age_days",
+      "maturity_state",
+      "completeness_state"
+    ]
+  },
+  {
+    "asset": "fact_gameplay_daily",
+    "role": "玩法汇总",
+    "grain": "date + app + country + mode + level_bucket",
+    "dimensions": [
+      "business_date",
+      "app_id",
+      "activity_country_code",
+      "mode_code",
+      "level_bucket"
+    ],
+    "measures": [
+      "games_started",
+      "games_finished",
+      "eligible_win_games",
+      "games_won",
+      "gameplay_seconds",
+      "total_score",
+      "revive_prompts",
+      "revive_clicks",
+      "successful_revives"
+    ],
+    "attributes": [
+      "score_unit",
+      "gameplay_schema_version",
+      "completeness_state"
+    ],
+    "boundary": "没有胜负定义的模式相关字段为不适用；不造轮/块明细，也不跨游戏直接比较分数。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "business_date",
+      "app_id",
+      "activity_country_code",
+      "mode_code",
+      "level_bucket",
+      "games_started",
+      "games_finished",
+      "eligible_win_games",
+      "games_won",
+      "gameplay_seconds",
+      "total_score",
+      "revive_prompts",
+      "revive_clicks",
+      "successful_revives",
+      "score_unit",
+      "gameplay_schema_version",
+      "completeness_state"
+    ]
+  },
+  {
+    "asset": "fact_ad_funnel_daily",
+    "role": "广告商业化链路",
+    "grain": "date + app + country + ad_format + network + event_schema_version",
+    "dimensions": [
+      "business_date",
+      "app_id",
+      "activity_country_code",
+      "ad_format",
+      "network_code",
+      "event_schema_version"
+    ],
+    "measures": [
+      "load_attempts",
+      "completed_load_attempts",
+      "successful_load_attempts",
+      "show_actions",
+      "ready_actions",
+      "completed_show_requests",
+      "successful_show_requests",
+      "impressions",
+      "clicks",
+      "revenue_usd"
+    ],
+    "attributes": [
+      "completeness_state"
+    ],
+    "boundary": "新合成事件字典定义attempt/request身份；load、ready、show不能互换，不直接命名成通用fill rate。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "business_date",
+      "app_id",
+      "activity_country_code",
+      "ad_format",
+      "network_code",
+      "event_schema_version",
+      "load_attempts",
+      "completed_load_attempts",
+      "successful_load_attempts",
+      "show_actions",
+      "ready_actions",
+      "completed_show_requests",
+      "successful_show_requests",
+      "impressions",
+      "clicks",
+      "revenue_usd",
+      "completeness_state"
+    ]
+  },
+  {
+    "asset": "fact_cohort_revenue_daily",
+    "role": "分来源回收",
+    "grain": "cohort_date + revenue_date + app + 获客范围 + revenue_source",
+    "dimensions": [
+      "cohort_date",
+      "revenue_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "campaign_id",
+      "ad_group_id",
+      "ad_id",
+      "creative_id",
+      "revenue_source"
+    ],
+    "measures": [
+      "revenue_usd",
+      "revenue_callback_count"
+    ],
+    "attributes": [
+      "age_days",
+      "observed_at",
+      "completeness_state"
+    ],
+    "boundary": "SDK和AF是两种观测不能相加；首版是广告回收，不默认为IAP流水。",
+    "dataset_version_required": true,
+    "aggregation_rules": [
+      "不得跨revenue_source相加声称总收入。"
+    ],
+    "declared_column_names": [
+      "dataset_version",
+      "cohort_date",
+      "revenue_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "campaign_id",
+      "ad_group_id",
+      "ad_id",
+      "creative_id",
+      "revenue_source",
+      "revenue_usd",
+      "revenue_callback_count",
+      "age_days",
+      "observed_at",
+      "completeness_state"
+    ]
+  },
+  {
+    "asset": "fact_creative_test_snapshot",
+    "role": "素材测试",
+    "grain": "snapshot_date + app + creative + UA媒体",
+    "dimensions": [
+      "snapshot_date",
+      "app_id",
+      "creative_id",
+      "ua_channel_id"
+    ],
+    "measures": [
+      "test_window_cost_usd",
+      "test_window_registers",
+      "test_window_revenue_usd"
+    ],
+    "attributes": [
+      "first_test_date",
+      "test_scope_state",
+      "is_eligible",
+      "eligible_at",
+      "is_tested",
+      "is_observable",
+      "is_graduated",
+      "rule_version",
+      "completeness_state"
+    ],
+    "boundary": "状态从投放与成熟度派生，不独立随机造；汇总跨媒体素材数要去重。",
+    "dataset_version_required": true,
+    "aggregation_rules": [
+      "跨UA渠道的素材数须按creative_id去重；不能相加状态快照。"
+    ],
+    "declared_column_names": [
+      "dataset_version",
+      "snapshot_date",
+      "app_id",
+      "creative_id",
+      "ua_channel_id",
+      "test_window_cost_usd",
+      "test_window_registers",
+      "test_window_revenue_usd",
+      "first_test_date",
+      "test_scope_state",
+      "is_eligible",
+      "eligible_at",
+      "is_tested",
+      "is_observable",
+      "is_graduated",
+      "rule_version",
+      "completeness_state"
+    ]
+  },
+  {
+    "asset": "fact_experiment_cohort_daily",
+    "role": "实验观察",
+    "grain": "experiment + arm + config_version + app + entry_cohort_date + observe_date + entry_country",
+    "dimensions": [
+      "experiment_id",
+      "arm_id",
+      "config_version",
+      "app_id",
+      "entry_cohort_date",
+      "observe_date",
+      "entry_country_code"
+    ],
+    "measures": [
+      "enrolled_units",
+      "observed_units",
+      "active_units",
+      "gameplay_seconds",
+      "ad_impressions",
+      "ad_revenue_usd"
+    ],
+    "attributes": [
+      "anchor_type",
+      "age_days",
+      "assignment_version",
+      "completeness_state"
+    ],
+    "boundary": "入组基数跨日不可累加；产品安装锚点与商业化触发锚点分开；不自动给显著性/全量上线结论。",
+    "dataset_version_required": true,
+    "aggregation_rules": [
+      "enrolled_units不可跨observe_date或age_days相加。",
+      "不同experiment_id的样本可能重叠，不能相加称全部用户。"
+    ],
+    "declared_column_names": [
+      "dataset_version",
+      "experiment_id",
+      "arm_id",
+      "config_version",
+      "app_id",
+      "entry_cohort_date",
+      "observe_date",
+      "entry_country_code",
+      "enrolled_units",
+      "observed_units",
+      "active_units",
+      "gameplay_seconds",
+      "ad_impressions",
+      "ad_revenue_usd",
+      "anchor_type",
+      "age_days",
+      "assignment_version",
+      "completeness_state"
+    ]
+  },
+  {
+    "asset": "fact_ad_operation_event",
+    "role": "操作变化",
+    "grain": "operation_event_id + field_name",
+    "dimensions": [
+      "operation_event_id",
+      "field_name"
+    ],
+    "measures": [],
+    "attributes": [
+      "app_id",
+      "media_code",
+      "account_id",
+      "entity_type",
+      "entity_id",
+      "effective_at",
+      "recorded_at",
+      "old_value",
+      "new_value",
+      "value_type",
+      "unit",
+      "change_source"
+    ],
+    "boundary": "行数是字段变更数，操作次数按event_id去重；不保存原始平台JSON或真实人员。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "operation_event_id",
+      "field_name",
+      "app_id",
+      "media_code",
+      "account_id",
+      "entity_type",
+      "entity_id",
+      "effective_at",
+      "recorded_at",
+      "old_value",
+      "new_value",
+      "value_type",
+      "unit",
+      "change_source"
+    ]
+  },
+  {
+    "asset": "fact_roi_forecast_snapshot",
+    "role": "预测历史",
+    "grain": "snapshot + cohort + app + 获客范围 + horizon + model_version + revenue_source",
+    "dimensions": [
+      "snapshot_date",
+      "cohort_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "campaign_id",
+      "horizon_days",
+      "model_version",
+      "revenue_source"
+    ],
+    "measures": [
+      "cost_as_of_usd",
+      "predicted_revenue_usd",
+      "predicted_roi_pct"
+    ],
+    "attributes": [
+      "prediction_id",
+      "input_cutoff",
+      "observed_age_days",
+      "prediction_state"
+    ],
+    "boundary": "预测只能使用input_cutoff之前可见数据；禁止写未来真实收入作模型输入。",
+    "dataset_version_required": true,
+    "aggregation_rules": [
+      "不得跨snapshot_date或model_version相加；选定一个预测视角。"
+    ],
+    "declared_column_names": [
+      "dataset_version",
+      "snapshot_date",
+      "cohort_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "campaign_id",
+      "horizon_days",
+      "model_version",
+      "revenue_source",
+      "cost_as_of_usd",
+      "predicted_revenue_usd",
+      "predicted_roi_pct",
+      "prediction_id",
+      "input_cutoff",
+      "observed_age_days",
+      "prediction_state"
+    ]
+  },
+  {
+    "asset": "fact_roi_forecast_evaluation",
+    "role": "预测复验",
+    "grain": "prediction_id + evaluation_as_of",
+    "dimensions": [
+      "prediction_id",
+      "evaluation_as_of",
+      "snapshot_date",
+      "cohort_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "campaign_id",
+      "horizon_days",
+      "model_version",
+      "revenue_source"
+    ],
+    "measures": [
+      "predicted_roi_pct",
+      "actual_revenue_usd",
+      "actual_cost_usd",
+      "actual_roi_pct",
+      "roi_error_pp",
+      "cost_weight_usd"
+    ],
+    "attributes": [
+      "maturity_state",
+      "input_revision_state",
+      "completeness_state"
+    ],
+    "boundary": "从同一个预测ID复制不可变范围及预测值，方便单表查询；仅成熟完整且输入成本可比时评估模型误差，输入回刷单列。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "prediction_id",
+      "evaluation_as_of",
+      "snapshot_date",
+      "cohort_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "campaign_id",
+      "horizon_days",
+      "model_version",
+      "revenue_source",
+      "predicted_roi_pct",
+      "actual_revenue_usd",
+      "actual_cost_usd",
+      "actual_roi_pct",
+      "roi_error_pp",
+      "cost_weight_usd",
+      "maturity_state",
+      "input_revision_state",
+      "completeness_state"
+    ]
+  },
+  {
+    "asset": "fact_fx_rate_daily",
+    "role": "汇率",
+    "grain": "rate_date + source_currency",
+    "dimensions": [
+      "rate_date",
+      "source_currency"
+    ],
+    "measures": [
+      "source_currency_per_usd"
+    ],
+    "attributes": [
+      "rate_status"
+    ],
+    "boundary": "定义为1 USD兑换多少原币；USD金额=原币金额/该rate。正数和缺失规则单独校验。",
+    "dataset_version_required": true,
+    "aggregation_rules": [
+      "汇率不可求和或不加说明地取平均。"
+    ],
+    "declared_column_names": [
+      "dataset_version",
+      "rate_date",
+      "source_currency",
+      "source_currency_per_usd",
+      "rate_status"
+    ]
+  },
+  {
+    "asset": "config_business_policy_snapshot",
+    "role": "合成经营规则",
+    "grain": "policy_id + policy_version + effective_from + scope",
+    "dimensions": [
+      "policy_id",
+      "policy_version",
+      "effective_from",
+      "scope_type",
+      "scope_key"
+    ],
+    "measures": [],
+    "attributes": [
+      "effective_to",
+      "target_roi_pct",
+      "warning_roi_pct",
+      "minimum_sample_units",
+      "test_window_days",
+      "maturity_days"
+    ],
+    "boundary": "所有阈值是新虚构配置；不复制公司红黄线，也不把阈值判断等同可执行投放建议。",
+    "dataset_version_required": true,
+    "aggregation_rules": [],
+    "declared_column_names": [
+      "dataset_version",
+      "policy_id",
+      "policy_version",
+      "effective_from",
+      "scope_type",
+      "scope_key",
+      "effective_to",
+      "target_roi_pct",
+      "warning_roi_pct",
+      "minimum_sample_units",
+      "test_window_days",
+      "maturity_days"
+    ]
+  }
+]

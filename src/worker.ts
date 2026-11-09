@@ -1,6 +1,7 @@
 import { loadConfig } from "./config.js";
 import { RedisJobQueue } from "./redis-queue.js";
 import { createRuntime } from "./runtime.js";
+import { recordExecutorActivity } from "./executor-activity.js";
 
 const config = loadConfig({
   stateMode: "mysql",
@@ -14,6 +15,7 @@ if (config.host !== "127.0.0.1") {
 }
 const runtime = createRuntime(config);
 await runtime.mysqlAsyncState();
+const stopActivity = recordExecutorActivity("worker", () => runtime.mysqlAsyncState());
 const queue = new RedisJobQueue({
   host: config.redisHost,
   port: config.redisPort,
@@ -37,10 +39,12 @@ try {
       }
       if (message?.job_id) {
         const claim = await (await runtime.mysqlAsyncState()).call("claimJob", message.job_id, runtime.jobs.workerOwner, Date.now(), config.leaseMs);
+        await stopActivity.progress();
         if (claim) await runtime.jobs.runClaimed(claim);
       }
       if (Date.now() >= nextRecovery) {
         const recovered = await (await runtime.mysqlAsyncState()).call("claimNext", runtime.jobs.workerOwner, Date.now(), config.leaseMs);
+        await stopActivity.progress();
         if (recovered) await runtime.jobs.runClaimed(recovered);
         nextRecovery = Date.now() + config.recoveryMs;
       }
@@ -52,6 +56,7 @@ try {
     }
   }
 } finally {
+  await stopActivity();
   await queue.close();
   await runtime.close({ abandon: true });
 }

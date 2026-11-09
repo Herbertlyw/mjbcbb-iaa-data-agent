@@ -1,0 +1,107 @@
+{
+  "asset_id": "contract.config_business_policy_snapshot",
+  "revision": "contract.config_business_policy_snapshot-v1",
+  "table": "config_business_policy_snapshot",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [],
+  "grain": [
+    "dataset_version",
+    "policy_id",
+    "policy_version",
+    "effective_from",
+    "scope_type",
+    "scope_key"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "policy_id",
+      "type": "String",
+      "description": "合成经营规则身份",
+      "nullable": false
+    },
+    {
+      "name": "policy_version",
+      "type": "String",
+      "description": "合成规则版本",
+      "nullable": false
+    },
+    {
+      "name": "effective_from",
+      "type": "DateTime64(3, 'UTC')",
+      "description": "规则生效UTC时刻",
+      "nullable": false
+    },
+    {
+      "name": "scope_type",
+      "type": "String",
+      "description": "app",
+      "nullable": false
+    },
+    {
+      "name": "scope_key",
+      "type": "String",
+      "description": "适用App ID",
+      "nullable": false
+    },
+    {
+      "name": "effective_to",
+      "type": "Nullable(DateTime64(3, 'UTC'))",
+      "description": "规则结束UTC时刻，无结束为NULL",
+      "nullable": true
+    },
+    {
+      "name": "target_roi_pct",
+      "type": "Decimal(24,6)",
+      "description": "虚构目标回收百分比，不是公司目标",
+      "nullable": false,
+      "unit": "%"
+    },
+    {
+      "name": "warning_roi_pct",
+      "type": "Decimal(24,6)",
+      "description": "虚构观察线，不是投放指令",
+      "nullable": false,
+      "unit": "%"
+    },
+    {
+      "name": "minimum_sample_units",
+      "type": "UInt32",
+      "description": "最小样本数，合成参数",
+      "nullable": false
+    },
+    {
+      "name": "test_window_days",
+      "type": "UInt32",
+      "description": "首次测试窗口日数",
+      "nullable": false,
+      "unit": "天"
+    },
+    {
+      "name": "maturity_days",
+      "type": "UInt32",
+      "description": "规则要求成熟日数",
+      "nullable": false,
+      "unit": "天"
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "policy_id + policy_version + effective_from + scope。所有阈值是新虚构配置；不复制公司红黄线，也不把阈值判断等同可执行投放建议。",
+  "aggregation_policy": {},
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": []
+}

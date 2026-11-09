@@ -78,6 +78,9 @@ export function diagnoseKnowledge(root = path.join(repoRoot(), "knowledge", "lum
     for (const asset of knowledge.assets) {
       if (!asset.contract || !/^[a-z_][a-z0-9_]*$/u.test(asset.contract.table)) continue;
       const series = asset.contract.series;
+      if (series?.coverage_semantics !== undefined && series.coverage_semantics !== "sparse_observations") {
+        issues.push({ code: "coverage_semantics_invalid", message: `${asset.contract.table} 的覆盖语义不受支持` });
+      }
       if (series && (series.predicted_column && series.prediction_mode || !series.predicted_column && series.prediction_values)) {
         issues.push({ code: "prediction_mapping_conflict", message: `${asset.contract.table} 的预测状态声明互相冲突` });
       }

@@ -1,0 +1,78 @@
+{
+  "asset_id": "contract.fact_fx_rate_daily",
+  "revision": "contract.fact_fx_rate_daily-v2",
+  "table": "fact_fx_rate_daily",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [
+    "rate_date"
+  ],
+  "grain": [
+    "dataset_version",
+    "rate_date",
+    "source_currency"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "rate_date",
+      "type": "Date",
+      "description": "汇率UTC业务日",
+      "nullable": false
+    },
+    {
+      "name": "source_currency",
+      "type": "String",
+      "description": "原始币种代码；XCU完全虚构",
+      "nullable": false
+    },
+    {
+      "name": "source_currency_per_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "1美元兑换原币数，美元=原币/该正数",
+      "nullable": true,
+      "unit": "原币/USD"
+    },
+    {
+      "name": "rate_status",
+      "type": "String",
+      "description": "known或missing",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "rate_date + source_currency。定义为1 USD兑换多少原币；USD金额=原币金额/该rate。正数和缺失规则单独校验。 dataset_version属于完整物理粒度和关联键，列入series.dimensions；日期分区仍只使用date_column。",
+  "aggregation_policy": {
+    "source_currency_per_usd": [
+      "rate_date",
+      "source_currency"
+    ]
+  },
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": [
+    "source_currency_per_usd"
+  ],
+  "series": {
+    "date_column": "rate_date",
+    "dimensions": [
+      "dataset_version",
+      "source_currency"
+    ],
+    "metrics": [],
+    "predicted_column": null,
+    "prediction_mode": "observed_only"
+  }
+}

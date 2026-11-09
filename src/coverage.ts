@@ -3,13 +3,13 @@ import { exactCalendarDatePredicate, parseReadonlySql } from "./sql.js";
 import { isCalendarDate } from "./config.js";
 import { clickHouseCoverageScope } from "./clickhouse-coverage-scope.js";
 
-export interface CoverageScope { equalities: Record<string, string>; inSets: Record<string, string[]> }
+export interface CoverageScope { equalities: Record<string, string>; inSets: Record<string, string[]>; selectedDates?: string[] }
 
 /** Keep legacy callers conservative: a multi-value set is never represented as
  * a single equality or passed to old evidence/lineage code as one value. */
 export function provenCoverageFilters(sql: string, contract: DataContract, timeRange: { start: string; end: string }): Record<string, string> | null {
   const scope = provenCoverageScope(sql, contract, timeRange);
-  return scope && !Object.keys(scope.inSets).length ? scope.equalities : null;
+  return scope && !scope.selectedDates && !Object.keys(scope.inSets).length ? scope.equalities : null;
 }
 
 /** Describe the same input population as the guarded single-table WHERE.
@@ -19,8 +19,7 @@ export function provenCoverageScope(sql: string, contract: DataContract, timeRan
   const series = contract.series;
   if (!series) return null;
   if (contract.engine === "clickhouse-local") {
-    const native = clickHouseCoverageScope(sql, contract, timeRange);
-    if (native !== undefined) return native;
+    return clickHouseCoverageScope(sql, contract, timeRange) ?? null;
   }
   let ast: Record<string, unknown>;
   try { ast = parseReadonlySql(sql).ast; } catch { return null; }
@@ -92,6 +91,7 @@ export function assessCoverage(
   });
   const series = contract?.series;
   if (!series || !timeRange?.start || !timeRange.end) return empty("unknown", "契约没有声明可核对的日期覆盖，覆盖情况未知");
+  if (series.coverage_semantics !== undefined && series.coverage_semantics !== "sparse_observations") return empty("unknown", "契约覆盖语义不受支持。");
   const dates = enumerateDates(timeRange.start, timeRange.end);
   if (!dates) return empty("unknown", "日期范围无法展开，覆盖情况未知");
   const setEntries = Object.entries(inSets).sort(([a], [b]) => a.localeCompare(b));
@@ -115,28 +115,36 @@ export function assessCoverage(
     }
   }
   if (!pinned) {
+    const free = series.dimensions.filter((dimension) => !equalities[dimension]);
+    for (const dimension of free) {
+      const type = contract.columns.find((column) => column.name === dimension)?.type.replace(/\s/gu, "") ?? "";
+      const nullable = /^nullable\(/iu.test(type) || /^lowcardinality\(nullable\(/iu.test(type);
+      // A SQL NULL in a declared nullable dimension is an observed group,
+      // not a missing column and not the string "NULL". A missing field or a
+      // NULL contrary to the contract cannot establish complete coverage.
+      if (rows.some((row) => !Object.hasOwn(row, dimension) ||
+          (row[dimension] === null ? !nullable : free.length > 1 && typeof row[dimension] !== "string")))
+        return { ...empty("unknown", "组合维度不完整，不能证明覆盖。"), ...overall };
+    }
     for (const dimension of series.dimensions) {
       if (equalities[dimension]) continue;
-      const values = new Map<string, Array<Record<string, unknown>>>();
+      const values = new Map<string | null, Array<Record<string, unknown>>>();
       for (const row of rows) {
-        const raw = row[dimension]; if (raw === undefined || raw === null) continue;
-        const value = String(raw); const subset = values.get(value) ?? [];
+        const raw = row[dimension]; const value = raw === null ? null : String(raw); const subset = values.get(value) ?? [];
         subset.push(row); values.set(value, subset);
       }
       if (values.size < 2) continue;
       groupDays += values.size * dates.length;
       if (groupDays > 100_000) return { ...empty("unknown", "覆盖分组和日期组合超过预算，未证明完整覆盖。"), ...overall };
       for (const [value, subset] of values) {
-        groups.push({ dimension, value, ...classify(subset, series.date_column, series.metrics, series.predicted_column ?? null, series.prediction_values, series.prediction_mode, dates) });
+        groups.push({ dimension: value === null ? `${dimension} IS NULL` : dimension, value: value === null ? "NULL" : value, ...classify(subset, series.date_column, series.metrics, series.predicted_column ?? null, series.prediction_values, series.prediction_mode, dates) });
       }
     }
     // Marginal coverage can look complete while each combination is missing
     // different days. Verify each observed tuple before proving multi-group SQL.
-    const free = series.dimensions.filter((dimension) => !equalities[dimension]);
     if (free.length > 1) {
       const combinations = new Map<string, Array<Record<string, unknown>>>();
       for (const row of rows) {
-        if (free.some((dimension) => typeof row[dimension] !== "string")) return { ...empty("unknown", "组合维度不完整，不能证明覆盖。"), ...overall };
         const key = JSON.stringify(free.map((dimension) => row[dimension]));
         const group = combinations.get(key) ?? [];
         group.push(row); combinations.set(key, group);
@@ -150,8 +158,10 @@ export function assessCoverage(
     }
   }
   return {
-    status: "known",
-    reason: pinned
+    status: series.coverage_semantics === "sparse_observations" ? "unknown" : "known",
+    reason: series.coverage_semantics === "sparse_observations"
+      ? "契约声明来源为稀疏观测；已出现的行可核对，但未出现的分组不证明完整或为零。"
+      : pinned
       ? "过滤条件钉住了契约声明的序列维度，并按自然日核对。同一天可同时包含 NULL、零和不同预测标记；实际与预测日期表示标记，不保证值非空。"
       : setEntries.length ? "IN 指定的维度组合按自然日逐一核对；其他未指定维度只评估已观察取值，未出现的对象不补零。" : "未过滤的维度只评估结果里出现的取值；没有出现的组合不算缺失。同一天的状态可以重叠，实际与预测日期表示标记，不保证值非空。",
     expected_days: dates.length,

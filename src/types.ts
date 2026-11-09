@@ -1,3 +1,8 @@
+import type { ClickHousePlanReceipt } from "./clickhouse-plan.js";
+import type { DimensionSnapshotReceipt, VerifiedDimensionObservation } from "./dimension-observation.js";
+import type { VerifiedQueryObservation } from "./query-observation.js";
+import type { ResultTable } from "./result-transform.js";
+import type { VerifiedJoinValue } from "./join-evidence.js";
 export type AssetKind =
   | "catalog"
   | "data_contract"
@@ -49,6 +54,8 @@ export interface DataContract {
   timezone: string;
   freshness: Freshness;
   must_filter: string[];
+  /** Dimensions that must remain fixed or grouped when summing a measure. */
+  aggregation_policy?: Record<string, string[]>;
   series?: {
     date_column: string;
     dimensions: string[];
@@ -56,13 +63,15 @@ export interface DataContract {
     predicted_column?: string | null;
     prediction_mode?: "observed_only";
     prediction_values?: { actual: number; predicted: number };
+    /** Sparse event populations cannot prove unseen groups from observed rows. */
+    coverage_semantics?: "sparse_observations";
     /** Explicitly closed expected domain for a dimension. Absent means unknown,
      * not an empty set; consumers must validate every value and bound. */
     coverage_domains?: Record<string, { values: string[] } | { prefix: string; start: number; end: number }>;
   };
   /** numerator and denominator identify the ordered left/right operands for
    * all operations, retained for backwards-compatible contract files. */
-  derived_metrics?: Array<{ id: string; label: string; operation: import("./exact-arithmetic.js").ArithmeticOp; numerator: string; denominator: string; prediction: "actual_only"; unit: string }>;
+  derived_metrics?: Array<{ id: string; label: string; operation: import("./exact-arithmetic.js").ArithmeticOp; numerator: string; denominator: string; prediction: "actual_only"; unit: string; scope?: "observed_partial_only" }>;
   columns: ContractColumn[];
   sensitive_columns: string[];
   grain?: string[];
@@ -222,6 +231,9 @@ export interface QueryResource {
   job_id?: string;
   engine: "sqlite-local" | "clickhouse-local";
   /** Audit metadata only; current authorization is rechecked on use. */
+  review_plan?: ClickHousePlanReceipt;
+  /** Observed dimension identity, independent of the contract validity range. */
+  dimension_snapshot?: DimensionSnapshotReceipt;
   sql_review_engine?: "clickhouse_ast_direct" | "clickhouse_ast_scoped" | "clickhouse_ast_scoped_observation" | "clickhouse_ast_join" | "legacy_guard";
   /** Versioned host-generated result semantics; older resources retain their
    * original evaluated representation during replay. */
@@ -235,12 +247,14 @@ export interface QueryResource {
   decimal_types?: Record<string, string>;
   sql: string;
   executed_sql?: string;
+  /** Private same-query overflow proof; omitted from model-facing pages. */
+  wide_aggregate_proof?: import("./wide-aggregate-proof.js").WideAggregateProof;
   tables: string[];
   contract_revisions: Record<string, string>;
   asset_hashes: Record<string, string>;
   registry_revision: string;
   receipt_ids: string[];
-  time_range: { start: string; end: string; timezone: string };
+  time_range: { start: string; end: string; timezone: string; selected_dates?: string[] };
   freshness: Freshness[];
   truncated: boolean;
   sql_limited?: boolean;
@@ -339,6 +353,7 @@ export interface AnalysisSource {
   execution_settings?: { join_use_nulls: true };
   observed_at?: string;
   data_capture_hash?: string;
+  dimension_snapshot?: DimensionSnapshotReceipt;
   sql: string;
   executed_sql?: string;
   tables: string[];
@@ -371,6 +386,10 @@ export interface AnalysisRecord {
   citations: Array<{ resource_id: string; note: string }>;
   resource_hashes?: Record<string, string>;
   sources: AnalysisSource[];
+  /** Host-derived saved metric cells, independent of optional model notes. */
+  query_observations?: VerifiedQueryObservation[];
+  dimension_observations?: VerifiedDimensionObservation[];
+  join_results?: Array<{ resource_id: string; execution_id: string; values: VerifiedJoinValue[] }>;
   calculations: Array<{
     resource_id: string;
     source_resource_id: string;
@@ -378,6 +397,8 @@ export interface AnalysisRecord {
     verified_cells?: import("./evidence.js").VerifiedCell[];
     verified_decimal_cells?: import("./decimal-cell-evidence.js").VerifiedDecimalCell[];
     verified_group_rollups?: import("./aggregate-rollup.js").VerifiedGroupRollup[];
+    /** Host-recomputed generic cells, never model-provided labels or values. */
+    verified_result?: ResultTable;
     input_truncated: boolean;
     complete_population: boolean;
   }>;
@@ -394,7 +415,7 @@ export interface AnalysisRecord {
     provenance: "model_declared";
     declaration: import("./analysis-declaration.js").AnalysisDeclaration;
     excerpts_checked: number;
-    verified_cells: Array<{ resource_id: string; execution_id: string; row: number; column: string; field: string; unit: string; value: string | boolean | null }>;
+    verified_cells: Array<{ resource_id: string; execution_id: string; row: number; column: string; field: string; unit: string; value: string | boolean | null; observation?: import("./query-observation.js").VerifiedQueryObservation }>;
   };
   model_suggested_status: string;
   model_draft: string;

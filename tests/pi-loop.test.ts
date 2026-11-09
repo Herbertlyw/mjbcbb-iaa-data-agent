@@ -127,7 +127,9 @@ test("生产演示走 faux，真实 Pi 模式没有密钥时不会访问外部�
     assert.ok(names.includes("query"));
     assert.equal(job.events.filter((event) => event.type === "candidate_reviewed").length, 1);
     assert.equal(job.status, "partial");
-    assert.ok(job.analysis?.server_reasons.includes("calculation_lineage_unsupported"));
+    assert.ok(job.analysis?.server_reasons.includes("calculation_input_incomplete"));
+    assert.ok(!job.analysis?.server_reasons.includes("calculation_lineage_unsupported"));
+    assert.equal(job.analysis?.calculations.find((item) => Object.hasOwn(item.cells, "revenue_predicted"))?.cells.revenue_predicted, null);
     const bare = analyst(runtime);
     await assert.rejects(() => ensureAgent(bare, runtime.tools, { ...runtime.config, modelMode: "pi", piApiKey: "" }));
   });

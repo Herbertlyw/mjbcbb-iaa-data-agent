@@ -3,6 +3,8 @@ import test from "node:test";
 import { verifyCell, verifiedNullMarkerPreview } from "../src/evidence.js";
 import { loadKnowledge } from "../src/knowledge.js";
 import type { QueryResource } from "../src/types.js";
+import { queryCellInput } from "../src/query-cell-input.js";
+import { calculateResultCells } from "../src/result-cells.js";
 
 const contract = loadKnowledge("knowledge/harborlight").contract_by_table.get("fact_fox_daily_install")!.contract!;
 const base = "SELECT event_date, new_users, isNull(new_users) AS is_null FROM fact_fox_daily_install WHERE event_date >= toDate('2026-10-06') AND event_date <= toDate('2026-10-08') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads' ORDER BY event_date";
@@ -27,6 +29,26 @@ test("空值辅助投影逐行重算，仅按契约原字段交付", () => {
   nullable.rows[0]!.new_users = null; nullable.rows[0]!.is_null = 1;
   assert.equal(verifyCell(nullable, contract, { op: "count_null", column: "new_users", as: "n" }, 1)?.value, 1);
   assert.equal(verifyCell(nullable, contract, { op: "count_zero", column: "new_users", as: "n" }, 1)?.value, 1);
+});
+
+test("无别名的 ClickHouse NULL 标记按实际列名逐行核对并隐藏", () => {
+  const plain = structuredClone(source);
+  plain.sql = plain.sql.replace("isNull(new_users) AS is_null", "isNull(new_users)");
+  plain.result_semantics_version = 2;
+  plain.columns = ["event_date", "new_users", "isNull(new_users)"];
+  plain.rows = plain.rows.map(({ is_null, ...row }) => ({ ...row, "isNull(new_users)": is_null }));
+  assert.equal(verifyCell(plain, contract, sum, 220)?.value, 220);
+  assert.deepEqual(verifiedNullMarkerPreview(plain, contract), [{ event_date: "2026-10-06", new_users: 100 }, { event_date: "2026-10-07", new_users: 0 }, { event_date: "2026-10-08", new_users: 120 }]);
+  const table = queryCellInput(plain, contract);
+  assert.ok(table);
+  assert.equal(calculateResultCells(table, [sum])?.table.rows[0]?.total, "220");
+  const forged = structuredClone(plain); forged.rows[0]!["isNull(new_users)"] = 1;
+  const wrongName = structuredClone(plain); wrongName.columns[2] = "isNull(other)";
+  const missing = structuredClone(plain); delete missing.rows[0]!.new_users;
+  for (const invalid of [forged, wrongName, missing]) {
+    assert.equal(verifyCell(invalid, contract, sum, 220), null);
+    assert.equal(queryCellInput(invalid, contract), null);
+  }
 });
 
 test("CK 原生审查的明细及空值标记由 CK 投影与覆盖范围重核", () => {

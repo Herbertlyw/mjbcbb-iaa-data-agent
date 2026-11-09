@@ -16,6 +16,34 @@ import { analyst, ask, bindTables, withRuntime } from "./helpers.js";
 
 const WEEK = "event_date >= '2026-10-06' AND event_date <= '2026-10-12'";
 
+test("稀疏观测即使出现某天的真实零也不能证明未出现分组完整", () => {
+  const contract = JSON.parse(readFileSync(new URL("../knowledge/starhaven/contracts/fact_cohort_revenue_daily.json", import.meta.url), "utf8")) as DataContract;
+  assert.equal(contract.series?.coverage_semantics, "sparse_observations");
+  const row = Object.fromEntries(contract.series!.dimensions.map((name) => [name, "synthetic"]));
+  Object.assign(row, { revenue_date: "2026-11-05", revenue_usd: "0.000000", revenue_callback_count: "0" });
+  const result = assessCoverage(contract, {}, { start: "2026-11-05", end: "2026-11-05" }, [row]);
+  assert.equal(result.status, "unknown");
+  assert.match(result.reason, /稀疏观测/u);
+  assert.ok(result.zero_dates.includes("2026-11-05"));
+  assert.equal(coverageHasGap(result), true);
+  (contract.series as unknown as { coverage_semantics: string }).coverage_semantics = "unrecognized";
+  assert.equal(assessCoverage(contract, {}, { start: "2026-11-05", end: "2026-11-05" }, [row]).status, "unknown");
+});
+
+test("稀疏契约向模型明确说明缺组不等于零和覆盖完整", async () => {
+  const { createServer } = await import("node:net");
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  try {
+    const port = (server.address() as AddressInfo).port;
+    await withRuntime({ knowledgeDir: "knowledge/starhaven", businessEngine: "clickhouse", clickhouseUrl: `http://127.0.0.1:${port}`, clickhouseUser: "fictional_reader", clickhousePassword: "fictional-password", clickhouseDatabase: "synthetic", startWorker: false }, async (runtime) => {
+      const result = await runtime.tools.readDataContractView(analyst(runtime).session_id, { asset_id: "contract.fact_cohort_revenue_daily" });
+      assert.equal(result.ok, true); if (!result.ok) return;
+      assert.match(String(result.notice), /稀疏记录.*不证明为零或已完整覆盖/u);
+    });
+  } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+});
+
 test("覆盖分组与日期组合超预算时返回未知，不用截断分组冒充完整", async () => {
   await withRuntime({}, async (runtime) => {
     const contract = runtime.knowledge.contract_by_table.get("daily_installs")?.contract;
@@ -41,6 +69,25 @@ test("多维组合各自缺日时不能被完整的单维覆盖掩盖", () => {
   assert.equal(report.groups.filter((group) => group.dimension === "country_code" || group.dimension === "channel").every((group) => group.absent_dates.length === 0), true);
   assert.equal(report.groups.filter((group) => group.dimension === "country_code,channel").length, 4);
   assert.equal(coverageHasGap(report), true);
+});
+
+test("可空维度作为独立观测分组，不能与文本 NULL、缺字段或缺日混淆", () => {
+  const contract = JSON.parse(readFileSync(new URL("../knowledge/lumenfox/contracts/daily-installs.json", import.meta.url), "utf8")) as DataContract;
+  contract.columns = contract.columns.map((column) => column.name === "country_code" ? { ...column, type: "Nullable(String)" } : column);
+  const range = { start: "2026-10-06", end: "2026-10-07" };
+  const rows = ["2026-10-06", "2026-10-07"].flatMap((event_date) => [null, "NULL"].map((country_code) => ({ event_date, country_code, channel: "nebula_ads", new_users: 1 })));
+  const filters = { product_id: "starlane_drift", platform: "ios" };
+  const complete = assessCoverage(contract, filters, range, rows);
+  assert.equal(complete.status, "known");
+  assert.equal(coverageHasGap(complete), false);
+  assert.ok(complete.groups.some((group) => group.dimension === "country_code IS NULL" && group.value === "NULL"));
+  assert.ok(complete.groups.some((group) => group.dimension === "country_code" && group.value === "NULL"));
+  assert.equal(coverageHasGap(assessCoverage(contract, filters, range, rows.filter((row) => !(row.event_date === "2026-10-07" && row.country_code === null)))), true);
+  const missing = rows.map((row, index) => index === 0 ? Object.fromEntries(Object.entries(row).filter(([key]) => key !== "country_code")) : row);
+  assert.equal(assessCoverage(contract, filters, range, missing).status, "unknown");
+  const nonNullable = structuredClone(contract);
+  nonNullable.columns = nonNullable.columns.map((column) => column.name === "country_code" ? { ...column, type: "String" } : column);
+  assert.equal(assessCoverage(nonNullable, filters, range, rows).status, "unknown");
 });
 
 test("当前日期使用显式时区，模拟时钟和无效日期有明确边界", () => {
@@ -371,10 +418,16 @@ test("真实模式不注入演示槽位，预算耗尽和 mock 身份有边界",
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
     const port = (server.address() as AddressInfo).port;
     try {
-      const created = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+      const spoof = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-demo-actor": "demo-viewer" },
         body: JSON.stringify({ userId: "root", role: "analyst", title: "观察者" }),
+      });
+      assert.equal(spoof.status, 400);
+      const created = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-demo-actor": "demo-viewer" },
+        body: JSON.stringify({ title: "观察者" }),
       });
       const viewer = (await created.json()) as { role: string; actor_id: string; session_id: string };
       assert.equal(viewer.role, "viewer");

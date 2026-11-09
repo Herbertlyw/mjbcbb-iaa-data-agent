@@ -1,0 +1,7 @@
+# 广告商业化
+
+获客ua_channel_id与游戏内network_code不是同一维度。事件schema为synthetic_ad_v1。load_attempt、show_request、ready和展示分别计数。
+
+加载成功率=successful_load_attempts/completed_load_attempts，同时报告结束覆盖completed_load_attempts/load_attempts。ready_actions/show_actions不是show成功率。预加载/缓存可以跨日，因此不假定当日load始终多于show。
+
+广告ARPDAU、观看渗透率、eCPM分别定义。funnel没有获客计划维度，不准按日期国家拼接投放明细归因加载失败。

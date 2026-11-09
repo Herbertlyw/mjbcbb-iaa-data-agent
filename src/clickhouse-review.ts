@@ -28,8 +28,9 @@ export type SqlReviewPolicy = {
   maxRows: number;
   maxSqlBytes?: number;
 };
+export type ReviewedScan = { table: string; alias: string; start: string; end: string };
 export type SqlReviewDecision =
-  | { ok: true; sql: string; tables: string[]; reason: 'approved' }
+  | { ok: true; sql: string; tables: string[]; scans: ReviewedScan[]; reason: 'approved' }
   | { ok: false; sql: string; reason: string; detail?: string };
 
 type Failure = { reason: string; detail?: string };
@@ -45,7 +46,7 @@ const record = (value: unknown): Record<string, unknown> | null =>
 const LANGUAGE_OPERATORS = new Set([
   'and', 'or', 'not', 'equals', 'notequals', 'greater', 'greaterorequals',
   'less', 'lessorequals', 'in', 'notin', 'globalin', 'globalnotin', 'plus', 'minus', 'multiply',
-  'divide', 'modulo', 'negate', 'isnull', 'isnotnull',
+  'divide', 'modulo', 'negate', 'isnull', 'isnotnull', 'tuple',
 ]);
 const DANGEROUS_FUNCTIONS = new Set([
   'sleep', 'sleepeachrow', 'url', 's3', 'remote', 'remotesecure',
@@ -207,7 +208,7 @@ function sentinelProof(where: Expression | undefined, column: string, value: str
 }
 
 function partitionProof(where: Expression | undefined, partition: string, maxDays: number,
-  sourceAlias: string, allowUnqualified: boolean): Failure | null {
+  sourceAlias: string, allowUnqualified: boolean, capture?: (start: string, end: string) => void): Failure | null {
   if (!where) return fail('missing_partition_predicate');
   const conjuncts: Expression[] = [];
   const flatten = (expr: Expression): void => {
@@ -234,10 +235,23 @@ function partitionProof(where: Expression | undefined, partition: string, maxDay
     if (name === 'or' && containsPartition(term)) return fail('unsafe_partition_or');
     const [left, right] = term.arguments;
     if (!left || !right || !isPartition(left)) continue;
-    if (name === 'equals') {
+    // The parser removes the singleton IN parentheses: its RHS is the date
+    // literal / toDate call itself, not a one-element Tuple node.
+    const functionTuple = right.type === 'Function' && key(right.name) === 'tuple' && right.is_operator;
+    if (name === 'equals' || name === 'in' && !(right.type === 'Literal' && right.value_type === 'Tuple') && !functionTuple) {
       const day = dateValue(right);
       if (day === null) return fail('partition_literal_required');
       low = Math.max(low ?? day, day); high = Math.min(high ?? day, day);
+    } else if (['in', 'globalin'].includes(name) && functionTuple && right.type === 'Function') {
+      // Constant date expressions in an IN list are a parser Function tuple,
+      // not a Literal tuple. Bound the scan by the extrema only; the separate
+      // coverage proof must still reject sparse dates it cannot represent.
+      if (!right.arguments.length || right.arguments.length > 32) return fail('partition_literal_required');
+      const days = right.arguments.map(dateValue);
+      if (days.some(day => day === null)) return fail('partition_literal_required');
+      const values = days as number[];
+      low = Math.max(low ?? Math.min(...values), Math.min(...values));
+      high = Math.min(high ?? Math.max(...values), Math.max(...values));
     } else if (['in', 'globalin'].includes(name) && right.type === 'Literal' && right.value_type === 'Tuple'
       && Array.isArray(right.value)) {
       const days = right.value.map(item => dateValue({ type: 'Literal', value_type: item.value_type,
@@ -256,6 +270,7 @@ function partitionProof(where: Expression | undefined, partition: string, maxDay
   if (low === null || high === null) return fail('missing_partition_predicate');
   // Contradictory, fully proved bounds are a bounded (empty) scan.
   if (high - low + 1 > maxDays) return fail('scan_limit_exceeded');
+  capture?.(new Date(low * 86_400_000).toISOString().slice(0, 10), new Date(high * 86_400_000).toISOString().slice(0, 10));
   return null;
 }
 
@@ -298,14 +313,14 @@ type Source = { names: string[]; columns: readonly ColumnGrant[]; grant?: TableG
 type Projections = { columns: ColumnGrant[]; failure?: Failure; requiresAggregation?: boolean };
 
 function reviewQuery(query: SelectWithUnionQueryNode, policy: SqlReviewPolicy,
-  used: Set<string>, inheritedCtes = new Map<string, Projections>(), depth = 0, finalOutput = false): Projections {
+  used: Set<string>, inheritedCtes = new Map<string, Projections>(), depth = 0, finalOutput = false, scans: ReviewedScan[] = []): Projections {
   if (depth > 64) return { columns: [], failure: fail('sql_depth_limit') };
   if (query.selects.length > 8) return { columns: [], failure: fail('union_branch_limit') };
   let columns: ColumnGrant[] = [];
   let requiresAggregation = false;
   for (const branch of query.selects) {
     if (branch.type !== 'SelectQuery') return { columns: [], failure: fail('nested_set_operation_unsupported') };
-    const reviewed = reviewSelect(branch, policy, used, inheritedCtes, depth + 1, finalOutput);
+    const reviewed = reviewSelect(branch, policy, used, inheritedCtes, depth + 1, finalOutput, scans);
     if (reviewed.failure) return reviewed;
     // All branch expressions were authorized independently. Sensitive raw
     // projections never enter a derived source, even under a different alias.
@@ -316,7 +331,7 @@ function reviewQuery(query: SelectWithUnionQueryNode, policy: SqlReviewPolicy,
 }
 
 function reviewSelect(query: SelectQueryNode, policy: SqlReviewPolicy, used: Set<string>,
-  inheritedCtes: Map<string, Projections>, depth: number, finalOutput: boolean): Projections {
+  inheritedCtes: Map<string, Projections>, depth: number, finalOutput: boolean, scans: ReviewedScan[]): Projections {
   const deny = (failure: Failure): Projections => ({ columns: [], failure });
   if (query.recursive_with) return deny(fail('cte_lineage_unsupported'));
   const ctes = new Map(inheritedCtes);
@@ -325,7 +340,7 @@ function reviewSelect(query: SelectQueryNode, policy: SqlReviewPolicy, used: Set
       return deny(fail('cte_lineage_unsupported'));
     }
     if (ctes.has(item.name)) return deny(fail('cte_shadowing_unsupported'));
-    const reviewed = reviewQuery(item.subquery.query, policy, used, ctes, depth + 1);
+    const reviewed = reviewQuery(item.subquery.query, policy, used, ctes, depth + 1, false, scans);
     if (reviewed.failure) return reviewed;
     ctes.set(item.name, reviewed);
   }
@@ -342,7 +357,7 @@ function reviewSelect(query: SelectQueryNode, policy: SqlReviewPolicy, used: Set
     let source: Source;
     if (expression.subquery) {
       if (expression.subquery.query.type !== 'SelectWithUnionQuery') return deny(fail('derived_source_unresolved'));
-      const reviewed = reviewQuery(expression.subquery.query, policy, used, ctes, depth + 1);
+      const reviewed = reviewQuery(expression.subquery.query, policy, used, ctes, depth + 1, false, scans);
       if (reviewed.failure) return reviewed;
       source = { names: expression.subquery.alias ? [expression.subquery.alias] : [],
         columns: reviewed.columns, requiresAggregation: reviewed.requiresAggregation };
@@ -359,7 +374,8 @@ function reviewSelect(query: SelectQueryNode, policy: SqlReviewPolicy, used: Set
       const proof = kind === 'unpartitioned' ? null
         : kind === 'datetime' ? datetimeProof(predicate, grant.partitionColumn!, grant.maxScanDays, alias, elements.length === 1)
         : kind === 'sentinel' ? sentinelProof(predicate, grant.partitionColumn!, grant.sentinelValue!, alias, elements.length === 1)
-        : partitionProof(predicate, grant.partitionColumn!, grant.maxScanDays, alias, elements.length === 1);
+        : partitionProof(predicate, grant.partitionColumn!, grant.maxScanDays, alias, elements.length === 1,
+          (start, end) => scans.push({ table: fqn, alias, start, end }));
       if (proof) return deny({ ...proof, detail: `${fqn}${proof.detail ? `: ${proof.detail}` : ''}` });
       const required = requiredFilterProof(predicate,
         (grant.requiredFilters ?? []).filter(field => !(kind === 'datetime' && field === grant.partitionColumn)), alias);
@@ -433,12 +449,13 @@ function reviewSelect(query: SelectQueryNode, policy: SqlReviewPolicy, used: Set
     if (node.type === 'Subquery') {
       const subquery = node.query;
       if (record(subquery)?.type !== 'SelectWithUnionQuery') return fail('derived_source_unresolved');
-      return reviewQuery(subquery as SelectWithUnionQueryNode, policy, used, ctes, depth + 1).failure ?? null;
+      return reviewQuery(subquery as SelectWithUnionQueryNode, policy, used, ctes, depth + 1, false, scans).failure ?? null;
     }
     if (node.type === 'Function') {
       if (node.is_lambda_function) return fail('expression_capability_unsupported', 'lambda');
       const args = node.arguments as Expression[];
       const name = key(String(node.name));
+      if (name === 'tuple' && (!node.is_operator || args.length < 1 || args.length > 32)) return fail('expression_capability_unsupported', 'tuple');
       if (!LANGUAGE_OPERATORS.has(name) && !policy.allowedFunctions.some(allowed => key(allowed) === name)
           && !approvedAggregate(name, policy)) return fail('function_not_allowed', name);
       const safePii = piiDistinct.has(name) && args.length === 1 && args[0]?.type === 'Identifier';
@@ -561,7 +578,8 @@ export function reviewSql(sql: string, policy: SqlReviewPolicy): SqlReviewDecisi
   const parsed = parseReadOnlySql(sql, policy.maxSqlBytes ?? 64 * 1024);
   if ('failure' in parsed) return deny(parsed.failure);
   const used = new Set<string>();
-  const failure = reviewQuery(parsed.query, policy, used, undefined, 0, true).failure
+  const scans: ReviewedScan[] = [];
+  const failure = reviewQuery(parsed.query, policy, used, undefined, 0, true, scans).failure
     ?? (!used.size ? fail('physical_source_required') : undefined);
-  return failure ? deny(failure) : { ok: true, sql, tables: [...used], reason: 'approved' };
+  return failure ? deny(failure) : { ok: true, sql, tables: [...used], scans, reason: 'approved' };
 }

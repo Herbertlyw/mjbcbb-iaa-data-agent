@@ -1,5 +1,8 @@
 import { createServer, type ServerResponse } from "node:http";
 import { shiftSyntheticDates } from "../src/synthetic-clock.js";
+import { REAL_F_FACT_SQL, REAL_F_JOIN_SQL } from "./real-model-f-sql.js";
+import { REAL_A_PAYMENT_SQL, REAL_A_SPEND_SQL } from "./real-model-a-sql.js";
+import { GROUPED_A_PAYMENT_SQL, GROUPED_A_SPEND_SQL, GROUPED_A_PAYMENT_OPERATIONS, GROUPED_A_SPEND_OPERATIONS } from "./grouped-a-fixture.js";
 
 export interface ProtocolObservation {
   script: string;
@@ -76,8 +79,17 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
         response.end(JSON.stringify({ error: { message: "fictional rate limit" } }));
         return;
       }
+      if (["status-400", "status-401", "status-402", "status-403", "status-429"].includes(script)) {
+        response.writeHead(Number(script.slice(7)), { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "fictional private error text and sk-fictional-do-not-store" } }));
+        return;
+      }
       if (script === "hold") {
         response.writeHead(200, { "content-type": "text/event-stream" });
+        return;
+      }
+      if (script === "connection-reset") {
+        request.socket.destroy();
         return;
       }
       if (script === "disconnect") {
@@ -111,6 +123,10 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
       const turnTools = currentTurn(fixtureMessages).filter((message) => message.role === "tool");
       if (script === "clarify-retry") {
         writeTextStream(response, true, options.cacheHitTokens, JSON.stringify(fixtureMessages).includes("宿主反馈") ? "[[clarify]] 请说明分析范围？" : "[[result:res_invalid]]");
+        return;
+      }
+      if (script === "clarify-trailing-request") {
+        writeTextStream(response, true, options.cacheHitTokens, "[[clarify]] 目前我还没有生成任何本次查询结果，也不会编造数字。你想看的是交易或支付金额，还是广告变现？另外请一并说明时间范围，以及想按哪个维度看。");
         return;
       }
       if (messageText(currentTurn(fixtureMessages)[0] ?? { role: "user" }).includes("合成并发契约") && turnTools.length === 0) {
@@ -187,6 +203,8 @@ function adaptScriptedCalculation(args: string, turn: ProtocolMessage[]): string
     const identity = (id: string) => ({ resource_id: id, execution_id: ids.get(id) ?? "" });
     const ref = (item: Record<string, any>) => ({ ...identity(item.resource_id), column: item.cell, ...(item.aggregate ? { aggregate: item.aggregate } : { row: item.row ?? 0 }) });
     const source = (item: Record<string, any>) => ({ ...identity(item.resource_id), column: item.cell });
+    if (value.operation === "cells" && value.input?.resource_id) return JSON.stringify({ ...value, input: identity(value.input.resource_id) });
+    if (["add", "subtract", "multiply", "divide"].includes(value.operation) && value.left?.resource_id && value.right?.resource_id) return JSON.stringify({ ...value, left: { ...value.left, ...identity(value.left.resource_id) }, right: { ...value.right, ...identity(value.right.resource_id) } });
     if (value.operations) return JSON.stringify({ operation: "cells", input: identity(value.resource_id), operations: value.operations });
     if (value.transform) return JSON.stringify({ operation: "transform", input: identity(value.transform.resource_id), steps: value.transform.steps });
     if (value.align) return JSON.stringify({ operation: "align", align_op: value.align.op, keys: value.align.keys, left: source(value.align.left), right: source(value.align.right) });
@@ -218,8 +236,19 @@ function happyCall(messages: ProtocolMessage[]): { id: string; name: string; arg
     return defaultSteps(ids)[results.length - 1] ?? null;
   }
   const hasBase = earlierUsers.some((text) => text.includes("纸灯") && text.includes("美国") && text.includes("iOS") && text.includes("雾帆") && text.includes("2026-10-06") && text.includes("2026-10-12"));
+  if (latest.includes("合成真实F计数组合关联")) return scriptedRealF(turn, "join");
+  if (latest.includes("合成真实F分查并引用名称")) return scriptedRealF(turn, "separate");
+  if (latest.includes("合成补读支付契约恢复")) return scriptedContractRecovery(turn);
+  if (latest.includes("合成独立维表名称")) return scripted(turn, independentDimensionSteps);
+  if (latest.includes("合成真实聚合维表轨迹")) return scripted(turn, acceptanceJoinSteps);
+  if (latest.includes("合成真实A单值日期IN")) return scripted(turn, ids => missingSpendComparisonSteps(ids, [REAL_A_PAYMENT_SQL, REAL_A_SPEND_SQL]));
+  if (latest.includes("合成真实A分组聚合")) return scripted(turn, ids => groupedSpendComparisonSteps(ids,"query"));
+  if (latest.includes("合成真实A聚合计算后差额")) return scripted(turn, ids => groupedSpendComparisonSteps(ids,"calculation"));
+  if (latest.includes("支付流水和投放成本") && latest.includes("2026-10-08")) return scripted(turn, missingSpendComparisonSteps);
+  if (latest.includes("合成错误摘录修正")) return scriptedExcerptRecovery(turn);
   if (latest.includes("合成纠正查询错误")) return scriptedAllowError(turn, false);
   if (latest.includes("合成第二项未完成")) return scriptedAllowError(turn, true);
+  if (latest.includes("合成无别名空值标记")) return scripted(turn, (ids) => nullMarkerSteps(ids).map((step) => ({ ...step, arguments: step.arguments.replace(" AS is_null", "") })));
   if (latest.includes("合成空值标记投影")) return scripted(turn, nullMarkerSteps);
   if (latest.includes("合成条件阈值")) return scripted(turn, conditionalThresholdSteps);
   if (latest.includes("合成单资源比较")) return scripted(turn, sameResourceComparisonSteps);
@@ -570,6 +599,93 @@ function rawCrossFactSteps(ids: string[]) {
   ];
 }
 
+/** Fixed local protocol replay of the two SQL statements observed in the
+ * real-model task. IDs and execution IDs come from the current tool replies. */
+function missingSpendComparisonSteps(ids: string[], queries?: readonly [string, string]) {
+  const where = "event_date = toDate('2026-10-08') AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'";
+  return [
+    { id: "missing_payment_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_payment" }) },
+    { id: "missing_spend_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_spend" }) },
+    { id: "missing_payment_query", name: "query", arguments: JSON.stringify({ sql: queries?.[0] ?? `SELECT event_date, title_id, platform, country_code, channel_id, amount_usd, cost_usd FROM fact_fox_daily_payment WHERE ${where}` }) },
+    { id: "missing_spend_query", name: "query", arguments: JSON.stringify({ sql: queries?.[1] ?? `SELECT event_date, title_id, platform, country_code, channel_id, is_predicted, spend_usd, payback_usd FROM fact_fox_daily_spend WHERE ${where}` }) },
+    { id: "missing_difference", name: "calculate_session_cells", arguments: JSON.stringify({ arithmetic: { op: "subtract", left: { resource_id: ids[0] ?? "", cell: "amount_usd", row: 0 }, right: { resource_id: ids[1] ?? "", cell: "spend_usd", row: 0 } } }) },
+    { id: "missing_result", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", resource_ids: [ids[2] ?? ""] }) },
+  ];
+}
+
+/** Replay the real grouped A shape; all IDs and execution IDs are current. */
+function groupedSpendComparisonSteps(
+  ids: string[],
+  right: "query" | "calculation",
+) {
+  return [
+    {
+      id: "grouped_payment_contract",
+      name: "read_data_contract_view",
+      arguments: JSON.stringify({
+        asset_id: "contract.fact_fox_daily_payment",
+      }),
+    },
+    {
+      id: "grouped_spend_contract",
+      name: "read_data_contract_view",
+      arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_spend" }),
+    },
+    {
+      id: "grouped_payment_query",
+      name: "query",
+      arguments: JSON.stringify({ sql: GROUPED_A_PAYMENT_SQL }),
+    },
+    {
+      id: "grouped_spend_query",
+      name: "query",
+      arguments: JSON.stringify({ sql: GROUPED_A_SPEND_SQL }),
+    },
+    {
+      id: "grouped_spend_cells",
+      name: "calculate_session_cells",
+      arguments: JSON.stringify({
+        operation: "cells",
+        input: { resource_id: ids[1] ?? "" },
+        operations: GROUPED_A_SPEND_OPERATIONS,
+      }),
+    },
+    {
+      id: "grouped_payment_cells",
+      name: "calculate_session_cells",
+      arguments: JSON.stringify({
+        operation: "cells",
+        input: { resource_id: ids[0] ?? "" },
+        operations: GROUPED_A_PAYMENT_OPERATIONS,
+      }),
+    },
+    {
+      id: "grouped_difference",
+      name: "calculate_session_cells",
+      arguments: JSON.stringify({
+        operation: "subtract",
+        left: {
+          resource_id: ids[3] ?? "",
+          column: "payment_amount_sum",
+          row: 0,
+        },
+        right:
+          right === "query"
+            ? { resource_id: ids[1] ?? "", column: "spend_usd_sum", row: 0 }
+            : { resource_id: ids[2] ?? "", column: "spend_actual_sum", row: 0 },
+      }),
+    },
+    {
+      id: "grouped_record",
+      name: "update_analysis",
+      arguments: JSON.stringify({
+        suggested_status: "completed",
+        resource_ids: [ids[3] ?? "", ids[1] ?? "", ids[4] ?? "", ids[2] ?? ""],
+      }),
+    },
+  ];
+}
+
 function rawNullCrossFactSteps(ids: string[], partial = false) {
   const where = `${partial ? "event_date >= '2026-10-08' AND event_date <= '2026-10-09'" : "event_date = '2026-10-09'"} AND title_id = 'paper_lantern' AND platform = 'ios'`;
   return [
@@ -778,6 +894,76 @@ function scriptedAllowError(turn: ProtocolMessage[], unresolved: boolean): { id:
   const valid = { id: "retry_valid", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, new_users FROM fact_fox_daily_install WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-08' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'" }) };
   const calculate = { id: "retry_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "new_users", as: "total" }] }) };
   return (unresolved ? [contract, valid, invalid] : [contract, invalid, valid, calculate])[results.length] ?? null;
+}
+
+/** Replay C exactly: the identical query fails before a contract read, then succeeds. */
+function scriptedContractRecovery(turn: ProtocolMessage[]): { id: string; name: string; arguments: string } | null {
+  const results = turn.filter(message => message.role === "tool");
+  const ids = [...results.map(messageText).join("\n").matchAll(/resource_id[=:]"?(res_[0-9a-f-]{36})/g)].map(match => match[1] ?? "");
+  const steps = rawSingleComparisonSteps(ids);
+  const query = steps[1]!;
+  return [{ ...query, id: "missing_contract_query" }, steps[0]!, query, ...steps.slice(2)][results.length] ?? null;
+}
+
+/** Fixed protocol replay of the actual F SQL; it does not simulate autonomous planning. */
+function scriptedRealF(turn: ProtocolMessage[], mode: "join" | "separate"): { id: string; name: string; arguments: string } | null {
+  const results = turn.filter(message => message.role === "tool");
+  const ids: string[] = [];
+  for (const message of results) {
+    try {
+      const value = JSON.parse(messageText(message)) as Record<string, unknown>;
+      if (value.ok === false) return { id: "f_failed", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "failed", resource_ids: [] }) };
+      if (typeof value.resource_id === "string") ids.push(value.resource_id);
+    } catch { throw new Error("invalid_real_f_protocol_fixture"); }
+  }
+  const steps = [
+    { id: "f_fact_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "f_dimension_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.dim_fox_title" }) },
+    { id: "f_query", name: "query", arguments: JSON.stringify({ sql: mode === "join" ? REAL_F_JOIN_SQL : REAL_F_FACT_SQL }) },
+    ...(mode === "separate" ? [{ id: "f_name_query", name: "query", arguments: JSON.stringify({ sql: "SELECT title_id, title_name FROM dim_fox_title WHERE title_id = 'paper_lantern'" }) }] : []),
+    { id: "f_calculate", name: "calculate_session_cells", arguments: JSON.stringify({ resource_id: ids[0] ?? "", operations: [{ op: "sum", column: "new_users_sum", as: "total_users" }] }) },
+    { id: "f_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", resource_ids: mode === "join" ? [ids[1] ?? ""] : [ids[2] ?? "", ids[1] ?? ""] }) },
+  ];
+  return steps[results.length] ?? null;
+}
+
+function independentDimensionSteps(ids: string[]) {
+  return [
+    { id: "dimension_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.dim_fox_title" }) },
+    { id: "dimension_query", name: "query", arguments: JSON.stringify({ sql: "SELECT title_id, title_name FROM dim_fox_title ORDER BY title_id" }) },
+    { id: "dimension_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", resource_ids: [ids[0] ?? ""] }) },
+  ];
+}
+
+function acceptanceJoinSteps(ids: string[]) {
+  return [
+    { id: "acceptance_fact_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.fact_fox_daily_install" }) },
+    { id: "acceptance_dimension_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.dim_fox_title" }) },
+    { id: "acceptance_join_query", name: "query", arguments: JSON.stringify({ sql: "SELECT t.title_id AS title_id, t.title_name AS title_name, SUM(f.new_users) AS new_users_sum, COUNT(f.new_users) AS rows_non_null, countIf(f.new_users IS NULL) AS rows_null FROM fact_fox_daily_install AS f JOIN dim_fox_title AS t ON f.title_id = t.title_id WHERE f.event_date >= toDate('2026-10-06') AND f.event_date <= toDate('2026-10-12') AND f.country_code = 'JP' AND f.platform = 'ios' AND f.channel_id = 'mist_ads' AND t.title_id = 'paper_lantern' GROUP BY t.title_id, t.title_name" }) },
+    { id: "acceptance_join_record", name: "update_analysis", arguments: JSON.stringify({ suggested_status: "completed", resource_ids: [ids[0] ?? ""] }) },
+  ];
+}
+
+/** Replay the observed failure shape: a correct contract hash accompanied by
+ * a paraphrase falsely presented as an exact quote, then an explicit repair. */
+function scriptedExcerptRecovery(turn: ProtocolMessage[]): { id: string; name: string; arguments: string } | null {
+  const results = turn.filter((message) => message.role === "tool");
+  const resultText = results.map(messageText).join("\n");
+  const ids = [...resultText.matchAll(/resource_id[=:]"?(res_[0-9a-f-]{36})/g)].map((match) => match[1] ?? "");
+  let hash = "";
+  try { hash = String((JSON.parse(messageText(results[0]!)) as { content_hash?: string }).content_hash ?? ""); } catch { /* malformed fixture fails closed */ }
+  let calc: { resource_id?: string; execution_id?: string } = {};
+  try { calc = JSON.parse(messageText(results[4]!)) as typeof calc; } catch { /* malformed fixture fails closed */ }
+  const note = { scope: "合成纸灯单日收入与成本", grain: "日", expected_group_keys: [], unresolved_questions: [] };
+  const steps = [
+    sameResourceComparisonSteps(ids)[0]!,
+    { id: "bad_excerpt", name: "update_analysis", arguments: JSON.stringify({ ...note, source_excerpts: [{ asset_id: "contract.fact_fox_daily_payment", content_hash: hash, quote: "并非原文的伪造合成摘录" }] }) },
+    { id: "corrected_excerpt", name: "update_analysis", arguments: JSON.stringify({ ...note, source_excerpts: [] }) },
+    ...sameResourceComparisonSteps(ids).slice(1, 3),
+    { id: "bad_cell", name: "update_analysis", arguments: JSON.stringify({ ...note, result_cells: [{ resource_id: calc.resource_id, execution_id: calc.execution_id, row: 0, column: "difference" }] }) },
+    { id: "corrected_cell", name: "update_analysis", arguments: JSON.stringify({ ...note, result_cells: [] }) },
+  ];
+  return steps[results.length] ?? null;
 }
 
 function defaultSteps(ids: string[]) {

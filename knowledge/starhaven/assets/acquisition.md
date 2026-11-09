@@ -1,0 +1,5 @@
+# 获客、注册与安装
+
+af_registers是投放报表计数；media_registers来自媒体报表；unique_install_events是去重安装事件，包含重装。first_install_devices是首次安装设备，new_active_devices是行为D0。四者不强制相等。
+
+reinstall_events、late_install_events和unattributed_install_events是安装子集，不额外加到总安装。自然来源没有投放账户或计划，其成本可以是已观测0；unknown不当自然量。

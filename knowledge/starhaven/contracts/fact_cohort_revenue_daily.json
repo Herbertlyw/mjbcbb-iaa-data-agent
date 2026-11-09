@@ -1,0 +1,166 @@
+{
+  "asset_id": "contract.fact_cohort_revenue_daily",
+  "revision": "contract.fact_cohort_revenue_daily-v3",
+  "table": "fact_cohort_revenue_daily",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [
+    "revenue_date"
+  ],
+  "grain": [
+    "dataset_version",
+    "cohort_date",
+    "revenue_date",
+    "app_id",
+    "acquisition_country_code",
+    "ua_channel_id",
+    "campaign_id",
+    "ad_group_id",
+    "ad_id",
+    "creative_id",
+    "revenue_source"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "cohort_date",
+      "type": "Date",
+      "description": "cohort_date：UTC业务日期；角色由表粒度定义，不与其他日期混用。",
+      "nullable": false
+    },
+    {
+      "name": "revenue_date",
+      "type": "Date",
+      "description": "revenue_date：UTC业务日期；角色由表粒度定义，不与其他日期混用。",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "acquisition_country_code",
+      "type": "String",
+      "description": "首次获客时国家，设备在本包体内分群固定",
+      "nullable": false
+    },
+    {
+      "name": "ua_channel_id",
+      "type": "String",
+      "description": "获客渠道ID，与广告变现network不同",
+      "nullable": false
+    },
+    {
+      "name": "campaign_id",
+      "type": "Nullable(String)",
+      "description": "全局唯一计划ID；自然来源不适用",
+      "nullable": true
+    },
+    {
+      "name": "ad_group_id",
+      "type": "Nullable(String)",
+      "description": "广告组ID；没有此层或自然来源为NULL",
+      "nullable": true
+    },
+    {
+      "name": "ad_id",
+      "type": "Nullable(String)",
+      "description": "全局唯一广告ID；自然来源不适用",
+      "nullable": true
+    },
+    {
+      "name": "creative_id",
+      "type": "Nullable(String)",
+      "description": "素材ID，可被多个广告复用",
+      "nullable": true
+    },
+    {
+      "name": "revenue_source",
+      "type": "String",
+      "description": "sdk或af，不可相加称总收入",
+      "nullable": false
+    },
+    {
+      "name": "revenue_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "本来源本范围的观测美元收入",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "revenue_callback_count",
+      "type": "Nullable(UInt64)",
+      "description": "收入回调次数",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "age_days",
+      "type": "UInt32",
+      "description": "观察日距cohort锚点的自然日",
+      "nullable": false,
+      "unit": "天"
+    },
+    {
+      "name": "observed_at",
+      "type": "DateTime64(3, 'UTC')",
+      "description": "观测可见UTC时刻",
+      "nullable": false
+    },
+    {
+      "name": "completeness_state",
+      "type": "String",
+      "description": "complete或partial；完整性与freshness分开",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "cohort_date + revenue_date + app + 获客范围 + revenue_source。SDK和AF是两种观测不能相加；首版是广告回收，不默认为IAP流水。 dataset_version属于完整物理粒度和关联键，列入series.dimensions；日期分区仍只使用date_column。",
+  "aggregation_policy": {
+    "revenue_usd": [
+      "revenue_source"
+    ],
+    "revenue_callback_count": [
+      "revenue_source"
+    ]
+  },
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": [],
+  "series": {
+    "date_column": "revenue_date",
+    "dimensions": [
+      "dataset_version",
+      "cohort_date",
+      "app_id",
+      "acquisition_country_code",
+      "ua_channel_id",
+      "campaign_id",
+      "ad_group_id",
+      "ad_id",
+      "creative_id",
+      "revenue_source"
+    ],
+    "metrics": [
+      "revenue_usd",
+      "revenue_callback_count"
+    ],
+    "predicted_column": null,
+    "prediction_mode": "observed_only",
+    "coverage_semantics": "sparse_observations"
+  }
+}

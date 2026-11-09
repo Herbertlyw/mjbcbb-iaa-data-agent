@@ -1,0 +1,219 @@
+{
+  "asset_id": "contract.fact_ad_funnel_daily",
+  "revision": "contract.fact_ad_funnel_daily-v2",
+  "table": "fact_ad_funnel_daily",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [
+    "business_date"
+  ],
+  "grain": [
+    "dataset_version",
+    "business_date",
+    "app_id",
+    "activity_country_code",
+    "ad_format",
+    "network_code",
+    "event_schema_version"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "business_date",
+      "type": "Date",
+      "description": "business_date：UTC业务日期；角色由表粒度定义，不与其他日期混用。",
+      "nullable": false
+    },
+    {
+      "name": "app_id",
+      "type": "String",
+      "description": "虚构包体ID，一款产品的一个平台实例",
+      "nullable": false
+    },
+    {
+      "name": "activity_country_code",
+      "type": "String",
+      "description": "事件发生时国家；不能自动替代获客国家",
+      "nullable": false
+    },
+    {
+      "name": "ad_format",
+      "type": "String",
+      "description": "interstitial、rewarded或banner",
+      "nullable": false
+    },
+    {
+      "name": "network_code",
+      "type": "String",
+      "description": "虚构变现network，不是获客媒体",
+      "nullable": false
+    },
+    {
+      "name": "event_schema_version",
+      "type": "String",
+      "description": "synthetic_ad_v1",
+      "nullable": false
+    },
+    {
+      "name": "load_attempts",
+      "type": "Nullable(UInt64)",
+      "description": "开始的加载尝试",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "completed_load_attempts",
+      "type": "Nullable(UInt64)",
+      "description": "已结束加载尝试，含成功失败",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "successful_load_attempts",
+      "type": "Nullable(UInt64)",
+      "description": "已结束尝试中成功的数量",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "show_actions",
+      "type": "Nullable(UInt64)",
+      "description": "调用show次数",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "ready_actions",
+      "type": "Nullable(UInt64)",
+      "description": "调用show时ready次数，不是展示成功",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "completed_show_requests",
+      "type": "Nullable(UInt64)",
+      "description": "已结束的show请求",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "successful_show_requests",
+      "type": "Nullable(UInt64)",
+      "description": "已结束请求中展示成功数量",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "impressions",
+      "type": "Nullable(UInt64)",
+      "description": "本事实范围的曝光或展示；投放与游戏内广告不是同一事件",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "clicks",
+      "type": "Nullable(UInt64)",
+      "description": "本事实范围的点击次数，不是去重点击用户",
+      "nullable": true,
+      "unit": "计数"
+    },
+    {
+      "name": "revenue_usd",
+      "type": "Nullable(Decimal(24,6))",
+      "description": "本来源本范围的观测美元收入",
+      "nullable": true,
+      "unit": "USD"
+    },
+    {
+      "name": "completeness_state",
+      "type": "String",
+      "description": "complete或partial；完整性与freshness分开",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "date + app + country + ad_format + network + event_schema_version。新合成事件字典定义attempt/request身份；load、ready、show不能互换，不直接命名成通用fill rate。 dataset_version属于完整物理粒度和关联键，列入series.dimensions；日期分区仍只使用date_column。",
+  "aggregation_policy": {},
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": [],
+  "series": {
+    "date_column": "business_date",
+    "dimensions": [
+      "dataset_version",
+      "app_id",
+      "activity_country_code",
+      "ad_format",
+      "network_code",
+      "event_schema_version"
+    ],
+    "metrics": [
+      "load_attempts",
+      "completed_load_attempts",
+      "successful_load_attempts",
+      "show_actions",
+      "ready_actions",
+      "completed_show_requests",
+      "successful_show_requests",
+      "impressions",
+      "clicks",
+      "revenue_usd"
+    ],
+    "predicted_column": null,
+    "prediction_mode": "observed_only"
+  },
+  "derived_metrics": [
+    {
+      "id": "load_success_rate",
+      "label": "已结束加载尝试成功率",
+      "operation": "divide",
+      "numerator": "successful_load_attempts",
+      "denominator": "completed_load_attempts",
+      "prediction": "actual_only",
+      "unit": "比值",
+      "scope": "observed_partial_only"
+    },
+    {
+      "id": "load_completion_coverage",
+      "label": "加载尝试结束覆盖",
+      "operation": "divide",
+      "numerator": "completed_load_attempts",
+      "denominator": "load_attempts",
+      "prediction": "actual_only",
+      "unit": "比值",
+      "scope": "observed_partial_only"
+    },
+    {
+      "id": "action_ready_rate",
+      "label": "调用show时ready比例",
+      "operation": "divide",
+      "numerator": "ready_actions",
+      "denominator": "show_actions",
+      "prediction": "actual_only",
+      "unit": "比值",
+      "scope": "observed_partial_only"
+    },
+    {
+      "id": "show_success_rate",
+      "label": "已结束展示请求成功率",
+      "operation": "divide",
+      "numerator": "successful_show_requests",
+      "denominator": "completed_show_requests",
+      "prediction": "actual_only",
+      "unit": "比值",
+      "scope": "observed_partial_only"
+    }
+  ]
+}

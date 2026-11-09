@@ -17,6 +17,8 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AppConfig } from "./config.js";
 import { thinkingLevelMap } from "./model-catalog.js";
 import { registerOpenAICompatible, type ProviderLedger } from "./openai-gateway.js";
+import { DOMAIN_TOOL_NAMES } from "./domain-tool-names.js";
+import { trustedDeliveredToolCalls } from "./provider-context.js";
 import type { AnalysisRecord } from "./types.js";
 import { domainTools } from "./agent.js";
 import { planFromTranscript } from "./planner.js";
@@ -32,24 +34,16 @@ export const DATA_ANALYSIS_SYSTEM_PROMPT = `你是本地只读数据分析代理
 如果从用户原话和会话上下文已能判断缺少完成分析必需的信息，直接提出简洁的澄清问题；不要为猜测用户的产品或时间范围反复检索，也不要把搜索结果当成用户已选择的范围。
 追问只修改用户明确更改的条件，其他条件沿用可确定的上下文；不能确定时先澄清。
 需要事实时先搜索已发布资产；搜索结果已经足以定位资产时，直接读取所需表卡，不要对同一目标反复搜索。正文一次读不完就分页阅读，并在查询前读取对应数据契约。
-只有权限、封闭时间范围、粒度和已登记的连接键都成立时，才执行只读查询。不要使用编码、文件或 shell 工具。
-把四件事分开：值为 NULL 的缺失、根本没有行的日期、观测到的真实零、以及预测值。预测不计入实际，缺失和缺行不要补成零。
-通过会话资源回读和计算形成可溯源结论，并写明限制与覆盖。每个正式数字都要引用本次任务的查询或计算结果；对明细做合计、计数等计算时先使用 calculate_session_cells，提交最终结果资源，服务端会自行追溯其来源。分组查询若需要对结果列再次汇总，也可在 calculate_session_cells 中引用该查询资源及其输出列；只有范围、覆盖和血缘完整时才能交付，不能假设缺失分组为零。
+查询前优先选择能覆盖问题的最少必要表；契约视图已包含所需字段、口径和登记关系时，无需重复读取相同内容。搜索默认返回小页，确需更多再续页；批量读取资产时 asset_ids 和 requests 二选一，列表分页与正文分页不要混用。每轮只引用本轮取得的结果；计算结果直接在最终回答中引用，不要把计算资源写成 update_analysis 的原始查询单元。
+只执行当前契约授权的只读查询。事实表必须满足 must_filter 声明的封闭业务日期；无日期分区的维表可以独立读取完整键和名称，不要把契约有效期当作数据统计周期或产品上线日期筛选。维表名称的正式证据需要完整主键及已发布的键值快照。JOIN 必须满足登记键与粒度，涉及多个表时用表别名限定字段，避免同名列歧义。不要使用编码、文件或 shell 工具。
+比较不连续日期时，分别查询各个确定日期或连续区间并各自核验；不要将稀疏日期集合的最早和最晚日期当作中间所有日期均已查询或覆盖。
+把四件事分开：值为 NULL 的缺失、根本没有行的日期、观测到的真实零、以及预测值。预测不计入实际，缺失和缺行不要补成零。涉及缺失值或零分母的运算也应通过计算工具形成可引用的未知结果，不要只在模型解释中描述；分组计算要分别覆盖实际返回的各组，不要给不存在的组虚构数值。
+通过会话资源回读和计算形成可溯源结论，并写明限制与覆盖。每个正式数字和维表名称都要引用本次任务的来源；独立查询维表和事实表时，最终须分别用 [[result:资源ID]] 选择维表查询及事实/计算结果，仅引用数值计算不会自动选入独立维表。若已通过登记 JOIN 取得数值与维表名称的对应，应引用包含该对应关系的 JOIN 结果或其派生计算；独立查询不自动证明两次读取属于同一快照。align 对数值指标按键做四则运算，不是名称查找；不要对产品编码等文本列做 add。对明细做合计、计数等计算时先使用 calculate_session_cells，提交最终结果资源，服务端会自行追溯其来源。分组查询若需要对结果列再次汇总，也可在 calculate_session_cells 中引用该查询资源及其输出列；只有范围、覆盖和血缘完整时才能交付，不能假设缺失分组为零。
 update_analysis 只保存工作记录，不会结束任务。工作记录和摘录是可选的，不能确认引用的字段、执行号或原文时不要填写。完成分析后自然回复，在正文中用 [[result:资源ID]] 选择本次任务的最终结果；可以只选最终派生结果。需要比较两个已选择的计算单元时，可明确写 [[compare:左资源ID.列名,右资源ID.列名]]。宿主重新验证来源并生成经核验的数字和标签，模型解释本身不经逐句认证。
 证据不足、契约失效、新鲜度不是已发布的新鲜状态、结果被截断或连接不成立时，明确说明不能得出结论。
 完成状态只是建议。服务端会核对主体、会话、任务、契约哈希、新鲜度回执、截断和覆盖。模型草稿里的数字不会自动变成已验证事实。`;
 
 const CODING_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"]);
-const DOMAIN_TOOL_NAMES = [
-  "search_assets",
-  "read_asset",
-  "read_assets",
-  "read_data_contract_view",
-  "query",
-  "calculate_session_cells",
-  "read_session_resource",
-  "update_analysis",
-];
 
 const modelRequests = new Map<string, { knowledgeBodyChars: number; roles: string[] }>();
 
@@ -269,11 +263,12 @@ export async function openGovernedSession(input: {
     allowModelNetwork: false,
   });
   let model;
+  let sessionManager: SessionManager | undefined;
   const selectedModel = input.modelId ?? input.config.piModel;
   const selectedReasoning = input.reasoning ?? input.config.piReasoning;
   if (input.config.piProvider === "openai-compatible" || input.config.piProvider === "deepseek") {
     if (!input.ledger) throw new SessionSnapshotError("provider_unavailable", "OpenAI 兼容供应商缺少任务账本。不会改用 faux。");
-    registerOpenAICompatible(runtime, { ...input.config, piModel: selectedModel, piReasoning: selectedReasoning }, input.ledger);
+    registerOpenAICompatible(runtime, { ...input.config, piModel: selectedModel, piReasoning: selectedReasoning }, input.ledger, () => trustedDeliveredToolCalls(sessionManager?.getBranch() ?? []));
     model = runtime.getModel(input.config.piProvider, selectedModel);
   } else if (input.config.piProvider === "faux") {
     const faux = fauxProvider({
@@ -303,7 +298,7 @@ export async function openGovernedSession(input: {
     model = runtime.getModel("lumenfox-local", "deterministic-analyst");
   } else throw new SessionSnapshotError("provider_unavailable", "供应商未启用。");
   if (!model) throw new SessionSnapshotError("provider_unavailable", "ModelRuntime 没有返回可用模型。");
-  const sessionManager = input.snapshot ? openSnapshot(input.snapshot.jsonl, sessionDir, cwd) : SessionManager.create(cwd, sessionDir);
+  sessionManager = input.snapshot ? openSnapshot(input.snapshot.jsonl, sessionDir, cwd) : SessionManager.create(cwd, sessionDir);
   if (input.snapshot) {
     const leafId = sessionManager.getLeafId();
     const branchIds = sessionManager.getBranch().map((entry) => entry.id);
@@ -365,7 +360,7 @@ export async function openGovernedSession(input: {
     sessionManager,
     resourceLoader,
     noTools: "all",
-    tools: DOMAIN_TOOL_NAMES,
+    tools: [...DOMAIN_TOOL_NAMES],
     excludeTools: [...CODING_TOOLS],
     customTools: domainTools(input.appSessionId, input.tools, records).map(asDefinition),
   });

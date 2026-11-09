@@ -1,0 +1,63 @@
+{
+  "asset_id": "contract.dim_ad_account",
+  "revision": "contract.dim_ad_account-v1",
+  "table": "dim_ad_account",
+  "engine": "clickhouse-local",
+  "simulated": true,
+  "valid_from": "2020-01-01",
+  "valid_until": "2099-12-31",
+  "timezone": "UTC",
+  "freshness": {
+    "as_of": null,
+    "status": "unknown",
+    "note": "仅使用受控发布；本文件不授予fresh。"
+  },
+  "must_filter": [],
+  "grain": [
+    "dataset_version",
+    "account_id"
+  ],
+  "columns": [
+    {
+      "name": "dataset_version",
+      "type": "String",
+      "description": "不可变数据发布版本",
+      "nullable": false
+    },
+    {
+      "name": "account_id",
+      "type": "String",
+      "description": "全局唯一虚构广告账户ID；自然来源不适用",
+      "nullable": false
+    },
+    {
+      "name": "media_code",
+      "type": "String",
+      "description": "虚构投放媒体代码",
+      "nullable": false
+    },
+    {
+      "name": "account_name",
+      "type": "String",
+      "description": "虚构广告账户名称",
+      "nullable": false
+    },
+    {
+      "name": "account_currency",
+      "type": "String",
+      "description": "原币，USD或完全虚构的XCU",
+      "nullable": false
+    },
+    {
+      "name": "account_timezone",
+      "type": "String",
+      "description": "账户报表时区元数据；生成器从UTC过程汇总",
+      "nullable": false
+    }
+  ],
+  "sensitive_columns": [],
+  "notes": "account_id；个人合成ID全局唯一。账户和币种均虚构；首版报表统一UTC业务日，源时区保留元数据。",
+  "aggregation_policy": {},
+  "dataset_policy": "one_immutable_release_per_database",
+  "certified_metric_exclusions": []
+}

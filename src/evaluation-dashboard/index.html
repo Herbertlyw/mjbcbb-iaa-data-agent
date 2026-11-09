@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VV · 分析评测记录</title><link rel="stylesheet" href="/style.css"><script type="module" src="/app.js"></script></head>
+<body><div class="shell"><header class="top"><div><p class="eyebrow">VV DATA AGENT / EVALUATION</p><h1>分析评测记录</h1><p class="sub">合成问题、独立答案与真实调用轨迹，一起核对。</p></div><div class="live"><span></span>本机只读 <button id="refresh" type="button">刷新记录 ↻</button></div></header>
+<section class="metrics" aria-label="评测概览"><div><span>评测题次</span><strong id="total">—</strong></div><div><span>已核对正确</span><strong id="correct">—</strong></div><div><span>需检查或失败</span><strong id="issues">—</strong></div><div><span>真实派发</span><strong id="calls">—</strong></div></section>
+<main class="layout"><aside><div class="list-head"><div><p class="eyebrow">RUN HISTORY</p><h2>题目记录</h2></div><span id="updated">等待加载</span></div><label class="search"><span>⌕</span><input id="search" placeholder="搜索问题、状态或模型" aria-label="搜索评测记录"></label><div id="list" class="list" aria-live="polite"></div></aside>
+<article id="detail" class="detail"><div class="empty"><div>◈</div><h2>选择一条评测</h2><p>查看独立预期、正式交付、调用用量和工具轨迹。</p></div></article></main>
+<footer>只展示本机保存的合成评测记录。模型草稿、正式证据与独立核对结论分别标注；未知用量不会按零计算。</footer></div></body></html>

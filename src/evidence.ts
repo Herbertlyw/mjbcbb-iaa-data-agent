@@ -1,6 +1,8 @@
 import { exactCalendarDatePredicate } from "./sql.js";
+import { permitsAggregation } from "./aggregation-policy.js";
 import { queryEvidenceShape } from "./evidence-shape.js";
 import { clickHouseCoverageScope } from "./clickhouse-coverage-scope.js";
+import { joinIntegerType, joinIntegerValue } from "./join-integer.js";
 import type { DataContract, QueryResource } from "./types.js";
 
 export interface CellOperation {
@@ -33,10 +35,10 @@ export interface VerifiedCell {
 export function verifyCell(source: QueryResource, contract: DataContract, operation: CellOperation, storedValue: number): VerifiedCell | null {
   if (source.truncated || !source.complete_population || source.tables.length !== 1 || source.tables[0] !== contract.table || !contract.series) return null;
   const ast = queryEvidenceShape(source, contract); if (!ast) return null;
-  const native = source.engine === "clickhouse-local" && source.sql_review_engine === "clickhouse_ast_direct";
+  const native = source.engine === "clickhouse-local";
   const nativeScope = native ? clickHouseCoverageScope(source.sql, contract, source.time_range) : null;
   if (native) {
-    if (!nativeScope || Object.keys(nativeScope.inSets).length) return null;
+    if (!nativeScope || nativeScope.selectedDates || Object.keys(nativeScope.inSets).length) return null;
   }
   if (ast.with || ast.distinct || ast.groupby || ast.having || ast.limit || ast._next || ast.options) return null;
   const from = Array.isArray(ast.from) ? ast.from : [];
@@ -50,7 +52,7 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
   const nullMarkers: Array<{ output: string; field: string; inverted: boolean }> = [];
   const outputNames = new Set<string>();
   const contractNames = new Set(contract.columns.map((column) => column.name));
-  for (const projection of projections) {
+  for (const [projectionIndex, projection] of projections.entries()) {
     const item = record(projection); const expr = record(item?.expr);
     if (!item || !expr) return null;
     if (expr.type === "function") {
@@ -59,9 +61,14 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
       const functionName = pieces.length === 1 ? record(pieces[0])?.value : undefined;
       const args = record(expr.args);
       const arg = Array.isArray(args?.value) && args.value.length === 1 ? record(args.value[0]) : null;
-      const output = item.as;
       const fn = typeof functionName === "string" ? functionName.toLowerCase() : "";
-      if (source.engine !== "clickhouse-local" || !["isnull", "isnotnull"].includes(fn) || expr.over || args?.type !== "expr_list" || !arg || arg.type !== "column_ref" || typeof arg.column !== "string" || (arg.table && arg.table !== qualifier) || !contractNames.has(arg.column) || contract.sensitive_columns.includes(arg.column) || typeof output !== "string" || !/^[a-z_][a-z0-9_]*$/u.test(output) || contractNames.has(output) || outputNames.has(output)) return null;
+      if (source.engine !== "clickhouse-local" || !["isnull", "isnotnull"].includes(fn) || expr.over || args?.type !== "expr_list" || !arg || arg.type !== "column_ref" || typeof arg.column !== "string" || (arg.table && arg.table !== qualifier) || !contractNames.has(arg.column) || contract.sensitive_columns.includes(arg.column)) return null;
+      const unaliased = item.as === null || item.as === undefined;
+      const output = unaliased ? source.columns?.[projectionIndex] : item.as;
+      // Only accept ClickHouse's canonical output name for an unqualified
+      // direct field. Never infer a label from an arbitrary expression.
+      const canonicalName = fn === "isnull" ? "isNull" : "isNotNull";
+      if (typeof output !== "string" || (unaliased ? Boolean(arg.table) || output !== `${canonicalName}(${arg.column})` : !/^[a-z_][a-z0-9_]*$/u.test(output)) || contractNames.has(output) || outputNames.has(output)) return null;
       outputNames.add(output);
       nullMarkers.push({ output, field: arg.column, inverted: fn === "isnotnull" });
       continue;
@@ -121,6 +128,7 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
   const column = outputColumn ? projectedToField.get(outputColumn) ?? "" : null;
   const declared = column ? contract.columns.find((item) => item.name === column) : undefined;
   if (op !== "count_rows" && (!column || !outputColumn || !contract.series.metrics.includes(column) || !declared)) return null;
+  if (op === "sum" && column && !permitsAggregation(contract, column, filters, [], source.time_range)) return null;
   if (outputColumn && source.rows.some((row) => !Object.hasOwn(row, outputColumn))) return null;
   const predColumn = contract.series.predicted_column;
   if (predColumn && contract.series.prediction_mode || !predColumn && contract.series.prediction_values) return null;
@@ -151,9 +159,28 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
   else {
     const values = rows.map((row) => row[outputColumn!]);
     excludedNulls = values.filter((value) => value === null).length;
-    if (values.some((value) => value !== null && (typeof value !== "number" || !Number.isFinite(value)))) return null;
+    const integerType = declared && source.engine === "clickhouse-local" &&
+      source.column_types?.[outputColumn!] &&
+      source.column_types[outputColumn!]!.replace(/\s/gu, "").toLowerCase() === declared.type.replace(/\s/gu, "").toLowerCase()
+      ? joinIntegerType(declared.type) : null;
+    const normalizedDeclared = declared?.type.replace(/\s/gu, "").toLowerCase() ?? "";
+    const innerDeclared = normalizedDeclared.startsWith("nullable(") && normalizedDeclared.endsWith(")") ? normalizedDeclared.slice(9, -1) : normalizedDeclared;
+    const declaredDecimal = /^decimal\((\d+),(\d+)\)$/u.exec(innerDeclared);
+    const decimalType = declaredDecimal && source.engine === "clickhouse-local" &&
+      source.column_types?.[outputColumn!]?.replace(/\s/gu, "").toLowerCase() === declared!.type.replace(/\s/gu, "").toLowerCase() &&
+      source.decimal_types?.[`${contract.table}.${column}`]?.replace(/\s/gu, "").toLowerCase() === declared!.type.replace(/\s/gu, "").toLowerCase()
+      ? { precision: Number(declaredDecimal[1]), scale: Number(declaredDecimal[2]) } : null;
+    if (declaredDecimal && values.includes(null) && !normalizedDeclared.startsWith("nullable(")) return null;
+    // Counts may inspect 64-bit values without converting them to Number.
+    // Validate each non-null value against its physical integer width first.
+    if (values.some((value) => value !== null &&
+      (integerType && op !== "sum"
+        ? joinIntegerValue(value, integerType) === null
+        : decimalType && op !== "sum"
+          ? !validExactDecimal(value, decimalType.precision, decimalType.scale)
+          : (declaredDecimal && source.engine === "clickhouse-local") || typeof value !== "number" || !Number.isFinite(value)))) return null;
     if (op === "count_null") actual = excludedNulls;
-    else if (op === "count_zero") actual = values.filter((value) => value === 0).length;
+    else if (op === "count_zero") actual = values.filter((value) => value === 0 || (integerType && value === "0") || (decimalType && typeof value === "string" && /^-?0+(?:\.0+)?$/u.test(value))).length;
     else {
       const numeric = values.filter((value): value is number => typeof value === "number");
       if (!numeric.length) return null;
@@ -176,6 +203,14 @@ export function verifyCell(source: QueryResource, contract: DataContract, operat
     unit: op === "sum" ? (declared?.unit || "契约未声明") : "行",
     operation: op, prediction, predictionFilter: operation.predicted ?? "any", filters, range: source.time_range, sourceResourceId: source.resource_id, excludedNulls,
   };
+}
+
+function validExactDecimal(value: unknown, precision: number, scale: number): boolean {
+  if (typeof value !== "string" || value.length > 80 || !Number.isInteger(precision) || precision < 1 || precision > 38 || !Number.isInteger(scale) || scale < 0 || scale > precision) return false;
+  const match = /^-?(\d+)(?:\.(\d+))?$/u.exec(value);
+  if (!match || (match[2]?.length ?? 0) > scale) return false;
+  const coefficient = `${match[1]}${(match[2] ?? "").padEnd(scale, "0")}`.replace(/^0+/u, "") || "0";
+  return coefficient.length <= precision;
 }
 
 /** Present only unaliased contract columns after the NULL-marker checks.

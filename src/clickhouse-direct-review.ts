@@ -19,7 +19,7 @@ export function reviewDirectClickHouse(sql: string, contract: DataContract, rule
   try {
     const review = reviewSql(sql, clickHouseReviewPolicy(database, [rule], maxRows));
     if (!review.ok || review.tables.length !== 1 || review.tables[0] !== `${database}.${rule.table}`) return null;
-    return { sql, tables: [rule.table], columns: [], time_range: range, equalities: scope?.scope.equalities ?? {} };
+    return { sql, tables: [rule.table], columns: [], time_range: { ...range, ...(scope?.scope.selectedDates ? { selected_dates: scope.scope.selectedDates } : {}) }, equalities: scope?.scope.equalities ?? {} };
   } catch { return null; }
 }
 

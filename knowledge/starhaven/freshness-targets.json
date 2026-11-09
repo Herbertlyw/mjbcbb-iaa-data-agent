@@ -1,0 +1,7 @@
+{
+  "source": "starhaven-v1",
+  "engine": "clickhouse-local",
+  "valid_until": "2099-12-31",
+  "targets": [],
+  "note": "未绑定具体发布，拒绝在线新鲜度；生成器输出release-knowledge时填充。"
+}

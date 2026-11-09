@@ -253,14 +253,15 @@ const SNAPSHOT_MAX_BYTES = 2_000_000;
 const SNAPSHOT_IDENTIFIER = /^[a-z_][a-z0-9_]*$/u;
 
 function validSnapshotColumns(keys: unknown, columns: unknown): keys is string[] {
-  return Array.isArray(keys) && keys.length > 0 && keys.length <= 4 && new Set(keys).size === keys.length
+  return Array.isArray(keys) && keys.length > 0 && keys.length <= 8 && new Set(keys).size === keys.length
     && keys.every((item) => typeof item === "string" && SNAPSHOT_IDENTIFIER.test(item))
     && Array.isArray(columns) && columns.length >= keys.length && columns.length <= 16 && new Set(columns).size === columns.length
     && columns.every((item) => typeof item === "string" && SNAPSHOT_IDENTIFIER.test(item))
     && keys.every((key) => columns.includes(key));
 }
 
-function dimensionCellHash(table: string, keys: string[], values: string[], column: string, value: string): string {
+/** Bind one observed dimension value to its full declared key. */
+export function dimensionCellHash(table: string, keys: string[], values: string[], column: string, value: string | null): string {
   return createHash("sha256").update(JSON.stringify(["dimension_snapshot_cell_v1", table, keys, values, column, value])).digest("hex");
 }
 
@@ -323,12 +324,12 @@ async function probeDimensionSnapshot(
     if (bytes > SNAPSHOT_MAX_BYTES) return { ...base, failure_reason: "dimension_snapshot_byte_limit" };
     let tuple: unknown;
     try { tuple = JSON.parse(row.event_date) as unknown; } catch { return { ...base, failure_reason: "dimension_snapshot_row_invalid" }; }
-    if (!Array.isArray(tuple) || tuple.length !== columns.length || tuple.some((value) => typeof value !== "string" || Buffer.byteLength(value) > 4096)) return { ...base, failure_reason: "dimension_snapshot_row_invalid" };
-    const values = tuple as string[];
-    const keyValues = keys.map((name) => values[columns.indexOf(name)]!);
-    if (keyValues.some((value) => !value) || seenKeys.has(JSON.stringify(keyValues))) return { ...base, failure_reason: "dimension_key_not_unique" };
+    if (!Array.isArray(tuple) || tuple.length !== columns.length || tuple.some((value) => value !== null && (typeof value !== "string" || Buffer.byteLength(value) > 4096))) return { ...base, failure_reason: "dimension_snapshot_row_invalid" };
+    const values = tuple as Array<string | null>;
+    const keyValues = keys.map((name) => values[columns.indexOf(name)]);
+    if (keyValues.some((value) => typeof value !== "string" || !value) || seenKeys.has(JSON.stringify(keyValues))) return { ...base, failure_reason: "dimension_key_not_unique" };
     seenKeys.add(JSON.stringify(keyValues));
-    for (const [index, column] of columns.entries()) cells.push(dimensionCellHash(target.table, keys, keyValues, column, values[index]!));
+    for (const [index, column] of columns.entries()) cells.push(dimensionCellHash(target.table, keys, keyValues as string[], column, values[index] ?? null));
   }
   cells.sort();
   return { ...base, status: "fresh", as_of: probedAt, observed_rows: rows.length, snapshot_cell_hashes: cells, snapshot_hash: dimensionSnapshotHash(target.table, keys, columns, cells) };

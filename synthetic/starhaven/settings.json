@@ -1,0 +1,115 @@
+{
+  "schema_version": "starhaven-v1",
+  "profiles": {
+    "tiny": {
+      "days": 14,
+      "installs_per_app_day": 4
+    },
+    "demo": {
+      "days": 120,
+      "installs_per_app_day": 8
+    },
+    "standard": {
+      "days": 455,
+      "installs_per_app_day": 4
+    },
+    "scale": {
+      "days": 455,
+      "installs_per_app_day": 12,
+      "row_budget": 5000000
+    }
+  },
+  "games": [
+    {
+      "id": "gridfit",
+      "name": "拼格",
+      "kind": "drag",
+      "modes": "endless,level",
+      "english_name": "GridFit"
+    },
+    {
+      "id": "blockfall",
+      "name": "落块",
+      "kind": "fall",
+      "modes": "level",
+      "english_name": "BlockFall"
+    },
+    {
+      "id": "stackjoy",
+      "name": "叠叠乐",
+      "kind": "unconfirmed",
+      "modes": "unconfirmed",
+      "english_name": "StackJoy"
+    }
+  ],
+  "countries": [
+    [
+      "US",
+      "美国",
+      "美洲",
+      "T1"
+    ],
+    [
+      "JP",
+      "日本",
+      "亚洲",
+      "T1"
+    ],
+    [
+      "DE",
+      "德国",
+      "欧洲",
+      "T1"
+    ]
+  ],
+  "channels": [
+    [
+      "breeze",
+      "风帆广告",
+      "sim_breeze",
+      "paid_ads",
+      1
+    ],
+    [
+      "moss",
+      "苔原广告",
+      "sim_moss",
+      "paid_ads",
+      1
+    ],
+    [
+      "organic",
+      "自然来源",
+      "organic",
+      "organic",
+      0
+    ],
+    [
+      "unknown",
+      "归因未知",
+      "unknown",
+      "unknown",
+      null
+    ]
+  ],
+  "policy": {
+    "target_roi_pct": 100,
+    "warning_roi_pct": 80,
+    "minimum_sample_units": 5,
+    "test_window_days": 3,
+    "maturity_days": 3
+  },
+  "seed": 20261108,
+  "row_budget": 2000000,
+  "device_budget": 250000,
+  "simulation": {
+    "paid_cost_microusd": 1500000,
+    "retention_base_per_mille": 500,
+    "network_shift_offset": 40,
+    "budget_cut_offset": 45,
+    "pause_start_offset": 80,
+    "pause_days": 3,
+    "retention_shift_offset": 70
+  },
+  "application_name": "VV Data Agent"
+}

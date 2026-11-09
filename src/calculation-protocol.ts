@@ -17,7 +17,7 @@ const steps = Type.Array(Type.Union([
 ]), { minItems: 1, maxItems: 10 });
 const ops = ["cells", "add", "subtract", "multiply", "divide", "align", "transform"] as const;
 const allFields = ["input", "operations", "left", "right", "numerator", "denominator", "keys", "align_op", "steps"];
-const branch = (op: string, fields: string[]) => ({ properties: { operation: { const: op }, ...(["add", "subtract", "multiply"].includes(op) ? { left: ref, right: ref } : op === "align" ? { left: columnSource, right: columnSource } : {}) }, required: ["operation", ...fields], not: { anyOf: allFields.filter((field) => !fields.includes(field)).map((field) => ({ required: [field] })) } });
+const branch = (op: string, fields: string[], optional: string[] = []) => ({ properties: { operation: { const: op }, ...(["add", "subtract", "multiply"].includes(op) ? { left: ref, right: ref } : op === "align" ? { left: columnSource, right: columnSource } : {}) }, required: ["operation", ...fields], not: { anyOf: allFields.filter((field) => !fields.includes(field) && !optional.includes(field)).map((field) => ({ required: [field] })) } });
 
 /** One object root for OpenAI-compatible suppliers; the discriminated branches
  * are mutually exclusive both in the schema and in the runtime validator. */
@@ -30,7 +30,7 @@ export const calculationSchema = Type.Object({
   keys: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 3 })),
   align_op: Type.Optional(Type.Union([Type.Literal("add"), Type.Literal("subtract"), Type.Literal("multiply"), Type.Literal("divide")])),
   steps: Type.Optional(steps),
-}, { additionalProperties: false, anyOf: [branch("cells", ["input", "operations"]), ...["add", "subtract", "multiply"].map((op) => branch(op, ["left", "right"])), branch("divide", ["numerator", "denominator"]), branch("align", ["left", "right", "keys", "align_op"]), branch("transform", ["input", "steps"])] });
+}, { additionalProperties: false, anyOf: [branch("cells", ["input", "operations"]), ...["add", "subtract", "multiply"].map((op) => branch(op, ["left", "right"], ["input"])), branch("divide", ["numerator", "denominator"], ["input"]), branch("align", ["left", "right", "keys", "align_op"]), branch("transform", ["input", "steps"])] });
 
 type Lookup = (id: string) => Promise<{ ok: true; resource: SessionResource } | { ok: false; code: string }>;
 type Legacy = Parameters<ToolService["calculateSessionCells"]>[1];
@@ -60,13 +60,23 @@ export async function normalizeCalculation(value: unknown, lookup: Lookup): Prom
   }
   const left = (raw.operation === "divide" ? raw.numerator : raw.left) as Record<string, unknown>;
   const right = (raw.operation === "divide" ? raw.denominator : raw.right) as Record<string, unknown>;
+  // A redundant top-level input is meaningful only when it identifies both
+  // operands exactly. Never let a conflicting hint select or authorize data.
+  if (raw.input !== undefined) {
+    const hint = raw.input as Record<string, unknown>;
+    if ([left, right].some((operand) => operand.resource_id !== hint.resource_id || operand.execution_id !== hint.execution_id)) return { ok: false, code: "resource_execution_mismatch" };
+  }
   const a = await resolve(left); if (!a) return { ok: false, code: lookupError };
   const b = await resolve(right); if (!b) return { ok: false, code: lookupError };
   if (raw.operation === "align") return { ok: true, hashes, input: { align: { op: raw.align_op as NonNullable<Legacy["align"]>["op"], keys: raw.keys as string[], left: { resource_id: a.resource_id, cell: String(left.column) }, right: { resource_id: b.resource_id, cell: String(right.column) } } } };
   const convert = (v: Record<string, unknown>, source: SessionResource) => {
     const scalar = source.kind === "calculation" || source.kind === "arithmetic";
     if (scalar && v.row !== 0 && v.aggregate !== "sum") return null;
-    return { resource_id: source.resource_id, execution_id: String(v.execution_id), cell: String(v.column), ...(scalar ? {} : v.row !== undefined ? { row: Number(v.row) } : { aggregate: "sum" as const }) };
+    // Arithmetic responses expose their scalar as result.value, while the
+    // unified one-row result view calls the same cell "result". Accept that
+    // unambiguous response name only for arithmetic resources.
+    const cell = source.kind === "arithmetic" && v.column === "value" ? "result" : String(v.column);
+    return { resource_id: source.resource_id, execution_id: String(v.execution_id), cell, ...(scalar ? {} : v.row !== undefined ? { row: Number(v.row) } : { aggregate: "sum" as const }) };
   };
   const l = convert(left, a), r = convert(right, b);
   if (!l || !r) return { ok: false, code: "invalid_calculation_shape" };

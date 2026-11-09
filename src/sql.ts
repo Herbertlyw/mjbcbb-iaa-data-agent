@@ -45,7 +45,7 @@ export interface GuardedSql {
   sql: string;
   tables: string[];
   columns: string[];
-  time_range: { start: string; end: string };
+  time_range: { start: string; end: string; selected_dates?: string[] };
   equalities: Record<string, string>;
 }
 

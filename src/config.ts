@@ -1,8 +1,21 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { realpathSync } from "node:fs";
+import { visitorOriginSettings } from "./visitor-credentials.js";
 
 export interface AppConfig {
+  identityMode: "local_mock" | "controlled_visitor";
+  visitorOrigin: string;
+  visitorAllowLoopbackHttp: boolean;
+  visitorWindowMs: number;
+  visitorMaxAccepted: number;
+  visitorMaxActive: number;
+  visitorMaxGlobalActive: number;
+  visitorSessionWindowMs: number;
+  visitorMaxSessionsPerWindow: number;
+  visitorMaxSessions: number;
+  visitorBootstrapWindowMs: number;
+  visitorBootstrapMaxCreates: number;
   host: string;
   port: number;
   modelMode: "deterministic" | "pi";
@@ -66,6 +79,7 @@ export interface AppConfig {
   clickhousePassword: string;
   clickhouseDatabase: string;
   clickhouseMaxRowsToRead: number;
+  clickhouseLockedReadonly: boolean;
   compactionReserveTokens: number;
   compactionKeepRecentTokens: number;
   fauxContextWindow: number;
@@ -92,6 +106,18 @@ function integer(name: string, fallback: number): number {
 export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
   const modelMode = overrides.modelMode ?? (process.env.MODEL_MODE === "pi" ? "pi" : "deterministic");
   const config: AppConfig = {
+    identityMode: process.env.IDENTITY_MODE === "controlled_visitor" ? "controlled_visitor" : "local_mock",
+    visitorOrigin: process.env.VISITOR_ORIGIN || "",
+    visitorAllowLoopbackHttp: process.env.VISITOR_ALLOW_LOOPBACK_HTTP === "true",
+    visitorWindowMs: integer("VISITOR_WINDOW_MS", 900000),
+    visitorMaxAccepted: integer("VISITOR_MAX_ACCEPTED", 6),
+    visitorMaxActive: integer("VISITOR_MAX_ACTIVE", 1),
+    visitorMaxGlobalActive: integer("VISITOR_MAX_GLOBAL_ACTIVE", 10),
+    visitorSessionWindowMs: integer("VISITOR_SESSION_WINDOW_MS", 900000),
+    visitorMaxSessionsPerWindow: integer("VISITOR_MAX_SESSIONS_PER_WINDOW", 40),
+    visitorMaxSessions: integer("VISITOR_MAX_SESSIONS", 500),
+    visitorBootstrapWindowMs: integer("VISITOR_BOOTSTRAP_WINDOW_MS", 900000),
+    visitorBootstrapMaxCreates: integer("VISITOR_BOOTSTRAP_MAX_CREATES", 60),
     host: process.env.HOST || "127.0.0.1",
     port: integer("PORT", 4317),
     modelMode,
@@ -138,6 +164,7 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     clickhousePassword: process.env.CLICKHOUSE_PASSWORD || "",
     clickhouseDatabase: process.env.CLICKHOUSE_DATABASE || "",
     clickhouseMaxRowsToRead: integer("CLICKHOUSE_MAX_ROWS_TO_READ", 5_000_000),
+    clickhouseLockedReadonly: process.env.CLICKHOUSE_LOCKED_READONLY === "true",
     compactionReserveTokens: integer("COMPACTION_RESERVE_TOKENS", 2048),
     compactionKeepRecentTokens: integer("COMPACTION_KEEP_RECENT_TOKENS", 4096),
     fauxContextWindow: integer("PI_FAUX_CONTEXT_WINDOW", 128_000),
@@ -167,6 +194,15 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     startWorker: true,
   };
   const merged = { ...config, ...overrides };
+  if (process.env.IDENTITY_MODE && !["local_mock", "controlled_visitor"].includes(process.env.IDENTITY_MODE)) throw new Error("IDENTITY_MODE 无效。");
+  if (merged.identityMode === "controlled_visitor") {
+    if (merged.stateMode !== "mysql") throw new Error("受控访客模式需要 MySQL 权威状态，不能使用 SQLite 回退。");
+    if (merged.businessEngine !== "clickhouse" || !merged.clickhouseLockedReadonly) throw new Error("受控访客模式需要启用锁定只读配置的本机 ClickHouse。");
+    visitorOriginSettings(merged.visitorOrigin, merged.visitorAllowLoopbackHttp);
+    if (merged.visitorWindowMs < 1000 || merged.visitorWindowMs > 86400000 || [merged.visitorMaxAccepted, merged.visitorMaxActive, merged.visitorMaxGlobalActive].some(n => !Number.isSafeInteger(n) || n < 1 || n > 10000)) throw new Error("访客准入配置无效。");
+    if (merged.visitorSessionWindowMs < 1000 || merged.visitorSessionWindowMs > 86400000 || [merged.visitorMaxSessionsPerWindow, merged.visitorMaxSessions].some(n => !Number.isSafeInteger(n) || n < 1 || n > 10000)) throw new Error("访客会话配额配置无效。");
+    if (merged.visitorBootstrapWindowMs < 1000 || merged.visitorBootstrapWindowMs > 86400000 || merged.visitorBootstrapMaxCreates < 1 || merged.visitorBootstrapMaxCreates > 10000) throw new Error("访客引导配额配置无效。");
+  }
   if ((overrides.knowledgeDir || process.env.KNOWLEDGE_DIR) && !overrides.freshnessTargetsPath && !process.env.FRESHNESS_TARGETS_PATH) {
     merged.freshnessTargetsPath = path.join(merged.knowledgeDir, "freshness-targets.json");
   }

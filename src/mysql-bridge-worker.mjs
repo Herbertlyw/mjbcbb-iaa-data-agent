@@ -1,27 +1,86 @@
 import { parentPort, workerData } from "node:worker_threads";
 import mysql from "mysql2/promise";
 import { cacheUsageFromMetadata } from "./provider-usage-metadata.mjs";
+import { finishEventPage, finishHistoryPage } from "./history-page.mjs";
 
 const config = workerData;
-const pool = mysql.createPool({
+const poolOptions = {
   host: config.host,
   port: config.port,
   user: config.user,
   password: config.password,
   database: config.database,
   waitForConnections: true,
-  connectionLimit: 8,
   queueLimit: 64,
   connectTimeout: 5000,
   multipleStatements: false,
   dateStrings: true,
-});
+};
+// Preserve the original maximum of eight connections while preventing queued
+// session/job creation locks from consuming the connections used by leases,
+// cancellation and bounded history reads. Each creation kind has its own lane.
+const pool = mysql.createPool({ ...poolOptions, connectionLimit: 6 });
+const sessionCreationPool = mysql.createPool({ ...poolOptions, connectionLimit: 1 });
+const jobCreationPool = mysql.createPool({ ...poolOptions, connectionLimit: 1 });
 
 const TERMINAL = "('completed','needs_clarification','partial','failed','cancelled','timed_out')";
 // SYSDATE is evaluated by MySQL at execution time, not supplied by the worker.
 const DB_NOW_MS = "CAST(UNIX_TIMESTAMP(SYSDATE(3)) * 1000 AS UNSIGNED)";
 
 const statements = `
+  CREATE TABLE IF NOT EXISTS state_authority (
+    singleton TINYINT PRIMARY KEY,
+    mode VARCHAR(32) NULL,
+    policy_json TEXT NULL,
+    policy_version INT NULL,
+    policy_revision BIGINT UNSIGNED NOT NULL DEFAULT 1
+  ) ENGINE=InnoDB;
+  CREATE TABLE IF NOT EXISTS visitor_session_admissions (
+    visitor_id VARCHAR(64) NOT NULL,
+    creation_key VARCHAR(128) NOT NULL,
+    session_id VARCHAR(64) NOT NULL UNIQUE,
+    requested_title VARCHAR(255) NOT NULL,
+    accepted_ms BIGINT UNSIGNED NOT NULL,
+    PRIMARY KEY (visitor_id, creation_key),
+    KEY idx_session_admission_window (visitor_id, accepted_ms)
+  ) ENGINE=InnoDB;
+  CREATE TABLE IF NOT EXISTS state_authority_history (
+    revision BIGINT UNSIGNED PRIMARY KEY,
+    previous_policy TEXT NOT NULL,
+    next_policy TEXT NOT NULL,
+    changed_at_ms BIGINT UNSIGNED NOT NULL
+  ) ENGINE=InnoDB;
+  CREATE TABLE IF NOT EXISTS executor_activity (
+    kind VARCHAR(16) NOT NULL,
+    instance_id VARCHAR(64) NOT NULL,
+    last_seen_ms BIGINT UNSIGNED NOT NULL,
+    last_progress_ms BIGINT UNSIGNED NULL,
+    PRIMARY KEY (kind, instance_id),
+    KEY idx_executor_seen (kind, last_seen_ms)
+  ) ENGINE=InnoDB;
+  CREATE TABLE IF NOT EXISTS visitor_credentials (
+    visitor_id VARCHAR(64) PRIMARY KEY,
+    credential_hash CHAR(64) NOT NULL UNIQUE,
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    expires_at_ms BIGINT UNSIGNED NOT NULL,
+    revoked_at_ms BIGINT UNSIGNED NULL,
+    KEY idx_visitor_expiry (expires_at_ms)
+  ) ENGINE=InnoDB;
+  CREATE TABLE IF NOT EXISTS visitor_bootstrap_limit (
+    singleton TINYINT PRIMARY KEY,
+    window_start_ms BIGINT UNSIGNED NOT NULL,
+    accepted INT UNSIGNED NOT NULL
+  ) ENGINE=InnoDB;
+  CREATE TABLE IF NOT EXISTS visitor_admission_mutex (singleton TINYINT PRIMARY KEY) ENGINE=InnoDB;
+  CREATE TABLE IF NOT EXISTS visitor_admissions (
+    job_id VARCHAR(64) PRIMARY KEY,
+    visitor_id VARCHAR(64) NOT NULL,
+    idempotency_key VARCHAR(128) NOT NULL,
+    accepted_ms BIGINT UNSIGNED NOT NULL,
+    request_hash CHAR(64) NULL,
+    UNIQUE KEY uniq_visitor_idempotency (visitor_id, idempotency_key),
+    KEY idx_visitor_admissions_window (visitor_id, accepted_ms)
+  ) ENGINE=InnoDB;
   CREATE TABLE IF NOT EXISTS sessions (
     session_id VARCHAR(64) PRIMARY KEY,
     title VARCHAR(255) NOT NULL,
@@ -30,6 +89,9 @@ const statements = `
     slots_json LONGTEXT NULL,
     bindings_json LONGTEXT NOT NULL,
     created_at VARCHAR(40) NOT NULL
+  ) ENGINE=InnoDB;
+  CREATE TABLE IF NOT EXISTS history_writers (
+    kind VARCHAR(16) PRIMARY KEY
   ) ENGINE=InnoDB;
   CREATE TABLE IF NOT EXISTS session_asset_budgets (
     session_id VARCHAR(64) PRIMARY KEY,
@@ -67,6 +129,7 @@ const statements = `
     lease_until BIGINT NULL,
     cancel_requested TINYINT NOT NULL DEFAULT 0,
     created_at VARCHAR(40) NOT NULL,
+    queued_ms BIGINT UNSIGNED NULL,
     started_at VARCHAR(40) NULL,
     finished_at VARCHAR(40) NULL,
     model_id VARCHAR(128) NULL,
@@ -91,6 +154,7 @@ const statements = `
     event_type VARCHAR(64) NOT NULL,
     payload_json LONGTEXT NOT NULL,
     created_at VARCHAR(40) NOT NULL,
+    created_ms BIGINT UNSIGNED NULL,
     dispatched_at VARCHAR(40) NULL,
     dispatch_attempts INT NOT NULL DEFAULT 0,
     UNIQUE KEY uniq_outbox (job_id, event_type),
@@ -162,6 +226,20 @@ const ready = (async () => {
   for (const statement of statements.split(";").map((item) => item.trim()).filter(Boolean)) {
     await pool.query(statement);
   }
+  await pool.query("INSERT IGNORE INTO history_writers (kind) VALUES ('sessions'), ('jobs')");
+  await pool.query("INSERT IGNORE INTO visitor_bootstrap_limit (singleton, window_start_ms, accepted) VALUES (1, 0, 0)");
+  await pool.query("INSERT IGNORE INTO visitor_admission_mutex (singleton) VALUES (1)");
+  const [requestHashColumn] = await pool.query("SHOW COLUMNS FROM visitor_admissions LIKE 'request_hash'");
+  if (!requestHashColumn.length) {
+    try { await pool.query("ALTER TABLE visitor_admissions ADD COLUMN request_hash CHAR(64) NULL"); }
+    catch (error) { if (error?.code !== "ER_DUP_FIELDNAME") throw error; }
+  }
+  for (const [table,column] of [["executor_activity","last_progress_ms"],["jobs","queued_ms"],["outbox","created_ms"]]) {
+    const [existing] = await pool.query(`SHOW COLUMNS FROM ${table} LIKE ?`, [column]);
+    if (!existing.length) { try { await pool.query(`ALTER TABLE ${table} ADD COLUMN ${column} BIGINT UNSIGNED NULL`); } catch (error) { if (error?.code !== "ER_DUP_FIELDNAME") throw error; } }
+  }
+  const [authorityRevision] = await pool.query("SHOW COLUMNS FROM state_authority LIKE 'policy_revision'");
+  if (!authorityRevision.length) { try { await pool.query("ALTER TABLE state_authority ADD COLUMN policy_revision BIGINT UNSIGNED NOT NULL DEFAULT 1"); } catch (error) { if (error?.code !== "ER_DUP_FIELDNAME") throw error; } }
   for (const [column, definition] of [["tool_call_count", "INT NOT NULL DEFAULT 0"], ["tool_call_limit", "INT NULL"]]) {
     const [existing] = await pool.query("SHOW COLUMNS FROM jobs LIKE ?", [column]);
     if (!existing.length) {
@@ -169,11 +247,39 @@ const ready = (async () => {
       catch (error) { if (error?.code !== "ER_DUP_FIELDNAME") throw error; }
     }
   }
+  // An insertion sequence freezes page membership even for equal timestamps
+  // and later backdated imports. This does not freeze mutable status/title.
+  for (const table of ["sessions", "jobs"]) {
+    const [columns] = await pool.query(`SHOW COLUMNS FROM ${table} LIKE 'history_seq'`);
+    if (!columns.length) {
+      try { await pool.query(`ALTER TABLE ${table} ADD COLUMN history_seq BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, ADD UNIQUE KEY idx_history_seq (history_seq)`); }
+      catch (error) { if (error?.code !== "ER_DUP_FIELDNAME") throw error; }
+    }
+    const [actual] = await pool.query(`SHOW COLUMNS FROM ${table} LIKE 'history_seq'`);
+    if (!actual[0]?.Extra?.includes("auto_increment")) throw new Error("history_schema_invalid");
+  }
+  for (const [table, name, columns] of [
+    ["sessions", "idx_sessions_history", "actor_id, created_at, session_id"],
+    ["jobs", "idx_jobs_history", "session_id, created_at, job_id"],
+    ["jobs", "idx_jobs_active", "session_id, status, created_at, job_id"],
+    ["jobs", "idx_jobs_queue_age", "status, queued_ms"],
+    ["outbox", "idx_outbox_age", "dispatched_at, created_ms"],
+  ]) {
+    const [existing] = await pool.query(`SHOW INDEX FROM ${table} WHERE Key_name = ?`, [name]);
+    if (!existing.length) {
+      try { await pool.query(`CREATE INDEX ${name} ON ${table} (${columns})`); }
+      catch (error) { if (error?.code !== "ER_DUP_KEYNAME") throw error; }
+    }
+    const [actual] = await pool.query(`SHOW INDEX FROM ${table} WHERE Key_name = ?`, [name]);
+    if (actual.sort((a, b) => a.Seq_in_index - b.Seq_in_index).map(row => row.Column_name).join(", ") !== columns) throw new Error("history_schema_invalid");
+  }
+  await initializeAuthority();
 })();
 
 parentPort.on("message", (message) => {
   void ready.then(() => handle(message)).catch((error) => {
-    message.port.postMessage({ ok: false, name: "schema_failed", message: error instanceof Error ? error.message : "schema failed" });
+    const name = error instanceof Error && ["authority_mode_conflict", "authority_policy_conflict", "authority_legacy_data"].includes(error.message) ? error.message : "schema_failed";
+    message.port.postMessage({ ok: false, name, message: "state initialization failed" });
   });
 });
 
@@ -192,13 +298,59 @@ async function handle(message) {
 
 async function dispatch(op, args) {
   if (op === "ping") return "ok";
+  if (op === "executorHeartbeat") {
+    const [kind, id] = args;
+    if (!['worker', 'dispatcher'].includes(kind) || !/^[0-9a-f-]{36}$/u.test(id)) throw new Error('invalid_executor_identity');
+    await pool.query(`INSERT INTO executor_activity (kind,instance_id,last_seen_ms) VALUES (?,?,${DB_NOW_MS}) ON DUPLICATE KEY UPDATE last_seen_ms=${DB_NOW_MS}`, [kind,id]);
+    return;
+  }
+  if (op === "executorStop") {
+    const [kind,id] = args;
+    if (!['worker', 'dispatcher'].includes(kind) || !/^[0-9a-f-]{36}$/u.test(id)) throw new Error('invalid_executor_identity');
+    await pool.query('DELETE FROM executor_activity WHERE kind=? AND instance_id=?', [kind,id]);
+    return;
+  }
+  if (op === "executorProgress") {
+    const [kind,id] = args;
+    if (!['worker','dispatcher'].includes(kind) || !/^[0-9a-f-]{36}$/u.test(id)) throw new Error('invalid_executor_identity');
+    await pool.query(`UPDATE executor_activity SET last_progress_ms=${DB_NOW_MS} WHERE kind=? AND instance_id=?`, [kind,id]);
+    return;
+  }
+  if (op === "executorProgressSummary") {
+    const [maxAge,stall] = args;
+    if (!Number.isSafeInteger(maxAge) || maxAge < 1000 || maxAge > 60000 || !Number.isSafeInteger(stall) || stall < maxAge || stall > 3600000) throw new Error('invalid_executor_age');
+    const [rows] = await pool.query(`SELECT
+      EXISTS(SELECT 1 FROM executor_activity WHERE kind='worker' AND last_seen_ms>${DB_NOW_MS}-? AND last_progress_ms>${DB_NOW_MS}-?) AS worker_progress,
+      EXISTS(SELECT 1 FROM executor_activity WHERE kind='dispatcher' AND last_seen_ms>${DB_NOW_MS}-? AND last_progress_ms>${DB_NOW_MS}-?) AS dispatcher_progress,
+      EXISTS(SELECT 1 FROM jobs WHERE status='queued' AND (queued_ms IS NULL OR queued_ms<${DB_NOW_MS}-?)) AS waiting,
+      EXISTS(SELECT 1 FROM jobs WHERE status='running' AND lease_until>${DB_NOW_MS}) AS busy,
+      EXISTS(SELECT 1 FROM outbox o JOIN jobs j ON j.job_id=o.job_id WHERE o.dispatched_at IS NULL AND j.status='queued' AND (o.created_ms IS NULL OR o.created_ms<${DB_NOW_MS}-?)) AS pending`, [maxAge,stall,maxAge,stall,stall,stall]);
+    const r=rows[0]; const worker = !Number(r.waiting) ? (Number(r.busy) ? 'busy' : 'idle') : Number(r.busy) ? 'busy_waiting' : Number(r.worker_progress) ? 'waiting' : 'stalled';
+    const dispatcher = !Number(r.pending) ? 'idle' : Number(r.dispatcher_progress) ? 'waiting' : 'stalled';
+    return {worker,dispatcher,blocked:worker==='stalled' || dispatcher==='stalled'};
+  }
+  if (op === "executorReadiness") {
+    const [maxAge] = args;
+    if (!Number.isSafeInteger(maxAge) || maxAge < 1000 || maxAge > 60000) throw new Error('invalid_executor_age');
+    const [rows] = await pool.query(`SELECT DISTINCT kind FROM executor_activity WHERE last_seen_ms > ${DB_NOW_MS} - ?`, [maxAge]);
+    return { worker: rows.some(row => row.kind === 'worker'), dispatcher: rows.some(row => row.kind === 'dispatcher') };
+  }
   if (op === "close") {
-    await pool.end();
+    await Promise.all([pool.end(), sessionCreationPool.end(), jobCreationPool.end()]);
     return "closed";
   }
-  if (op === "createSession") return createSession(args[0]);
+  if (op === "createSession") return createSession(args[0], args[1]);
+  if (op === "createVisitor") return createVisitor(args[0]);
+  if (op === "lookupVisitor") return lookupVisitor(args[0]);
+  if (op === "revokeVisitor") return revokeVisitor(args[0]);
+  if (op === "recoverVisitorSubmission") return recoverVisitorSubmission(args[0], args[1], args[2]);
   if (op === "getSession") return getSession(args[0]);
   if (op === "listSessions") return listSessions();
+  if (op === "listSessionSummaries") return listSessionSummaries(args[0], args[1]);
+  if (op === "getSessionMetadata") return getSessionMetadata(args[0], args[1]);
+  if (op === "listJobSummaries") return listJobSummaries(args[0], args[1], args[2]);
+  if (op === "getJobHead") return getJobHead(args[0]);
+  if (op === "readJobEvents") return readJobEvents(args[0], args[1]);
   if (op === "saveSession") return saveSession(args[0], args[1]);
   if (op === "upsertContractBinding") return upsertContractBinding(args[0], args[1], args[2], args[3], args[4]);
   if (op === "addMessage") return addMessage(args[0]);
@@ -234,9 +386,10 @@ async function dispatch(op, args) {
   throw new Error(`未知状态操作 ${op}`);
 }
 
-async function transaction(fn) {
-  const conn = await pool.getConnection();
+async function transaction(fn, target = pool, readCommitted = false) {
+  const conn = await target.getConnection();
   try {
+    if (readCommitted) await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
     await conn.beginTransaction();
     const value = await fn(conn);
     await conn.commit();
@@ -249,12 +402,111 @@ async function transaction(fn) {
   }
 }
 
-async function createSession(session) {
-  await pool.query(
-    "INSERT INTO sessions (session_id, title, role, actor_id, slots_json, bindings_json, created_at) VALUES (?, ?, ?, ?, ?, '[]', ?)",
-    [session.session_id, session.title, session.role, session.actor_id || "demo-analyst", JSON.stringify(session.slots), session.created_at],
-  );
-  return session;
+const authority = config.authority ?? { mode: "local_mock" };
+function canonicalPolicy(policy) {
+  const fields = ["version", "windowMs", "maxAccepted", "maxActive", "maxGlobalActive", "sessionWindowMs", "maxSessionsPerWindow", "maxSessions", "bootstrapWindowMs", "bootstrapMaxCreates"];
+  if (!policy || fields.some(key => !Number.isSafeInteger(policy[key])) || policy.version !== 1 || ["windowMs", "sessionWindowMs", "bootstrapWindowMs"].some(key => policy[key] < 1000 || policy[key] > 86400000) || ["maxAccepted", "maxActive", "maxGlobalActive", "maxSessionsPerWindow", "maxSessions", "bootstrapMaxCreates"].some(key => policy[key] < 1 || policy[key] > 10000)) throw new Error("authority_policy_invalid");
+  return JSON.stringify(Object.fromEntries(fields.map(key => [key, policy[key]])));
+}
+async function initializeAuthority() {
+  if (!["local_mock", "controlled_visitor"].includes(authority.mode)) throw new Error("authority_mode_conflict");
+  const policy = authority.mode === "controlled_visitor" ? canonicalPolicy(authority.policy) : null;
+  await pool.query("INSERT IGNORE INTO state_authority (singleton,mode,policy_json,policy_version) VALUES (1,NULL,NULL,NULL)");
+  await transaction(async conn => {
+    const [rows] = await conn.query("SELECT mode,policy_json,policy_version FROM state_authority WHERE singleton=1 FOR UPDATE");
+    const row = rows[0];
+    if (row.mode === null) {
+      const [legacy] = await conn.query("SELECT (SELECT COUNT(*) FROM sessions) AS sessions, (SELECT COUNT(*) FROM jobs) AS jobs, (SELECT COUNT(*) FROM visitor_credentials) AS visitors, (SELECT COUNT(*) FROM sessions WHERE actor_id LIKE 'vis\\_%') AS visitor_sessions");
+      if ((authority.mode === "controlled_visitor" && (Number(legacy[0].sessions) || Number(legacy[0].jobs) || Number(legacy[0].visitors))) || (authority.mode === "local_mock" && (Number(legacy[0].visitor_sessions) || Number(legacy[0].visitors)))) throw new Error("authority_legacy_data");
+      await conn.query("UPDATE state_authority SET mode=?,policy_json=?,policy_version=? WHERE singleton=1", [authority.mode,policy,policy ? 1 : null]);
+    } else if (row.mode !== authority.mode) throw new Error("authority_mode_conflict");
+    else if ((row.policy_json ?? null) !== policy || (row.policy_version ?? null) !== (policy ? 1 : null)) throw new Error("authority_policy_conflict");
+  });
+}
+async function requireAuthority(conn) {
+  const [rows] = await conn.query("SELECT mode,policy_json,policy_version FROM state_authority WHERE singleton=1 FOR SHARE");
+  const row = rows[0];
+  if (!row || row.mode !== authority.mode) throw new Error("authority_mode_conflict");
+  if (authority.mode === "controlled_visitor") {
+    const policy = canonicalPolicy(authority.policy);
+    if (row.policy_json !== policy || Number(row.policy_version) !== 1) throw new Error("authority_policy_conflict");
+    return JSON.parse(policy);
+  }
+  return null;
+}
+async function requireVisitor(conn, input) {
+  if (!input || !/^vis_[0-9a-f]{32}$/u.test(input.visitorId) || !/^[0-9a-f]{64}$/u.test(input.credentialHash ?? "")) { const e = new Error("visitor_required"); e.name = "visitor_required"; throw e; }
+  const [visitors] = await conn.query(`SELECT visitor_id FROM visitor_credentials WHERE visitor_id=? AND credential_hash=? AND revoked_at_ms IS NULL AND expires_at_ms > ${DB_NOW_MS} FOR UPDATE`, [input.visitorId, input.credentialHash]);
+  if (!visitors[0]) { const e = new Error("visitor_expired"); e.name = "visitor_expired"; throw e; }
+}
+async function recoverVisitorSubmission(sessionId, admission, key) {
+  return transaction(async conn => {
+    const policy = await requireAuthority(conn);
+    if (!policy) throw new Error("authority_mode_conflict");
+    await requireVisitor(conn, admission);
+    if (!/^[0-9a-f]{64}$/u.test(admission.requestHash ?? "")) throw new Error("invalid_request_fingerprint");
+    const [rows] = await conn.query("SELECT a.job_id,a.request_hash,j.session_id FROM visitor_admissions a JOIN jobs j ON j.job_id=a.job_id WHERE a.visitor_id=? AND a.idempotency_key=?", [admission.visitorId,key]);
+    if (!rows[0]) return null;
+    if (!rows[0].request_hash || rows[0].session_id !== sessionId || rows[0].request_hash !== admission.requestHash) { const e = new Error("idempotency_conflict"); e.name = "idempotency_conflict"; throw e; }
+    return getJobOn(conn, String(rows[0].job_id));
+  }, pool, true);
+}
+
+async function createVisitor(input) {
+  if (!/^vis_[0-9a-f]{32}$/u.test(input.visitorId) || !/^[0-9a-f]{64}$/u.test(input.credentialHash) || !Number.isSafeInteger(input.ttlMs) || input.ttlMs < 1 || input.ttlMs > 31 * 86400000 || !Number.isSafeInteger(input.windowMs) || input.windowMs < 1 || input.windowMs > 86400000 || !Number.isSafeInteger(input.maxCreates) || input.maxCreates < 1 || input.maxCreates > 10000) throw new Error("invalid_visitor_create");
+  return transaction(async conn => {
+    const policy = await requireAuthority(conn);
+    if (!policy) throw new Error("authority_mode_conflict");
+    const [limits] = await conn.query("SELECT window_start_ms, accepted FROM visitor_bootstrap_limit WHERE singleton=1 FOR UPDATE");
+    const [times] = await conn.query(`SELECT ${DB_NOW_MS} AS now_ms`);
+    const now = Number(times[0].now_ms), row = limits[0];
+    const start = Number(row.window_start_ms), count = now - start >= policy.bootstrapWindowMs || now < start ? 0 : Number(row.accepted);
+    if (count >= policy.bootstrapMaxCreates) return null;
+    const expires = now + input.ttlMs;
+    await conn.query("UPDATE visitor_bootstrap_limit SET window_start_ms=?, accepted=? WHERE singleton=1", [count === 0 ? now : start, count + 1]);
+    await conn.query("INSERT INTO visitor_credentials (visitor_id,credential_hash,created_at_ms,expires_at_ms) VALUES (?,?,?,?)", [input.visitorId,input.credentialHash,now,expires]);
+    return {visitor_id:input.visitorId,expires_at_ms:expires};
+  }, sessionCreationPool);
+}
+
+async function lookupVisitor(hash) {
+  if (typeof hash !== "string" || !/^[0-9a-f]{64}$/u.test(hash)) return null;
+  const [rows] = await pool.query(`SELECT visitor_id, expires_at_ms FROM visitor_credentials WHERE credential_hash=? AND revoked_at_ms IS NULL AND expires_at_ms > ${DB_NOW_MS}`, [hash]);
+  return rows[0] ? {visitor_id:String(rows[0].visitor_id),expires_at_ms:Number(rows[0].expires_at_ms)} : null;
+}
+
+async function revokeVisitor(id) {
+  const [result] = await pool.query(`UPDATE visitor_credentials SET revoked_at_ms=${DB_NOW_MS} WHERE visitor_id=? AND revoked_at_ms IS NULL`, [id]);
+  return result.affectedRows === 1;
+}
+
+async function createSession(session, admission) {
+  return transaction(async (conn) => {
+    const policy = await requireAuthority(conn);
+    if (policy) {
+      await requireVisitor(conn, admission);
+      if (session.actor_id !== admission.visitorId || session.role !== "analyst" || typeof admission.creationKey !== "string" || !admission.creationKey.trim() || admission.creationKey.length > 128) { const e = new Error("visitor_required"); e.name = "visitor_required"; throw e; }
+      const [existing] = await conn.query("SELECT s.*,a.requested_title FROM visitor_session_admissions a JOIN sessions s ON s.session_id=a.session_id WHERE a.visitor_id=? AND a.creation_key=?", [admission.visitorId,admission.creationKey]);
+      if (existing[0]) {
+        if (existing[0].requested_title !== session.title) { const e = new Error("idempotency_conflict"); e.name = "idempotency_conflict"; throw e; }
+        return sessionFromRow(existing[0]);
+      }
+      const [times] = await conn.query(`SELECT ${DB_NOW_MS} AS now_ms`); const now = Number(times[0].now_ms);
+      const [recent] = await conn.query("SELECT COUNT(*) AS n FROM visitor_session_admissions WHERE visitor_id=? AND accepted_ms>?", [admission.visitorId, now-policy.sessionWindowMs]);
+      const [total] = await conn.query("SELECT COUNT(*) AS n FROM sessions WHERE actor_id=?", [admission.visitorId]);
+      if (Number(recent[0].n) >= policy.maxSessionsPerWindow || Number(total[0].n) >= policy.maxSessions) { const e = new Error("visitor_session_limit"); e.name = "visitor_session_limit"; throw e; }
+    } else if (admission) throw new Error("authority_mode_conflict");
+    // Allocate insertion identities in commit order. AUTO_INCREMENT alone can
+    // leave lower, uncommitted IDs behind a page's visible MAX(history_seq).
+    await conn.query("SELECT kind FROM history_writers WHERE kind = 'sessions' FOR UPDATE");
+    if (policy) await requireVisitor(conn, admission);
+    await conn.query(
+      "INSERT INTO sessions (session_id, title, role, actor_id, slots_json, bindings_json, created_at) VALUES (?, ?, ?, ?, ?, '[]', ?)",
+      [session.session_id, session.title, session.role, session.actor_id || "demo-analyst", JSON.stringify(session.slots), session.created_at],
+    );
+    if (policy) await conn.query(`INSERT INTO visitor_session_admissions (visitor_id,creation_key,session_id,requested_title,accepted_ms) VALUES (?,?,?,?,${DB_NOW_MS})`, [admission.visitorId,admission.creationKey,session.session_id,session.title]);
+    return session;
+  }, sessionCreationPool, true);
 }
 
 async function getSession(sessionId) {
@@ -265,6 +517,47 @@ async function getSession(sessionId) {
 async function listSessions() {
   const [rows] = await pool.query("SELECT * FROM sessions ORDER BY created_at");
   return rows.map(sessionFromRow);
+}
+
+async function listSessionSummaries(actorId, page) {
+  const [latest] = page.cursor ? [] : await pool.query("SELECT CAST(COALESCE(MAX(history_seq), 0) AS CHAR) AS n FROM sessions");
+  const snapshot = page.cursor?.snapshot ?? String(latest[0].n);
+  const before = page.cursor;
+  const [rows] = await pool.query(`SELECT session_id, LEFT(title, 200) AS title, role, actor_id, created_at FROM sessions
+    WHERE actor_id = ? AND history_seq <= ? ${before ? "AND (created_at < ? OR (created_at = ? AND session_id < ?))" : ""}
+    ORDER BY created_at DESC, session_id DESC LIMIT ?`, [actorId, snapshot, ...(before ? [before.at, before.at, before.id] : []), page.limit + 1]);
+  return finishHistoryPage(rows, page, "sessions", actorId, snapshot, "session_id");
+}
+
+async function getSessionMetadata(sessionId, actorId) {
+  const [rows] = await pool.query("SELECT session_id, LEFT(title, 200) AS title, role, actor_id, created_at FROM sessions WHERE session_id = ? AND actor_id = ?", [sessionId, actorId]);
+  if (!rows[0]) return null;
+  const [active] = await pool.query("SELECT job_id FROM jobs WHERE session_id = ? AND status IN ('queued', 'running') ORDER BY created_at DESC, job_id DESC LIMIT 1", [sessionId]);
+  return { ...rows[0], active_job_id: active[0]?.job_id ?? null };
+}
+
+async function listJobSummaries(sessionId, actorId, page) {
+  const [latest] = page.cursor ? [] : await pool.query("SELECT CAST(COALESCE(MAX(history_seq), 0) AS CHAR) AS n FROM jobs");
+  const snapshot = page.cursor?.snapshot ?? String(latest[0].n);
+  const before = page.cursor;
+  const [rows] = await pool.query(`SELECT j.job_id, j.session_id, j.status, LEFT(j.user_text, 240) AS user_text_preview, j.created_at
+    FROM jobs j WHERE j.session_id = ? AND j.history_seq <= ? AND EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = j.session_id AND s.actor_id = ?)
+    ${before ? "AND (j.created_at < ? OR (j.created_at = ? AND j.job_id < ?))" : ""}
+    ORDER BY j.created_at DESC, j.job_id DESC LIMIT ?`, [sessionId, snapshot, actorId, ...(before ? [before.at, before.at, before.id] : []), page.limit + 1]);
+  return finishHistoryPage(rows, page, "jobs", `${actorId}/${sessionId}`, snapshot, "job_id");
+}
+
+async function getJobHead(jobId) {
+  const [rows] = await pool.query("SELECT job_id, session_id, status, next_seq - 1 AS last_seq FROM jobs WHERE job_id = ?", [jobId]);
+  return rows[0] ?? null;
+}
+
+async function readJobEvents(jobId, after) {
+  const head = await getJobHead(jobId);
+  if (!head) return null;
+  const [rows] = await pool.query(`SELECT seq, type, at, CASE WHEN OCTET_LENGTH(payload_json) <= 65536 THEN payload_json ELSE NULL END AS payload_json
+    FROM job_events WHERE job_id = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT 32`, [jobId, after, head.last_seq]);
+  return finishEventPage(head, rows, after);
 }
 
 async function assertExecutionLease(conn, sessionId, lease) {
@@ -351,18 +644,47 @@ async function countResources() {
 
 async function createJob(input) {
   return transaction(async (conn) => {
-    await conn.query("SELECT session_id FROM sessions WHERE session_id = ? FOR UPDATE", [input.job.session_id]);
-    const [existing] = await conn.query("SELECT job_id, user_text FROM jobs WHERE session_id = ? AND idempotency_key = ?", [
+    const policy = await requireAuthority(conn);
+    const [sessions] = await conn.query("SELECT session_id, actor_id FROM sessions WHERE session_id = ? FOR UPDATE", [input.job.session_id]);
+    const admission = input.visitorAdmission;
+    if (policy && !admission) { const e = new Error("visitor_required"); e.name = "visitor_required"; throw e; }
+    if (!policy && admission) throw new Error("authority_mode_conflict");
+    if (admission && (!sessions[0] || sessions[0].actor_id !== admission.visitorId)) { const error = new Error("visitor_not_owner"); error.name = "visitor_not_owner"; throw error; }
+    if (admission) {
+      await requireVisitor(conn, admission);
+      if (!/^[0-9a-f]{64}$/u.test(admission.requestHash ?? "")) throw new Error("invalid_request_fingerprint");
+      const [replayed] = await conn.query("SELECT j.job_id, j.session_id, j.user_text, j.model_id, j.reasoning, a.request_hash FROM visitor_admissions a JOIN jobs j ON j.job_id=a.job_id WHERE a.visitor_id=? AND a.idempotency_key=?", [admission.visitorId, input.job.idempotency_key]);
+      if (replayed[0]) {
+        if (!replayed[0].request_hash || replayed[0].request_hash !== admission.requestHash || replayed[0].session_id !== input.job.session_id || replayed[0].user_text !== input.job.user_text) { const error = new Error("idempotency_conflict"); error.name = "idempotency_conflict"; throw error; }
+        return getJobOn(conn, String(replayed[0].job_id));
+      }
+    }
+    const [existing] = await conn.query("SELECT job_id, user_text, model_id, reasoning FROM jobs WHERE session_id = ? AND idempotency_key = ?", [
       input.job.session_id,
       input.job.idempotency_key,
     ]);
     if (existing[0]) {
-      if (String(existing[0].user_text) !== input.job.user_text) {
+      if (policy) { const e = new Error("visitor_receipt_missing"); e.name = "visitor_receipt_missing"; throw e; }
+      if (String(existing[0].user_text) !== input.job.user_text || (input.visitorAdmission && ((existing[0].model_id ?? null) !== (input.job.model_id ?? null) || (existing[0].reasoning ?? null) !== (input.job.reasoning ?? null)))) {
         const error = new Error("idempotency_conflict");
         error.name = "idempotency_conflict";
         throw error;
       }
       return getJobOn(conn, String(existing[0].job_id));
+    }
+    // Every creator takes this mutex so that controlled-mode capacity counts
+    // cannot race another process using the same authoritative job table.
+    await conn.query("SELECT singleton FROM visitor_admission_mutex WHERE singleton=1 FOR UPDATE");
+    let acceptedMs = null;
+    if (admission) {
+      await requireVisitor(conn, admission);
+      const [times] = await conn.query(`SELECT ${DB_NOW_MS} AS now_ms`); const now = Number(times[0].now_ms);
+      const [accepted] = await conn.query("SELECT COUNT(*) AS n FROM visitor_admissions WHERE visitor_id=? AND accepted_ms > ?", [admission.visitorId, now - policy.windowMs]);
+      const [activeVisitor] = await conn.query(`SELECT COUNT(*) AS n FROM jobs j JOIN sessions s ON s.session_id=j.session_id WHERE s.actor_id=? AND j.status NOT IN ${TERMINAL}`, [admission.visitorId]);
+      const [activeGlobal] = await conn.query(`SELECT COUNT(*) AS n FROM jobs WHERE status NOT IN ${TERMINAL}`);
+      const code = Number(accepted[0].n) >= policy.maxAccepted ? "visitor_rate_limit" : Number(activeVisitor[0].n) >= policy.maxActive ? "visitor_active_limit" : Number(activeGlobal[0].n) >= policy.maxGlobalActive ? "global_active_limit" : null;
+      if (code) { const error = new Error(code); error.name = code; throw error; }
+      acceptedMs = now;
     }
     // The session row above serializes all createJob calls for this session.
     // A locking range scan here additionally acquires InnoDB next-key/gap
@@ -381,11 +703,15 @@ async function createJob(input) {
       JSON.stringify(input.session.slots),
       input.session.session_id,
     ]);
+    // Only creation uses this short lock; event, heartbeat, cancellation and
+    // provider writes do not contend on it. Keep the session -> history order.
+    await conn.query("SELECT kind FROM history_writers WHERE kind = 'jobs' FOR UPDATE");
+    if (admission) await requireVisitor(conn, admission);
     await conn.query(
       `INSERT INTO jobs (
-        job_id, session_id, status, user_text, idempotency_key, turn_json, analysis_json, error_json,
+        job_id, session_id, status, user_text, idempotency_key, turn_json, analysis_json, error_json, queued_ms,
         version, next_seq, fence, lease_owner, lease_until, cancel_requested, created_at, model_id, reasoning
-      ) VALUES (?, ?, 'queued', ?, ?, ?, NULL, NULL, 1, 2, 0, NULL, NULL, 0, ?, ?, ?)`,
+      ) VALUES (?, ?, 'queued', ?, ?, ?, NULL, NULL, ${DB_NOW_MS}, 1, 2, 0, NULL, NULL, 0, ?, ?, ?)`,
       [input.job.job_id, input.job.session_id, input.job.user_text, input.job.idempotency_key, JSON.stringify(input.job.turn), input.job.created_at, input.job.model_id ?? null, input.job.reasoning ?? null],
     );
     await insertEvent(conn, input.job.job_id, 1, "job_queued", { status: "queued" });
@@ -396,13 +722,14 @@ async function createJob(input) {
       input.message.text,
       input.message.created_at,
     ]);
-    await conn.query("INSERT INTO outbox (job_id, event_type, payload_json, created_at) VALUES (?, 'job_queued', ?, ?)", [
+    await conn.query(`INSERT INTO outbox (job_id, event_type, payload_json, created_at, created_ms) VALUES (?, 'job_queued', ?, ?, ${DB_NOW_MS})`, [
       input.job.job_id,
       JSON.stringify({ job_id: input.job.job_id }),
       input.job.created_at,
     ]);
+    if (admission) await conn.query("INSERT INTO visitor_admissions (job_id, visitor_id, idempotency_key, accepted_ms, request_hash) VALUES (?,?,?,?,?)", [input.job.job_id, admission.visitorId, input.job.idempotency_key, acceptedMs, admission.requestHash]);
     return getJobOn(conn, input.job.job_id);
-  });
+  }, jobCreationPool, true);
 }
 
 async function getJob(jobId) {

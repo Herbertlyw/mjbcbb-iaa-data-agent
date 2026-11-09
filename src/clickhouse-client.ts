@@ -7,7 +7,10 @@ export interface ClickHouseConfig {
   database: string;
   maxRowsToRead: number;
   timeoutSeconds: number;
+  lockedReadonly?: boolean;
 }
+
+const lockedProfiles = new WeakMap<ClickHouseClient, { config: ClickHouseConfig }>();
 
 export function assertLocalClickHouse(url: string): void {
   const parsed = new URL(url);
@@ -18,7 +21,8 @@ export function assertLocalClickHouse(url: string): void {
 
 export function createClickHouseClient(config: ClickHouseConfig, readonly: boolean): ClickHouseClient {
   assertLocalClickHouse(config.url);
-  return createClient({
+  if (config.lockedReadonly && !readonly) throw new Error("clickhouse_locked_profile_requires_readonly");
+  const client = createClient({
     url: config.url,
     username: config.username,
     password: config.password,
@@ -27,7 +31,7 @@ export function createClickHouseClient(config: ClickHouseConfig, readonly: boole
     // The tool layer maps failures to safe error codes instead.
     log: { level: ClickHouseLogLevel.OFF },
     request_timeout: Math.max(config.timeoutSeconds, 1) * 1000,
-    clickhouse_settings: {
+    ...(!config.lockedReadonly ? { clickhouse_settings: {
       readonly: readonly ? "1" : "0",
       max_execution_time: Math.max(config.timeoutSeconds, 1),
       max_rows_to_read: String(config.maxRowsToRead),
@@ -38,11 +42,25 @@ export function createClickHouseClient(config: ClickHouseConfig, readonly: boole
       // LEFT JOIN must expose an unmatched right-hand key as SQL NULL, not
       // ClickHouse's type default. This is host-controlled, not model SQL.
       join_use_nulls: 1,
-    },
+    } } : {}),
   });
+  if (config.lockedReadonly) lockedProfiles.set(client, { config });
+  return client;
+}
+
+async function ensureLockedProfile(client: ClickHouseClient): Promise<void> {
+  const profile = lockedProfiles.get(client);
+  if (!profile) return;
+  await (async () => {
+    const result = await client.query({ query: "SELECT getSetting('readonly') AS ro, getSetting('max_execution_time') AS seconds, getSetting('max_rows_to_read') AS rows, getSetting('read_overflow_mode') AS overflow, getSetting('join_use_nulls') AS join_nulls, getSetting('output_format_json_quote_decimals') AS decimals, getSetting('max_block_size') AS block_size", format: "JSONEachRow" });
+    const [settings] = await result.json<Record<string, unknown>>();
+    const seconds = Number(settings?.seconds), rows = Number(settings?.rows), block = Number(settings?.block_size);
+    if (Number(settings?.ro) !== 1 || !Number.isFinite(seconds) || seconds <= 0 || seconds > profile.config.timeoutSeconds || !Number.isSafeInteger(rows) || rows <= 0 || rows > profile.config.maxRowsToRead || settings?.overflow !== "throw" || Number(settings?.join_nulls) !== 1 || Number(settings?.decimals) !== 1 || !Number.isSafeInteger(block) || block <= 0 || block > 1024) throw new Error("clickhouse_locked_profile_invalid");
+  })();
 }
 
 export async function clickHouseQuery(client: ClickHouseClient, sql: string, signal?: AbortSignal): Promise<Array<Record<string, unknown>>> {
+  await ensureLockedProfile(client);
   const result = await client.query({ query: sql, format: "JSONEachRow", abort_signal: signal });
   const rows = await result.json<Record<string, unknown>>();
   return rows.map(normalizeRow);
@@ -51,7 +69,8 @@ export async function clickHouseQuery(client: ClickHouseClient, sql: string, sig
 /** Read a bounded complete result, or stop after observing the first row over
  * either limit. A truncated result's count is only a lower bound. */
 export async function clickHouseQueryBounded(client: ClickHouseClient, sql: string, maxRows: number, maxBytes: number, signal?: AbortSignal): Promise<{ rows: Array<Record<string, unknown>>; column_types: Record<string, string>; observed_rows: number; truncated: boolean; query_id: string }> {
-  const result = await client.query({ query: sql, format: "JSONCompactEachRowWithNamesAndTypes", abort_signal: signal, clickhouse_settings: { max_block_size: "1024", join_use_nulls: 1 } });
+  await ensureLockedProfile(client);
+  const result = await client.query({ query: sql, format: "JSONCompactEachRowWithNamesAndTypes", abort_signal: signal, ...(!lockedProfiles.has(client) ? { clickhouse_settings: { max_block_size: "1024", join_use_nulls: 1 } } : {}) });
   const rows: Array<Record<string, unknown>> = []; let names: string[] | null = null; let types: string[] | null = null; let bytes = 2; let observed = 0; let truncated = false;
   try {
     outer: for await (const chunk of result.stream<unknown[]>()) {
@@ -99,7 +118,9 @@ export async function clickHousePreflightedQuery(client: ClickHouseClient, sql: 
     throw new ClickHousePlanError("clickhouse_plan_unavailable");
   }
   const columns = Object.keys(plan.column_types);
-  if (plan.truncated || !plan.rows.length || columns.length !== 1 || columns[0] !== "explain" || plan.column_types.explain !== "String" || plan.rows.some((row) => typeof row.explain !== "string" || !row.explain)) throw new ClickHousePlanError("clickhouse_plan_invalid");
+  // ClickHouse can insert blank separators inside an otherwise complete plan.
+  // Require real plan content while retaining all bounds and wire type checks.
+  if (plan.truncated || !plan.rows.length || columns.length !== 1 || columns[0] !== "explain" || plan.column_types.explain !== "String" || plan.rows.some((row) => typeof row.explain !== "string") || !plan.rows.some((row) => typeof row.explain === "string" && row.explain.trim().length > 0)) throw new ClickHousePlanError("clickhouse_plan_invalid");
   return clickHouseQueryBounded(client, sql, maxRows, maxBytes, signal);
 }
 
@@ -118,6 +139,7 @@ export async function clickHouseColumns(client: ClickHouseClient, table: string)
 
 export async function clickHouseColumnTypes(client: ClickHouseClient, table: string): Promise<Record<string, string>> {
   if (!/^[a-z_][a-z0-9_]*$/u.test(table)) throw new Error("unsafe table");
+  await ensureLockedProfile(client);
   const result = await client.query({ query: `DESCRIBE TABLE ${table}`, format: "JSONEachRow" });
   const rows = await result.json<{ name: string; type: string }>();
   return Object.fromEntries(rows.map((row) => [row.name, row.type]));

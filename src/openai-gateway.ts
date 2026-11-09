@@ -6,6 +6,7 @@ import type { AppConfig } from "./config.js";
 import { GlobalBudget } from "./global-budget.js";
 import { thinkingLevelMap } from "./model-catalog.js";
 import { compactPreviousAnalyses } from "./provider-context.js";
+import { DOMAIN_TOOL_NAMES } from "./domain-tool-names.js";
 import { observeProviderUsage, waitForProviderUsage, type ProviderUsageObservation, type ProviderUsageReceipt } from "./provider-usage.js";
 import type { ProviderStepRecord, StateStore } from "./state-store.js";
 
@@ -18,7 +19,7 @@ export interface ProviderLedger {
   state: { [K in "beginProviderStep" | "saveProviderPayload" | "settleProviderStep"]: (...args: Parameters<StateStore[K]>) => Promise<ReturnType<StateStore[K]>> };
 }
 
-export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfig, ledger: ProviderLedger): void {
+export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfig, ledger: ProviderLedger, deliveredCalls: () => ReadonlySet<string> = () => new Set()): void {
   const deepseek = config.piProvider === "deepseek";
   runtime.registerProvider(config.piProvider, {
     name: deepseek ? "DeepSeek" : "OpenAI-compatible",
@@ -43,7 +44,7 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
     ],
     streamSimple: (model, context, options) => {
       const outer = createAssistantMessageEventStream();
-      const providerContext = compactPreviousAnalyses(context);
+      const providerContext = compactPreviousAnalyses(context, deliveredCalls());
       const estimate = estimateContextTokens(providerContext);
       const stepId = `step_${randomUUID()}`;
       const started = Date.now();
@@ -52,6 +53,7 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
       let globalReserved = false;
       let globalSettled = false;
       const usageCapture: { observation?: ProviderUsageObservation } = {};
+      let rejectedHttpStatus: number | undefined;
       try {
       assertDispatchTarget(config.piBaseUrl, deepseek && config.allowRemoteHttps);
       const began = await ledger.state.beginProviderStep({
@@ -83,7 +85,7 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
         owner: ledger.owner,
         fence: ledger.fence,
         kind: "request",
-        body: JSON.stringify({ format: "metadata-only", estimated_input: estimate.tokens, estimate_source: estimate.source }),
+        body: JSON.stringify({ format: "metadata-only", estimated_input: estimate.tokens, estimate_source: estimate.source, context_window: config.piContextWindow, reserved_output: config.piMaxOutputTokens, context_sizes: contextSizeStats(providerContext) }),
       });
       if (!recorded) throw new Error("provider_fence_rejected");
       const markNotDispatched = async (code: string) => {
@@ -122,6 +124,10 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
           if (dispatched) throw new Error("provider_outcome_unknown");
           dispatched = true;
           const response = await transport(request, init);
+          // Persist only a bounded HTTP status category, never provider error
+          // bodies or headers. The SDK may omit the status from its message.
+          if (!response.ok && response.status >= 400 && response.status <= 599)
+            rejectedHttpStatus = response.status;
           usageCapture.observation = observeProviderUsage(response);
           return response;
         };
@@ -152,6 +158,10 @@ export function registerOpenAICompatible(runtime: ModelRuntime, config: AppConfi
       }
       if (!terminal) throw new Error("provider_outcome_unknown");
       const message = await stream.result();
+      if (message.stopReason === "error" && rejectedHttpStatus !== undefined) {
+        message.errorMessage = `HTTP ${rejectedHttpStatus}`;
+        if (terminal.type === "error") terminal = { ...terminal, error: message };
+      }
       const reportedUsage = usageCapture.observation ? await waitForProviderUsage(usageCapture.observation) : null;
       if (globalBudget) {
         const settlement = await globalBudget.settle({ stepId, outcome: message.stopReason === "aborted" ? "cancelled" : message.stopReason === "error" ? "error" : "completed", inputTokens: reportedUsage?.inputTokens ?? null, outputTokens: reportedUsage?.outputTokens ?? null, cacheHitTokens: reportedUsage?.cacheHitTokens ?? null, cacheMissTokens: reportedUsage?.cacheMissTokens ?? null });
@@ -187,6 +197,20 @@ export function estimateContextTokens(context: unknown): { tokens: number; sourc
   // A deliberately conservative UTF-8 heuristic, not measured provider usage
   // or a guaranteed upper bound for an unknown provider tokenizer.
   return { tokens: Math.max(1, Math.ceil(Buffer.byteLength(text, "utf8") / 2)), source: "utf8_byte_estimate" };
+}
+
+/** Size diagnostics only: never persist text, arguments, IDs or arbitrary tool names. */
+export function contextSizeStats(context: { messages: ReadonlyArray<{ role: string; toolName?: string }> }): Record<string, { messages: number; utf8_bytes: number }> {
+  const buckets: Record<string, { messages: number; utf8_bytes: number }> = Object.create(null);
+  const tools: ReadonlySet<string> = new Set(DOMAIN_TOOL_NAMES);
+  for (const message of context.messages) {
+    const role = ["user", "assistant", "toolResult"].includes(message.role) ? message.role : "other";
+    const key = role === "toolResult" ? `tool:${tools.has(message.toolName ?? "") ? message.toolName : "other"}` : role;
+    const bucket = buckets[key] ??= { messages: 0, utf8_bytes: 0 };
+    bucket.messages++;
+    bucket.utf8_bytes += Buffer.byteLength(JSON.stringify(message), "utf8");
+  }
+  return buckets;
 }
 
 export function assertDispatchTarget(baseUrl: string, allowDeepSeek = false): void {
@@ -245,6 +269,9 @@ export function safeProviderError(error: unknown): { code: string; message: stri
   if (/\b402\b|insufficient.balance/i.test(redacted)) return { code: "provider_balance_insufficient", message: "供应商报告余额不足；未自动重试。" };
   if (/\b400\b|bad.request/i.test(redacted)) return { code: "provider_invalid_request", message: "供应商拒绝了请求格式；未记录原始请求或错误正文。" };
   if (/aborted|cancel/i.test(redacted)) return { code: "provider_cancelled", message: "供应商请求已取消。" };
+  if (/\bconnection error\b|\bfetch failed\b|\bE(?:CONNRESET|CONNREFUSED|NOTFOUND|AI_AGAIN)\b|provider_connection_error/i.test(redacted)) {
+    return { code: "provider_connection_error", message: "连接供应商时发生网络错误。请求是否已送达及用量未知，不会自动重试。" };
+  }
   const known = redacted.match(/global_budget_[a-z_]+|provider_outcome_unknown|provider_fence_rejected|token_budget_unknown|budget_exhausted|context_window_exceeded|remote_dispatch_disabled|settlement_conflict|model_not_enabled|reasoning_not_enabled/);
   if (known) {
     const messages: Record<string, string> = {

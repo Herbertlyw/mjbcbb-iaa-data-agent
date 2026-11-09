@@ -4,10 +4,24 @@ import { Check } from "typebox/value";
 import { calculationSchema } from "../src/calculation-protocol.js";
 import { analyst, bindTables, withRuntime } from "./helpers.js";
 
+test("非法计算参数返回具体分支说明且不回显任意输入", async () => {
+  await withRuntime({}, async (runtime) => {
+    const session = analyst(runtime);
+    runtime.sessions.setActiveJob(session.session_id, "job_invalid_shape");
+    const result = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "divide", numerator: { secret: "fictional-private-text" }, denominator: {} });
+    assert.equal(result.ok, false); if (result.ok) return;
+    assert.equal(result.code, "invalid_calculation_shape");
+    assert.match(result.message, /numerator.*denominator/u);
+    assert.match(result.message, /row.*aggregate/u);
+    assert.doesNotMatch(JSON.stringify(result), /fictional-private-text/u);
+  });
+});
+
 test("模型计算协议的 object 根和 operation 分支互斥，除法明确分子分母", () => {
   const ref = { resource_id: "res_a", execution_id: "exec_a", column: "amount", row: 0 };
   assert.equal(calculationSchema.type, "object");
   assert.equal(Check(calculationSchema, { operation: "divide", numerator: ref, denominator: ref }), true);
+  assert.equal(Check(calculationSchema, { operation: "divide", input: { resource_id: "res_a", execution_id: "exec_a" }, numerator: ref, denominator: ref }), true);
   assert.equal(Check(calculationSchema, { operation: "divide", left: ref, right: ref }), false);
   assert.equal(Check(calculationSchema, { operation: "add", left: ref, right: ref, operations: [] }), false);
   assert.equal(Check(calculationSchema, { operation: "add", left: { ...ref, aggregate: "sum" }, right: ref }), false);
@@ -24,8 +38,8 @@ test("派生结果再计算可重算来源并供后续算术及交付", async ()
     assert.ok(direct.ok, JSON.stringify(direct)); if (direct.ok) assert.equal((direct.result as { value: string }).value, "430");
     const sorted = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "transform", input: { resource_id: query.resource_id, execution_id: query.execution_id }, steps: [{ op: "sort", keys: [{ column: "event_date", direction: "asc", nulls: "last" }] }] });
     assert.ok(sorted.ok, JSON.stringify(sorted)); if (!sorted.ok) return;
-    const instrumented = runtime.tools as unknown as { evaluateResultNode: (...args: unknown[]) => Promise<unknown> };
-    const original = instrumented.evaluateResultNode.bind(runtime.tools); let sortedEvaluations = 0;
+    const instrumented = (runtime.tools as unknown as { evaluator: { evaluateResultNode: (...args: unknown[]) => Promise<unknown> } }).evaluator;
+    const original = instrumented.evaluateResultNode.bind(instrumented); let sortedEvaluations = 0;
     instrumented.evaluateResultNode = (...args) => { if (args[2] === sorted.resource_id) sortedEvaluations++; return original(...args); };
     const sortedRef = { resource_id: sorted.resource_id, execution_id: sorted.execution_id, column: "total", aggregate: "sum" };
     const twiceSorted = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: sortedRef, right: sortedRef });
@@ -75,6 +89,12 @@ test("新协议经过真实工具入口核验执行身份并组合分组与变�
     const arithmeticTable = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "transform", input: { resource_id: String(doubled.resource_id), execution_id: String(doubled.execution_id) }, steps: [{ op: "sort", keys: [{ column: "result", direction: "asc", nulls: "last" }] }] });
     assert.ok(arithmeticTable.ok, JSON.stringify(arithmeticTable)); if (!arithmeticTable.ok) return;
     const twiceRef = { resource_id: String(arithmeticTable.resource_id), execution_id: String(arithmeticTable.execution_id), column: "result", row: 0 };
+    const arithmeticValue = { resource_id: String(doubled.resource_id), execution_id: String(doubled.execution_id), column: "value", row: 0 };
+    const valueAlias = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: arithmeticValue, right: arithmeticValue });
+    assert.ok(valueAlias.ok, JSON.stringify(valueAlias));
+    if (valueAlias.ok) assert.equal((valueAlias.result as { value: string }).value, "860");
+    const badValueAlias = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: { ...arithmeticValue, execution_id: "wrong" }, right: arithmeticValue });
+    assert.equal(badValueAlias.ok, false);
     const quadrupled = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "add", left: twiceRef, right: twiceRef });
     assert.ok(quadrupled.ok, JSON.stringify(quadrupled)); if (!quadrupled.ok) return;
     assert.equal((quadrupled.result as { value: string }).value, "860");
@@ -94,6 +114,13 @@ test("新协议经过真实工具入口核验执行身份并组合分组与变�
     const transformed = { resource_id: String(transform.resource_id), execution_id: String(transform.execution_id), column: "all_users", row: 0 };
     const divided = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "divide", numerator: transformed, denominator: transformed });
     assert.ok(divided.ok, JSON.stringify(divided)); if (divided.ok) assert.equal((divided.result as { value: string }).value, "1.000000000000000000");
+    const redundant = { resource_id: transformed.resource_id, execution_id: transformed.execution_id };
+    const dividedWithHint = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "divide", input: redundant, numerator: transformed, denominator: transformed });
+    assert.ok(dividedWithHint.ok, JSON.stringify(dividedWithHint));
+    const conflictingHint = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "divide", input: { ...redundant, execution_id: "other" }, numerator: transformed, denominator: transformed });
+    assert.equal(conflictingHint.ok, false); if (!conflictingHint.ok) assert.equal(conflictingHint.code, "resource_execution_mismatch");
+    const conflictingOperand = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "divide", input: redundant, numerator: transformed, denominator: { ...transformed, resource_id: "other" } });
+    assert.equal(conflictingOperand.ok, false);
     const badTransform = await runtime.tools.calculateFromProtocol(session.session_id, { operation: "transform", input: { resource_id: String(doubled.resource_id), execution_id: "wrong" }, steps: [{ op: "sort", keys: [{ column: "result", direction: "asc", nulls: "last" }] }] });
     assert.equal(badTransform.ok, false);
     const saved = runtime.sessions.lookupResource(session.session_id, String(sum.resource_id));

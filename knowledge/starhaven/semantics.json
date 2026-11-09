@@ -1,0 +1,23 @@
+{
+  "simulated": true,
+  "note": "仅用于Pi原话模式；不提供槽位编译器默认问题或标准答案。",
+  "application_name": "VV Data Agent",
+  "default_game": "gridfit",
+  "games": [
+    {
+      "game_id": "gridfit",
+      "name": "拼格",
+      "english_name": "GridFit"
+    },
+    {
+      "game_id": "blockfall",
+      "name": "落块",
+      "english_name": "BlockFall"
+    },
+    {
+      "game_id": "stackjoy",
+      "name": "叠叠乐",
+      "english_name": "StackJoy"
+    }
+  ]
+}

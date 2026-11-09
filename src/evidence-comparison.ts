@@ -1,4 +1,5 @@
 import { coverageHasGap } from "./coverage.js";
+import { decimalOperation } from "./decimal-kernel.js";
 import type { VerifiedCell } from "./evidence.js";
 import type { DataContract, QueryResource } from "./types.js";
 
@@ -44,17 +45,6 @@ export function compareVerifiedIntegers(
     if (days(a.range.start, a.range.end) !== days(b.range.start, b.range.end)) return null;
   }
   const difference = a.value - b.value;
-  return { left, right, difference, change_percent: b.value === 0 ? null : percent(difference, b.value) };
-}
-
-// Integer arithmetic; two decimal places, ties away from zero.
-function percent(difference: number, baseline: number): string {
-  const numerator = BigInt(difference) * 10000n;
-  const denominator = BigInt(baseline);
-  const negative = (numerator < 0n) !== (denominator < 0n);
-  const n = numerator < 0n ? -numerator : numerator;
-  const d = denominator < 0n ? -denominator : denominator;
-  const rounded = (n * 2n + d) / (2n * d);
-  const sign = negative && rounded !== 0n ? "-" : "";
-  return `${sign}${rounded / 100n}.${String(rounded % 100n).padStart(2, "0")}`;
+  const change_percent = decimalOperation("divide", (BigInt(difference) * 100n).toString(), String(b.value), 2);
+  return change_percent === undefined ? null : { left, right, difference, change_percent };
 }

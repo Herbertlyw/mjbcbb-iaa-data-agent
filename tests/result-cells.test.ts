@@ -18,6 +18,9 @@ test("已验证表的单元计算区分精确数值、零、NULL 和空集", () 
   assert.equal(actual?.table.rows[0]?.x, "9007199254740993.20");
   assert.equal(actual?.table.prediction_scope, "observed_only");
   assert.equal(calculateResultCells(observed, [{ op: "sum", column: "amount", as: "x", predicted: "predicted_only" }]), null);
+  assert.equal(calculateResultCells(observed, [{ op: "sum", column: "amount", as: "MODEL_TOTAL" }])?.table.rows[0]?.MODEL_TOTAL, "9007199254740993.20");
+  assert.equal(calculateResultCells(observed, [{ op: "sum", column: "amount", as: "KELVIN" }]), null, "Unicode 同形字符不能冒充 ASCII 标识符");
+  assert.equal(calculateResultCells(observed, [{ op: "sum", column: "amount", as: "Constructor" }]), null, "不同大小写的原型属性仍须拒绝");
   assert.equal(calculateResultCells(input, [{ op: "count_zero", column: "unknown", as: "x" }]), null);
   assert.equal(calculateResultCells(input, [{ op: "count_rows", as: "x" }, { op: "count_rows", as: "x" }]), null);
 });
