@@ -1,6 +1,8 @@
 // Build authoritative analysis from the current task evidence graph.
 import { createHash } from "node:crypto";
+import { unresolvedCandidateFailures } from "./candidate-failures.js";
 import { aggregateObservationInput, selectedAggregateReferences } from "./aggregate-observation.js";
+import { alignmentHasUnresolvedRows } from "./alignment-completeness.js";
 import {
   compareDecimalAggregates,
   compareVerifiedDecimalCells,
@@ -71,6 +73,9 @@ import {
   verifyJoinResource,
   type JoinQueryResource,
 } from "./join-resource-proof.js";
+import { verifiedJoinArithmeticGroup } from "./join-arithmetic-group.js";
+import { reviewHasVerifiedReferences, type DeliveryReview } from "./delivery-review.js";
+import { displayModelProse } from "./analysis-prose.js";
 import {
   canQueryTable,
   canRead,
@@ -119,7 +124,7 @@ export class AnalysisDelivery {
     sessionId: string,
     input: AnalysisInput,
     signal?: AbortSignal,
-    host?: { unresolvedToolFailures: number },
+    host?: { events: ReadonlyArray<{ type: string; payload: Record<string, unknown> }>; review?: DeliveryReview | null; reviewInvalid?: boolean; textReviewed?: boolean; allowUnreferenced?: boolean },
   ): Promise<ToolResult> {
     const cancelled = await this.access.gate(sessionId, signal);
     if (cancelled) return cancelled;
@@ -269,7 +274,7 @@ export class AnalysisDelivery {
     if (
       claimsNumbers &&
       !input.clarification_question &&
-      verifiedQueries.length === 0
+      verifiedQueries.length === 0 && !host?.allowUnreferenced
     ) {
       const attempt = await this.nextRevision(sessionId, jobId);
       if (attempt === "lost")
@@ -325,29 +330,27 @@ export class AnalysisDelivery {
       };
     }
     let status: AnalysisStatus = input.suggested_status;
-    if (
-      host &&
-      host.unresolvedToolFailures > 0 &&
-      (status === "completed" || status === "partial")
-    ) {
-      reasons.push("unresolved_tool_failure");
+    const failedUnreferencedData = Boolean(host?.allowUnreferenced && host.events.some((event) => event.type === "tool_finished" && event.payload.is_error === true && ["query", "read_session_resource", "calculate_session_cells"].includes(String(event.payload.tool_name))));
+    if (failedUnreferencedData) {
       if (status === "completed") status = "partial";
+      reasons.push("data_tool_failure_without_result");
     }
     if (invalidSelectedResource && status === "completed") status = "partial";
     if (input.clarification_question) {
       status = "needs_clarification";
       reasons.push("clarification_requested");
     }
+    const optionalQuestions = Boolean(host?.textReviewed && input.declaration?.unresolved_questions.length && input.declaration.unresolved_questions.every((question) => host.review?.items.some((item) => item.requirement === question && item.status === "optional")));
     if (
       input.declaration?.unresolved_questions.length &&
-      status === "completed"
+      status === "completed" && !optionalQuestions
     ) {
       status = "partial";
       reasons.push("model_declared_unresolved");
     }
     if (
       (status === "completed" || status === "partial") &&
-      sources.length === 0
+      sources.length === 0 && !host?.allowUnreferenced
     ) {
       status = input.clarification_question ? "needs_clarification" : "failed";
       reasons.push("insufficient_evidence");
@@ -374,6 +377,7 @@ export class AnalysisDelivery {
     const conditionalAggregates: VerifiedConditionalAggregate[] = [];
     const joinLines: string[] = [];
     const joinResults: NonNullable<AnalysisRecord["join_results"]> = [];
+    const verifiedJoinSources = new Map<string, { source: QueryResource; proof: NonNullable<ReturnType<typeof verifyJoinResource>> }>();
     const expressionLines: string[] = [];
     const dimensionObservations: VerifiedDimensionObservation[] = [];
     for (const source of sources) {
@@ -487,6 +491,7 @@ export class AnalysisDelivery {
             )
           : null;
       if (joined) {
+        verifiedJoinSources.set(source.resource_id, { source: original!, proof: joined });
         source.evidence_eligible = true;
         source.coverage = joinCoverage(
           joined.plan,
@@ -648,6 +653,17 @@ export class AnalysisDelivery {
       } else if (coverageHasGap(source.coverage)) {
         if (status === "completed") status = "partial";
         reasons.push("completeness_gap");
+      }
+    }
+    if (host && (status === "completed" || status === "partial")) {
+      // A selected, successful tool call is not enough to retire an earlier
+      // failure. It must be a currently authorized, complete query with a
+      // usable freshness/coverage receipt. Calculations remain conservative
+      // until their own complete result is proven as a repair route.
+      const verifiedQueries = new Set(sources.filter((source) => source.evidence_eligible && !source.truncated && source.complete_population && source.coverage.status === "known" && !coverageHasGap(source.coverage) && source.coverage.unknown_prediction_dates.length === 0).map((source) => source.resource_id));
+      if (unresolvedCandidateFailures(host.events, verifiedQueries) > 0) {
+        reasons.push("unresolved_tool_failure");
+        if (status === "completed") status = "partial";
       }
     }
     let analysisDeclaration: AnalysisRecord["analysis_declaration"];
@@ -1056,13 +1072,16 @@ export class AnalysisDelivery {
         if (status === "completed") status = "partial";
         continue;
       }
-      arithmeticResults.push({
+      const arithmetic: NonNullable<AnalysisRecord["arithmetic_results"]>[number] = {
         resource_id: resource.resource_id,
         operation: resource.operation,
         left: resource.left,
         right: resource.right,
         result: checked.value,
-      });
+      };
+      const joined = verifiedJoinSources.get(arithmetic.left.resource_id);
+      const group = joined && verifiedJoinArithmeticGroup(arithmetic, joined.source, joined.proof.plan, joined.proof.values);
+      arithmeticResults.push({ ...arithmetic, ...(group ? { verified_group: group } : {}) });
       if (checked.value.approximate) {
         reasons.push("floating_point_approximate");
         if (status === "completed") status = "partial";
@@ -1072,8 +1091,15 @@ export class AnalysisDelivery {
         reasons.push("arithmetic_input_incomplete");
         if (status === "completed") status = "partial";
       }
-      if (checked.value.value === null && status === "completed")
-        status = "partial";
+      if (
+        checked.value.value === null &&
+        status === "completed" &&
+        (checked.value.undefined_reason !== "zero_divisor" ||
+          checked.value.partial ||
+          checked.value.scope_unverified ||
+          checked.value.approximate ||
+          checked.value.interpretation === "mathematical_only")
+      ) status = "partial";
     }
     const transformResults: NonNullable<AnalysisRecord["transform_results"]> =
       [];
@@ -1176,13 +1202,7 @@ export class AnalysisDelivery {
         reasons.push("transform_coverage_incomplete");
         if (status === "completed") status = "partial";
       }
-      if (
-        checked.rows.some(
-          (row) =>
-            row.status !== "matched" ||
-            Object.values(row.group).some((value) => value === null),
-        )
-      ) {
+      if (alignmentHasUnresolvedRows(checked.rows)) {
         reasons.push("alignment_incomplete");
         if (status === "completed") status = "partial";
       }
@@ -1226,6 +1246,15 @@ export class AnalysisDelivery {
     if (input.suggested_status === "completed" && status !== "completed")
       reasons.push("model_completion_was_not_authoritative");
     const limitations: string[] = [];
+    if (optionalQuestions) limitations.push("模型复核将工作记录中的未解事项列为可选研究；该判断未被宿主独立认证。");
+    if (failedUnreferencedData) limitations.push("本轮数据工具失败且没有可交付结果；模型对原因的解释未经独立核验。");
+    // Successful evidence verification only covers the selected resources.
+    // A natural-language request can contain additional requirements that the
+    // model never selected, so the host cannot certify request completeness.
+    if (host && (status === "completed" || status === "partial")) {
+      reasons.push("request_coverage_unverified");
+      limitations.push("仅对标为已核验的结果检查了来源和计算；尚不能独立确认结果覆盖了用户问题的全部要求，请对照原问题检查是否有漏项。");
+    }
     for (const source of sources) {
       if (source.evidence_eligible && source.time_range.selected_dates?.length)
         limitations.push(`查询仅选择日期 ${source.time_range.selected_dates.join("、")}（${source.time_range.timezone}）；中间日期没有查询，所选日期的业务覆盖尚未证明。`);
@@ -1299,14 +1328,37 @@ export class AnalysisDelivery {
     }
     if (groupedObservationPreviewTruncated)
       limitations.push("分组观察值最多展示 32 个；其余保存在本任务结果资源中，可分页回读，不能据此推断未出现分组。");
+    if (host) {
+      // A review can only reference selected, host-verified deliverables. The
+      // model's interpretation of the original wording is never certified.
+      const verifiedResults = new Set([
+        ...aggregates.map((item) => item.source_resource_id),
+        ...conditionalAggregates.map((item) => item.source_resource_id),
+        ...queryObservations.map((item) => item.resource_id),
+        ...joinResults.map((item) => item.resource_id),
+        ...dimensionObservations.map((item) => item.resource_id),
+        ...calculations.filter((item) => item.verified_result || item.verified_cells?.length || item.verified_decimal_cells?.length || item.verified_group_rollups?.length).map((item) => item.resource_id),
+        ...arithmeticResults.map((item) => item.resource_id),
+        ...transformResults.map((item) => item.resource_id),
+        ...alignmentResults.map((item) => item.resource_id),
+      ]);
+      const unknowns = new Set(arithmeticResults.filter((item) => item.result.value === null && item.result.undefined_reason === "zero_divisor" && !item.result.partial && !item.result.scope_unverified && !item.result.approximate).map((item) => item.resource_id));
+      const explicitlyMissing = host.review?.items.some((item) => item.status === "missing" || item.status === "uncertain") ?? false;
+      if (host.reviewInvalid || (host.review && (!reviewHasVerifiedReferences(host.review, new Set(input.resource_ids ?? []), verifiedResults, unknowns) || explicitlyMissing))) {
+        if (status === "completed") status = "partial";
+        reasons.push("request_coverage_review_incomplete");
+        limitations.push("本轮交付覆盖复核未完成、发现缺项，或引用的结果未通过核验；不能认定问题已答全。");
+        const missing = host.review?.items.filter((item) => item.status === "missing" || item.status === "uncertain").map((item) => item.requirement) ?? [];
+        if (missing.length) limitations.push(`模型复核认为以下要求尚未完成或有歧义（这是模型理解，并非服务端认证）：${missing.join("；")}`);
+        if (input.suggested_status === "completed") reasons.push("model_completion_was_not_authoritative");
+      }
+    }
     // The model's prose is retained only as an explicitly unverified draft.
     // Its numbers must neither certify a claim nor downgrade an independently
     // verified result: matching text cannot establish metric, scope or units.
     if (input.draft_answer.trim()) {
       reasons.push("model_draft_not_verified");
-      limitations.push(
-        "模型草稿及其数字、标签和解释未作为已验证事实；正式结论由本次证据生成。",
-      );
+      limitations.push("模型草稿和分析中的数字、标签及解释未逐句核验，未作为已验证事实；请与已核验结果及来源对照。");
     }
     if (reasons.includes("model_declared_unresolved"))
       limitations.push(
@@ -1424,7 +1476,7 @@ export class AnalysisDelivery {
       ...aggregates.slice(0, 100).map(renderAggregate),
       ...conditionalAggregates.slice(0, 100).map(renderConditionalAggregate),
       ...aggregateComparisons.map(renderAggregateComparison),
-      ...arithmeticResults.map(renderArithmetic),
+      ...arithmeticResults.map((item) => renderArithmetic(item, item.verified_group)),
       ...transformLines,
     ];
     if (aggregates.length > 100)
@@ -1445,19 +1497,23 @@ export class AnalysisDelivery {
         "相同范围的覆盖观测内容发生变化，跨次计算结果不能作为一致数据集的完整结论。",
       );
     derivedLines.push(...joinLines);
-    const answer = renderAnswer(
+    const answer = host?.allowUnreferenced && sources.length === 0 ? "本轮未交付数据库查询结果；模型分析未逐句核验。" : renderAnswer(
       status,
       verified,
       sources,
       input.clarification_question,
       derivedLines,
     );
+    const unsafeProse = invalidSelectedResource || reasons.some((reason) => ["contract_or_authorization_changed", "freshness_version_changed", "arithmetic_lineage_unsupported", "calculation_lineage_unsupported", "alignment_lineage_unsupported", "transform_lineage_unsupported"].includes(reason));
     const analysis: AnalysisRecord = {
       analysis_id: newId("an"),
       job_id: jobId,
       session_id: sessionId,
       status,
       answer,
+      ...((host && !unsafeProse && displayModelProse(input.draft_answer)) ? { model_answer: displayModelProse(input.draft_answer) } : {}),
+      ...(host ? { source_review: { status: sources.length === 0 && !failedUnreferencedData ? "not_applicable" as const : sources.length > 0 && sources.every((source) => source.evidence_eligible && !source.truncated && source.complete_population && (source.dimension_snapshot || source.coverage.status === "known" && !coverageHasGap(source.coverage) && source.coverage.unknown_prediction_dates.length === 0)) && !unsafeProse ? "verified" as const : "partial" as const }, text_review: { status: host.textReviewed ? host.review?.items.some((item) => item.status === "uncertain") ? "ambiguous" as const : status === "partial" ? "gaps_found" as const : "model_checked" as const : "not_run" as const, correctness: "not_certified" as const } } : {}),
+      ...(host?.textReviewed && host.review ? { model_coverage_review: { provenance: "model_declared" as const, items: structuredClone(host.review.items) } } : {}),
       limitations: unique(limitations),
       clarification_question: input.clarification_question ?? null,
       citations,

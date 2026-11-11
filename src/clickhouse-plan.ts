@@ -89,11 +89,16 @@ export function planClickHouse(
     const rejectedFunction = review.reason === "function_not_allowed" &&
       typeof review.detail === "string" && /^[a-z_][a-z0-9_]{0,63}$/u.test(review.detail)
       ? review.detail : null;
+    const specificHint = rejectedFunction === "countdistinct"
+      ? "COUNT(DISTINCT ...) 当前未通过函数授权；普通 COUNT 不能替代去重计数。若有完整、授权且未截断的明细，可另行评估支持的计算；否则说明限制。"
+      : rejectedFunction === "multiif"
+        ? "CASE 条件表达式当前未通过函数授权；不能直接假定 sumIf 与原表达式的 NULL、ELSE 和空集语义相同。请先核对口径和受支持形状，否则说明限制。"
+        : null;
     throw new SqlRejected(
       codes[review.reason] ?? review.reason,
-      rejectedFunction
+      specificHint ?? (rejectedFunction
         ? `函数 ${rejectedFunction} 不在当前允许范围。不要重复使用；可改用受支持的 SUM、COUNT、受控 countIf 或读取有界明细后使用计算工具。`
-        : "ClickHouse 权限、函数或封闭扫描范围未通过审查。",
+        : "ClickHouse 权限、函数或封闭扫描范围未通过审查。"),
     );
   }
   const features = queryFeatures(sql);

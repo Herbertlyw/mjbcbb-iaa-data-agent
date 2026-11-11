@@ -381,6 +381,11 @@ export interface AnalysisRecord {
   session_id: string;
   status: AnalysisStatus;
   answer: string;
+  /** Model-authored explanation, not an independently verified fact. */
+  model_answer?: string;
+  source_review?: { status: "verified" | "partial" | "not_applicable" };
+  text_review?: { status: "not_run" | "model_checked" | "gaps_found" | "ambiguous"; correctness: "not_certified" };
+  model_coverage_review?: { provenance: "model_declared"; items: import("./delivery-review.js").DeliveryReview["items"] };
   limitations: string[];
   clarification_question: string | null;
   citations: Array<{ resource_id: string; note: string }>;
@@ -404,7 +409,7 @@ export interface AnalysisRecord {
   }>;
   comparisons?: import("./evidence-comparison.js").VerifiedComparison[];
   aggregate_comparisons?: import("./aggregate-comparison.js").AggregateComparison[];
-  arithmetic_results?: Array<{ resource_id: string; operation: import("./exact-arithmetic.js").ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef; result: import("./exact-arithmetic.js").ArithmeticValue }>;
+  arithmetic_results?: Array<{ resource_id: string; operation: import("./exact-arithmetic.js").ArithmeticOp; left: ArithmeticRef; right: ArithmeticRef; result: import("./exact-arithmetic.js").ArithmeticValue; verified_group?: Record<string, string | null> }>;
   transform_results?: Array<{ resource_id: string; source_resource_id: string; steps: import("./result-transform.js").TransformStep[]; result: import("./result-transform.js").ResultTable; total_rows?: number; preview_has_more?: boolean }>;
   alignment_results?: Array<{ resource_id: string; spec: import("./result-alignment.js").AlignmentSpec; rows: import("./result-alignment.js").AlignedRow[]; total_rows?: number; preview_has_more?: boolean; coverage_incomplete?: boolean }>;
   aggregates?: import("./aggregate-evidence.js").VerifiedAggregate[];

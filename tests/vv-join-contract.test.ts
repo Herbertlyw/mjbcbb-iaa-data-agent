@@ -203,6 +203,19 @@ test("不支持函数仍拒绝并提供安全的函数名和替代方向", () =>
   (error: unknown) => error instanceof SqlRejected && error.code === "function_not_allowed" && /medianexact/u.test(error.message) && !error.message.includes("SELECT"));
 });
 
+test("DISTINCT 和 CASE 的拒绝反馈说明语义边界，不将不等价写法当作通用替代", () => {
+  const source = fact("fact_delivery_daily");
+  const rules = [{ table: source.table, allowed_columns: source.columns.map((column) => column.name), sensitive_columns: source.sensitive_columns, must_filter: source.must_filter, column_types: Object.fromEntries(source.columns.map((column) => [column.name, column.type])) }];
+  const sqls = [
+    ["SELECT COUNT(DISTINCT ua_channel_id) AS n FROM fact_delivery_daily WHERE business_date = '2026-11-01'", /普通 COUNT 不能替代去重计数/u],
+    ["SELECT SUM(CASE WHEN ua_channel_id = 'organic' THEN discounted_cost_usd ELSE 0 END) AS n FROM fact_delivery_daily WHERE business_date = '2026-11-01'", /NULL、ELSE 和空集/u],
+  ] as const;
+  for (const [sql, message] of sqls) assert.throws(
+    () => planClickHouse(sql, rules, [source], [], "starhaven_validation", 1000),
+    (error: unknown) => error instanceof SqlRejected && error.code === "function_not_allowed" && message.test(error.message) && !error.message.includes("2026-11-01"),
+  );
+});
+
 test("UInt64 捕获按精确整数复算，不经过浮点", () => {
   const source = fact("fact_activity_daily");
   const admitted = plan(activitySql, source).join!;

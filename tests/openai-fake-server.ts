@@ -57,7 +57,7 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
         assistantReasoning: messages.filter((message) => message.role === "assistant" && typeof message.reasoning_content === "string").map((message) => message.reasoning_content!),
         authorizationPresent: header.length > 0,
         authorizationMatched: matched,
-        userMessages: messages.filter((message) => message.role === "user" && !historySummary(message)).map(messageText),
+        userMessages: messages.filter((message) => message.role === "user" && !historySummary(message) && !hostFeedback(message)).map(messageText),
         currentTurnRoles: currentTurn(messages).map((message) => message.role),
         historySummaryCount: messages.filter(historySummary).length,
         historySummaryBytes: messages.filter(historySummary).reduce((sum, message) => sum + Buffer.byteLength(messageText(message)), 0),
@@ -103,7 +103,7 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
         return;
       }
       if (script === "no-candidate") {
-        writeTextStream(response, true, options.cacheHitTokens, "这只是没有结果来源的探索。 ");
+        writeTextStream(response, true, options.cacheHitTokens, "候选引用了不存在的结果。 [[result:res_not_authorized]]");
         return;
       }
       const plainBody = body.replaceAll("\\", "");
@@ -121,6 +121,67 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
       // Pi session and persisted user message always keep the original text.
       const fixtureMessages = dateShift ? JSON.parse(shiftSyntheticDates(JSON.stringify(messages), -dateShift)) as ProtocolMessage[] : messages;
       const turnTools = currentTurn(fixtureMessages).filter((message) => message.role === "tool");
+      if (script === "repeat-denied-cycle") {
+        const call = turnTools.length % 2 === 0
+          ? { id: `denied_contract_${turnTools.length}`, name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.daily_installs" }) }
+          : { id: `denied_query_${turnTools.length}`, name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, new_users FROM daily_installs WHERE event_date = '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'" }) };
+        writeToolStream(response, call, true, false, options.cacheHitTokens);
+        return;
+      }
+      if (script === "equivalent-retry" || script === "equivalent-truncated" || script === "narrow-retry") {
+        const tools = fixtureMessages.filter((message) => message.role === "tool");
+        const feedback = fixtureMessages.some(hostFeedback);
+        const base = "SELECT SUM(new_users) AS total FROM daily_installs WHERE event_date >= '2026-10-06' AND event_date <= '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND channel = 'nebula_ads'" + (script !== "narrow-retry" ? " AND country_code = 'US'" : "");
+        if (feedback) {
+          const result = tools.map((message) => { try { return JSON.parse(messageText(message)) as { resource_id?: string }; } catch { return {}; } }).find((item) => item.resource_id);
+          const id = result?.resource_id ?? "res_missing";
+          const review = `[[review:${JSON.stringify({ items: [{ requirement: "合成指标", status: "answered", resource_ids: [id] }] })}]]`;
+          writeTextStream(response, true, options.cacheHitTokens, `${script === "equivalent-retry" ? "" : "[[partial]] 原范围的探索失败仍待核对。 "}[[result:${id}]] ${review}`);
+        } else if (tools.length === 0) writeToolStream(response, { id: "equivalent_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.daily_installs" }) }, true, false, options.cacheHitTokens);
+        else if (tools.length === 1) writeToolStream(response, { id: "equivalent_first", name: "query", arguments: JSON.stringify({ sql: base }) }, true, false, options.cacheHitTokens);
+        else if (tools.length === 2) writeToolStream(response, { id: "equivalent_second", name: "query", arguments: JSON.stringify({ sql: script === "narrow-retry" ? `${base} AND country_code = 'US'` : base.replace("SELECT SUM", "SELECT  SUM") }) }, true, false, options.cacheHitTokens);
+        else {
+          const result = JSON.parse(messageText(tools.at(-1)!)) as { resource_id?: string };
+          writeTextStream(response, true, options.cacheHitTokens, `[[result:${result.resource_id ?? "res_missing"}]]`);
+        }
+        return;
+      }
+      if (script === "repeat-unbound-query") {
+        writeToolStream(response, { id: `repeated_query_${turnTools.length}`, name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, new_users FROM daily_installs WHERE event_date = '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'" }) }, true, false, options.cacheHitTokens);
+        return;
+      }
+      if (script === "partial-repair" || script === "partial-repair-invalid" || script === "partial-repair-failed" || script === "partial-repair-drift" || script === "partial-repair-misleading") {
+        const tools = fixtureMessages.filter((message) => message.role === "tool");
+        const feedback = fixtureMessages.some(hostFeedback);
+        if (feedback) {
+          const results = tools.map((message) => { try { return JSON.parse(messageText(message)) as { resource_id?: string }; } catch { return {}; } }).filter((item) => item.resource_id);
+          if ((script === "partial-repair-drift" || script === "partial-repair-misleading") && results.length === 1) {
+            writeToolStream(response, { id: "repair_drift_query", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, new_users FROM daily_installs WHERE event_date = '2026-10-08' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'" }) }, true, false, options.cacheHitTokens);
+          } else if (script === "partial-repair-misleading" && !tools.some((message) => messageText(message).includes('"scope":"复核后仍有缺口"'))) {
+            writeToolStream(response, { id: "repair_open_note", name: "update_analysis", arguments: JSON.stringify({ scope: "复核后仍有缺口", grain: "日", expected_group_keys: [], unresolved_questions: ["另一项缺少证据"] }) }, true, false, options.cacheHitTokens);
+          } else {
+            const selected = script === "partial-repair-drift" ? results.at(-1) : results[0];
+            const answer = script === "partial-repair-misleading" ? results.map((item) => `[[result:${item.resource_id}]]`).join(" ") : `[[partial]] 另一项尚无法核验。 [[result:${selected?.resource_id ?? "res_missing"}]]`;
+            writeTextStream(response, true, options.cacheHitTokens, script === "partial-repair-invalid" ? "无法形成新候选" : script === "partial-repair-failed" ? "[[failed]]" : answer);
+          }
+        } else if (tools.length === 0) writeToolStream(response, { id: "repair_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.daily_installs" }) }, true, false, options.cacheHitTokens);
+        else if (tools.length === 1) writeToolStream(response, { id: "repair_query", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, new_users FROM daily_installs WHERE event_date = '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'" }) }, true, false, options.cacheHitTokens);
+        else if (tools.length === 2) writeToolStream(response, { id: "repair_note", name: "update_analysis", arguments: JSON.stringify({ scope: "合成范围", grain: "日", expected_group_keys: [], unresolved_questions: ["另一项缺少证据"] }) }, true, false, options.cacheHitTokens);
+        else {
+          const result = JSON.parse(messageText(tools[1]!)) as { resource_id?: string };
+          writeTextStream(response, true, options.cacheHitTokens, `[[result:${result.resource_id ?? "res_missing"}]]`);
+        }
+        return;
+      }
+      if (script === "partial-candidate") {
+        if (turnTools.length === 0) writeToolStream(response, { id: "partial_contract", name: "read_data_contract_view", arguments: JSON.stringify({ asset_id: "contract.daily_installs" }) }, true, false, options.cacheHitTokens);
+        else if (turnTools.length === 1) writeToolStream(response, { id: "partial_query", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, new_users FROM daily_installs WHERE event_date = '2026-10-06' AND product_id = 'starlane_drift' AND platform = 'ios' AND country_code = 'US' AND channel = 'nebula_ads'" }) }, true, false, options.cacheHitTokens);
+        else {
+          const result = JSON.parse(messageText(turnTools.at(-1)!)) as { resource_id?: string };
+          writeTextStream(response, true, options.cacheHitTokens, result.resource_id ? `[[partial]] 尚有要求无法核验。 [[result:${result.resource_id}]]` : "[[failed]]");
+        }
+        return;
+      }
       if (script === "clarify-retry") {
         writeTextStream(response, true, options.cacheHitTokens, JSON.stringify(fixtureMessages).includes("宿主反馈") ? "[[clarify]] 请说明分析范围？" : "[[result:res_invalid]]");
         return;
@@ -128,6 +189,31 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
       if (script === "clarify-trailing-request") {
         writeTextStream(response, true, options.cacheHitTokens, "[[clarify]] 目前我还没有生成任何本次查询结果，也不会编造数字。你想看的是交易或支付金额，还是广告变现？另外请一并说明时间范围，以及想按哪个维度看。");
         return;
+      }
+      // This protocol fixture supplies a scripted review for the already
+      // scripted answer. It is not a model-quality or semantic-completeness test.
+      const feedbackIndex = fixtureMessages.findLastIndex(hostFeedback);
+      const userIndex = fixtureMessages.findLastIndex((message) => message.role === "user" && !historySummary(message) && !hostFeedback(message));
+      if (feedbackIndex > userIndex) {
+        if (messageText(fixtureMessages[userIndex]!).includes("合成纠正查询错误")) {
+          const later = fixtureMessages.slice(feedbackIndex + 1).filter((message) => message.role === "tool");
+          if (!later.length) {
+            writeToolStream(response, { id: "review_scope_drift", name: "query", arguments: JSON.stringify({ sql: "SELECT event_date, new_users FROM fact_fox_daily_install WHERE event_date = '2026-10-06' AND title_id = 'paper_lantern' AND platform = 'ios' AND country_code = 'US' AND channel_id = 'mist_ads'" }) }, true, false, options.cacheHitTokens);
+          } else {
+            const result = JSON.parse(messageText(later.at(-1)!)) as { resource_id?: string };
+            const id = result.resource_id ?? "res_missing";
+            writeTextStream(response, true, options.cacheHitTokens, `[[result:${id}]] [[review:${JSON.stringify({ items: [{ requirement: "脚本范围漂移反例", status: "answered", resource_ids: [id] }] })}]]`);
+          }
+          return;
+        }
+        const prior = fixtureMessages.slice(0, feedbackIndex).findLast((message) => message.role === "assistant" && messageText(message).includes("[[result:"));
+        const priorText = prior ? messageText(prior) : "";
+        const ids = [...priorText.matchAll(/\[\[result:(res_[A-Za-z0-9-]+)\]\]/gu)].map((match) => match[1]!);
+        if (ids.length) {
+          const review = { items: [{ requirement: "脚本演示中选择的结果", status: priorText.includes("[[partial]]") ? "missing" : "answered", resource_ids: priorText.includes("[[partial]]") ? [] : [ids.at(-1)!] }] };
+          writeTextStream(response, true, options.cacheHitTokens, `${priorText} [[review:${JSON.stringify(review)}]]`);
+          return;
+        }
       }
       if (messageText(currentTurn(fixtureMessages)[0] ?? { role: "user" }).includes("合成并发契约") && turnTools.length === 0) {
         const names = ["contract.fact_fox_daily_install", "contract.fact_fox_daily_payment", "contract.dim_fox_channel"];
@@ -185,6 +271,10 @@ export async function startFakeOpenAI(token: string, options: { recordObservatio
 }
 
 interface ProtocolMessage { role: string; content?: unknown; reasoning_content?: string; tool_calls?: Array<{ function?: { name?: string } }> }
+
+function hostFeedback(message: ProtocolMessage): boolean {
+  return message.role === "user" && /^(?:宿主反馈：|宿主正文核对：)/u.test(messageText(message));
+}
 
 function historySummary(message: ProtocolMessage): boolean {
   if (message.role !== "tool" && message.role !== "user") return false;

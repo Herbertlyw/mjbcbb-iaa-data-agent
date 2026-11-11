@@ -107,7 +107,9 @@ export function renderAggregateComparison(item: AggregateComparison): string {
 
 export function renderArithmetic(
   item: NonNullable<AnalysisRecord["arithmetic_results"]>[number],
+  verifiedGroup?: Readonly<Record<string, string | null>>,
 ): string {
+  const group = verifiedGroup ? `；同次查询分组 ${Object.entries(verifiedGroup).map(([key, value]) => `${key}=${value === null ? "NULL" : JSON.stringify(value)}`).join("，")}` : "";
   const value =
     item.result.value === null
       ? item.result.undefined_reason === "null_input"
@@ -115,7 +117,7 @@ export function renderArithmetic(
         : "除数为零，结果不可计算"
       : `${item.result.value} ${item.result.unit}`;
   if (item.result.interpretation === "mathematical_only")
-    return `${item.result.formula ?? "所选结果单元"} 可复核数学运算 ${item.operation}：${value}；输入 ${item.left.resource_id}、${item.right.resource_id}；计算资源 ${item.resource_id}。仅认证计算与来源，不认证业务指标名称、用户意图或完整范围。${item.result.approximate ? "输入含浮点观测，结果为近似值。" : ""}${item.result.partial ? "输入有缺失或覆盖不完整。" : ""}`;
+    return `${item.result.formula ?? "所选结果单元"} 可复核数学运算 ${item.operation}：${value}${group}；输入 ${item.left.resource_id}、${item.right.resource_id}；计算资源 ${item.resource_id}。仅认证计算与来源，不认证业务指标名称、用户意图或完整范围。${item.result.approximate ? "输入含浮点观测，结果为近似值。" : ""}${item.result.partial ? "输入有缺失或覆盖不完整。" : ""}`;
   const scope = item.result.scopes
     .map(
       (entry) =>
@@ -124,7 +126,7 @@ export function renderArithmetic(
           .join("，")}；${entry.start} 到 ${entry.end}`,
     )
     .join(" / ");
-  return `${item.result.formula ?? `${item.result.basis.table}.${item.result.basis.column}`} 可复核四则运算 ${item.operation}：${value}；范围 ${scope}（${item.result.basis.timezone}）；输入 ${item.left.resource_id}、${item.right.resource_id}；计算资源 ${item.resource_id}。除法保留 18 位，半数远离零。${item.result.scope_unverified ? "仅基于该分组的已观察数据，未证明完整业务总体或不存在其他分组。" : ""}`;
+  return `${item.result.formula ?? `${item.result.basis.table}.${item.result.basis.column}`} 可复核四则运算 ${item.operation}：${value}${group}；范围 ${scope}（${item.result.basis.timezone}）；输入 ${item.left.resource_id}、${item.right.resource_id}；计算资源 ${item.resource_id}。除法保留 18 位，半数远离零。${item.result.scope_unverified ? "仅基于该分组的已观察数据，未证明完整业务总体或不存在其他分组。" : ""}`;
 }
 
 export function renderQueryObservation(item: VerifiedQueryObservation): string {

@@ -12,6 +12,7 @@ import { analyst, ask, openRuntime, waitForJob, withRuntime } from "./helpers.js
 import { startFakeOpenAI } from "./openai-fake-server.js";
 import type { ProviderStepBegin, ProviderStepDecision, ProviderStepSettle, StateStore } from "../src/state-store.js";
 import { GlobalBudget } from "../src/global-budget.js";
+import { sessionAnalyses } from "../src/tools.js";
 
 const token = "fictional-loopback-token";
 
@@ -333,6 +334,210 @@ test("Pi 自然澄清无需调用工具，宿主提交且不多次派发", async
     });
   } finally { await fake.close(); }
 });
+
+test("普通 Pi 任务主动声明未完成时，只交付受验证部分且终态为 partial", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: "partial-candidate" }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "纸灯 在 2026-10-06 到 2026-10-12（美国、iOS、雾帆）的新增用户是多少？");
+      assert.equal(job.status, "partial", JSON.stringify(job.error));
+      assert.equal(job.analysis?.model_suggested_status, "partial");
+      assert.match(job.analysis?.answer ?? "", /这个回答不完整/u);
+      assert.ok(job.analysis?.sources.some((source) => source.evidence_eligible));
+      assert.equal(job.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
+    });
+  } finally { await fake.close(); }
+});
+
+for (const script of ["partial-repair", "partial-repair-invalid", "partial-repair-failed"] as const) {
+  test(`普通 Pi 候选的未解事项获得一次反馈，${script === "partial-repair" ? "可接受部分修订" : "无效修订保留原有部分结果"}`, async () => {
+    const fake = await startFakeOpenAI(token);
+    try {
+      await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: script }), async (runtime) => {
+        const session = analyst(runtime);
+        const job = await ask(runtime, session.session_id, "请核验合成数据并说明其他缺失项。");
+        assert.equal(job.status, "partial", JSON.stringify(job.error));
+        assert.match(job.analysis?.answer ?? "", /这个回答不完整/u);
+        const feedback = job.events.filter((event) => event.type === "candidate_feedback");
+        assert.equal(feedback.length, 1);
+        assert.equal(feedback[0]?.payload.code, "candidate_partial_evidence");
+        assert.deepEqual(feedback[0]?.payload.reason_codes, ["model_declared_unresolved"]);
+        assert.doesNotMatch(JSON.stringify(feedback), /另一项缺少证据/u, "普通事件不保存工作记录正文");
+        assert.equal(job.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === "query").length, 1, "修订应复用查询结果");
+        assert.equal(job.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
+      });
+    } finally { await fake.close(); }
+  });
+}
+
+test("修订查询改了日期且丢弃已有证据时保留原候选，并记录丢弃原因", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: "partial-repair-drift" }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成范围和未解项。");
+      assert.equal(job.status, "partial");
+      assert.equal(job.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === "query").length, 2);
+      assert.equal(job.events.filter((event) => event.type === "candidate_revision_discarded").at(-1)?.payload.code, "prior_verified_sources_omitted");
+      assert.equal(job.analysis?.sources.length, 1);
+      assert.match(job.analysis?.sources[0]?.sql ?? "", /2026-10-06/u);
+      assert.doesNotMatch(job.analysis?.sources[0]?.sql ?? "", /2026-10-08/u);
+      assert.equal(job.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
+    });
+  } finally { await fake.close(); }
+});
+
+test("无关补证且复核仍承认缺口时，保留有效结果并保持部分完成", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: "partial-repair-misleading" }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成范围和未解项。");
+      assert.equal(job.status, "partial");
+      assert.equal(job.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === "query").length, 2);
+      assert.equal(job.analysis?.sources.length, 2, "保留已验证的新增结果，但不能据此声称缺口已经解决");
+      assert.ok(job.analysis?.server_reasons.includes("model_declared_unresolved"));
+    });
+  } finally { await fake.close(); }
+});
+
+test("普通 Pi 在首份候选之前连续重复相同契约错误时停止，保留错误和唯一终态", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: "repeat-unbound-query", maxModelCalls: 8 }), async (runtime) => {
+      const session = analyst(runtime);
+      const job = await ask(runtime, session.session_id, "合成范围内查数据。");
+      assert.equal(job.status, "failed");
+      assert.equal(job.error?.code, "repeated_tool_failure");
+      const finished = job.events.filter((event) => event.type === "tool_finished" && event.payload.tool_name === "query");
+      assert.equal(finished.length, 3);
+      assert.ok(finished.every((event) => event.payload.code === "missing_data_contract_evidence"));
+      assert.equal(fake.observations.length, 3);
+      assert.equal(job.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
+      assert.doesNotMatch(JSON.stringify(job.events), /SELECT event_date|starlane_drift/u, "事件只记录摘要，不保存查询或用户原文");
+    });
+  } finally { await fake.close(); }
+});
+
+test("普通 Pi 在首份候选前交替重复无权限契约与查询时停止", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: "repeat-denied-cycle", maxModelCalls: 12 }), async (runtime) => {
+      const session = runtime.sessions.create("viewer");
+      const job = await ask(runtime, session.session_id, "合成范围内查数据。");
+      assert.equal(job.status, "failed");
+      assert.equal(job.error?.code, "repeated_tool_failure");
+      const failures = job.events.filter((event) => event.type === "tool_finished" && event.payload.is_error === true);
+      assert.equal(failures.length, 6);
+      assert.deepEqual(failures.map((event) => event.payload.tool_name), ["read_data_contract_view", "query", "read_data_contract_view", "query", "read_data_contract_view", "query"]);
+      assert.equal(fake.observations.length, 6);
+      assert.equal(job.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
+    });
+  } finally { await fake.close(); }
+});
+
+test("部分候选反馈快照后失权接管，重建受核验候选且不重跑查询", { timeout: 20000 }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "partial-repair-recovery-"));
+  const fake = await startFakeOpenAI(token);
+  let first: ReturnType<typeof openRuntime> | undefined;
+  let second: ReturnType<typeof openRuntime> | undefined;
+  let release!: () => void; let entered!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  try {
+    const config = gateway({ piBaseUrl: fake.url, protocolScript: "partial-repair-invalid", heartbeatMs: 50, pollMs: 20, leaseMs: 5000 });
+    first = openRuntime(dir, config);
+    const original = first.state.saveAgentSnapshot.bind(first.state);
+    const state = first.state as unknown as { saveAgentSnapshot: (input: Parameters<StateStore["saveAgentSnapshot"]>[0]) => Promise<boolean> };
+    state.saveAgentSnapshot = async (input) => {
+      const saved = original(input);
+      if (saved && input.kind === "progress" && typeof input.body.jsonl === "string" && input.body.jsonl.includes("lumenfox.candidate_feedback")) { entered(); await gate; }
+      return saved;
+    };
+    const session = analyst(first);
+    const submitted = first.jobs.submit(session.session_id, "合成范围和未解项。", "partial-recovery");
+    await ready;
+    first.jobs.pauseHeartbeats();
+    first.jobs.expireLease(submitted.job_id);
+    // Runtimes in this test share a JS process; discard the old worker's
+    // in-memory cache to model the state after a genuine process restart.
+    sessionAnalyses(session).splice(0);
+    second = openRuntime(dir, config);
+    const job = await waitForJob(second, submitted.job_id);
+    assert.equal(job.status, "partial", JSON.stringify(job.error));
+    assert.match(job.analysis?.answer ?? "", /这个回答不完整/u);
+    assert.equal(job.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === "query").length, 1);
+    assert.equal(job.events.filter((event) => event.type === "candidate_feedback").length, 1);
+    assert.equal(job.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
+  } finally {
+    release();
+    if (first) await first.close({ abandon: true });
+    if (second) await second.close({ abandon: true });
+    await fake.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("部分候选反馈保存期间取消，不再派发修订且不交付旧候选", async () => {
+  const fake = await startFakeOpenAI(token);
+  try {
+    await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: "partial-repair" }), async (runtime) => {
+      let release!: () => void; let entered!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const ready = new Promise<void>((resolve) => { entered = resolve; });
+      const original = runtime.state.saveAgentSnapshot.bind(runtime.state);
+      const state = runtime.state as unknown as { saveAgentSnapshot: (input: Parameters<StateStore["saveAgentSnapshot"]>[0]) => Promise<boolean> };
+      state.saveAgentSnapshot = async (input) => {
+        const saved = original(input);
+        if (saved && input.kind === "progress" && typeof input.body.jsonl === "string" && input.body.jsonl.includes("lumenfox.candidate_feedback")) { entered(); await gate; }
+        return saved;
+      };
+      try {
+        const session = analyst(runtime); const submitted = runtime.jobs.submit(session.session_id, "合成范围和未解项。", crypto.randomUUID());
+        await ready;
+        const prior = fake.observations.length;
+        runtime.jobs.cancel(submitted.job_id); release();
+        const job = await waitForJob(runtime, submitted.job_id);
+        assert.equal(job.status, "cancelled");
+        assert.equal(job.analysis, null);
+        assert.equal(fake.observations.length, prior);
+        assert.equal(job.events.filter((event) => event.type === "job_cancelled").length, 1);
+        assert.equal(job.events.filter((event) => event.type === "candidate_feedback").length, 1);
+      } finally { release(); }
+    });
+  } finally { await fake.close(); }
+});
+
+for (const script of ["equivalent-retry", "narrow-retry", "equivalent-truncated"] as const) {
+  test(`普通 Pi 探索失败后${script === "equivalent-retry" ? "仅等价且已验证的查询消解失败" : script === "narrow-retry" ? "缩小范围的成功不能消解失败" : "截断的成功不能消解失败"}`, async () => {
+    const fake = await startFakeOpenAI(token);
+    try {
+      await withRuntime(gateway({ piBaseUrl: fake.url, protocolScript: script }), async (runtime) => {
+        const original = runtime.tools.query.bind(runtime.tools); let calls = 0;
+        runtime.tools.query = async (...args) => {
+          if (++calls === 1) return { ok: false, code: "function_not_allowed", message: "合成策略拒绝。" };
+          const result = await original(...args);
+          if (script === "equivalent-truncated" && result.ok && typeof result.resource_id === "string") {
+            const found = runtime.sessions.lookupResource(args[0], result.resource_id);
+            assert.ok(found.ok && found.resource.kind === "query_result");
+            runtime.state.saveResource({ ...found.resource, truncated: true, complete_population: false });
+          }
+          return result;
+        };
+        const session = analyst(runtime);
+        const job = await ask(runtime, session.session_id, "分析合成指标。 ");
+        assert.equal(calls, 2);
+        assert.equal(job.status, script === "equivalent-retry" ? "completed" : "partial", JSON.stringify({ error: job.error, reasons: job.analysis?.server_reasons, events: job.events.filter((event) => event.type.startsWith("tool_")) }));
+        assert.ok(job.analysis?.server_reasons.includes("request_coverage_unverified"));
+        assert.ok(job.analysis?.limitations.some((item) => item.includes("全部要求")));
+        assert.equal(job.analysis?.server_reasons.includes("unresolved_tool_failure"), script !== "equivalent-retry");
+        assert.equal(job.events.filter((event) => event.type === "tool_finished" && event.payload.code === "function_not_allowed").length, 1, "失败事件仍可审计");
+        assert.equal(job.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
+      });
+    } finally { await fake.close(); }
+  });
+}
 
 test("Pi 自然澄清保留原话且不发查询", async () => {
   const fake = await startFakeOpenAI(token);

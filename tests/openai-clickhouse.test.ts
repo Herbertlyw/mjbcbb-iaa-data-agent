@@ -254,12 +254,13 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(notedTools[0], "update_analysis");
     assert.ok(notedTools.indexOf("query") > notedTools.indexOf("update_analysis"));
     assert.ok(notedTools.indexOf("calculate_session_cells") > notedTools.indexOf("query"));
-    assert.equal(noted.events.filter((event) => event.type === "candidate_reviewed").length, 1);
+    assert.deepEqual(noted.events.filter((event) => event.type === "candidate_reviewed").map((event) => event.payload.status), ["partial", "partial"], "覆盖复核前后均不得把存在 NULL 的观察升级为完整结果");
+    assert.equal(noted.events.filter((event) => event.type === "candidate_feedback").length, 1);
     assert.equal(noted.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
     if (process.env.TEST_DEEPSEEK_DIALECT === "1") assert.ok(fake.observations.every((item) => item.thinkingType === "disabled"));
     const followup = await postQuestion(apiPort, session.session_id, "那日本呢？");
     const followupTools = followup.events.filter((event) => event.type === "tool_started").map((event) => event.payload.tool_name);
-    assert.equal(followup.status, "completed", `followup=${followup.status} tools=${followupTools.join("> ")} answer=${followup.analysis?.answer ?? ""} error=${JSON.stringify(followup.error)} events=${JSON.stringify(followup.events.filter((e) => ["model_context", "tool_finished"].includes(e.type)))} obs=${JSON.stringify(fake.observations.slice(-4))}`);
+    assert.equal(followup.status, "completed", `followup=${followup.status} tools=${followupTools.join("> ")} answer=${followup.analysis?.answer ?? ""} reasons=${JSON.stringify(followup.analysis?.server_reasons)} error=${JSON.stringify(followup.error)} events=${JSON.stringify(followup.events.filter((e) => ["model_context", "tool_finished", "candidate_reviewed", "candidate_feedback", "candidate_revision_discarded"].includes(e.type)))} obs=${JSON.stringify(fake.observations.slice(-4))}`);
     assert.match(followup.analysis?.answer ?? "", /不是同一原子快照/);
     assert.match(followup.analysis?.answer ?? "", /70/);
     assert.equal(followup.analysis?.sources?.[0]?.engine, "clickhouse-local");
@@ -677,7 +678,8 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(resumedJoin.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === "query").length, 1);
     assert.equal(resumedJoin.events.filter((event) => event.type === "tool_started" && event.payload.tool_name === "calculate_session_cells").length, 2);
     assert.equal(resumedJoin.events.find((event) => event.type === "model_context" && event.payload.decision === "reread_candidate")?.payload.leaf_id, savedCandidate);
-    assert.equal(resumedJoin.events.filter((event) => event.type === "candidate_reviewed").length, 1);
+    assert.deepEqual(resumedJoin.events.filter((event) => event.type === "candidate_reviewed").map((event) => event.payload.status), ["completed", "completed"], "恢复后的候选必须经过一次正文核对");
+    assert.equal(resumedJoin.events.filter((event) => event.type === "candidate_feedback").length, 1);
     assert.equal(resumedJoin.events.filter((event) => ["job_finished", "job_failed", "job_cancelled", "job_timed_out"].includes(event.type)).length, 1);
     const channelJoinSession = await fetch(`http://127.0.0.1:${apiPort}/api/sessions`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     const channelJoinSessionId = ((await channelJoinSession.json()) as { session_id: string }).session_id;
@@ -801,11 +803,14 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     };
     const dailySession = await createSyntheticSession();
     const corrected = await postQuestion(apiPort, await createSyntheticSession(), "合成纠正查询错误：纸灯美国三日新增合计。");
-    assert.equal(corrected.status, "completed", JSON.stringify({ error: corrected.error, reasons: corrected.analysis?.server_reasons, answer: corrected.analysis?.answer }));
+    // The failed SQL is only "SELECT (": its intended scope cannot be
+    // reconstructed, so an unrelated successful query cannot retire it.
+    assert.equal(corrected.status, "partial", JSON.stringify({ error: corrected.error, reasons: corrected.analysis?.server_reasons, answer: corrected.analysis?.answer }));
     assert.match(corrected.analysis?.answer ?? "", /220/);
     const queryEvents = corrected.events.filter((event) => event.type === "tool_finished" && event.payload.tool_name === "query");
-    assert.equal(queryEvents.length, 2); assert.equal(queryEvents[0]?.payload.is_error, true); assert.equal(queryEvents[1]?.payload.is_error, false);
-    assert.ok(!corrected.analysis?.server_reasons?.includes("unresolved_tool_failure"));
+    assert.equal(queryEvents.length, 3); assert.equal(queryEvents[0]?.payload.is_error, true); assert.equal(queryEvents[1]?.payload.is_error, false);
+    assert.equal(corrected.events.filter((event) => event.type === "candidate_revision_discarded").at(-1)?.payload.code, "prior_verified_sources_omitted", "范围漂移的修订不应覆盖原 220 结果");
+    assert.ok(corrected.analysis?.server_reasons?.includes("unresolved_tool_failure"));
     const contractRecovery = await postQuestion(apiPort, await createSyntheticSession(), "合成补读支付契约恢复：纸灯美国单日支付流水和支付表对应成本。");
     assert.equal(contractRecovery.status, "completed", JSON.stringify({ error: contractRecovery.error, reasons: contractRecovery.analysis?.server_reasons, events: contractRecovery.events }));
     const recoveredAnalysis = contractRecovery.analysis as unknown as AnalysisRecord;
@@ -1168,7 +1173,8 @@ test("本地 OpenAI 兼容假服务驱动 AgentSession 查询 ClickHouse，未�
     assert.equal(withoutRecord.status, "completed", JSON.stringify(withoutRecord.error));
     assert.match(withoutRecord.analysis?.answer ?? "", /数据库求和 70；单位 人/);
     assert.equal(withoutRecord.events.some((event) => event.type === "tool_started" && event.payload.tool_name === "update_analysis"), false);
-    assert.equal(withoutRecord.events.filter((event) => event.type === "candidate_reviewed").length, 1);
+    assert.deepEqual(withoutRecord.events.filter((event) => event.type === "candidate_reviewed").map((event) => event.payload.status), ["completed", "completed"]);
+    assert.equal(withoutRecord.events.filter((event) => event.type === "candidate_feedback").length, 1);
     // Optional manual browser regression: a loopback proxy really drops the first
     // SSE socket and records the browser's subsequent cursor and event IDs.
     if (process.env.BROWSER_TRACE_DIR) {

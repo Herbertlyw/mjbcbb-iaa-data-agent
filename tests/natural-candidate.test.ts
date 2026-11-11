@@ -17,6 +17,17 @@ test("仅选择当前任务成功回执中的最终结果，不自动选择探�
   assert.equal(naturalCandidate([msg("[[result:res_a]] [[compare:res_a.total,res_b.total]]")], allowed), null);
 });
 
+test("模型可主动标识有证据的部分回答，不能借标记选择其他任务结果", () => {
+  const selected = naturalCandidate([msg("[[partial]] 仍有范围未能核验。 [[result:res_a]]")], new Set(["res_a"]));
+  assert.ok(selected?.kind === "answer");
+  assert.equal(selected.suggestedStatus, "partial");
+  assert.deepEqual(selected.resourceIds, ["res_a"]);
+  assert.equal(naturalCandidate([msg("[[partial]] [[result:res_b]]")], new Set(["res_a"])), null);
+  assert.equal(naturalCandidate([msg("[[partial]] 尚无任何证据")], new Set(["res_a"])), null);
+  assert.equal(naturalCandidate([msg("[[result:res_a]] [[partial]]")], new Set(["res_a"])), null);
+  assert.equal(naturalCandidate([msg("[[partial]] [[partial]] [[result:res_a]]")], new Set(["res_a"])), null);
+});
+
 test("澄清是独立的无结果问句，不能承载数字或伪造结果选择", () => {
   assert.deepEqual(naturalCandidate([msg("[[clarify]] 请补充产品和日期范围？")], new Set()), { kind: "clarification", question: "请补充产品和日期范围？" });
   assert.equal(naturalCandidate([msg("[[clarify]] 收入是 70，请问产品？")], new Set()), null);

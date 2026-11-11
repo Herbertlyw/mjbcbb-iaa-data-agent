@@ -348,6 +348,47 @@ test("结论先于用量展示，澄清、取消和模型文本保留不同含�
   assert.doesNotMatch(question, /数据来源/);
 });
 
+test("请求完整性未核验时，页面不会将执行终态展示为请求全部完成", () => {
+  const { api } = page();
+  for (const question of ["按地区查看收入和成本", "比较两个日期的设备数", "按渠道计算转化率"]) {
+    const rendered = api.renderJob({
+      status: "completed", user_text: question,
+      analysis: { status: "completed", answer: "已核验的所选结果", sources: [], limitations: ["请对照原问题检查是否有漏项。"], server_reasons: ["request_coverage_unverified"] },
+    });
+    assert.match(rendered, /结果已生成 · 请求覆盖待核对/);
+    assert.match(rendered, /请对照原问题检查是否有漏项/);
+  }
+});
+
+test("模型正文、核验结果和缺口直接可见，模型 HTML 按文本转义", () => {
+  const { api } = page();
+  const html = api.renderJob({ status: "partial", user_text: "合成问题", analysis: {
+    status: "partial", model_answer: "解释 1.146593；成本缺失。<img src=x onerror=alert(1)>", answer: "核验结果 1.146593", sources: [], calculations: [],
+    limitations: ["成本缺失，差额未知"], server_reasons: [],
+  } });
+  assert.match(html, /模型分析 · 未逐句核验/);
+  assert.match(html, /解释 1\.146593；成本缺失/);
+  assert.match(html, /核验结果 1\.146593/);
+  assert.match(html, /成本缺失，差额未知/);
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.doesNotMatch(html, /<img src=x/);
+  assert.match(html, /<details class="limitations" open>/);
+});
+
+test("零分母显示已核验的同次查询分组，模型标记不泄露到解释正文", () => {
+  const { api } = page();
+  const html = api.renderJob({ status: "partial", user_text: "合成问题", analysis: {
+    status: "partial", answer: "完整服务端结果", limitations: [], resource_hashes: {},
+    sources: [{ resource_id: "res_source", evidence_eligible: true, tables: ["synthetic"], rows: [], time_range: { start: "2026-10-08", end: "2026-10-08", timezone: "UTC" }, sql: "SELECT", freshness_receipts: [] }],
+    model_draft: "[[partial]] 范围待核验 [[result:res_source]]",
+    arithmetic_results: [{ resource_id: "res_calc", operation: "divide", verified_group: { "dim.channel": "organic<script>", "dim.other": null }, result: { value: null, unit: "USD/人", undefined_reason: "zero_divisor", interpretation: "mathematical_only" } }],
+  } });
+  assert.match(html, /不可计算（除数为零）/u);
+  assert.match(html, /同次查询分组/u);
+  assert.match(html, /organic&lt;script&gt;/u);
+  assert.doesNotMatch(html, /organic<script>|\[\[partial\]\]|\[\[result:/u);
+});
+
 test("核验结果表只使用核验单元，保留筛选、精度、零和 NULL 说明", () => {
   const { api } = page();
   const html = api.renderJob({

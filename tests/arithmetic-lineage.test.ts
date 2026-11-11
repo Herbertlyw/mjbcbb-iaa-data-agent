@@ -132,7 +132,16 @@ test("同任务聚合的四则运算可递归复核，零分母、篡改和跨�
     if (implicitAncestors.ok) { assert.equal(implicitAncestors.status, "completed"); assert.match(String(implicitAncestors.answer), /1\.791666666666666667/); }
     const noZero = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [b.resource_id, zero.resource_id, invalid.ref.resource_id] });
     assert.equal(noZero.ok, true);
-    if (noZero.ok) { assert.equal(noZero.status, "partial"); assert.match(String(noZero.answer), /除数为零，结果不可计算/); }
+    if (noZero.ok) { assert.equal(noZero.status, "completed"); assert.match(String(noZero.answer), /除数为零，结果不可计算/); }
+    const stillMissing = await runtime.tools.updateAnalysis(session.session_id, {
+      suggested_status: "completed", draft_answer: "", resource_ids: [invalid.ref.resource_id],
+      declaration: { scope: "当前合成范围", grain: "日期", expected_group_keys: [], unresolved_questions: ["另一项结果尚无证据"] },
+    });
+    assert.equal(stillMissing.ok, true);
+    if (stillMissing.ok) {
+      assert.equal(stillMissing.status, "partial", "已证明除零不能消除其他未解项");
+      assert.ok((stillMissing.server_reasons as string[]).includes("model_declared_unresolved"));
+    }
     const stored = runtime.sessions.lookupResource(session.session_id, sum.ref.resource_id);
     assert.ok(stored.ok && stored.resource.kind === "arithmetic");
     if (!stored.ok || stored.resource.kind !== "arithmetic") return;
@@ -140,6 +149,9 @@ test("同任务聚合的四则运算可递归复核，零分母、篡改和跨�
     const tampered = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: ids });
     assert.equal(tampered.ok, true);
     if (tampered.ok) { assert.notEqual(tampered.status, "completed"); assert.doesNotMatch(String(tampered.answer), /999999/); assert.ok((tampered.server_reasons as string[]).includes("arithmetic_lineage_unsupported")); }
+    const unsafeProse = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "模型称计算结果是 999999。", resource_ids: ids }, undefined, { events: [] });
+    assert.ok(unsafeProse.ok);
+    if (unsafeProse.ok) { assert.equal(unsafeProse.model_answer, undefined, "来源或计算被篡改时不交付依赖它的模型正文"); assert.notEqual(unsafeProse.status, "completed"); }
     const tamperedAncestor = await runtime.tools.updateAnalysis(session.session_id, { suggested_status: "completed", draft_answer: "", resource_ids: [chain.ref.resource_id] });
     assert.ok(tamperedAncestor.ok);
     if (tamperedAncestor.ok) { assert.notEqual(tamperedAncestor.status, "completed"); assert.doesNotMatch(String(tamperedAncestor.answer), /999999/); }

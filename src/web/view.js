@@ -2,7 +2,7 @@
 export const labels = {
   queued: "排队中",
   running: "运行中",
-  completed: "完成",
+  completed: "执行结束",
   needs_clarification: "需要澄清",
   partial: "部分完成",
   failed: "失败",
@@ -124,7 +124,9 @@ export function usageSummary(job) {
 
 export function renderJob(job) {
   const status = Object.hasOwn(labels, job.status) ? job.status : "failed";
-  const heading = `<div class="result-heading"><h3>${escapeHtml(job.user_text)}</h3><span class="status ${status}">${escapeHtml(labels[status])}</span></div>`;
+  const statusLabel = status === "completed" && job.analysis?.server_reasons?.includes("request_coverage_unverified")
+    ? "结果已生成 · 请求覆盖待核对" : labels[status];
+  const heading = `<div class="result-heading"><h3>${escapeHtml(job.user_text)}</h3><span class="status ${status}">${escapeHtml(statusLabel)}</span></div>`;
   const diagnostics = `<details class="diagnostics"><summary>模型与用量</summary><p>模型 ${escapeHtml(job.model_id || "未记录")} · 档位 ${escapeHtml(job.reasoning || "未记录")}</p>${usageSummary(job)}</details>`;
   const analysis = job.analysis;
   if (!analysis) {
@@ -167,6 +169,7 @@ export function renderJob(job) {
     .join("");
   return `${heading}
     ${job.error ? `<p class="inline-error">${escapeHtml(job.error.message)}</p>` : ""}
+    ${analysis.model_answer ? `<section class="model-answer"><h4>模型分析 · 未逐句核验</h4><p class="prose">${escapeHtml(analysis.model_answer)}</p><p class="muted">请结合下方已核验结果和来源判断；正文中的推断和数字未获得独立认证。</p></section>` : ""}
     <div class="answer">${renderVerifiedSummary(analysis) || escapeHtml(analysis.answer)}</div>
     ${verifiedRows ? `<section class="verified-results"><h4>经核验的查询单元</h4><p class="muted">仅代表所列保存结果行，不自动代表总计或模型对问题的理解。</p><ul>${verifiedRows}</ul></section>` : ""}
     ${analysis.clarification_question ? `<div class="clarification"><strong>请补充</strong><p>${escapeHtml(analysis.clarification_question)}</p><p class="muted">在下方问题框补充条件，将继续当前会话。</p></div>` : ""}
@@ -189,7 +192,7 @@ export function renderJob(job) {
             .join("")}</div>`
         : ""
     }
-    ${analysis.model_draft && analysis.sources.some((source) => source.evidence_eligible) ? `<details class="diagnostics"><summary>模型解释 · 未逐句核验</summary><p class="prose">${escapeHtml(analysis.model_draft.replace(/\[\[(?:result|compare):[^\]]+\]\]/g, ""))}</p><p class="muted">解释中的业务判断、范围和数字没有逐句认证；请以核验结果及来源为准。</p></details>` : ""}
+    ${analysis.model_draft && analysis.sources.some((source) => source.evidence_eligible) ? `<details class="diagnostics"><summary>模型解释 · 未逐句核验</summary><p class="prose">${escapeHtml(analysis.model_draft.replace(/\[\[(?:result|compare):[^\]]+\]\]|\[\[partial\]\]|\[\[review:\{[^\n]*\}\]\]/g, ""))}</p><p class="muted">解释中的业务判断、范围和数字没有逐句认证；请以核验结果及来源为准。</p></details>` : ""}
     ${workRecord}${diagnostics}
     <details class="diagnostics"><summary>结果核验记录</summary><p>服务端判定：${escapeHtml(labels[analysis.status] || analysis.status)}。模型建议：${escapeHtml(analysis.model_suggested_status)}。</p><ul>${(analysis.server_reasons || []).map((reason) => `<li><code>${escapeHtml(reason)}</code></li>`).join("")}</ul></details>`;
 }
@@ -296,6 +299,7 @@ function renderVerifiedSummary(analysis) {
   const computed = arithmetic
     .map((item) => {
       const value = item.result;
+      const group = Object.entries(item.verified_group || {}).map(([key, part]) => `${key}=${part === null ? "NULL" : JSON.stringify(part)}`).join(" · ");
       const shown =
         value.value === null
           ? value.undefined_reason === "null_input"
@@ -303,6 +307,7 @@ function renderVerifiedSummary(analysis) {
             : "不可计算（除数为零）"
           : `${value.approximate ? "约 " : ""}${value.value}`;
       return `<section class="metric-block"><h4>已核验运算 · ${escapeHtml({ add: "相加", subtract: "相减", multiply: "相乘", divide: "相除" }[item.operation] || item.operation)}</h4>
+      ${group ? `<p class="metric-scope">同次查询分组：${escapeHtml(group)}</p>` : ""}
       <div class="table-scroll" tabindex="0" role="region" aria-label="已核验运算结果"><table><thead><tr><th scope="col">结果</th><th scope="col">单位</th></tr></thead><tbody><tr><td class="metric-value">${escapeHtml(shown)}</td><td>${escapeHtml(value.unit)}</td></tr></tbody></table></div>
       <p class="muted">${value.interpretation === "mathematical_only" ? "核验数学运算与来源，不认证模型给出的业务名称。" : ""}${value.partial ? "输入有缺失或覆盖不完整。" : ""}</p>
       <details class="diagnostics"><summary>计算公式与来源</summary><p class="metric-scope">${escapeHtml(value.formula || `${value.basis?.table || "结果资源"}.${value.basis?.column || "结果"}`)}</p><p class="muted">计算资源 ${escapeHtml(item.resource_id)}</p></details></section>`;

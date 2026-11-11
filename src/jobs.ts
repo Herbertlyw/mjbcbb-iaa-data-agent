@@ -1,4 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { buildSessionContext } from "@earendil-works/pi-coding-agent";
 import { canContinueTranscript, captureTranscript, ensureAgent, modelPrompt, restoreAgent, withoutUnfinishedToolCall, type AgentTranscriptSnapshot } from "./agent.js";
 import { safeProviderError, usageFromSteps } from "./openai-gateway.js";
 import { resolveModelChoice } from "./model-catalog.js";
@@ -19,9 +22,9 @@ import type { StateStore, StoredSession, VisitorAdmission } from "./state-store.
 import type { AsyncMysqlStateStore } from "./async-mysql-state-store.js";
 import { sessionAnalyses, type ToolService } from "./tools.js";
 import { naturalCandidate } from "./natural-candidate.js";
-import { queryRetryKey, safeToolResultCode, unresolvedCandidateFailures } from "./candidate-failures.js";
-import { ResourceGraph } from "./resource-graph.js";
-import type { AnalysisDeclaration } from "./analysis-declaration.js";
+import { contractProgressKey, partialCandidateFeedback, queryEquivalentKey, queryRetryKey, repeatedIdenticalToolFailure, safeToolResultCode, toolAttemptKey } from "./candidate-failures.js";
+import { parseDeliveryReview } from "./delivery-review.js";
+import { SessionAnalysisRecords, type AnalysisDeclaration } from "./analysis-declaration.js";
 import { passthroughTurn, resolveTurn } from "./turn.js";
 import { isTerminal, type AnalysisRecord, type JobRecord, type JobStatus } from "./types.js";
 
@@ -401,7 +404,7 @@ export class JobService {
           }
         }
         if (event.type === "tool_execution_start") {
-          const started = await this.stateCall("appendEvent", jobId, this.owner, fence, "tool_started", { tool_name: event.toolName, tool_call_id: event.toolCallId, retry_key: queryRetryKey(event.toolName, event.args), args: sanitizeToolArgs(event.args) });
+          const started = await this.stateCall("appendEvent", jobId, this.owner, fence, "tool_started", { tool_name: event.toolName, tool_call_id: event.toolCallId, retry_key: queryRetryKey(event.toolName, event.args), equivalent_key: queryEquivalentKey(event.toolName, event.args), attempt_key: toolAttemptKey(event.toolName, event.args), args: sanitizeToolArgs(event.args) });
           if (!started) lostFence(); else this.publishEvent(jobId, started);
         }
         if (event.type === "tool_execution_end") {
@@ -498,34 +501,39 @@ export class JobService {
     if (await this.stateCall("finish", jobId, this.owner, fence, status, analysis, error, measuredUsage(this.host.config.modelMode, this.host.config.piProvider, modelCalls, toolCalls, steps))) await this.publish(jobId);
   }
 
-  private async deliverNaturalCandidate(jobId: string, fence: number, sessionId: string, messages: Parameters<typeof naturalCandidate>[0], declaration?: AnalysisDeclaration, candidateEntryId?: string | null): Promise<{ error?: { code: string; message: string } }> {
+  private async deliverNaturalCandidate(jobId: string, fence: number, sessionId: string, messages: Parameters<typeof naturalCandidate>[0], declaration?: AnalysisDeclaration, candidateEntryId?: string | null, preservePartial = false, reviewAllowed = false): Promise<{ error?: { code: string; message: string }; feedback?: { codes: string[]; message: string } }> {
     const job = await this.stateCall("getJob", jobId);
     if (!job || job.status !== "running" || job.fence !== fence || job.cancel_requested) return {};
     const allowed = new Set(job.events.filter((event) => event.type === "tool_finished" && event.payload.is_error === false && typeof event.payload.resource_id === "string").map((event) => String(event.payload.resource_id)));
     const candidate = naturalCandidate(messages, allowed);
     if (!candidate) return { error: { code: "model_stopped_without_candidate", message: "模型未明确选择本次结果，也没有形成可交付的澄清。" } };
+    if (preservePartial && candidate.kind !== "answer") return { error: { code: "candidate_revision_no_data", message: "修订没有保留先前可验证的部分结果。" } };
     const beat = await this.stateCall("heartbeat", jobId, this.owner, fence, Date.now(), this.host.config.leaseMs);
     if (!beat.ok || beat.cancel_requested) return {};
-    const closure = new Set<string>();
-    if (candidate.kind === "answer") {
-      const graph = new ResourceGraph((id) => this.host.sessions.lookupResourceAsync(sessionId, id), sessionId, jobId);
-      for (const id of candidate.resourceIds) if (await graph.add(id)) break;
-      for (const resource of graph.nodes()) closure.add(resource.resource_id);
-    }
-    const unresolvedFailures = candidate.kind === "answer" ? unresolvedCandidateFailures(job.events, closure) : 0;
+    const dataEvents = job.events.filter((event) => event.type === "tool_finished" && ["query", "read_session_resource", "calculate_session_cells"].includes(String(event.payload.tool_name)));
+    const allowUnreferenced = candidate.kind === "answer" && candidate.resourceIds.length === 0 && !dataEvents.some((event) => event.payload.is_error === false);
+    const unknownUsage = allowUnreferenced && (this.host.config.piProvider === "openai-compatible" || this.host.config.piProvider === "deepseek") && (await this.stateCall("listProviderSteps", jobId)).some((step) => step.usage_source === "unknown");
     const input = candidate.kind === "answer"
-      ? { suggested_status: "completed" as const, draft_answer: candidate.text, resource_ids: candidate.resourceIds, ...(candidate.comparisons ? { comparisons: candidate.comparisons } : {}), ...(declaration ? { declaration } : {}) }
+      ? { suggested_status: candidate.suggestedStatus ?? (unknownUsage ? "partial" as const : "completed" as const), draft_answer: candidate.text, resource_ids: candidate.resourceIds, ...(candidate.comparisons ? { comparisons: candidate.comparisons } : {}), ...(declaration ? { declaration } : {}) }
       : candidate.kind === "clarification"
       ? { suggested_status: "needs_clarification" as const, draft_answer: "", resource_ids: [], clarification_question: candidate.question }
       : { suggested_status: "failed" as const, draft_answer: "", resource_ids: [] };
-    const result = await this.host.tools.updateAnalysis(sessionId, input, undefined, { unresolvedToolFailures: unresolvedFailures });
+    const review = candidate.kind === "answer" && reviewAllowed ? parseDeliveryReview(candidate.text) : null;
+    const result = await this.host.tools.updateAnalysis(sessionId, input, undefined, candidate.kind === "answer" ? { events: job.events, review, reviewInvalid: reviewAllowed && candidate.text.includes("[[review:") && !review, textReviewed: reviewAllowed, allowUnreferenced } : undefined);
     if (!result.ok) return { error: { code: String(result.code ?? "candidate_delivery_failed"), message: "候选答案未通过服务端证据检查。" } };
     if (!candidateEntryId || !job.events.some((event) => event.type === "candidate_reviewed" && event.payload.candidate_entry_id === candidateEntryId)) {
       const event = await this.stateCall("appendEvent", jobId, this.owner, fence, "candidate_reviewed", { candidate_entry_id: candidateEntryId ?? null, status: result.status, selected_count: candidate.kind === "answer" ? candidate.resourceIds.length : 0 });
       if (!event) return { error: { code: "execution_fence_rejected", message: "候选审查的任务围栏已失效。" } };
       this.publishEvent(jobId, event);
     }
-    return {};
+    // Explicit gaps take precedence; a successful data result or a tool
+    // failure otherwise gets one same-session prose check, not a mandatory
+    // model-written JSON certificate. Faux is a fixed demonstration planner.
+    const actionable = result.status === "partial" ? partialCandidateFeedback(result.server_reasons) : null;
+    const feedback = this.host.config.piProvider !== "faux" && candidate.kind === "answer" && !reviewAllowed
+      ? actionable ?? (dataEvents.length ? { codes: ["model_body_self_check"], message: "宿主正文核对：对照本轮用户原话、候选正文及实际工具回执，检查是否遗漏必需指标、范围、对象、数字或未知原因；有缺口时复用已有证据补充，不能安全补齐时明确说明并以 [[partial]] 交付。模型核对不认证正文正确性。" } : null)
+      : null;
+    return feedback ? { feedback } : {};
   }
 
   private async runPiSession(input: {
@@ -699,7 +707,8 @@ export class JobService {
             }
           }
           if (event.type === "tool_execution_start") {
-            const started = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "tool_started", { tool_name: event.toolName, tool_call_id: event.toolCallId, retry_key: queryRetryKey(event.toolName, event.args), args: sanitizeToolArgs(event.args) });
+            const authority = await toolAuthorityFingerprint(this.host.sessions, input.sessionId, this.host.config.knowledgeDir, event.toolName);
+            const started = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "tool_started", { tool_name: event.toolName, tool_call_id: event.toolCallId, retry_key: queryRetryKey(event.toolName, event.args), equivalent_key: queryEquivalentKey(event.toolName, event.args), authority_key: authority, attempt_key: authority ? toolAttemptKey(event.toolName, event.args, authority) : undefined, args: sanitizeToolArgs(event.args) });
             if (!started) markLost(); else this.publishEvent(input.jobId, started);
           }
           if (event.type === "tool_execution_end") {
@@ -711,8 +720,22 @@ export class JobService {
               is_error: event.isError,
               code: safeToolResultCode(event.toolName, event.result, event.isError),
               resource_id: detailsRecord.resource_id ?? null,
+              progress_key: contractProgressKey(event.toolName, event.result),
             });
-            if (!finished) markLost(); else this.publishEvent(input.jobId, finished);
+            if (!finished) markLost(); else {
+              this.publishEvent(input.jobId, finished);
+              if (event.isError) {
+                const authority = await this.stateCall("getJob", input.jobId);
+                if (!authority || authority.fence !== input.fence || authority.status !== "running") markLost();
+                else {
+                  const repeated = repeatedIdenticalToolFailure(authority.events);
+                  if (repeated) {
+                    fail({ code: "repeated_tool_failure", message: `工具错误重复且没有新证据（${repeated.tool}：${repeated.code}）；已停止重复尝试。` });
+                    void session.abort();
+                  }
+                }
+              }
+            }
           }
         } catch (error) {
           // An asynchronous timeout/bridge failure can have committed. Stop the
@@ -729,6 +752,34 @@ export class JobService {
     const leaf = session.sessionManager.getLeafEntry();
     const leafMessage = leaf?.type === "message" ? leaf.message : undefined;
     const entries = session.sessionManager.getBranch();
+    let reconstructedPartial = false;
+    let fallbackCandidate: AnalysisRecord | null = null;
+    // A feedback snapshot can survive a worker restart while the provisional
+    // in-memory analysis cannot. Rebuild the prior candidate from the native
+    // active branch and current authority; never trust model text as an
+    // already-delivered result or re-execute its query.
+    if (progress) {
+      const feedback = entries.findLast((entry) => entry.type === "custom_message" && entry.customType === "lumenfox.candidate_feedback" && entry.details && typeof entry.details === "object" && (entry.details as { job_id?: unknown }).job_id === input.jobId);
+      const details = feedback?.type === "custom_message" ? feedback.details as { candidate_entry_id?: unknown } : undefined;
+      const candidateId = typeof details?.candidate_entry_id === "string" ? details.candidate_entry_id : null;
+      const current = candidateId ? await this.stateCall("getJob", input.jobId) : null;
+      if (candidateId && current?.events.some((event) => event.type === "candidate_feedback" && event.payload.code === "candidate_partial_evidence" && event.payload.candidate_entry_id === candidateId) && current.events.some((event) => event.type === "candidate_reviewed" && event.payload.candidate_entry_id === candidateId && ["partial", "completed"].includes(String(event.payload.status)))) {
+        const prior = buildSessionContext(entries, candidateId).messages;
+        const records = new SessionAnalysisRecords();
+        records.restoreFromPersistedMessages(prior);
+        const appSession = await this.host.sessions.requireAsync(input.sessionId);
+        const analyses = sessionAnalyses(appSession);
+        const before = analyses.length;
+        const restored = await this.deliverNaturalCandidate(input.jobId, input.fence, input.sessionId, prior, records.currentProjection()?.declaration, candidateId);
+        const reconstructed = analyses.length > before ? analyses.at(-1) : undefined;
+        analyses.splice(before);
+        if (!restored.error && reconstructed?.job_id === input.jobId && ["partial", "completed"].includes(reconstructed.status)) {
+          input.rememberCandidate(reconstructed);
+          fallbackCandidate = reconstructed;
+          reconstructedPartial = true;
+        }
+      }
+    }
     const inspection = inspectCompaction(entries, context.messages, input.userText);
     const decision = decideResume({
       contextMessages: context.messages,
@@ -787,15 +838,31 @@ export class JobService {
         }
       }
       if (!lost && !failed && !input.shouldStop() && !input.hasAnalysis() && !candidate) {
-        let delivered = await this.deliverNaturalCandidate(input.jobId, input.fence, input.sessionId, session.sessionManager.buildSessionContext().messages, governed.analysisRecords.currentProjection()?.declaration, session.sessionManager.getLeafId());
-        if (!input.shouldStop() && delivered.error && ["model_stopped_without_candidate", "evidence_feedback"].includes(delivered.error.code)) {
+        const appSession = await this.host.sessions.requireAsync(input.sessionId);
+        const candidates = sessionAnalyses(appSession);
+        const beforeCandidate = candidates.length;
+        let delivered = await this.deliverNaturalCandidate(input.jobId, input.fence, input.sessionId, session.sessionManager.buildSessionContext().messages, governed.analysisRecords.currentProjection()?.declaration, session.sessionManager.getLeafId(), reconstructedPartial, reconstructedPartial);
+        const restoredRevision = candidates.length > beforeCandidate ? candidates.at(-1) : undefined;
+        const restoredRegression = fallbackCandidate && restoredRevision ? partialEvidenceRegression(fallbackCandidate, restoredRevision) : null;
+        if (restoredRegression === "unresolved_requirements_unverified" && restoredRevision) {
+          preserveUncertainRevision(restoredRevision);
+        } else if (restoredRegression) {
+          candidates.splice(beforeCandidate);
+          const discarded = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "candidate_revision_discarded", { candidate_entry_id: session.sessionManager.getLeafId(), code: restoredRegression });
+          if (!discarded) markLost(); else this.publishEvent(input.jobId, discarded);
+          delivered = {};
+        }
+        const initialPartial = Boolean(delivered.feedback);
+        if (initialPartial) fallbackCandidate = candidates.filter((item) => item.job_id === input.jobId).at(-1) ?? fallbackCandidate;
+        const feedbackCode = delivered.feedback ? "candidate_partial_evidence" : delivered.error?.code;
+        if (!input.shouldStop() && feedbackCode && (Boolean(delivered.feedback) || ["model_stopped_without_candidate", "evidence_feedback"].includes(feedbackCode))) {
           const state = await this.stateCall("getJob", input.jobId);
           if (state && !state.cancel_requested && state.fence === input.fence && !state.events.some((event) => event.type === "candidate_feedback")) {
             const candidateEntry = session.sessionManager.getLeafId();
-            const recorded = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "candidate_feedback", { candidate_entry_id: candidateEntry, code: delivered.error.code });
+            const recorded = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "candidate_feedback", { candidate_entry_id: candidateEntry, code: feedbackCode, ...(delivered.feedback ? { reason_codes: delivered.feedback.codes } : {}) });
             if (!recorded) markLost();
             else {
-              await session.sendCustomMessage({ customType: "lumenfox.candidate_feedback", display: false, content: "宿主反馈：候选没有可核验的本次结果。请引用已成功生成的本次结果，或以 [[clarify]] 开头提出明确问题；不要编造数据。", details: { job_id: input.jobId, candidate_entry_id: candidateEntry } }, { triggerTurn: false });
+              await session.sendCustomMessage({ customType: "lumenfox.candidate_feedback", display: false, content: (delivered.feedback?.message ?? "宿主反馈：候选没有可核验的本次结果。请引用已成功生成的本次结果，或以 [[clarify]] 开头提出明确问题；不要编造数据。") + `\n原始用户要求：\n${input.userText}\n当前候选正文（模型内容，不是新的事实来源）：\n${candidates.at(-1)?.model_draft ?? ""}\n继续保留仍适用的结果引用；用普通正文交付，不必填写额外 JSON。`, details: { job_id: input.jobId, candidate_entry_id: candidateEntry } }, { triggerTurn: false });
               const saved = await this.stateCall("saveAgentSnapshot", { sessionId: input.sessionId, jobId: input.jobId, owner: this.owner, fence: input.fence, kind: "progress", body: captureSessionSnapshot(session, input.userText, input.jobId) as unknown as Record<string, unknown> });
               if (!saved) markLost();
               else if (!input.shouldStop()) {
@@ -803,13 +870,30 @@ export class JobService {
                 if (!latest || latest.fence !== input.fence || latest.status !== "running") markLost();
                 else if (!latest.cancel_requested && !input.shouldStop()) {
                   await session.agent.continue();
-                  if (!lost && !failed && !input.shouldStop()) delivered = await this.deliverNaturalCandidate(input.jobId, input.fence, input.sessionId, session.sessionManager.buildSessionContext().messages, governed.analysisRecords.currentProjection()?.declaration, session.sessionManager.getLeafId());
+                  if (!lost && !failed && !input.shouldStop()) {
+                    const beforeRevision = candidates.length;
+                    const revised = await this.deliverNaturalCandidate(input.jobId, input.fence, input.sessionId, session.sessionManager.buildSessionContext().messages, governed.analysisRecords.currentProjection()?.declaration, session.sessionManager.getLeafId(), initialPartial || reconstructedPartial, true);
+                    const revisedAnalysis = candidates.length > beforeRevision ? candidates.at(-1) : undefined;
+                    const regression = fallbackCandidate && revisedAnalysis ? partialEvidenceRegression(fallbackCandidate, revisedAnalysis) : null;
+                    if (regression === "unresolved_requirements_unverified" && revisedAnalysis) {
+                      preserveUncertainRevision(revisedAnalysis);
+                      const limited = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "candidate_revision_limited", { candidate_entry_id: session.sessionManager.getLeafId(), code: regression });
+                      if (!limited) markLost(); else this.publishEvent(input.jobId, limited);
+                    } else if (regression) {
+                      candidates.splice(beforeRevision);
+                      const discarded = await this.stateCall("appendEvent", input.jobId, this.owner, input.fence, "candidate_revision_discarded", { candidate_entry_id: session.sessionManager.getLeafId(), code: regression });
+                      if (!discarded) markLost(); else this.publishEvent(input.jobId, discarded);
+                    }
+                    // An invalid revision does not erase the previously checked
+                    // partial result. A fence rejection still stops delivery.
+                    if ((!regression || regression === "unresolved_requirements_unverified") && (!initialPartial || !revised.error || revised.error.code === "execution_fence_rejected")) delivered = revised;
+                  }
                 }
               }
             }
           }
         }
-        if (delivered.error && !lost && !input.shouldStop()) fail(delivered.error);
+        if (delivered.error && !lost && !input.shouldStop() && (!reconstructedPartial || delivered.error.code === "execution_fence_rejected")) fail(delivered.error);
       }
       if (!lost && !failed && !input.shouldStop()) {
         session.sessionManager.appendCustomEntry("lumenfox.host_turn", {
@@ -873,6 +957,48 @@ export class JobService {
   }
 }
 
+/** A repair cannot replace a previously verified result with unrelated scope,
+ * or claim completion by merely clearing a model-authored unresolved note. */
+function partialEvidenceRegression(previous: AnalysisRecord, revised: AnalysisRecord): "prior_verified_sources_omitted" | "unresolved_requirements_unverified" | null {
+  const next = new Set(revised.citations.map((item) => item.resource_id));
+  if (previous.sources.some((source) => source.evidence_eligible && !next.has(source.resource_id) && !equivalentVerifiedSource(previous, revised, source))) return "prior_verified_sources_omitted";
+  const previousQuestions = previous.analysis_declaration?.declaration.unresolved_questions ?? [];
+  const explicitlyOptional = previousQuestions.length > 0 && previousQuestions.every((question) => revised.model_coverage_review?.items.some((item) => item.requirement === question && item.status === "optional"));
+  if (previous.server_reasons.includes("model_declared_unresolved") && !revised.server_reasons.includes("model_declared_unresolved") && !explicitlyOptional && revised.citations.every((item) => previous.citations.some((old) => old.resource_id === item.resource_id))) {
+    // A newly cited resource may be unrelated. We cannot independently map a
+    // free-text working note to the user's entire request; never claim that
+    // clearing it or adding arbitrary evidence resolved the requirement.
+    return "unresolved_requirements_unverified";
+  }
+  return null;
+}
+
+/** Permit a new execution ID only for a narrowly equivalent, fully verified
+ * aggregate. Identical SQL alone cannot prove that observations agree. */
+function equivalentVerifiedSource(previous: AnalysisRecord, revised: AnalysisRecord, prior: AnalysisRecord["sources"][number]): boolean {
+  if (prior.truncated || !prior.complete_population || prior.coverage.status !== "known" || previous.aggregates_has_more || revised.aggregates_has_more) return false;
+  const key = queryEquivalentKey("query", { sql: prior.sql });
+  const normalized = (record: AnalysisRecord, id: string) => (record.aggregates ?? []).filter((item) => item.source_resource_id === id && !item.coverage_incomplete).map(({ source_resource_id: _source, output_column: _alias, ...item }) => JSON.stringify(item)).sort();
+  const oldValues = normalized(previous, prior.resource_id);
+  if (!oldValues.length) return false;
+  return revised.sources.some((source) => {
+    if (!source.evidence_eligible || source.truncated || !source.complete_population || source.coverage.status !== "known") return false;
+    if (source.sql !== prior.sql && (!key || key !== queryEquivalentKey("query", { sql: source.sql }))) return false;
+    if (JSON.stringify(source.time_range) !== JSON.stringify(prior.time_range) || JSON.stringify(source.contract_revisions) !== JSON.stringify(prior.contract_revisions) || JSON.stringify(source.asset_hashes) !== JSON.stringify(prior.asset_hashes)) return false;
+    const values = normalized(revised, source.resource_id);
+    return values.length === oldValues.length && values.every((value, index) => value === oldValues[index]);
+  });
+}
+
+/** Keep independently verified additions even when their relationship to a
+ * previous model-authored missing item cannot yet be established. */
+function preserveUncertainRevision(revised: AnalysisRecord): void {
+  revised.status = "partial";
+  revised.answer = revised.answer.replace(/^以下数字由当前任务的已授权查询和计算生成。/u, "这个回答不完整。");
+  if (!revised.server_reasons.includes("unresolved_requirements_unverified")) revised.server_reasons.push("unresolved_requirements_unverified");
+  revised.limitations.push("新增结果已核验，但仍不能独立确认它解决了此前的必需缺口。");
+}
+
 /** Test-only recovery barrier. It never blocks the event loop and aborts promptly. */
 function pauseForTest(ms: number, signal?: AbortSignal): Promise<void> {
   if (ms <= 0 || signal?.aborted) return Promise.resolve();
@@ -929,6 +1055,22 @@ function sanitizeToolArgs(args: unknown): unknown {
   if (!args || typeof args !== "object" || Array.isArray(args)) return {};
   const visible = (args as Record<string, unknown>).knowledge_body_visible;
   return typeof visible === "boolean" ? { knowledge_body_visible: visible } : {};
+}
+
+/** Reset identical-failure detection when the principal's bindings or the
+ * registry/policy bytes change. Failure to observe authority disables this
+ * heuristic; it never grants a query or bypasses the actual authorization. */
+async function toolAuthorityFingerprint(sessions: SessionStore, sessionId: string, knowledgeDir: string, tool: string): Promise<string | undefined> {
+  if (!["query", "calculate_session_cells", "read_data_contract_view"].includes(tool)) return undefined;
+  try {
+    const [session, registry, policy] = await Promise.all([
+      sessions.requireAsync(sessionId),
+      readFile(join(knowledgeDir, "registry.json")),
+      readFile(join(knowledgeDir, "policy.json")),
+    ]);
+    const bindings = session.bindings.map(({ receipt_id: _receipt, read_at: _readAt, ...binding }) => binding).sort((a, b) => a.asset_id.localeCompare(b.asset_id));
+    return createHash("sha256").update(JSON.stringify({ role: session.role, actor_id: session.actor_id, bindings })).update("\0").update(registry).update("\0").update(policy).digest("hex");
+  } catch { return undefined; }
 }
 
 function measuredUsage(

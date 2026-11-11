@@ -2,7 +2,7 @@
  * selections are hints, never authority: the host must separately verify the
  * selected resources and their ancestry at delivery time. */
 export type NaturalCandidate =
-  | { kind: "answer"; text: string; resourceIds: string[]; comparisons?: Array<{ left: { resource_id: string; cell: string }; right: { resource_id: string; cell: string } }> }
+  | { kind: "answer"; text: string; resourceIds: string[]; suggestedStatus?: "partial"; comparisons?: Array<{ left: { resource_id: string; cell: string }; right: { resource_id: string; cell: string } }> }
   | { kind: "clarification"; question: string }
   | { kind: "failed"; text: string };
 
@@ -33,10 +33,17 @@ export function naturalCandidate(messages: Message[], successfulResources: Reado
     return { kind: "clarification", question };
   }
   if (text === "[[failed]]") return { kind: "failed", text: "未能形成可验证的结论。" };
+  // This marker can only reduce a candidate's status. It is not proof of
+  // coverage, user intent or the accuracy of any explanation in the draft.
+  const partial = text.startsWith("[[partial]]");
+  if ((text.match(/\[\[partial\]\]/g)?.length ?? 0) !== Number(partial)) return null;
   const ids = [...text.matchAll(/\[\[result:(res_[A-Za-z0-9-]{1,128})\]\]/g)].map((match) => match[1]!);
-  if (!ids.length || ids.length > 40 || ids.some((id) => !successfulResources.has(id))) return null;
+  if ((text.match(/\[\[result:/g)?.length ?? 0) !== ids.length || ids.length > 40 || ids.some((id) => !successfulResources.has(id))) return null;
+  // No-result prose is appropriate for knowledge or hypothetical answers;
+  // it cannot silently omit already produced current-task data resources.
+  if (!ids.length && (successfulResources.size > 0 || !text.replace(/\[\[partial\]\]/gu, "").trim())) return null;
   const selected = new Set(ids);
   const comparisons = [...text.matchAll(/\[\[compare:(res_[A-Za-z0-9-]{1,128})\.([A-Za-z_][A-Za-z0-9_]{0,127}),(res_[A-Za-z0-9-]{1,128})\.([A-Za-z_][A-Za-z0-9_]{0,127})\]\]/g)].map((match) => ({ left: { resource_id: match[1]!, cell: match[2]! }, right: { resource_id: match[3]!, cell: match[4]! } }));
   if (comparisons.length > 20 || comparisons.some((item) => !selected.has(item.left.resource_id) || !selected.has(item.right.resource_id)) || (text.match(/\[\[compare:/g)?.length ?? 0) !== comparisons.length) return null;
-  return { kind: "answer", text, resourceIds: [...selected], ...(comparisons.length ? { comparisons } : {}) };
+  return { kind: "answer", text, resourceIds: [...selected], ...(partial ? { suggestedStatus: "partial" as const } : {}), ...(comparisons.length ? { comparisons } : {}) };
 }
